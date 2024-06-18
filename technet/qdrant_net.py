@@ -1,6 +1,6 @@
 from qdrant_client import QdrantClient, AsyncQdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchRequest, SearchParams, VectorParams, \
-    PointStruct, CollectionStatus, Distance, Range
+from qdrant_client.models import Filter, FieldCondition, HasIdCondition, MatchValue, SearchRequest, SearchParams, \
+    QuantizationSearchParams, VectorParams, CollectionStatus, PointStruct, OrderBy, Batch, Distance, Range
 from py2neo import Graph, Node, Relationship, Subgraph
 import numpy as np
 import asyncio
@@ -12,6 +12,25 @@ def cosine_sim(A, B):
     return similarity
 
 
+def create_vdb_collection(collection_name, size, new=False):
+    if new and client.collection_exists(collection_name=collection_name):
+        client.delete_collection(collection_name=collection_name)
+
+    if not client.collection_exists(collection_name=collection_name):
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=size, distance=Distance.COSINE),  # { "size": 128, "distance": "Cosine" }
+            # optimizer_config=OptimizersConfigDiff(indexing_threshold=0),#上传期间禁用索引,避免不必要的向量索引，这些向量将被下一批覆盖
+        )
+    return client.count(collection_name=collection_name, exact=True)  # get_collection(collection_name)
+
+
+def get_vdb_point(host, collection_name, ids):
+    import requests
+    response = requests.get(f'http://{host}:6333/collections/{collection_name}/points/{ids}')  # 从单个点检索所有详细信息
+    return response.json()
+
+
 def most_similar_by_name(name, collection_name, client, mutch=[], exclude=[], topn=10, score_threshold=0.5):
     match_name = FieldCondition(key='word', match=MatchValue(value=name, ), )
     match_not_name = [FieldCondition(key='word', match=MatchValue(value=w), ) for w in exclude]
@@ -20,7 +39,9 @@ def most_similar_by_name(name, collection_name, client, mutch=[], exclude=[], to
                                   scroll_filter=scroll_filter,
                                   with_vectors=True,
                                   with_payload=True,
-                                  limit=1)  # 只获取一个匹配的结果
+                                  limit=1,  # 只获取一个匹配的结果
+                                  # order_by=OrderBy(key='df',direction='desc')
+                                  )
 
     query_vector = scroll_result[0][0].vector
 
@@ -30,8 +51,10 @@ def most_similar_by_name(name, collection_name, client, mutch=[], exclude=[], to
                                query_filter=query_filter,
                                limit=topn,
                                score_threshold=score_threshold,
-                               search_params=SearchParams(exact=True, ),
-                               # Turns on the exact search mode
+                               search_params=SearchParams(exact=True,  # Turns on the exact search mode
+                                                          # quantization=QuantizationSearchParams(rescore=True),
+                                                          ),
+                               # offset=1
                                )
 
     return [(p.payload['word'], p.score) for p in search_hit]
@@ -44,8 +67,12 @@ def most_similar_by_ids(ids, collection_name, client, mutch=[], exclude=[], topn
     match_not_name = [FieldCondition(key='word', match=MatchValue(value=w), ) for w in names + exclude]
     query_filter = Filter(must=mutch, must_not=match_not_name)  # 缩小查询范围
 
-    search_queries = [SearchRequest(vector=p.vector, filter=query_filter, limit=topn, score_threshold=score_threshold,
-                                    with_payload=True)
+    search_queries = [SearchRequest(vector=p.vector, filter=query_filter, limit=topn,
+                                    score_threshold=score_threshold,
+                                    with_payload=['word'],
+                                    # params=SearchParams(exact=True),
+                                    # offset=1,
+                                    )
                       for p in id_record]
 
     search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
@@ -128,13 +155,14 @@ class VDB_Similar:
     collection_name = ''
     key_name = 'word'
     match_first = []
-    name_ids = {}  # unique,记忆
 
     def __init__(self, client, collection_name, key_name='word', match_first=[]):
         self.client = client
         self.collection_name = collection_name
         self.key_name = key_name  # .lower()
         self.match_first = match_first
+
+        self.name_ids = {}  # unique,记忆
 
     def get_ids(self, names):
         finds = set(names) - self.name_ids.keys()
@@ -148,23 +176,48 @@ class VDB_Similar:
     def get_menory(self):
         return self.name_ids
 
-    def get_vec(self, names):
+    def get_vecs(self, names):
         ids = self.get_ids(names)
         id_record = self.client.retrieve(collection_name=self.collection_name, ids=ids, with_vectors=True)
         return {p.payload[self.key_name]: p.vector for p in id_record}
 
-    def get_payload(self, names):
+    def get_vec(self, name):
+        if name in self.name_ids:
+            point_result = self.client.retrieve(collection_name=self.collection_name, ids=[self.name_ids[name]],
+                                                with_vectors=True)
+        else:
+            match_name = FieldCondition(key=self.key_name, match=MatchValue(value=name, ), )
+            scroll_filter = Filter(must=self.match_first + [match_name])
+            scroll_result = self.client.scroll(collection_name=self.collection_name,
+                                               scroll_filter=scroll_filter,
+                                               with_vectors=True,
+                                               with_payload=True,
+                                               limit=1,  # 只获取一个匹配的结果
+                                               # order_by=OrderBy(key='df',direction='desc')
+                                               )
+
+            point_result = scroll_result[0]  # (points,next_page_offset)
+            if not point_result:
+                return []
+
+            self.name_ids[point_result[0].payload[self.key_name]] = point_result[0].id
+
+        return point_result[0].vector
+
+    def get_payload(self, names, fields=[]):
         ids = self.get_ids(names)
-        id_record = self.client.retrieve(collection_name=self.collection_name, ids=ids, with_payload=True)
+        id_record = self.client.retrieve(collection_name=self.collection_name, ids=ids,
+                                         with_payload=fields if len(fields) else True)
         return [p.payload for p in id_record]  # [{},]
 
-    def SimilarByNames(self, names, exclude=[], topn=10, duplicate=0, score_threshold=0.0):
+    def SimilarByNames(self, names, exclude=[], not_ids=[], topn=10, duplicate=0, score_threshold=0.0):
         ids = self.get_ids(names)
         id_record = self.client.retrieve(collection_name=self.collection_name, ids=ids, with_vectors=True)
 
         names = [p.payload[self.key_name] for p in id_record]
         match_not_name = [FieldCondition(key=self.key_name, match=MatchValue(value=w), ) for w in names + exclude]
-        query_filter = Filter(must=self.match_first, must_not=match_not_name)  # 缩小查询范围
+        match_not_ids = [HasIdCondition(has_id=ids + not_ids)]
+        query_filter = Filter(must=self.match_first, must_not=match_not_ids + match_not_name)  # 缩小查询范围
 
         search_queries = [
             SearchRequest(vector=p.vector, filter=query_filter, limit=topn * len(names), with_payload=True,
@@ -173,9 +226,33 @@ class VDB_Similar:
 
         search_hit = self.client.search_batch(collection_name=self.collection_name,
                                               requests=search_queries)  # ScoredPoint
+
         self.name_ids.update({p.payload[self.key_name]: p.id for hit in search_hit for p in hit})
 
         return rerank_similar_by_search(names, search_hit, topn=topn, duplicate=duplicate, key_name=self.key_name)
+
+    def SimilarByName(self, name, exclude=[], not_ids=[], topn=10, score_threshold=0.0):
+        query_vector = self.get_vec(name)
+        if not query_vector:
+            return []
+
+        match_not_name = [FieldCondition(key=self.key_name, match=MatchValue(value=w), ) for w in exclude]
+        match_not_ids = [HasIdCondition(has_id=not_ids)]
+        query_filter = Filter(must=self.match_first, must_not=match_not_ids + match_not_name)  # [match_name] + 缩小查询范围
+        hit = self.client.search(collection_name=self.collection_name,
+                                 query_vector=query_vector,  # tolist()
+                                 query_filter=query_filter,
+                                 limit=topn,
+                                 score_threshold=score_threshold,
+                                 offset=(0 if name in exclude else 1),
+                                 # search_params=SearchParams(exact=True,  # Turns on the exact search mode
+                                 #                            # quantization=QuantizationSearchParams(rescore=True),
+                                 #                            ),
+                                 )  # ScoredPoint
+
+        self.name_ids.update({p.payload[self.key_name]: p.id for p in hit})
+
+        return [(p.payload[self.key_name], p.score) for p in hit]
 
 
 def CreateNode(word, depth, graph, node_name='Word', **kwargs):
@@ -223,31 +300,28 @@ class VDBRelationships:
                 "MATCH (source:" + node_name + " {name:\"" + name + "\"})-[relation:SIMILAR_TO]->(target) RETURN source,relation,target").data()
         return []
 
-    def create_relationships(self, width=3, depth=0, similar_words=[], names_depth={}, relationships_edges=[],
+    def create_relationships(self, width=3, depth=0, similar_names=[], names_depth={}, relationships_edges=[],
                              vdb_key='Word_all', duplicate=3, create=0, score_threshold=0.0, exclude=[], **kwargs):
 
         name_first = [k for k, v in names_depth.items() if v == 0]  # list(words_depth)[0]
         try:
-            similar_words_next = self.vdb[vdb_key].SimilarByNames(similar_words,
-                                                                  exclude=list(names_depth) + exclude,
-                                                                  topn=width,
-                                                                  duplicate=duplicate,
-                                                                  score_threshold=score_threshold)  # 分支会有合并,下层关系去重
+            not_ids = self.vdb[vdb_key].get_ids(list(names_depth))
+            similar_next = self.vdb[vdb_key].SimilarByNames(similar_names,
+                                                            exclude=exclude,  # +list(names_depth)
+                                                            not_ids=not_ids,
+                                                            topn=width,
+                                                            duplicate=duplicate,
+                                                            score_threshold=score_threshold)  # 分支会有合并,下层关系去重
 
-            similar_words = list(set(y[0] for x in similar_words_next for y in x[1]))  # 迭代词组
-            print("Depth:", depth, "Similar:", [x[0] for x in similar_words_next], "->", similar_words_next)
-            names_depth.update({w: depth + 1 for w in similar_words if w not in names_depth})
+            similar_names = list(set(y[0] for x in similar_next for y in x[1]))  # 迭代词组
+            print("Depth:", depth, "Similar:", [x[0] for x in similar_next], "->", similar_next)
+            names_depth.update({w: depth + 1 for w in similar_names if w not in names_depth})
 
-            if not (self.graph and create):
-                relationships = [
-                    {'source': x[0], 'target': y[0], 'relation': str(round(y[1], 5)), 'value': 1.0 - y[1]}
-                    for x in similar_words_next for i, y in enumerate(x[1])]
-                relationships_edges += relationships
-            else:
+            if self.graph and create:
                 prefix = vdb_key.split('_')[0]
                 node_name = f"{prefix}_{name_first}"
 
-                for x in similar_words_next:
+                for x in similar_next:
                     word_node = CreateNode(x[0], names_depth[x[0]], self.graph, node_name)  # w=x[0]
                     relationships = [Relationship(word_node, "SIMILAR_TO",
                                                   CreateNode(y[0], names_depth[y[0]], self.graph, node_name),
@@ -256,91 +330,146 @@ class VDBRelationships:
 
                     self.graph.create(Subgraph(relationships=relationships))  # 创建关系
                     relationships_edges += relationships
+            else:
+                relationships = [
+                    {'source': x[0], 'target': y[0], 'relation': str(round(y[1], 5)), 'value': 1.0 - y[1]}
+                    for x in similar_next for i, y in enumerate(x[1])]
+                relationships_edges += relationships
 
         except KeyError:
-            print(f"Data '{name_first, similar_words}' not in vocabulary.")
-            similar_words = []
+            print(f"Data '{name_first, similar_names}' not in vocabulary.")
+            similar_names = []
 
-        return similar_words
+        return similar_names
 
-    def create_relationships_layer(self, name, vdb_key='Word_all', layers=[3, 3, 3], duplicate=3, create=0,
-                                   max_node=400, score_threshold=0.0, exclude=[], **kwargs):
+    def create_relationship(self, width, depth, name, names_depth={}, vdb_key='Word_all', exclude_all=True, create=0,
+                            score_threshold=0.0, exclude=[]):
+        name_first = [k for k, v in names_depth.items() if v == 0]
+        relationships = []
+        try:
+            exclude_names = list(names_depth) if exclude_all else [k for k in names_depth if
+                                                                   names_depth[k] <= depth]  # 深度遍历时,排除上几层出现的
+            not_ids = self.vdb[vdb_key].get_ids(exclude_names)
+            similar_next = self.vdb[vdb_key].SimilarByName(name, exclude=exclude,
+                                                           not_ids=not_ids,
+                                                           topn=width,
+                                                           score_threshold=score_threshold)
+            similar_names = [y[0] for y in similar_next]
+            if len(similar_names) == 0:
+                return names_depth, relationships  # 返回递归
+
+            print("Depth:", depth, "Similar:", name, "->", similar_next)
+            new_depth = {w: depth + 1 for w in similar_names if w not in names_depth}
+            names_depth.update(new_depth)  # 当前层去重
+
+            if self.graph and create:
+                prefix = vdb_key.split('_')[0]
+                node_name = f"{prefix}_{name_first}"
+                word_node = CreateNode(name, names_depth[name], self.graph, node_name)  # 创建节点
+                relationships = [Relationship(word_node, "SIMILAR_TO",
+                                              CreateNode(y[0], names_depth[y[0]], self.graph, word_node),
+                                              similarity=y[1], rank=i)
+                                 for i, y in enumerate(similar_next)]
+                self.graph.create(Subgraph(relationships=relationships))  # 创建关系
+            else:
+                relationships = [
+                    {'source': name, 'target': y[0], 'relation': str(round(y[1], 5)), 'value': 1.0 - y[1]}
+                    for i, y in enumerate(similar_next)]
+
+        except KeyError:
+            print(f"Data '{name_first, name}' not in vocabulary.")
+            # new_depth = {}
+
+        return new_depth, relationships
+
+    def create_relationships_breadth(self, name, vdb_key='Word_all', layers=[3, 3, 3], duplicate=3, max_node=500,
+                                     create=0, score_threshold=0.0, exclude=[], **kwargs):
         if vdb_key not in self.vdb:
             return {}, []
 
         names_depth = {name: 0}
         relationships_edges = []
 
-        similar_words = [name]
+        similar_names = [name]
         depth = 0
 
         for width in layers:  # while depth <= max_depth and len(names_depth) <= max_node
-            if len(names_depth) > max_node:
-                break
+            if len(names_depth) + len(similar_names) * width > max_node:
+                drop_len = (max_node - len(names_depth)) // width
+                if drop_len <= 0:
+                    break
+                similar_names = similar_names[:drop_len]
 
-            similar_words = self.create_relationships(width=width, depth=depth,
-                                                      similar_words=similar_words,
+            similar_names = self.create_relationships(width=width, depth=depth,
+                                                      similar_names=similar_names,
                                                       names_depth=names_depth,
                                                       relationships_edges=relationships_edges,
                                                       vdb_key=vdb_key, duplicate=duplicate, create=create,
                                                       score_threshold=score_threshold, exclude=exclude, **kwargs)
 
             depth += 1
-            if len(similar_words) == 0:
+            if len(names_depth) > max_node or len(similar_names) == 0:
                 break
 
         return names_depth, relationships_edges
 
-    def create_relationships_layer_wd(self, name, vdb_key='Word_all', width=3, max_depth=3, duplicate=3, create=0,
-                                      max_node=400, score_threshold=0.0, exclude=[], **kwargs):
+    def create_relationships_depth(self, name, vdb_key='Word_all', layers=[3, 3, 3], max_node=500,
+                                   create=0, score_threshold=0.0, exclude_all=True, exclude=[],
+                                   depth=0, names_depth={}, relationships_edges=[]):
+        if vdb_key not in self.vdb:
+            return {}, []
 
-        layers = [width] * max_depth
-        return self.create_relationships_layer(name, vdb_key, layers, duplicate=duplicate, create=create,
-                                               max_node=max_node, score_threshold=score_threshold,
-                                               exclude=exclude,**kwargs)
+        if names_depth is None:
+            names_depth = {}
+        if relationships_edges is None:
+            relationships_edges = []
 
+        if depth == 0:
+            relationships_edges.clear()
+            names_depth.clear()
+            names_depth[name] = 0
 
-# def create_relationships_depth(word, model, graph=None, words_depth=None, width=3, depth=0, max_depth=5, wid=0,
-#                                         max_node=1000, exclude_all=False):
-#     if words_depth is None:
-#         words_depth = {}
-#     if depth == 0:
-#         words_depth[word] = 0
-#     if depth > max_depth or len(words_depth) > max_node:
-#         return [word]
-#     else:
-#         try:
-#             exclude = list(words_depth) if exclude_all else [w for w in words_depth if
-#                                                              words_depth[w] <= depth]  # 排除上几层出现的
-#             if len(exclude) > 1:
-#                 similar_words = similar_by_aword(word, model, width, exclude)
-#             else:
-#                 similar_words = model.wv.most_similar(word, topn=width)
-#
-#             if len(similar_words) > 0:
-#                 similar_words_depth = {w[0]: depth + 1 for w in similar_words if
-#                                        w[0] not in words_depth}  # 当前层去重相似度最高的词
-#                 words_depth.update(similar_words_depth)
-#                 print("Depth:", depth, "Similar:", word, "->", similar_words)
-#
-#                 if graph:
-#                     word_node = create_word_node(word, words_depth[word], graph, wid)  # 创建节点
-#                     relationships = [
-#                         Relationship(word_node, "SIMILAR_TO", create_word_node(w[0], words_depth[w[0]], graph, wid),
-#                                      similarity=w[1], rank=i)
-#                         for i, w in enumerate(similar_words)]
-#                     print(relationships)
-#                     graph.create(Subgraph(relationships=relationships))  # 创建关系
-#
-#                 return [word] + [
-#                     create_word_similarity_relationship(w[0], model, graph, words_depth, width, depth + 1, max_depth,
-#                                                         wid, exclude_all)
-#                     if w[0] in similar_words_depth else [w[0]] for w in similar_words]
-#             else:
-#                 return [word]  # 返回递归
-#         except KeyError:
-#             print(f"Word '{word}' not in vocabulary.")
-#             return [word]
+        if depth >= len(layers) or len(names_depth) + layers[depth] > max_node:
+            return names_depth, relationships_edges
+
+        new_depth, relationships = self.create_relationship(width=layers[depth], depth=depth,
+                                                            name=name, names_depth=names_depth,
+                                                            vdb_key=vdb_key, exclude_all=exclude_all,
+                                                            create=create, score_threshold=score_threshold,
+                                                            exclude=exclude)
+
+        relationships_edges += relationships
+
+        # 递归创建更深层次的关系,只找新的
+        for w in new_depth:
+            self.create_relationships_depth(w, vdb_key, layers, max_node,
+                                            create, score_threshold, exclude_all, exclude,
+                                            depth + 1, names_depth, relationships_edges)
+
+        # return [name] + [
+        #     self.create_relationships_depth(w, vdb_key, names_depth, relationships_edges,
+        #                                     width, depth + 1, max_depth, max_node,
+        #                                     create, score_threshold, exclude_all)
+        #     if w in new_depth else [w] for w in similar_words]
+
+        return names_depth, relationships_edges
+
+    # functions
+    def SimilarRelationships(self, name, vdb_key='Word_all', width=3, max_depth=3, layers=[], batch=True,
+                             duplicate=3, create=0, max_node=500, score_threshold=0.0, exclude=[], **kwargs):
+
+        if not layers:
+            layers = [width] * max_depth
+
+        if batch:
+            return self.create_relationships_breadth(name, vdb_key, layers, duplicate=duplicate, max_node=max_node,
+                                                     create=create, score_threshold=score_threshold,
+                                                     exclude=exclude, **kwargs)
+        else:
+            return self.create_relationships_depth(name, vdb_key, layers, max_node=max_node, create=create,
+                                                   score_threshold=score_threshold,
+                                                   exclude=exclude, exclude_all=(duplicate > 0))
+
 
 if __name__ == '__main__':
     client = QdrantClient(host="10.10.10.5", grpc_port=6334, prefer_grpc=True)
@@ -348,15 +477,24 @@ if __name__ == '__main__':
     vdbs = VDB_Similar(client, collection_name='专利_w2v', key_name='word', match_first=match_first)
     res = vdbs.SimilarByNames(['计算机', '训练方法', '电子设备'], exclude=[], topn=3, duplicate=3, score_threshold=0.3)
     print(res)
+    res = vdbs.SimilarByName('领域', exclude=[], topn=10, score_threshold=0.5)
+    print(res)
 
     vdr = VDBRelationships()
     vdr.load(None, client, collection_name='专利_w2v', prefix='Word', match_hy=['金融', '传统制造'])
-    words_depth, relationships_edges = vdr.create_relationships_layer('计算机', 'Word_金融', [2, 3, 4],
-                                                                      duplicate=3,
-                                                                      create=0, max_node=400,
-                                                                      score_threshold=0.0)
+    words_depth, relationships_edges = vdr.create_relationships_breadth('计算机', 'Word_金融', [2, 3, 4],
+                                                                        duplicate=3,
+                                                                        create=0, max_node=400,
+                                                                        score_threshold=0.0)
 
     print(words_depth, '\n', relationships_edges)
 
-    words_depth, relationships_edges = vdr.create_relationships_layer_wd('计算机', 'Word_金融', width=3, max_depth=3)
+    words_depth, relationships_edges = vdr.create_relationships_depth('计算机', 'Word_金融',
+                                                                      [2, 3, 3],
+                                                                      max_node=500, create=0, score_threshold=0.0,
+                                                                      exclude_all=False)
+
+    print(words_depth, '\n', relationships_edges, '\n')
+
+    words_depth, relationships_edges = vdr.SimilarRelationships('计算机', 'Word_金融', width=3, max_depth=3)
     print(words_depth, '\n', relationships_edges)
