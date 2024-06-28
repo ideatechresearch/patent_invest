@@ -179,9 +179,6 @@ class StopWordsFlag:
         words_table = data.iloc[start:start + limit].copy()
         words_select = words_table.index.to_list()
 
-        mask = words_table['dmc_idx'].duplicated(keep='first')
-        words_table.loc[mask, ['标题 (中文)', '摘要 (中文)']] = '同上'
-
         if uid >= 0:
             if not self.user_data[uid].get('task'):
                 self.user_data[uid]['task'] = []
@@ -190,6 +187,7 @@ class StopWordsFlag:
                 self.user_data[uid]['task'].pop(0)
 
         return words_select, words_table  # to_json(force_ascii=False)
+
 
     def set_stop_flag(self, stops: list, uid=0):  # stop>0
         task_words = self.user_data[uid].get('task', [])
