@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {% if title %}
+    <title>{{ title }}</title>
+    {% else %}
+    <title>Flask App</title>
+    {% endif %}
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <style>
+        .github-link {
+            position: absolute;
+            font-size: 12px;
+            text-decoration: none;
+            color: #0366d6;
+        }
+        .github-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+<!--模板引用-->
+{% include 'navbar.html' %}
+<a href="https://github.com/ideatechresearch/patent_invest" target="_blank" class="github-link">View on GitHub</a>
+<div style="text-align: right; margin-top: 10px;">
+    <small>
+        <a href="{{url_for('login') }}">login</a> 
+        <a href="{{url_for('logout')}}">logout</a>
+    </small>
+</div>
+<!--{% block content %}-->
+<!--<h1>Template</h1>-->
+<!--{% endblock %}-->
+
+{% for p in data %}
+<p>{{ p }}</p>
+{% endfor %}
+</body>
+</html>

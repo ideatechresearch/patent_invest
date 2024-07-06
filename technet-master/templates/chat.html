@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>问答</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <style>
+        .chat-container {
+            width: calc(100% - 20px);
+            max-width: 100%;
+            /* height: calc(100vh - 80px); */
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            background-color: #fff;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chat-box {
+            flex: 1;
+            padding: 10px;
+            overflow-y: auto;
+            border-bottom: 1px solid #ccc;
+        }
+
+        .message {
+            padding: 5px;
+            margin-bottom: 5px;
+            border-radius: 3px;
+            max-width: 95%;
+            font-size: 12px;
+        }
+
+        .user-message {
+            background-color: #ffff99;
+            align-self: flex-end;
+        }
+
+        .ai-message {
+            background-color: #f1f0f0;
+            align-self: flex-start;
+        }
+
+        .input-box {
+            display: flex;
+            padding: 10px;
+            border-top: 1px solid #ccc;
+        }
+
+        #chat-input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            resize: none;
+            font-size: inherit; 
+        }
+
+        #send-button {
+            margin-left: 10px;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            background-color: #007bff;
+            color: #fff;
+            cursor: pointer;
+        }
+
+        #send-button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+
+<body>
+    {% include 'navbar.html' %}
+    <h1>GAI</h1>
+    <div class="chat-container">
+        <div class="chat-box">
+            <div class="message user-message">
+                Hello! How can I help you today?
+            </div>
+            <div class="message ai-message">
+                I'm looking for information on creating a chat interface.
+            </div>
+            <!-- More messages can be added here -->
+        </div>
+        <div class="input-box">
+            <textarea id="chat-input" rows="3" placeholder="Your message..."></textarea>
+            <button id="send-button">Send</button>
+        </div>
+    </div>
+    <!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
+    <script>
+        document.getElementById('send-button').addEventListener('click', function () {
+            var input = document.getElementById('chat-input');
+            var message = input.value.trim();
+            if (message === "") return;
+            addMessage(message, 'user-message');
+            input.value = '';
+
+            fetch('/ask', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ question: message })
+            })
+                .then(response => response.json())
+                .then(data => {
+                    addMessage(data.answer, 'ai-message');
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                });
+            // setTimeout(function () {
+            //     addMessage("This is a simulated response.", 'ai-message');
+            // }, 1000);
+        });
+
+        function addMessage(text, className) {
+            var chatBox = document.querySelector('.chat-box');
+            var messageDiv = document.createElement('div');
+            messageDiv.className = 'message ' + className;
+            messageDiv.textContent = text;
+            chatBox.appendChild(messageDiv);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+    </script>
+</body>
+
+</html>

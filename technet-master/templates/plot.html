@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plotly Plot</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <script src="/static/js/local.storage.js"></script>
+</head>
+<body>
+{% include 'navbar.html' %}
+<h1>Patent Plotly Plot</h1>
+<form method="post">
+    <label for="patent_type">Select Patent Type:</label>
+    <select name="patent_type" id="patent_type" class="selectBox">
+        {% for i in patent_type %}
+        <option value="{{ i }}">{{ i }}</option>
+        {% endfor %}
+    </select>
+    <label for="columns">Select Patent Columns:</label>
+    <select name="columns" id="columns" class="selectBox">
+        {% for i in columns %}
+        <option value="{{ i }}">{{ i }}</option>
+        {% endfor %}
+    </select>
+    <input type="submit" value="Submit">
+</form>
+<div>
+    {{ graph_html|safe }}
+</div>
+<script>
+    // Call setSelectBoxValue function for each select box when page loads
+    window.onload = function () {
+      var selectBoxes = document.querySelectorAll(".selectBox");
+      selectBoxes.forEach(function (selectBox) {
+        setSelectBoxValue(selectBox);
+        // Save selected value when select box value changes
+        selectBox.addEventListener("change", function () {
+          saveSelectedValue(selectBox);
+        });
+      });
+    };
+
+</script>
+</body>
+</html>

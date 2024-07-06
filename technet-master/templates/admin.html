@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Admin</title>
+</head>
+
+<body>
+    <h2>管理员配置：</h2>
+    <form id="adminForm" method="POST">
+        <ul>
+            {% for item in checklist %}
+            <li>
+                <input type="checkbox" name="item" value="{{ item }}">
+                {{ item }}
+            </li>
+            {% endfor %}
+        </ul>
+        <button type="submit">Submit</button>
+        <a href="{{url_for('home')}}">返回首页</a>
+        <a href="{{url_for('download')}}">下载文件</a>
+        <a href="{{url_for('uploader')}}">上传文件</a>
+        <br>
+        {% if inform %}
+        <text> {{ inform }}</text>
+        {% endif %}
+    </form>
+</body>
+
+</html>

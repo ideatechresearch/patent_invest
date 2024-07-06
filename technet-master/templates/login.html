@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Login</title>
+</head>
+<body>
+<h2>User Login</h2>
+<form method="POST" action="{{ url_for('login') }}">
+    <label>Username:</label>
+    <input type="text" name="username"><br>
+    <label>Password :</label>
+    <input type="password" name="password"><br>
+    <input type="hidden" name="hashed_password" value="{{ hashed_password }}">
+    <input type="submit" value="Login">
+    {% if error %}
+    <p>{{ error }}</p>
+    {% endif %}
+    <div style="text-align: center; margin-top: 10px;">
+        <small>如果没有账户,点此<a href="{{url_for('register')}}">注册</a></small>
+    </div>
+</form>
+</body>
