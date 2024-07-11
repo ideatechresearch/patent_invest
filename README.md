@@ -1,7 +1,10 @@
 # TechNet Master Project
 
 ## 项目简介
-TechNet 是一个综合性的项目，旨在通过网站和文档目录的协同工作，提供数据整理、转换和分析等功能。
+本项目是一个综合性的项目，旨在通过网站和文档目录的协同工作，提供数据整理、转换和分析等功能。  
+本项目拟通过研究机器学习、AI和大模型技术在金融领域的最新发展趋势和应用，深入研究并开发人工智能和大模型技术在金融场景中的应用平台。研究内容涵盖新兴技术的趋势分析、金融数据的收集、处理与商业价值挖掘、AI模型的定制开发与优化，以及构建集成这些技术的金融实操应用平台。  
+
+其中technet-master是基于TechNet 文本分析方法的技术相似专利挖掘方法及应用
 
 ## 目录结构
 项目的目录结构如下：
@@ -21,7 +24,7 @@ TechNet 是一个综合性的项目，旨在通过网站和文档目录的协同
 
 1. 克隆项目:
    ```bash
-   git clone https://github.com/yourusername/technet-master.git
+   git clone https://github.com/ideatechresearch/patent_invest/technet-master.git 
 2. 进入项目目录:
     ```bash
     cd technet-master
