@@ -58,6 +58,10 @@
         ```bash
         cp /technet-master/config_debug.py /technet-master/config.py
         ```
+    6. 数据库：  
+        需要安装sql数据库和qdrant数据库。  
+        如果使用文件方式运行，可以查看历史版本中/technet的w2v_neo4j_net.py,vec_neo4j_net.py,matrix_neo4j_net.py这些方法构建。
+
 5. technet说明:  
     #### 选取停用词部分(select_stop_words.py)，主要是用位运算对不同用户给选取的词做标记，其他还包括清零和置位。
         如:set_stop_flag,set_words_flag
@@ -103,7 +107,7 @@
         17.create_relationship根据已有节点和其所在层数信息给VDBSimilar::Similar
         18.Similar动态的过滤一些节点id后请求qdrant_client.search得到点击节点name的相似值
         19.得到(name,score)后转换一下，使用(new_depth, relationships)打包(nodes, edges),其中这边source，target传的是节点向量数据库id
-        20.使用json格式返回请求或对新节点填下缺失后push给js的(nodes, edges),然后使用updateSimulation更新图形创建新节点和边
+        20.使用json格式返回请求或对新节点填下缺失后push给前端js的(nodes, edges),然后使用updateSimulation更新图形创建新节点和边
 
 
 ## 贡献
