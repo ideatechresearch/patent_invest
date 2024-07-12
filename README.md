@@ -2,7 +2,8 @@
 
 ## 项目简介
     本项目是一个综合性的项目，旨在通过网站和数据的协同工作，提供数据分析研究等功能。  
-    本项目拟通过研究机器学习、AI和大模型技术在金融领域的最新发展趋势和应用，深入研究并开发人工智能和大模型技术在金融场景中的应用平台。研究内容涵盖新兴技术的趋势分析、金融数据的收集、处理与商业价值挖掘、AI模型的定制开发与优化，以及构建集成这些技术的金融实操应用平台。  
+    本项目拟通过研究机器学习、AI和大模型技术在金融领域的最新发展趋势和应用，深入研究并开发人工智能和大模型技术在金融场景中的应用平台。  
+    研究内容涵盖新兴技术的趋势分析、金融数据的收集、处理与商业价值挖掘、AI模型的定制开发与优化，以及构建集成这些技术的金融实操应用平台。  
 其中technet-master是基于[TechNet](https://github.com/SerhadS/TechNet)文本分析方法的技术相似专利挖掘方法及应用。  
 随着中国经济步入高质量发展阶段，创新成为关键驱动力。创新实力的重要体现就是专利，其中高价值专利对高质量发展作用不断凸显，它不仅代表着技术创新的高度,更是推动经济和社会高质量发展的核心因素。高价值专利承载着重要的创新和技术突破，对于企业和社会的发展具有巨大影响。因此，科学、客观和精确地识别这些高价值的专利，是政府及创新主体开展高价值专利培育和布局工作的基础，对推动我国知识产权高质量发展和知识产权强国建设具有重要意义。
 
@@ -60,29 +61,29 @@
         ```
     6. 数据库：  
         需要安装sql数据库和qdrant数据库。  
-        如果使用文件方式运行，可以查看历史版本中/technet的w2v_neo4j_net.py,vec_neo4j_net.py,matrix_neo4j_net.py这些方法构建。
+        如果使用文件方式运行，可以查看历史版本中/technet中w2v_neo4j_net.py,vec_neo4j_net.py,matrix_neo4j_net.py这些方法构建。
 
 5. technet说明:  
     #### 选取停用词部分(select_stop_words.py)，主要是用位运算对不同用户给选取的词做标记，其他还包括清零和置位。
-        如:set_stop_flag,set_words_flag
+        如:StopWordsFlag::set_stop_flag,StopWordsFlag::set_words_flag
     #### 向量搜索功能部分(qdrant_net.py)，使用qdrant向量数据库。
         1. 提供通用字段筛选方法，如：field_match,empty_match
-        2. 提供嵌入模型查询方法，如：get_bge_embeddings，most_similar_embeddings
+        2. 提供嵌入模型查询方法，如：get_bge_embeddings,most_similar_embeddings
         3. 节点匹配重复关系优化方法：rerank_similar_by_search
-        4. 提供ID和Name映射记忆模块，如VDBSimilar：get_id,get_ids，主要使用names_to_ids方法
+        4. 提供ID和Name映射记忆模块，如VDBSimilar：get_id,get_ids,主要使用names_to_ids方法
             获取向量数据方法：get_vec,get_vecs
             可选字段载荷数据方法：get_payload
             搜索方法：SimilarByName,SimilarByNames
         5. 提供关系查询模块：VDBRelationships,对不同的查询筛选类别创建VDBSimilar
-            查询和关系方法：similar,similar_by_names,create_relationship,create_relationships，主要是返回数据构造不同
-            多项网络查询方法：create_relationships_breadth，create_relationships_depth，主要是广度和深度区别
-            通用相似关系方法：SimilarRelationships,可以提供不同参数自动使用相应方法
+            查询和关系方法：similar,similar_by_names,create_relationship,create_relationships,主要是返回数据构造不同
+            多项网络查询方法：create_relationships_breadth,create_relationships_depth,主要是广度和深度区别
+            通用网络关系方法：SimilarRelationships,可以提供不同参数自动使用相应方法
             还有给路由返回的数据打包节点和关系，如：SimulationNodes
     #### Web应用部分(flask_app.py)，使用Flask框架。
         1.定义/search提供查询功能
         2.定义/get_words提供词浏览页面及标记停用词功能
         3.定义/relationship提供关系网络查询页面功能
-        4.定义/show_relationships，/node_relations提供关系网络显示功能
+        4.定义/show_relationships,/node_relations提供关系网络显示功能
         5.定义/similar响应点击返回相似词
         6.定义/details提供数据库查询及表格页面显示功能
         7.定义companys_detail_links,patents_detail_links,words_detail_links,words_detail_absrtact提供表格数据转换附加链接等功能
@@ -99,14 +100,14 @@
         9.得到(name,score)更新names_depth和累加relationships_edges
         10.然后给SimulationNodes改变格式组装打包数据
         11.使用json格式返回请求给 JavaScript fetch 
-        12.获取数据后对各个节点关系查下错，给drawGraph绘制图形
+        12.获取数据后根据各个节点关系(source,target)匹配，给drawGraph绘制图形
         13.新建力导向图，根据(nodes, edges)数据建立节点和边,并根据属性添加文字、颜色，给节点添加ticked、ClickNode函数
         14.当点击节点时触发ClickNode事件,然后给fetchNodeRelations
         15.fetchNodeRelations请求数据到/node_relations，并传递页面参数，节点name和当前已有的Nodes信息
         16.node_relations转换参数后给VDBRelationships::create_relationship
         17.create_relationship根据已有节点和其所在层数信息给VDBSimilar::Similar
         18.Similar动态的过滤一些节点id后请求qdrant_client.search得到点击节点name的相似值
-        19.得到(name,score)后转换一下，使用(new_depth, relationships)打包(nodes, edges),其中这边source，target传的是节点向量数据库id
+        19.得到(name,score)后转换一下，使用(new_depth, relationships)打包(nodes, edges),其中这边source,target传的是节点向量数据库id
         20.使用json格式返回请求或对新节点填下缺失后push给前端js的(nodes, edges),然后使用updateSimulation更新图形创建新节点和边
 
 
