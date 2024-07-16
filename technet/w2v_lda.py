@@ -1,12 +1,12 @@
 from gensim import corpora
-from gensim.models import Word2Vec, LdaModel, TfidfModel
-from sklearn.metrics.pairwise import cosine_similarity, cosine_distances
-from collections import Counter, OrderedDict, defaultdict
-
+from gensim.models import Word2Vec,LdaModel,TfidfModel
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import Counter,OrderedDict,defaultdict
+import jieba
+import multiprocessing
 import pandas as pd
 import numpy as np
-import re, os, sys, pickle
-
+import re,os,sys,pickle
 
 class W2vLda:
     args = {
@@ -14,20 +14,20 @@ class W2vLda:
         'sg': 0,
         'window': 5,
         'len_below': 2,  # word
-        'no_below': 3,
-        'min_count': 2,
+        'no_below': 2, # 最少频次.3
+        'min_count': 2, #同上
         'count_fifter': 10,  # doc
 
-        'num_topics': 20,  # 定义主题数
-        'top_n_words': 10,  # 每个主题显示几个词
-        # 'top_n_topics': 5, # 每个文档前几个主题,None,数量截取
-        'weight_threshold_topics': 0.1,  # 文档主题权重大于阈值的,0.1,阈值截取
-        # 'minimum_probability':0.05#同上
+        'num_topics': 20,  # 定义主题数.50
+        'top_n_words': 10,  # 每个主题显示几个词.30
+        'top_n_topics': 5, # 每个文档前几个主题,None,数量截取
+        'weight_threshold_topics': 0.05,  # 文档主题权重大于阈值的,0.1,阈值截取
+        'minimum_probability':0.05 #同上
     }
     # 初始化数据，不随改变参数改变
-    id_data = pd.Series()  # index
-    wd_data = pd.Series()  # cleaned documents
-    group_ids = pd.DataFrame()
+    sentences = pd.Series() # cleaned document
+    id_data = None  # index
+    group_ids = None # values,[arr.tolist() for arr in array_data]
     # public
     stop_words = set()
     dictionary = None
@@ -42,53 +42,63 @@ class W2vLda:
     new_filter = False  # 控制停用词筛选
     suffix = ''
 
-    # 导入数据及分词
-    def __init__(self, id_data, co_data, wd_data, stop_words=None, calc=True, suffix='',
-                 **kwargs) -> None:  # data['标题 (中文)'].str.cat(data['摘要 (中文)'])
+    #导入数据及分词 
+    def __init__(self, sentences,wd_data=None,co_data=None,suffix='',stop_words=None,**kwargs)-> None:
         self.args = {**self.args, **kwargs}
-        self.id_data = id_data.copy()
         self.suffix = suffix
 
         if stop_words:
-            self.stop_words = stop_words.copy()
+            self.stop_words = set(stop_words)#self.reset_stop_words(stop_words)
 
-        if calc:
-            import jieba
+        if wd_data is None:  #导入分词数据
+            self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)].dropna()
+        else:
             # self.wd_data=wd_data.dropna().apply(lambda x:
             # [w.strip() for w in jieba.lcut(clean_doc(x)) if len(w) >= self.args.get('len_below',2) and w not in self.stop_words]).dropna()
             # flag_data=wd_data.dropna().apply(lambda x:
             # [ i.flag for i in jieba.posseg.cut(clean_doc(x.lower())) if not i.word.isdigit()]).dropna()
-            self.wd_data = wd_data.dropna().apply(lambda x:
-                                                  [w.strip().lower() for w in jieba.lcut(clean_doc(x))
+            assert '序号' in wd_data.columns,'需要索引!'
+                
+            self.sentences = wd_data['标题 (中文)'].str.cat(wd_data['摘要 (中文)'].replace(np.nan,'')).dropna().apply(lambda x: [w.strip().lower() for w in jieba.lcut(clean_doc(x))
                                                    if not (len(w) < self.args.get('len_below', 2) or
                                                            w.isdigit() or re.match('\d+\.\d+$', w) or
                                                            w in self.stop_words)]).dropna()
 
-            pd.concat([id_data, self.wd_data.rename('词语')], axis=1).to_parquet(
+            self.id_data = wd_data['序号'].copy()
+            pd.concat([self.id_data, self.sentences.rename('词语')], axis=1).to_parquet(
                 f'data\patent_cut_doc_{self.suffix}.parquet', index=False)  # 序号,[word,]
-            # .to_pickle('data\patent_cut_doc.pkl')#to_csv('data\patent_cut_doc.csv',encoding="utf_8_sig")
-            self.wd_data = self.wd_data[self.wd_data.apply(len) >= self.args.get('count_fifter', 0)]
+            # .to_pickle('data\patent_cut_doc.pkl') #to_csv('data\patent_cut_doc.csv',encoding="utf_8_sig")
+            self.sentences = self.sentences[self.sentences.apply(len) >= self.args.get('count_fifter', 0)]
 
-            co_unstack = pd.merge(co_data, id_data.loc[self.wd_data.index], left_index=True,
+            if not co_data:
+                co_data=wd_data['申请人'].str.split(';',expand=True).stack().str.strip().reset_index(level=1,drop=True).rename('Co')
+                
+            co_unstack = pd.merge(co_data, wd_data.loc[self.sentences.index,'序号'], left_index=True,
                                   right_index=True)  # Co,序号(wd_data dropna)
+            
+           
             self.group_ids = co_unstack.groupby('Co')['序号'].apply(lambda x: x.to_list()).reset_index()  # Co,['序号',]
             self.group_ids.to_parquet(f'data\patent_co_ids_{self.suffix}.parquet', index=False)
-
+    
             self.new_filter = False
-        else:
-            self.wd_data = wd_data[wd_data.apply(len) >= self.args.get('count_fifter', 0)].dropna()
-            self.group_ids = co_data  # values,[arr.tolist() for arr in array_data]
 
+        
     # 中途可能推出，需要备份
     def save(self):
-        self.dictionary.save(f'data\patent_dictionary_{self.suffix}.dict')
-        self.wo.save(f'data\patent_w2v_{self.suffix}.model')
-        self.lda.save(f'data\patent_lda_{self.suffix}.model')
+        if self.dictionary:
+            self.dictionary.save(f'data\patent_dictionary_{self.suffix}.dict')
+        if self.wo:
+            self.wo.save(f'data\patent_w2v_{self.suffix}.model')
+        if self.lda:
+            self.lda.save(f'data\patent_lda_{self.suffix}.model')
 
-    def load(self):
-        self.dictionary = corpora.Dictionary.load(f'data\patent_dictionary_{self.suffix}.dict')
-        self.wo = Word2Vec.load(f'data\patent_w2v_{self.suffix}.model')
-        self.lda = LdaModel.load(f'data\patent_lda_{self.suffix}.model')
+    def load(self,dictionary=True, wo=True, lda=True):
+        if dictionary:
+            self.dictionary = corpora.Dictionary.load(f'data\patent_dictionary_{self.suffix}.dict')
+        if wo:
+            self.wo = Word2Vec.load(f'data\patent_w2v_{self.suffix}.model')
+        if lda:
+            self.lda = LdaModel.load(f'data\patent_lda_{self.suffix}.model')
 
     def update(self, params: dict):  # argparse.ArgumentParser() add_argument
         self.args.update(params)
@@ -96,6 +106,12 @@ class W2vLda:
     def params(self):  # parser.parse_args()
         return self.args  # |.__dict__
 
+    def on_init(self,sentences,suffix=''):
+        self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)].dropna()
+        self.new_filter = True
+        if suffix:
+            self.suffix = suffix
+        
     def reset_stop_words(self, stop_words):  # 初始化停用词,搭配filter_stop_words
         self.stop_words = set(stop_words)
         self.dictionary = None  # 重建词典,dictionary.cfs
@@ -119,25 +135,27 @@ class W2vLda:
 
         return len(stop_ids), len(self.dictionary)
 
-    # 词汇表及特征提取向量化:wd_data,corpus,document_topics,documents_vec
-    def on_corpus(self, **kwargs):
-        self.args.update(kwargs)  # 更新参数
 
-        processed_doc = self.wd_data.apply(
-            lambda x: [w for w in x if w not in self.stop_words]) if self.new_filter else self.wd_data  # 不需要重新分词
+    # 词汇表及特征提取向量化:sentences,corpus,document_topics,documents_vec
+    def on_corpus(self, **kwargs):
+        if kwargs:
+            self.args.update(kwargs)  # 更新参数
+
+        processed_doc = self.sentences.map(
+            lambda x: [w for w in x if w not in self.stop_words]) if self.new_filter else self.sentences  
+        # .to_frame().applymap()不需要重新分词
 
         if not self.dictionary:
             self.dictionary = corpora.Dictionary(processed_doc)  # 单词ID到单词的映射
-            self.dictionary.filter_extremes(no_below=self.args.get('no_below', 3),
-                                            no_above=self.args.get('no_above', 0.95),
+            self.dictionary.filter_extremes(no_below=self.args.get('no_below', 2),
+                                            no_above=self.args.get('no_above', 0.99),
                                             keep_n=self.args.get('keep_n', 800000))  # 删除出现少于3个文档的单词或在95％以上文档中出现的单词
-        self.corpus = [self.dictionary.doc2bow(text) for text in
-                       processed_doc]  # new_corpus,整个语料库的词袋表示,文档集合,[(字典中词索引,词频)]：Counter(model.wd_data[i])
 
+        self.corpus = [self.dictionary.doc2bow(text) for text in
+                       processed_doc]  # new_corpus,整个语料库的词袋表示,文档集合,[(字典中词索引,词频)]：Counter(model.sentences[i])
         print(self.args)
 
         if not self.wo:
-            import multiprocessing
             self.wo = Word2Vec(processed_doc,
                                sg=self.args.get('sg', 0), vector_size=self.args['vector_size'],
                                window=self.args.get('window', 5), min_count=self.args.get('min_count', 2),
@@ -146,6 +164,7 @@ class W2vLda:
         self.dict2vecs = {word: self.wo.wv[word] for word in
                           (set(self.wo.wv.index_to_key) & set(self.dictionary.values()))}
 
+
         if not self.lda:
             self.lda = LdaModel(corpus=self.corpus, id2word=self.dictionary, num_topics=self.args['num_topics'],
                                 chunksize=self.args.get('chunksize', 1000), passes=self.args.get('passes', 3),
@@ -153,14 +172,18 @@ class W2vLda:
 
         new_filter = False
 
-        return len(self.wo.wv), len(self.dictionary), len(self.dict2vecs)  # len(self.word2vecs),wo.wv.vectors.shape
+        return len(self.wo.wv), len(self.dictionary), len(self.dict2vecs)  
+        # len(self.word2vecs),wo.wv.vectors.shape
+
+
 
     def on_topics(self, **kwargs):
-        self.args.update(kwargs)
+        if kwargs:
+            self.args.update(kwargs)
 
         self.document_topics = self.lda.get_document_topics(self.corpus,
-                                                            minimum_probability=self.args.get('minimum_probability',
-                                                                                              0.05))  # 所有文档的主题分布,列表
+                                                    minimum_probability=self.args.get('minimum_probability',0.05))  
+        # 所有文档的主题分布,列表
         # [lda[doc] for doc in corpus]\ [lda.get_document_topics(doc) for doc in corpus]
 
         topics_vec = []  # 基于词向量的主题向量表示
@@ -192,25 +215,80 @@ class W2vLda:
             v_doc = (w_distribute * v_topics).sum(axis=0)  # 专利文档中前个技术主题向量分别乘以其权重后加和
             documents_vec.append(v_doc)
 
-        return topics_vec, np.array(documents_vec)  # <-document_topics<-corpus<-wd_data
+        return topics_vec, np.array(documents_vec)  # <-document_topics<-corpus<-sentences
+
 
     def union_vec(self, documents_vec):
-        df_lda_w2v = pd.DataFrame(documents_vec, index=self.wd_data.index)
-        df_lda_w2v = df_lda_w2v[df_lda_w2v.sum(axis=1) != 0]
+        df_lda_w2v = pd.DataFrame({'vec': [vec for vec in documents_vec]}, index=self.sentences.index)
+        df_lda_w2v = df_lda_w2v[df_lda_w2v['vec'].apply(np.sum) != 0]
         df_lda_w2v['序号'] = self.id_data.loc[df_lda_w2v.index]  # iloc
-        co_ids_vec = self.group_ids['序号'].apply(lambda x: df_lda_w2v.loc[df_lda_w2v['序号'].isin(x),
-                                                            0: self.args['vector_size'] - 1].mean(
-            axis=0))  # 序号:vec_mean...
+        df_lda_w2v.set_index('序号', inplace=True)
+
+        #.apply(lambda x: df_lda_w2v.loc[df_lda_w2v['序号'].isin(x), 0: self.args['vector_size'] - 1].mean(axis=0)) 
+        co_ids_vec = self.group_ids['序号'].apply(lambda x: df_lda_w2v.loc[df_lda_w2v.index.isin(x),'vec'].apply(pd.Series).mean(axis=0))
         co_ids_vec.index = self.group_ids['Co']
         return co_ids_vec[co_ids_vec.sum(axis=1) != 0]  # Co:vec,以此做group相似度计算
 
-    def arr2_cosine_sim(self, arr):
-        return pd.DataFrame(restore_matrix(arr), index=self.group_ids.Co, columns=self.group_ids.Co)
+    def docs_vec(self, documents_vec,wd_data=None):
+        doc_lda_w2v = pd.DataFrame(documents_vec, index=self.sentences.index)
+        doc_lda_w2v = doc_lda_w2v[doc_lda_w2v.sum(axis=1) != 0]
+        if wd_data is not None:
+            doc_lda_w2v=doc_lda_w2v.join(wd_data['序号']).set_index('序号')
+            # doc_lda_w2v.merge(wd_data['序号'], left_index=True, right_index=True, how='left')
+            # doc_lda_w2v['序号'] = wd_data.loc[doc_lda_w2v.index,'序号'] 
+            # doc_lda_w2v.set_index('序号', inplace=True)
+  
+        doc_lda_w2v.to_parquet(f'data\\documents_vec_{self.suffix}.parquet')    
+        return doc_lda_w2v
 
+    def group_vec(self, df_documents_vec,group_ids):
+        ids_vec = group_ids['序号'].apply(lambda x: df_documents_vec.loc[df_documents_vec.index.isin(x)].mean(axis=0))
+        ids_vec.index = group_ids['Co']
+        return ids_vec[ids_vec.sum(axis=1) != 0]
+
+    def topic_vec(self,doc,topics_vec):
+        processed_doc=[w.strip().lower() for w in jieba.lcut(clean_doc(doc))
+                                     if not (len(w) < self.args.get('len_below', 2) or w.isdigit() 
+                                             or re.match('\d+\.\d+$', w) or w in self.stop_words)]
+
+        bow=self.dictionary.doc2bow(processed_doc)
+        topic_distribution=self.lda.get_document_topics(bow,minimum_probability=self.args.get('minimum_probability',0.05))
+
+        if len(topic_distribution) == 0:  # get 不到主题：空摘要,'',nan,[],去除停用词后词太少
+            return np.zeros_like(topics_vec[0])
+
+        topic_n = sorted(topic_distribution, key=lambda x: x[1], reverse=True)[:self.args.get('top_n_topics', None)]
+        distribute = np.array(topic_n)[:, 1]
+        mask = distribute >= self.args.get('weight_threshold_topics', 0.0)  # 主题权重大于阈值
+
+        v_topics = np.array([topics_vec[t[0]] for t in topic_n])[mask]  # 主题向量
+        if np.sum(distribute[mask]) == 0:
+            return np.zeros_like(v_topics[0])
+            
+        w_distribute = (distribute[mask] / np.sum(distribute[mask])).reshape(-1, 1)  # 将归一化结果作为每个技术主题的权重
+        v_doc = (w_distribute * v_topics).sum(axis=0) 
+
+        return v_doc #然后与documents_vec找相似
+
+    def topic_search(self,doc,topics_vec,documents_vec,wd_data=None):
+        v_doc=self.topic_vec(doc,topics_vec)
+        scores =cosine_similarity(documents_vec,v_doc.reshape(1, -1))
+        scores_map= pd.Series(scores,index=self.sentences.index,name='score')
+        if wd_data is not None:
+            scores_map=scores_map.to_frame().join(wd_data['序号']).set_index('序号')
+        return scores_map.sort_values(by='score', ascending=False)
+        
     def df_topics(self, topn=30):  # lda.print_topics(num_topics=lda.num_topics, num_words=20)
         return pd.concat(
-            [pd.DataFrame(self.lda.show_topic(topicid=topic_id, topn=topn), columns=['word', topic_id]) for topic_id in
+            [pd.DataFrame(self.lda.show_topic(topicid=topic_id, topn=topn if topn>0 else self.args['top_n_words']), columns=['word', topic_id]) for topic_id in
              range(self.lda.num_topics)], axis=1)
+
+    def topics_words(self, topn=30):
+        words=[]
+        for topic_id in range(self.lda.num_topics):
+            word_distribute=self.lda.show_topic(topicid=topic_id, topn=topn if topn>0 else self.args['top_n_words'])
+            words +=[word for word, _ in word_distribute]#(word,topic_id) 
+        return pd.Series(words,name='word')# value_counts()[:30],通用词停用
 
     def topic_cross(self):  # 计算主题之间的交叉度
         topic_cross_dists = np.zeros((self.lda.num_topics, self.lda.num_topics))
@@ -233,7 +311,7 @@ class W2vLda:
         topic_wid_df_dict = {}  # wid:[df]
         topic_wid_tf_entropy_sum = Counter()
         for topic, doc_index in self.topic_documents_dict.items():
-            # topic_doc_data=model.wd_data.iloc[topic_doc_index]#每个主题的文档内容
+            # topic_doc_data=model.sentences.iloc[topic_doc_index]#每个主题的文档内容
             wid_tf_dict = {}  # wid:[tf]
             wid_df_list = []  # Counter([wid for idx in topic_doc_index for wid, _ in model.corpus[idx]])
             for idx in doc_index:
@@ -269,7 +347,7 @@ class W2vLda:
         word_df = pd.Series()
         word_tf_eics = pd.Series()
         for topic, doc_index in self.topic_documents_dict.items():  # 每个主题的文档集合的索引
-            topic_doc_data = self.wd_data.iloc[doc_index]  # 每个主题的文档内容
+            topic_doc_data = self.sentences.iloc[doc_index]  # 每个主题的文档内容
             print(topic, len(doc_index))  # lib_c,tf_c,df_c =calc_tf_df(topic_doc_data)
             word_df = pd.concat([word_df, pd.Series(Counter([val for row in topic_doc_data for val in set(row)]))],
                                 axis=0)  # 词 ｗｉ在类别 ｃｔ中的文档频次
@@ -277,8 +355,8 @@ class W2vLda:
             word_tf_eics = pd.concat(
                 [word_tf_eics, word_tf.groupby(word_tf.index).apply(lambda x: calc_entropy(list(x) / x.sum()))], axis=0)
 
-        word_entropy = pd.concat([self.wd_data.explode().value_counts().rename('tf'),
-                                  self.wd_data.apply(set).explode().value_counts().rename('df'),
+        word_entropy = pd.concat([self.sentences.explode().value_counts().rename('tf'),
+                                  self.sentences.apply(set).explode().value_counts().rename('df'),
                                   word_df.groupby(word_df.index).apply(
                                       lambda x: calc_entropy(list(x) / x.sum())).rename('ebc'),
                                   word_tf_eics.groupby(word_tf_eics.index).sum().rename('eic_sum')], axis=1)
@@ -289,13 +367,14 @@ class W2vLda:
         word_df = []
         word_tfs = []
         for topic, topic_doc_index in self.topic_documents_dict.items():  # 每个主题的文档集合的索引
-            topic_doc_data = self.wd_data.iloc[topic_doc_index]  # 每个主题的文档内容
+            topic_doc_data = self.sentences.iloc[topic_doc_index]  # 每个主题的文档内容
             word_df.append(sum(1 for d in topic_doc_data if word in d))  # 词 ｗｉ在类别 ｃｔ中的文档频次
             word_tfs.append([d.count(word) for d in topic_doc_data if word in d])  # ｗｉ在类别 ｃｔ中的总词频
 
         ebc = calc_entropy(np.array(word_df) / sum(word_df))
         eic_sum = sum(calc_entropy(np.array(word_tf) / sum(word_tf)) for word_tf in word_tfs)
         return ebc, eic_sum, ebc * eic_sum
+
 
 
 def cosine_sim_arr(co_ids_vec):
@@ -341,6 +420,8 @@ def restore_matrix(cosine_sim_arr):
     matrix += matrix.T - np.diag(matrix.diagonal())  # 对称填充下半角
     return matrix
 
+def arr2_cosine_sim(self, arr, columns):#group_ids.Co
+    return pd.DataFrame(restore_matrix(arr), index=columns, columns=columns)
 
 def get_max_count(word, word_counter, doc=None):
     s1 = word_counter.apply(lambda x: x.get(word))
@@ -452,3 +533,47 @@ def read2list(file, encoding='UTF-8', **kwargs):
     with open(file, encoding=encoding, **kwargs) as file:
         l = [line.strip('\n') for line in file.readlines()]
     return l
+
+#TF-IDF 改进
+class BM25:
+    def __init__(self, corpus, k1=1.5, b=0.75):
+        self.k1 = k1
+        self.b = b
+        self.corpus = corpus
+        self.doc_lengths = [len(doc) for doc in corpus]
+        self.avg_doc_length = sum(self.doc_lengths) / len(self.doc_lengths)
+        self.doc_count = len(corpus)
+        self.doc_term_freqs = [Counter(doc) for doc in corpus]
+        self.inverted_index = self.build_inverted_index()
+
+    def build_inverted_index(self):
+        inverted_index = {}
+        for doc_id, doc_term_freq in enumerate(self.doc_term_freqs):
+            for term, freq in doc_term_freq.items():
+                if term not in inverted_index:
+                    inverted_index[term] = []
+                inverted_index[term].append((doc_id, freq))
+        return inverted_index
+
+    def idf(self, term):
+        doc_freq = len(self.inverted_index.get(term, []))
+        if doc_freq == 0:
+            return 0
+        return math.log((self.doc_count - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0)
+
+    def bm25_score(self, query_terms, doc_id):
+        score = 0
+        doc_length = self.doc_lengths[doc_id]
+        for term in query_terms:
+            tf = self.doc_term_freqs[doc_id].get(term, 0)
+            idf = self.idf(term)
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / self.avg_doc_length))
+            score += idf * (numerator / denominator)
+        return score
+
+    def rank_documents(self, query):
+        query_terms = query.split()
+        scores = [(doc_id, self.bm25_score(query_terms, doc_id)) for doc_id in range(self.doc_count)]
+        sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
+        return sorted_scores
