@@ -195,14 +195,14 @@ def most_similar_by_name(name, collection_name, client, match=[], exclude=[], to
 
     return [(p.payload['word'], p.score) for p in search_hit]
 
-
+#SimilarByIds
 def most_similar_by_ids(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10,
                         score_threshold=0.0, exact=True):
     id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
 
-    names = [p.payload[key_name] for p in id_record]
-    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in names + exclude]
-    query_filter = Filter(must=match, must_not=not_match_name)  # 缩小查询范围
+    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in exclude]
+    not_match_ids = [HasIdCondition(has_id=ids)]
+    query_filter = Filter(must=match, must_not=not_match_ids+not_match_name)  # 缩小查询范围
 
     search_queries = [
         SearchRequest(vector=p.vector, filter=query_filter, limit=topn, score_threshold=score_threshold,
@@ -211,26 +211,9 @@ def most_similar_by_ids(ids, collection_name, client, key_name='word', match=[],
 
     search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
 
-    return [(id, name, [(p.payload['word'], p.score) for p in hit]) for id, name, hit in
-            zip(ids, names, search_hit)]  # [:topn]
+    return [(id,  [(p.payload[key_name], p.score) for p in hit]) for id, hit in
+            zip(ids, search_hit)]  # [:topn]
 
-
-def SimilarByIds(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10, duplicate=0,
-                 score_threshold=0, exact=True):
-    id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
-
-    names = [p.payload[key_name] for p in id_record]
-    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in names + exclude]
-    query_filter = Filter(must=match, must_not=not_match_name)  # 缩小查询范围
-
-    search_queries = [
-        SearchRequest(vector=p.vector, filter=query_filter, limit=topn * len(names), score_threshold=score_threshold,
-                      with_payload=[key_name], params=SearchParams(exact=exact))
-        for p in id_record]
-
-    search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
-
-    return rerank_similar_by_search(names, search_hit, topn=topn, duplicate=duplicate, key_name=key_name)
 
 
 # 选择合适的索引类型和参数,性能优先: HNSW 索引,资源优先:IVF_FLAT
@@ -240,14 +223,17 @@ def SimilarByIds(ids, collection_name, client, key_name='word', match=[], exclud
 def names_to_ids(names, collection_name, client, match=[], key_name='word'):
     shoulds = [FieldCondition(key=key_name, match=MatchValue(value=w)) for w in names]
     scroll_filter = Filter(must=match, should=shoulds)
+    try:
+        scroll_result = client.scroll(collection_name=collection_name,
+                                    scroll_filter=scroll_filter,
+                                    with_payload=True,
+                                    # with_vectors=True,
+                                    limit=len(names))
 
-    scroll_result = client.scroll(collection_name=collection_name,
-                                  scroll_filter=scroll_filter,
-                                  with_payload=True,
-                                  # with_vectors=True,
-                                  limit=len(names))
-
-    return {i.payload[key_name]: i.id for i in scroll_result[0]}
+        return {i.payload[key_name]: i.id for i in scroll_result[0]}
+    except Exception as e:
+        print(f"Error occurred in scroll function: {e}")
+    return {}
 
 
 def ids_to_names(ids, collection_name, client, key_name='word'):
@@ -350,6 +336,23 @@ def rerank_similar_by_recommend(ids, recommend_hit, topn=10, duplicate=0):
 
     # print(similar_next)
     return [(i, similar_next[i]) for i in ids if i in similar_next]
+
+def SearchByIds(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10, duplicate=0,
+                 score_threshold=0, exact=True):
+    id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
+
+    names = [p.payload[key_name] for p in id_record]
+    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in names + exclude]
+    query_filter = Filter(must=match, must_not=not_match_name)  # 缩小查询范围
+
+    search_queries = [
+        SearchRequest(vector=p.vector, filter=query_filter, limit=topn * len(names), score_threshold=score_threshold,
+                      with_payload=[key_name], params=SearchParams(exact=exact))
+        for p in id_record]
+
+    search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
+
+    return rerank_similar_by_search(names, search_hit, topn=topn, duplicate=duplicate, key_name=key_name)
 
 
 def recommend_by_ids(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10, score_threshold=0):

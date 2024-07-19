@@ -377,7 +377,7 @@ class W2vLda:
 
 
 def cosine_sim_arr(vectors):
-    matrix = cosine_similarity(vectors.values)
+    matrix = cosine_similarity(vectors if isinstance(vectors,np.ndarray) else vectors.values)
     return matrix[np.triu_indices(matrix.shape[1], k=1)]  # upper_triangle
 
 
