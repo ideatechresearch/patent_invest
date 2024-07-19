@@ -3,6 +3,7 @@
     --hover-color: #ffff99;
     --text-color: #333;
     --background-color: #fff;
+    --font-size-mobile: 1em;
 }
 
 body {
@@ -14,16 +15,17 @@ body {
 }
 
 /* 导航栏样式 */
-.navbar {
+.nav {
     background-color: var(--background-color);
     color: var(--primary-color);
     padding: 2px 10px;
-    font-size: 1.4em;
+    display: block;
 }
 
 .navbar a {
     text-decoration: none;
     margin: 0 10px;
+    display: inline-block;
 }
 
 .navbar a:hover {
@@ -90,4 +92,15 @@ tr:hover {
 .text-label {
     font-family: sans-serif;
     font-size: 10px;
+}
+
+
+@media (max-width: 600px) {
+    body {
+        font-size: 14px; 
+    }
+
+    nav a {
+        font-size: 14px; 
+    }
 }

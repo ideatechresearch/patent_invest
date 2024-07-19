@@ -11,7 +11,16 @@ import plotly.io as pio
 import pandas as pd
 import string, time, os, re
 import inspect
+from lda_topics import LdaTopics
+import logging
 
+
+class IgnoreHeadRequestsFilter(logging.Filter):
+    def filter(self, record):
+        return "HEAD / HTTP/1.0" not in record.getMessage()
+
+
+lt = LdaTopics()
 swg = StopWordsFlag()
 vdr = VDBRelationships()
 
@@ -49,16 +58,22 @@ def get_user_id():
 #     if not hasattr(g, 'db'):#'db' not in g
 #         g.db = connect_db()
 #     return g.db
-@app.teardown_appcontext
-def teardown_db(error):
-    """Closes the database again at the end of the request."""
-    g_db = g.pop('db', None)
-    if g_db is not None:  # hasattr(g, 'db')
-        g_db.close()
 
+# @app.teardown_appcontext
+# def teardown_db(error):
+#     """Closes the database again at the end of the request."""
+#     g_db = g.pop('db', None)
+#     if g_db is not None:  # hasattr(g, 'db')
+#         g_db.close()
+
+# @app.before_request
+# def block_head_requests():
+#     if request.method == 'HEAD' and request.path == '/':
+#         return "HEAD requests are not allowed", 405
 
 @app.route('/search', methods=['GET', 'POST'])
 def search():
+    names, data, detail = [], [], []
     if request.method == 'POST':
         action = request.form.get('action')  # get('event_type')
         if action == 'search_words':
@@ -90,6 +105,23 @@ def search():
                 return render_template('search.html', inform=f'{txt}',
                                        table=detail.to_html(escape=False, classes='custom-table'))
 
+        if action == 'search_topic':
+            txt = request.form['search_topic'].strip()
+            if lt.notload():
+                lt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
+            if txt:
+                vec = lt.encode(txt)
+                search_hit = client.search(collection_name='专利_先进制造_w2v_lda_120',
+                                           query_vector=vec,
+                                           score_threshold=float(request.form.get('score_threshold', 0.0)),
+                                           limit=int(request.form.get('topn', 10)))
+
+                data = [(p.payload, p.score) for p in search_hit]
+                detail = patents_detail_links(data, base_url='/details')
+            if len(detail):
+                return render_template('search.html', inform=f'{txt}',
+                                       table=detail.to_html(escape=False, classes='custom-table'))
+
         if action == 'search_co':
             txt = request.form['search_co'].strip()
             match = field_match(field_key='行业', match_values=request.form.get('hy', 'all'))
@@ -111,7 +143,6 @@ def search():
                 return render_template('search.html', inform=f'{txt}',
                                        table=detail.to_html(escape=False, classes='custom-table'))
 
-        names, data = [], []
         if action == 'search_sim_words':
             txt = request.form['search_sim_words'].strip()
             tokens = re.split(r'[^\w\s]| ', txt)
@@ -178,12 +209,13 @@ def relationship():
 
 def relationship_params(args_form, uid, key_prefix=''):
     nums = re.split(r'[^\w\s]| ', args_form.get('layers', '').strip())
+    nums = [int(i) for i in nums if i.isdigit()]
 
     params = dict()
     params['vdb_key'] = key_prefix + args_form.get('hy', 'all')
-    params['max_calc'] = 30 if uid < 0 else 100
-    params['max_node'] = 300 if uid < 0 else 1000
-    params['layers'] = [int(i) for i in nums if i.isdigit() and int(i) in range(1, params['max_node'])]
+    params['max_calc'] = 30 if uid < 0 else 300
+    params['max_node'] = 300 if uid < 0 else 3000
+    params['layers'] = [i for i in nums if i >= 1 and i <= params['max_node']]
     params['batch'] = int(args_form.get('batch', 1))
     params['width'] = int(args_form.get('width', 3))
     params['max_depth'] = int(args_form.get('depth', 3))
@@ -203,13 +235,15 @@ def show_relationships():
     uid, inf = swg.get_user(session.get("username"))
     name = request.args.get('create_relationships', '').strip(string.punctuation).strip().lower()
     params = relationship_params(request.args, uid, key_prefix=request.args.get('key_prefix', ''))
-    names_depth, relationships_edges = vdr.SimilarRelationships(name, create=0, **params)
+    data = vdr.SimilarRelations(name, draw=0, **params)
 
-    if not len(relationships_edges):
-        nodes = [{"name": name, "id": 1, "depth": 0, "radius": 20}]
-        return jsonify({"nodes": nodes, "edges": []})
-
-    data = vdr.SimulationNodes(names_depth, relationships_edges, params['vdb_key'], params.get('key_radius', ''))
+    # names_depth, relationships_edges = vdr.SimilarRelationships(name, create=0, **params)
+    #
+    # if not len(relationships_edges):
+    #     nodes = [{"name": name, "id": 1, "depth": 0, "radius": 20}]
+    #     return jsonify({"nodes": nodes, "edges": []})
+    #
+    # data = vdr.SimulationNodes(names_depth, relationships_edges, params['vdb_key'], params.get('key_radius', ''))
 
     return jsonify(data)
 
@@ -270,17 +304,6 @@ def similar(id, name):
     return jsonify({"similar_next": data})
 
 
-@app.route('/proxy/<path:url>/<string:username>/<string:password>', methods=['GET'])
-def proxy(url, username, password):
-    import requests
-    response = requests.get(f'https://{url}', auth=(username, password))
-
-    if response.status_code == 200:
-        return Response(response.content, content_type=response.headers['Content-Type'])
-    else:
-        return "Failed to fetch the page", response.status_code
-
-
 @app.route('/get_words', methods=['GET', 'POST'])
 def get_words():
     uid, inf = swg.get_user(session.get("username"))
@@ -300,7 +323,7 @@ def get_words():
             if action == 'call_back':
                 words, detail = swg.call_back_words(uid=uid)
                 detail = words_detail_links(detail)
-                detail = words_detail_absrtact(words, detail, absrtact=int(request.form.get('absrtact', 0)))
+                detail = words_detail_absrtact(words, detail, absrtact=int(request.form.get('absrtact', 1)))
 
                 return render_template('words.html', wordslist=words,
                                        table=detail.to_html(escape=False, classes='custom-table'))
@@ -312,7 +335,7 @@ def get_words():
                                           cross=inf.get('cross', False), uid=uid)
 
     detail = words_detail_links(detail)
-    detail = words_detail_absrtact(words, detail, absrtact=int(request.form.get('absrtact', 0)))
+    detail = words_detail_absrtact(words, detail, absrtact=int(request.form.get('absrtact', 1)))
 
     html_detail = detail.to_html(escape=False, classes='custom-table')  # index=False
 
@@ -321,6 +344,8 @@ def get_words():
 
 
 def companys_detail_links(data, base_url='/details'):
+    if not data:
+        return []
     payloads, scores = zip(*data)  # [{}]
     if list(payloads):
         df = pd.DataFrame(payloads)
@@ -341,22 +366,27 @@ def companys_detail_links(data, base_url='/details'):
 
 
 def patents_detail_links(data, base_url='/details'):
+    if not data:
+        return []
     payloads, scores = zip(*data)  # [{}]
     if list(payloads):
-        df = pd.DataFrame(payloads)
+        df = pd.DataFrame(payloads).rename(
+            columns={'标题 (中文)': 'patent_title', "公开（公告）号": 'publication_number'})
         df['score'] = list(scores)
-        df['encode_id'] = df['序号'].map(
-            lambda x: encode_id(xor_encrypt_decrypt(str(x), Config.SECRET_KEY)))
-        df['publication_number'] = df.apply(
-            lambda
-                row: f'<a href="{base_url}/index/{row["encode_id"]}" target="_blank">{row["公开（公告）号"]}</a>',
-            axis=1)
+        if '序号' in df.columns:
+            df['encode_id'] = df['序号'].map(
+                lambda x: encode_id(xor_encrypt_decrypt(str(x), Config.SECRET_KEY)))
+            df['publication_number'] = df.apply(
+                lambda
+                    row: f'<a href="{base_url}/index/{row["encode_id"]}" target="_blank">{row["publication_number"]}</a>',
+                axis=1)
+
         df['encode_id'] = df['申请号'].map(
             lambda x: encode_id(xor_encrypt_decrypt(x, Config.SECRET_KEY)))
         df['application_number'] = df.apply(
             lambda row: f'<a href="{base_url}/patent/{row["encode_id"]}" target="_blank">{row["申请号"]}</a>', axis=1)
 
-        return df[['标题 (中文)', 'Co', 'publication_number', 'application_number', 'score']]
+        return df[['patent_title', 'Co', 'publication_number', 'application_number', 'score']]
     return []
 
 
@@ -695,6 +725,9 @@ def admin_do():
             vdr.switch_clients(client)
             ret += f"clients change to: {hosts[host_index]}"
         if '检测向量库' in selected:
+            global Baidu_Access_Token
+            Baidu_Access_Token = get_baidu_access_token()
+
             res, status = qdrant_livez(hosts[host_index])
             ret += str(res)
         if '连接图库' in selected:
@@ -778,16 +811,19 @@ def uploader():
     return render_template('upload.html')
 
 
-@app.route('/home')
-def home():
-    # 获取当前登录用户的用户名
-    username = session.get("username")
-    if username:
-        return render_template("index.html")
-    # username = request.cookies.get('username')
-    # if 'username' in session:
-    #     return f'Welcome, Logged in as {session["username"]}'
-    return redirect("/login")
+@app.route('/proxy/<path:url>/<string:name>/<string:password>', methods=['GET'])
+def proxy(url, name, password):
+    if session.get("username") != 'admin':
+        return jsonify({'error': 'The user is not admin!'}), 400
+
+    import requests
+    auth = (name, password) if name and password else None
+    response = requests.get(f'https://{url}', auth=auth)
+
+    if response.status_code == 200:
+        return Response(response.content, content_type=response.headers['Content-Type'])
+    else:
+        return "Failed to fetch the page", response.status_code
 
 
 @app.route('/register', methods=['GET', 'POST'], endpoint='register')
@@ -865,15 +901,27 @@ def logout():
     return redirect(url_for('login'))
 
 
-@app.route("/", endpoint='home_page')
-def index():
-    paragraphs = [
-        '1 专利',
-        '2 融资',
-        '3 专利与融资'
-    ]
+@app.route('/home', methods=['GET'], endpoint='home_page')
+def home():
+    # 获取当前登录用户的用户名
+    username = session.get("username")
+    if username:
+        paragraphs = [
+            '1 专利',
+            '2 融资',
+            '3 专利与融资'
+        ]
+        return render_template("index.html", title='Home', data=paragraphs)
+    # username = request.cookies.get('username')
+    # if 'username' in session:
+    #     return f'Welcome, Logged in as {session["username"]}'
     ##<a href='https://ideatech.info/'>易得融信</a>
-    return render_template('index.html', title='Web App', data=paragraphs)
+    return redirect("/login")
+
+
+@app.route('/', methods=['GET'], endpoint='index')
+def index():
+    return render_template('index.html', title='Web App')
 
 
 if __name__ == "__main__":
@@ -908,6 +956,9 @@ if __name__ == "__main__":
         except:
             print('neo4j graph connection unavailable')
 
+        log = logging.getLogger('werkzeug')
+        log.addFilter(IgnoreHeadRequestsFilter())
+
         # Config.QDRANT_HOST = '47.110.156.41'
 
     client = QdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
@@ -917,7 +968,6 @@ if __name__ == "__main__":
     vdr.append(client, collection_name='专利_w2v_188_37', prefix='Word', match_values=['all'])
     vdr.append(client, collection_name='企业_w2v_lda', prefix='Co',
                match_values=['先进制造', '医疗健康', '金融科技', 'all'])
-
 
     db.init_app(app)  # Flask对象与QLAlchemy()进行绑定
     with app.app_context():  # init_db

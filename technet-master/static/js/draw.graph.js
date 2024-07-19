@@ -73,7 +73,6 @@ function drawGraph(nodes, edges) {
         .attr('font-weight', '100')
         .attr('class', 'label')
         .style('user-select', 'none');// 禁止文本被选中
-    ;
 
     //绘制节点，先为节点和节点上的文字分组
     var gs = g.selectAll(".node")

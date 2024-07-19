@@ -13,7 +13,7 @@
 | 文件/目录              | 描述         | 用途                               |
 |-----------------------|--------------|------------------------------------|
 | /technet-master       | 网站目录     | 存放项目的源代码                   |
-| /technet-master/static/| 网站目录     | 存放静态预预置文件的源代码          |
+| /technet-master/static/| 网站目录     | 存放静态预置文件的源代码           |
 | /technet-master/static/js| 网站目录     | 存放JavaScript的源代码           |
 | /technet-master/templates| 网站目录     | 存放Html页面的源代码             |
 | /technet              | 其他目录     | 包含历史版本及一些方法             |
@@ -133,11 +133,11 @@
 我们使用 GitHub Issues 来跟踪任务、错误和功能请求。您可以通过以下步骤来报告问题或提出功能请求：
 
 1. **报告错误**：
-   - 如果发现项目中的错误或问题，请在 [GitHub Issues](https://github.com/yourusername/technet-master/issues) 页面中创建一个新的 Issue。
+   - 如果发现项目中的错误或问题，请在 [GitHub Issues](https://github.com/ideatechresearch/patent_invest/issues) 页面中创建一个新的 Issue。
    - 请详细描述错误，包括重现步骤、预期结果和实际结果。
 
 2. **提出功能请求**：
-   - 如果您有新功能的建议，请在 [GitHub Issues](https://github.com/yourusername/technet-master/issues) 页面中创建一个新的 Issue，并选择 "Feature request" 标签。
+   - 如果您有新功能的建议，请在 [GitHub Issues](https://github.com/ideatechresearch/patent_invest/issues) 页面中创建一个新的 Issue，并选择 "Feature request" 标签。
    - 请详细描述功能，包括用途、预期效果和实现思路。
 
 3. **参与讨论**：

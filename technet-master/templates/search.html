@@ -2,128 +2,171 @@
 <html lang="en">
 
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>查询</title>
-    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
-    <script src="/static/js/local.storage.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>查询</title>
+  <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+  <script src="/static/js/local.storage.js"></script>
 </head>
 
 <body>
-    {% include 'navbar.html' %}
+  {% include 'navbar.html' %}
 
-    <form method="post">
-        <label for="topn">数量:</label>
-        <select name="topn" id="topn" class="selectBox group1">
-            {% for i in range(1, 33) %}
-            <option value="{{i}}" {% if i==10 %}selected{% endif %}>{{i}}</option>
-            {% endfor %}
-        </select>
+  <form method="post">
+    <label for="topn">数量:</label>
+    <select name="topn" id="topn" class="selectBox group1">
+      {% for i in range(1, 33) %}
+      <option value="{{i}}" {% if i==10 %}selected{% endif %}>{{i}}</option>
+      {% endfor %}
+    </select>
 
-        <label for="duplicate">去重方式:</label>
-        <select name="duplicate" id="duplicate" class="selectBox group1">
-            {% for i in range(0, 4) %}
-            <option value="{{i}}">{{i}}</option>
-            {% endfor %}
-        </select>
+    <label for="duplicate">去重方式:</label>
+    <select name="duplicate" id="duplicate" class="selectBox group1">
+      {% for i in range(0, 4) %}
+      <option value="{{i}}">{{i}}</option>
+      {% endfor %}
+    </select>
 
-        <label for="score_threshold">得分阈值:</label>
-        <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0" style="width: 50px;">
+    <label for="score_threshold">得分阈值:</label>
+    <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0"
+      style="width: 50px;">
 
-        <label for="hy">行业类型:</label>
-        <select name="hy" id="hy" class="selectBox group1">
-            <option value="all" selected>所有</option>
-            <option value="先进制造">先进制造</option>
-            <option value="医疗健康">医疗健康</option>
-            <option value="传统制造">传统制造</option>
-            <option value="金融">金融</option>
-            <option value='金融科技'>金融科技</option>
-        </select>
+    <label for="hy">行业类型:</label>
+    <select name="hy" id="hy" class="selectBox group1">
+      <option value="all" selected>所有</option>
+      <option value="先进制造">先进制造</option>
+      <option value="医疗健康">医疗健康</option>
+      <option value="传统制造">传统制造</option>
+      <option value="金融">金融</option>
+      <option value='金融科技'>金融科技</option>
+    </select>
 
-        <button type="button" id="save" class="submitButton" data-group="group1">Save</button>
-        <br>
-        <br>
+    <button type="button" id="save" class="submitButton" data-group="group1">Save</button>
+    <br>
+    <br>
 
-        
 
-        <label for="search_words">词文本查询:</label>
-        <input type=text id="search_words" name="search_words">
-        <button type="submit" name="action" value="search_words">Submit</button>
-        <br>
+    <label for="search_words">词文本查询:</label>
+    <input type=text id="search_words" name="search_words">
+    <button type="submit" name="action" value="search_words">Submit</button>
+    <br>
 
-        <label for="search_sim_words">相似词查询:</label>
-        <input type=text id="search_sim_words" name="search_sim_words">
-        <button type="submit" id="smb1" class="submitButton" data-group="group1" name="action"
-            value="search_sim_words">Submit</button>
+    <label for="search_sim_words">相似词查询:</label>
+    <input type=text id="search_sim_words" name="search_sim_words">
+    <button type="submit" id="smb1" class="submitButton" data-group="group1" name="action"
+      value="search_sim_words">Submit
+    </button>
 
-        <label for="exclude">使用停用词:</label>
-        <select name="exclude" id="exclude" class="selectBox group1">
-            <option value="0" selected>False</option>
-            <option value="1">True</option>
-        </select>
+    <label for="exclude">使用停用词:</label>
+    <select name="exclude" id="exclude" class="selectBox group1">
+      <option value="0" selected>False</option>
+      <option value="1">True</option>
+    </select>
+    
+    <br>
+    <label for="search_topic">专利主题查询:</label>
+    <input type=text id="search_topic" size="50" name="search_topic">
+    <button type="submit" class="submitButton" name="action" value="search_topic">Submit</button>
 
-        <br>
-        <label for="search_patent">专利语义查询:</label>
-        <input type=text id="search_patent" size="50" name="search_patent">
-        <!-- <textarea id="search_patent" name="search_patent" rows="2" cols="22" maxlength="500"></textarea> -->
-        <button type="submit" id="smb5" class="submitButton" data-group="group5" name="action" value="search_patent">Submit</button>
-        
-        <label for="abstract5">使用摘要:</label>
-        <select name="abstract5" id="abstract5" class="selectBox group5">
-            <option value="0">False</option>
-            <option value="1" selected>True</option>
-        </select>
+    <br>
+    <label for="search_patent">专利语义查询:</label>
+    <input type=text id="search_patent" size="50" name="search_patent">
+    <!-- <textarea id="search_patent" name="search_patent" rows="2" cols="22" maxlength="500"></textarea> -->
+    <button type="submit" id="smb5" class="submitButton" data-group="group5" name="action" value="search_patent">
+      Submit
+    </button>
 
-        <br>
-        <label for="search_co">公司名称查询:</label>
-        <input type=text id="search_co" size="50" name="search_co">
-        <button type="submit" id="smb4" class="submitButton" data-group="group4" name="action"
-            value="search_co">Submit</button>
+    <label for="abstract5">使用摘要:</label>
+    <select name="abstract5" id="abstract5" class="selectBox group5">
+      <option value="0">False</option>
+      <option value="1" selected>True</option>
+    </select>
 
-        <label for="abstract4">使用简介:</label>
-        <select name="abstract4" id="abstract4" class="selectBox group4">
-            <option value="0" selected>False</option>
-            <option value="1">True</option>
-        </select>
-        <br>
-        <label for="search_sim_co">科技相似查询:</label>
-        <input type=text id="search_sim_co" name="search_sim_co">
-        <button type="submit"  name="action" value="search_sim_co">Submit</button>
-        <br>
-    </form>
+    <br>
+    <label for="search_co">公司名称查询:</label>
+    <input type=text id="search_co" size="50" name="search_co">
+    <button type="submit" id="smb4" class="submitButton" data-group="group4" name="action" value="search_co">Submit
+    </button>
+
+    <label for="abstract4">使用简介:</label>
+    <select name="abstract4" id="abstract4" class="selectBox group4">
+      <option value="0" selected>False</option>
+      <option value="1">True</option>
+    </select>
+    <br>
+    <label for="search_sim_co">科技相似查询:</label>
+    <input type=text id="search_sim_co" name="search_sim_co">
+    <button type="submit" name="action" value="search_sim_co">Submit</button>
+    <br>
+  </form>
+  <div id="inform">
     {% if inform %}
     <text>{{ inform }}</text>
     {% endif %}
-    <br>
-    {% for p in data %}
-    <p>{{ p }}</p>
-    {% endfor %}
+  </div>
+  <br>
+  {% for p in data %}
+  <p>{{ p }}</p>
+  {% endfor %}
 
-    {% if table %}
-    <div class="dataframe">
-        <h2> 表详细信息：</h2>
-        <!-- 插入 Pandas 表格 -->
-        {{table |safe}}
-    </div>
-    {% endif %}
+  {% if table %}
+  <div class="dataframe">
+    <h2> 表详细信息：</h2>
+    <!-- 插入 Pandas 表格 -->
+    {{table |safe}}
+  </div>
+  {% endif %}
 
-    <script>
-        // Call setSelectBoxValues function for Group 1 and Group 2 when page loads
-        window.onload = function () {
-            setSelectBoxValues('group1');
-            setSelectBoxValues('group4');
-            setSelectBoxValues('group5');
-        };
+  <script>
+    // Call setSelectBoxValues function for Group 1 and Group 2 when page loads
+    window.onload = function () {
+      setSelectBoxValues('group1');
+      setSelectBoxValues('group4');
+      setSelectBoxValues('group5');
+    };
 
-        // Save selected values for each group when corresponding submit button clicked
-        var submitButtons = document.querySelectorAll('.submitButton');
-        submitButtons.forEach(function (button) {
-            button.addEventListener("click", function () {
-                var group = this.getAttribute('data-group');
-                saveSelectedValues(group);
-            });
+    // Save selected values for each group when corresponding submit button clicked
+    var submitButtons = document.querySelectorAll('.submitButton');
+    submitButtons.forEach(function (button) {
+      button.addEventListener("click", function () {
+        var group = this.getAttribute('data-group');
+        saveSelectedValues(group);
+      });
+    });
+
+    document.addEventListener('DOMContentLoaded', (event) => {
+      const clickableElements = document.querySelectorAll('.clickable');
+      clickableElements.forEach(function (element) {
+        element.addEventListener('click', handleClick);
+      });
+    });
+
+    function handleClick(event) {
+      const targetCell = event.target;
+      targetCell.style.color = 'blue';
+      const cellContent = targetCell.innerText;
+      const url = `/similar/${targetCell.getAttribute('data-info')}/${cellContent}`;
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+        .then(response => response.json())
+        .then(data => {
+          console.log(cellContent, ' Received data:', data);
+          const informElement = document.getElementById('inform');
+          if (informElement) {
+            informElement.textContent = `${cellContent}: ${JSON.stringify(data.similar_next)}`;
+            // informElement.innerHTML = `<text>${JSON.stringify(data.similar_next)}</text>`;
+          }
+        })
+        .catch(error => {
+          console.error('数据请求错误:', error);
         });
-    </script>
+    };
+
+  </script>
 </body>
 
 </html>

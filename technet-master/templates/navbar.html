@@ -1,5 +1,25 @@
-<h3 class="navbar">
-    <a href="/home">首页</a> <a href="/search">查询</a> <a href="/relationship">关系网络</a> <a href="/get_words">标记停用词</a> <a
-        href="/plot">可视化</a> <a href="/chat">问答</a> <a href="/get_user_info">展示</a> <a href="/set_user">设置</a>
-</h3>
+<nav id="navbar" class="navbar">
+        <a href="/home">首页</a>
+        <a href="/search">查询</a>
+        <a href="/relationship">关系网络</a>
+        <a href="/get_words">标记停用词</a>
+        <a href="/plot">可视化</a> <a href="/chat">问答</a>
+        <a href="/get_user_info">展示</a>
+        <a href="/set_user">设置</a>
+</nav>
+<button id="toggle" style="float:right; background-color: white; color: #0366d6;border: none;">&uarr;</button>
 <hr>
+
+<script>
+        document.getElementById('toggle').addEventListener('click', function () {
+                const navbar = document.getElementById('navbar');
+                const toggle= document.getElementById('toggle');
+                if (navbar.style.display === 'none') {
+                        navbar.style.display = 'block';
+                        toggle.innerHTML = '&uarr;';
+                } else {
+                        navbar.style.display = 'none';
+                        toggle.innerHTML = '&darr;';
+                }
+        });
+</script>

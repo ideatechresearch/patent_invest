@@ -14,15 +14,15 @@ class W2vLda:
         'sg': 0,
         'window': 5,
         'len_below': 2,  # word
-        'no_below': 2, # 最少频次.3
-        'min_count': 2, #同上
+        'no_below': 3, # 最少频次
+        'min_count': 2, #同上 <=no_below
         'count_fifter': 10,  # doc
 
         'num_topics': 20,  # 定义主题数.50
         'top_n_words': 10,  # 每个主题显示几个词.30
         'top_n_topics': 5, # 每个文档前几个主题,None,数量截取
-        'weight_threshold_topics': 0.05,  # 文档主题权重大于阈值的,0.1,阈值截取
-        'minimum_probability':0.05 #同上
+        'minimum_probability':0.05, # 文档主题权重大于阈值的
+        'weight_threshold_topics': 0.00, #同上,阈值截取,功能重复
     }
     # 初始化数据，不随改变参数改变
     sentences = pd.Series() # cleaned document
@@ -148,7 +148,7 @@ class W2vLda:
         if not self.dictionary:
             self.dictionary = corpora.Dictionary(processed_doc)  # 单词ID到单词的映射
             self.dictionary.filter_extremes(no_below=self.args.get('no_below', 2),
-                                            no_above=self.args.get('no_above', 0.99),
+                                            no_above=self.args.get('no_above', 0.97),
                                             keep_n=self.args.get('keep_n', 800000))  # 删除出现少于3个文档的单词或在95％以上文档中出现的单词
 
         self.corpus = [self.dictionary.doc2bow(text) for text in
@@ -270,13 +270,12 @@ class W2vLda:
 
         return v_doc #然后与documents_vec找相似
 
-    def topic_search(self,doc,topics_vec,documents_vec,wd_data=None):
-        v_doc=self.topic_vec(doc,topics_vec)
-        scores =cosine_similarity(documents_vec,v_doc.reshape(1, -1))
-        scores_map= pd.Series(scores,index=self.sentences.index,name='score')
-        if wd_data is not None:
-            scores_map=scores_map.to_frame().join(wd_data['序号']).set_index('序号')
-        return scores_map.sort_values(by='score', ascending=False)
+    def topic_search(self,doc,topics_vec,documents_vec,top_n=10): # similarity_topic()
+        v_doc = self.topic_vec(doc,topics_vec)
+        scores_2d = cosine_similarity(documents_vec,v_doc.reshape(1, -1))
+        scores = scores_2d.reshape(-1)
+        largest_idx = np.argsort(scores)[:-top_n-1:-1]
+        return self.sentences.index[largest_idx],scores[largest_idx] #list(zip(t.p))
         
     def df_topics(self, topn=30):  # lda.print_topics(num_topics=lda.num_topics, num_words=20)
         return pd.concat(
@@ -377,30 +376,36 @@ class W2vLda:
 
 
 
-def cosine_sim_arr(co_ids_vec):
-    matrix = cosine_similarity(co_ids_vec.values)
+def cosine_sim_arr(vectors):
+    matrix = cosine_similarity(vectors.values)
     return matrix[np.triu_indices(matrix.shape[1], k=1)]  # upper_triangle
 
 
-def cosine_sim_df(co_ids_vec, triu=False):
-    matrix = cosine_similarity(co_ids_vec.values)
+def cosine_sim_df(vectors, triu=False):
+    matrix = cosine_similarity(vectors.values)
     if triu:
         matrix[np.triu_indices(matrix.shape[0], k=0)] = np.nan
-    return pd.DataFrame(matrix, index=co_ids_vec.index, columns=co_ids_vec.index)
+    return pd.DataFrame(matrix, index=vectors.index, columns=vectors.index)
     # co_cosine_sim.to_numpy()[~np.isnan(co_cosine_sim)]
 
 
-def cosim_sim_top(co_ids_vec, top_n=50):
-    matrix = cosine_similarity(co_ids_vec.values)
-    upper_indices = np.triu_indices(co_ids_vec.shape[0], k=1)  # upper_triangle
+def similarity_top(vectors, top_n=50):
+    matrix = cosine_similarity(vectors.values)
+    upper_indices = np.triu_indices(vectors.shape[0], k=1)  # upper_triangle
     upper_values = matrix[upper_indices]
     sorted_indices = np.argsort(upper_values)  # sorted(enumerate(arr), key=lambda x: x[1], reverse=True)
     top_indices = sorted_indices[-top_n:]
-    top_table = np.stack((co_ids_vec.index[upper_indices[0][top_indices]],
-                          co_ids_vec.index[upper_indices[1][top_indices]],
+    top_table = np.stack((vectors.index[upper_indices[0][top_indices]],
+                          vectors.index[upper_indices[1][top_indices]],
                           upper_values[top_indices]), axis=1)
     return pd.DataFrame(top_table[::-1])
 
+def similarity_topic(model,doc,topics_vec,df_lda_w2v):
+    v_doc = model.topic_vec(doc,topics_vec)
+    scores_2d = cosine_similarity(df_lda_w2v.values,v_doc.reshape(1, -1))
+    scores = pd.DataFrame(scores_2d,index=df_lda_w2v.index,columns=['score'])
+    return scores.sort_values(by='score', ascending=False)
+    
 
 def restore_matrix(cosine_sim_arr):
     n = np.sqrt(2 * len(cosine_sim_arr) + 1 / 4) + 1 / 2  # 阶数
@@ -464,7 +469,7 @@ def average_jensen_shannon_kl_distance(distributions):  # 计算多个概率分�
 
 
 def calc_entropy(class_probs):  # 计算类别间的信息熵,类别内的信息熵。(类别概率,样本概率)
-    return -np.sum(class_probs * np.log2(class_probs))  # np.multiply
+    return -np.sum(class_probs * np.log2(class_probs + 1e-10))  # np.multiply
 
 
 def calc_tf_df(documents):

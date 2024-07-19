@@ -1,5 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import Column, TIMESTAMP, ForeignKey, func, text,create_engine
+from sqlalchemy import Column, TIMESTAMP, ForeignKey, func, text, create_engine
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from datetime import datetime
 
@@ -17,6 +17,7 @@ class Base(db.Model):
             if hasattr(self, key) and key != 'id':  # 当前对象是否包含名字为k的属性
                 setattr(self, key, value)
 
+
 # class Role(db.Model):
 #     # 定义表名
 #     __tablename__ = 'roles'
@@ -31,7 +32,7 @@ class User(db.Model):
     user_id: Mapped[int] = db.Column(db.Integer, unique=True, nullable=False)
     username: Mapped[str] = db.Column(db.String(99), unique=True, nullable=False)
     password = db.Column(db.String(128), nullable=False)
-    #role_id = db.Column(db.Integer, db.ForeignKey('roles.id'))
+    # role_id = db.Column(db.Integer, db.ForeignKey('roles.id'))
     created_at: Mapped[datetime] = db.Column(db.DateTime(timezone=True), default=func.now())
     updated_at = mapped_column(TIMESTAMP, onupdate=func.utc_timestamp(), default=func.utc_timestamp())
     cross = mapped_column(db.Boolean)
@@ -85,6 +86,46 @@ class StopWords(db.Model):
 # 	placeholders = ', '.join(['%s'] * len(ids))
 # 	query = f"SELECT {column_name} FROM {table_name} WHERE {id_column} IN ({placeholders})"
 # 	return pd.read_sql(query, engine, params=tuple(ids))#\'in ({});'.format(','.join(.astype(str).to_list()))
+
+import pymysql
+
+
+class OperationMysql:
+    def __init__(self, host, user, password, db, port=3306):
+        self.conn = pymysql.connect(
+            host=host,  # 外网
+            port=3306,
+            user=user,
+            password=password,
+            db=db,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor  # 这个定义使数据库里查出来的值为字典类型
+        )
+        self.cur = self.conn.cursor()
+
+    def search(self, sql):
+        self.cur.execute(sql)
+        result = self.cur.fetchall()
+        # result=json.dumps(result,cls=DateEncoder) #把字典转成字符串,方便与处理后的返回结果进行对比
+        # result=json.dumps(result,cls=DecimalEncoder) #Decimal类型转成json
+        self.cur.close()
+        self.conn.close()
+        return result
+
+    def create_table(self, sql):
+        self.cur.execute(sql)
+
+    def update_table(self, sql):
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.cur.close()
+        self.conn.close()
+
+    def delete_data(self, sql):
+        self.cur.execute(sql)
+        self.conn.commit()
+        self.cur.close()
+        self.conn.close()
 
 
 if __name__ == "__main__":
