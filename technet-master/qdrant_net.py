@@ -195,14 +195,15 @@ def most_similar_by_name(name, collection_name, client, match=[], exclude=[], to
 
     return [(p.payload['word'], p.score) for p in search_hit]
 
-#SimilarByIds
+
+# SimilarByIds
 def most_similar_by_ids(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10,
                         score_threshold=0.0, exact=True):
     id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
 
     not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in exclude]
     not_match_ids = [HasIdCondition(has_id=ids)]
-    query_filter = Filter(must=match, must_not=not_match_ids+not_match_name)  # 缩小查询范围
+    query_filter = Filter(must=match, must_not=not_match_ids + not_match_name)  # 缩小查询范围
 
     search_queries = [
         SearchRequest(vector=p.vector, filter=query_filter, limit=topn, score_threshold=score_threshold,
@@ -211,9 +212,8 @@ def most_similar_by_ids(ids, collection_name, client, key_name='word', match=[],
 
     search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
 
-    return [(id,  [(p.payload[key_name], p.score) for p in hit]) for id, hit in
+    return [(id, [(p.payload[key_name], p.score) for p in hit]) for id, hit in
             zip(ids, search_hit)]  # [:topn]
-
 
 
 # 选择合适的索引类型和参数,性能优先: HNSW 索引,资源优先:IVF_FLAT
@@ -223,17 +223,13 @@ def most_similar_by_ids(ids, collection_name, client, key_name='word', match=[],
 def names_to_ids(names, collection_name, client, match=[], key_name='word'):
     shoulds = [FieldCondition(key=key_name, match=MatchValue(value=w)) for w in names]
     scroll_filter = Filter(must=match, should=shoulds)
-    try:
-        scroll_result = client.scroll(collection_name=collection_name,
-                                    scroll_filter=scroll_filter,
-                                    with_payload=True,
-                                    # with_vectors=True,
-                                    limit=len(names))
+    scroll_result = client.scroll(collection_name=collection_name,
+                                  scroll_filter=scroll_filter,
+                                  with_payload=True,
+                                  # with_vectors=True,
+                                  limit=len(names))
 
-        return {i.payload[key_name]: i.id for i in scroll_result[0]}
-    except Exception as e:
-        print(f"Error occurred in scroll function: {e}")
-    return {}
+    return {i.payload[key_name]: i.id for i in scroll_result[0]}
 
 
 def ids_to_names(ids, collection_name, client, key_name='word'):
@@ -241,12 +237,8 @@ def ids_to_names(ids, collection_name, client, key_name='word'):
     return {p.id: p.payload[key_name] for p in id_record}
 
 
-def field_match(field_key, match_values):
-    if not field_key or match_values == 'all':
-        return []
-    if isinstance(match_values, (str, int, float)):
-        return [FieldCondition(key=field_key, match=MatchValue(value=match_values, ), )]
-    return [FieldCondition(key=field_key, match=MatchValue(value=v), ) for v in match_values]
+def ids_match(ids):
+    return [HasIdCondition(has_id=ids)]
 
 
 def empty_match(field_key):
@@ -255,8 +247,12 @@ def empty_match(field_key):
     return [IsEmptyCondition(is_empty=PayloadField(key=field_key), )]
 
 
-def ids_match(ids):
-    return [HasIdCondition(has_id=ids)]
+def field_match(field_key, match_values):
+    if not field_key or match_values == 'all':
+        return []
+    if isinstance(match_values, (str, int, float)):
+        return [FieldCondition(key=field_key, match=MatchValue(value=match_values, ), )]
+    return [FieldCondition(key=field_key, match=MatchValue(value=v), ) for v in match_values]
 
 
 def rerank_similar_by_search(names, search_hit, topn=10, duplicate=0, key_name='word'):
@@ -337,8 +333,9 @@ def rerank_similar_by_recommend(ids, recommend_hit, topn=10, duplicate=0):
     # print(similar_next)
     return [(i, similar_next[i]) for i in ids if i in similar_next]
 
+
 def SearchByIds(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10, duplicate=0,
-                 score_threshold=0, exact=True):
+                score_threshold=0, exact=True):
     id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
 
     names = [p.payload[key_name] for p in id_record]
@@ -419,7 +416,7 @@ class VDBSimilar:
             if result:
                 self.name_ids.update({n: i for i, n in result.items()})
         id_to_name = {i: n for n, i in self.name_ids.items()}
-        return [id_to_name.get(i, None) for i in ids]
+        return [id_to_name[i] for i in ids if i in id_to_name]
 
     def get_name(self, _id):
         if _id not in self.name_ids.values():
@@ -741,7 +738,7 @@ class VDBRelationships:
                                                             score_threshold=score_threshold)  # 分支会有合并,下层关系去重
 
             ids = list(set(y[0] for x in similar_next for y in x[1]))
-            print("Depth:", depth, "Similar:", [x[0] for x in similar_next], "->", similar_next)
+            # print("Depth:", depth, "Similar:", [x[0] for x in similar_next], "->", similar_next)
             ids_depth.update({i: depth + 1 for i in ids if i not in ids_depth})
             relationships = [
                 {'source': x[0], 'target': y[0], 'relation': str(round(y[1], 5)), 'value': 1.0 - y[1], 'rank': i}
@@ -802,11 +799,11 @@ class VDBRelationships:
             not_ids = list(ids_depth) if exclude_all else [k for k in ids_depth if ids_depth[k] <= depth]
             similar_next = self.vdb[vdb_key].Recommend(ids=[_id], exclude=exclude, not_ids=not_ids,
                                                        topn=width, score_threshold=score_threshold, use_name=False)
-            ids = [y[0] for y in similar_next]
+            ids = [y[0] for y in similar_next]  # p.payload[self.key_name] if use_name else p.id
             if len(ids) == 0:
                 return ids_depth, relationships  # 返回递归
 
-            print("Depth:", depth, "Similar:", _id, "->", similar_next)
+            # print("Depth:", depth, "Similar:", _id, "->", similar_next)
             new_depth = {i: depth + 1 for i in ids if i not in ids_depth}
             ids_depth.update(new_depth)  # 当前层去重
 
@@ -1003,7 +1000,7 @@ class VDBRelationships:
                                                    score_threshold=score_threshold, exclude=exclude,
                                                    exclude_all=(duplicate > 0))
 
-        # self.SimulationNodes(names_depth, relationships_edges, params['vdb_key'], params.get('key_radius', ''))
+        # 老方法:self.SimulationNodes(names_depth, relationships_edges, params['vdb_key'], params.get('key_radius', ''))
 
     def SimilarRelations(self, name, vdb_key='Word_all', key_radius='', width=3, max_depth=3, layers=[], batch=True,
                          duplicate=3, draw=0, max_calc=30, max_node=0, score_threshold=0.0, exclude=[]):
@@ -1028,7 +1025,7 @@ class VDBRelationships:
                                                                  score_threshold=score_threshold,
                                                                  exclude_all=(duplicate > 0), exclude=exclude)
 
-        if draw == 0:
+        if draw == 0:  # Simulation
             if key_radius:
                 key_name = self.vdb[vdb_key].get_keyname()  # vdb_key.split('_')[0].lower() 'word' get_payload
                 payloads = self.get_payload(vdb_key, names=[], ids=list(ids_depth), fields=[key_name, key_radius])
@@ -1043,13 +1040,64 @@ class VDBRelationships:
 
             key_nodes = {n['id']: n for n in nodes}
             edges = relationships_edges.copy()
-            for r in edges:
-                r['source'] = key_nodes.get(r['source'])
-                r['target'] = key_nodes.get(r['target'])
+            for rel in edges:
+                rel['source'] = key_nodes.get(rel['source'])
+                rel['target'] = key_nodes.get(rel['target'])
 
             return {"nodes": nodes, "edges": edges}
 
+        if draw == 1:  # Cytoscape
+            key_name = self.vdb[vdb_key].get_keyname()
+            payloads = self.get_payload(vdb_key, names=[], ids=list(ids_depth))
+            nodes = [{"id": str(i), 'label': p[key_name], 'properties': {**p, 'depth': ids_depth[i]}}
+                     for i, p in payloads]
+
+            edges = relationships_edges.copy()
+            for i, rel in enumerate(edges):
+                rel['id'] = str(i)
+                rel['source'] = str(rel['source'])
+                rel['target'] = str(rel['target'])
+                rel['label'] = rel.pop('relation')
+                rel['rank'] = rel.get('rank', 0)
+                # edges[i] = {"data": rel}
+
+            return {"nodes": nodes, "edges": edges}
+
+        if draw == 2:
+            # NetworkxPlot(names_depth, relationships_edges)
+            pass
+
         return ids_depth, relationships_edges
+
+    def SimilarRelation(self, node_id, node_name, existing_nodes, vdb_key='Word_all', width=3, duplicate=3,
+                        score_threshold=0.0, exclude=[]):
+        if vdb_key not in self.vdb:
+            return {}
+
+        if node_id > 0:
+            ids_depth = {n['id']: n['depth'] for n in existing_nodes}
+            new_depth, new_relationships = self.Relation(width=width, depth=ids_depth.get(node_id, 1),
+                                                         _id=node_id, ids_depth=ids_depth,
+                                                         vdb_key=vdb_key, exclude_all=(duplicate > 0),
+                                                         score_threshold=score_threshold, exclude=exclude)
+
+            ids_name = self.get_names(vdb_key, list({**ids_depth, **new_depth}))
+            nodes = [{"id": i, "name": ids_name.get(i, 'None'), "depth": d, "radius": 20} for i, d in new_depth.items()]
+        else:  # 老方法
+            # self.vdb[vdb_key].get_id(node_name)
+            names_depth = {n['name']: n['depth'] for n in existing_nodes}
+            new_depth, new_relationships = self.create_relationship(width=width, depth=names_depth.get(node_name, 1),
+                                                                    name=node_name, names_depth=names_depth,
+                                                                    vdb_key=vdb_key, exclude_all=(duplicate > 0),
+                                                                    create=0,
+                                                                    score_threshold=score_threshold, exclude=exclude)
+
+            nodes = [{"id": vdr.get_id(vdb_key, n), "name": n, 'depth': d, "radius": 20} for n, d in new_depth.items()]
+            for r in new_relationships:
+                r['source'] = self.get_id(vdb_key, r['source'])  # get_ids
+                r['target'] = self.get_id(vdb_key, r['target'])
+
+        return {"nodes": nodes, "edges": new_relationships}
 
     def SimulationNodes(self, names_depth, relationships_edges, vdb_key='Word_all', key_radius=''):
         if vdb_key not in self.vdb:
@@ -1073,6 +1121,82 @@ class VDBRelationships:
             r['target'] = key_nodes.get(r['target'])
 
         return {"nodes": nodes, "edges": edges}
+
+
+# def NetworkxPlot(names_depth, relationships_edges):
+#     import networkx as nx
+#     import plotly.graph_objects as go
+#     G = nx.Graph()
+#     for rel in relationships_edges:
+#         G.add_edge(rel['source'], rel['target'], label=rel['relation'], value=rel['value'], rank=rel['rank'])
+#     pos = nx.spring_layout(G)
+#     edge_trace = go.Scatter(
+#         x=[],
+#         y=[],
+#         line=dict(width=0.5, color='#888'),
+#         hoverinfo='none',
+#         mode='lines'
+#     )
+#     for rel in G.edges(data=True):
+#         x0, y0 = pos[rel[0]]
+#         x1, y1 = pos[rel[1]]
+#         edge_trace['x'] += [x0, x1, None]
+#         edge_trace['y'] += [y0, y1, None]
+#
+#     node_trace = go.Scatter(
+#         x=[],
+#         y=[],
+#         text=[],
+#         mode='markers+text',
+#         hoverinfo='text',
+#         marker=dict(
+#             showscale=True,
+#             colorscale='YlGnBu',
+#             size=10,
+#             color=[],
+#             colorbar=dict(
+#                 thickness=15,
+#                 title='Node Connections',
+#                 xanchor='left',
+#                 titleside='right'
+#             ),
+#             line_width=2
+#         )
+#     )
+#
+#     for node in G.nodes():
+#         x, y = pos[node]
+#         node_trace['x'] += [x]
+#         node_trace['y'] += [y]
+#
+#     node_adjacencies = []
+#     node_text = []
+#     for node, adjacencies in enumerate(G.adjacency()):
+#         node_adjacencies.append(len(adjacencies[1]))
+#         node_text.append(f'# of connections: {len(adjacencies[1])}')
+#
+#     node_trace.marker.color = node_adjacencies
+#     node_trace.text = node_text
+#
+#     # 创建图形对象
+#     fig = go.Figure(data=[edge_trace, node_trace],
+#                     layout=go.Layout(
+#                         title='Network Graph',
+#                         titlefont_size=16,
+#                         showlegend=False,
+#                         hovermode='closest',
+#                         margin=dict(b=20, l=5, r=5, t=40),
+#                         annotations=[dict(
+#                             text="Python code by <a href='https://plotly.com/'>Plotly</a>",
+#                             showarrow=False,
+#                             xref="paper", yref="paper",
+#                             x=0.005, y=-0.002
+#                         )],
+#                         xaxis=dict(showgrid=False, zeroline=False),
+#                         yaxis=dict(showgrid=False, zeroline=False))
+#                     )
+#
+#     graph_div = fig.to_html(full_html=False)
 
 
 if __name__ == '__main__':

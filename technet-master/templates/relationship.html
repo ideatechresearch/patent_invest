@@ -8,7 +8,7 @@
     <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
     <script src="/static/js/d3.v7.min.js"></script>
     <!-- "https://d3js.org/d3.v7.min.js" -->
-    <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.20.0/cytoscape.min.js"></script> -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.20.0/cytoscape.min.js"></script>
     <script src="/static/js/local.storage.js"></script>
     <script src="/static/js/draw.graph.js"></script>
     <style>
@@ -26,6 +26,7 @@
             height: 150%;
             transition: all 0.5s ease;
         }
+
         #zoomBtn {
             position: absolute;
             top: 5px;
@@ -138,12 +139,12 @@
         <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0"
             style="width: 50px;">
 
-        <label for="create">创建方式:</label>
-        <select name="create" id="create" class="selectBox group2">
-            <option value="simulation" selected>simulation</option>
-            <option value="cytoscape">cytoscape</option>
-            <option value="networkx">networkx</option>
-            <option value="neo4j">neo4j</option>
+        <label for="draw">创建方式:</label>
+        <select name="draw" id="draw" class="selectBox group2">
+            <option value="0" selected>simulation</option>
+            <option value="1">cytoscape</option>
+            <option value="2">networkx</option>
+            <option value="3">neo4j</option>
         </select>
 
         <label for="hy">行业类型:</label>
@@ -200,6 +201,7 @@
     {% endfor %}
 
     <svg width="1600" height="1200"></svg>
+    <div id="cy" style="width: 1200px; height: 800px; display: none;"></div>
     <div id="zoomBtn">Zoom</div>
 
     <script>
@@ -227,6 +229,7 @@
             height = +svg.attr("height");
         var g = svg.append("g")
             .attr("transform", "translate(" + marge.top + "," + marge.left + ")");
+        var cy = cytoscape({container: document.getElementById('cy')});
         // 初始化调整大小
         updateSize();
 
@@ -241,6 +244,7 @@
         // 页面加载时获取并绘制数据
         //fetchDataAndDraw("/show_relationships");
 
+        //+action 提交表单
         function handleSubmit(actionValue) {
             const form = document.getElementById('myForm');
             const actionInput = document.createElement('input');
@@ -253,26 +257,44 @@
 
         // 当按钮点击时从 Flask 获取数据并绘制图形
         document.getElementById("show_relationships").addEventListener("click", function (event) {
-            if (document.getElementById("create").value == 'neo4j') {
-                handleSubmit('create_relationships');
+            const draw = document.getElementById("draw").value;
+            if (draw == '3') {
+                handleSubmit('create_relationships');//neo4j
             }
             else {
                 event.preventDefault();
                 last_key = 'Word_';
-                const url = `/show_relationships?create_relationships=${document.getElementById("create_relationships").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&key_radius=${document.getElementById("radius").value}&exclude=${document.getElementById("exclude").value}`;
-                fetchDataAndDraw(url);
+                const url = `/show_relationships?name=${document.getElementById("create_relationships").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&draw=${draw}&key_radius=${document.getElementById("radius").value}&exclude=${document.getElementById("exclude").value}`;
+                if (draw == '0') {
+                    document.getElementById('cy').style.display = 'none';
+                    document.querySelector('svg').style.display = 'block';
+                    fetchDataAndDraw(url);
+                } else if (draw == '1') {
+                    document.querySelector('svg').style.display = 'none';
+                    document.getElementById('cy').style.display = 'block';
+                    fetchCytoscape(url);
+                }
             }
         });
 
         document.getElementById("show_relationships_co").addEventListener("click", function (event) {
-            if (document.getElementById("create").value == 'neo4j') {
+            const draw = document.getElementById("draw").value;
+            if (draw == '3') {
                 handleSubmit('create_relationships_co');
             }
             else {
                 event.preventDefault();
                 last_key = 'Co_';
-                const url = `/show_relationships?create_relationships=${document.getElementById("create_relationships_co").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}`;
-                fetchDataAndDraw(url);
+                const url = `/show_relationships?name=${document.getElementById("create_relationships_co").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&draw=${draw}`;
+                if (draw == '0') {
+                    document.getElementById('cy').style.display = 'none';
+                    document.querySelector('svg').style.display = 'block';
+                    fetchDataAndDraw(url);
+                } else if (draw == '1') {
+                    document.querySelector('svg').style.display = 'none';
+                    document.getElementById('cy').style.display = 'block';
+                    fetchCytoscape(url);
+                }
             }
         });
 
@@ -297,7 +319,7 @@
 
         // Function to handle node click
         function ClickNode(event, d) {
-            const url = `/node_relations/${d.name}?key_prefix=${last_key}&hy=${document.getElementById("hy").value}&duplicate=${document.getElementById("duplicate").value}&exclude=${document.getElementById("exclude").value}&nodewidth=${document.getElementById("nodewidth").value}`;//id
+            const url = `/node_relations/${d.id}/${d.name}?key_prefix=${last_key}&hy=${document.getElementById("hy").value}&duplicate=${document.getElementById("duplicate").value}&exclude=${document.getElementById("exclude").value}&nodewidth=${document.getElementById("nodewidth").value}`;//id
             fetchNodeRelations(url);
         };
 
@@ -306,13 +328,30 @@
 
         document.getElementById('zoomBtn').addEventListener('click', function () {
             var svgElement = document.querySelector('svg');
+            var cyElement = document.getElementById('cy');
             var zoomBtn = document.getElementById('zoomBtn');
-            if (svgElement.classList.contains('fullscreen')) {
-                svgElement.classList.remove('fullscreen');
+
+            if (svgElement.style.display === 'block') {
+                if (svgElement.classList.contains('fullscreen')) {
+                    svgElement.classList.remove('fullscreen');
+                } else {
+                    svgElement.classList.add('fullscreen');
+                    cyElement.classList.remove('fullscreen');
+                }
+            } else if (cyElement.style.display === 'block') {
+                if (cyElement.classList.contains('fullscreen')) {
+                    cyElement.classList.remove('fullscreen');
+                } else {
+                    cyElement.classList.add('fullscreen');
+                    svgElement.classList.remove('fullscreen');
+                }
             } else {
+                svgElement.style.display = 'block';
+                cyElement.style.display = 'none';
                 svgElement.classList.add('fullscreen');
-                zoomBtn.style.zIndex = 101;
             }
+
+            zoomBtn.style.zIndex = 101;
         });
     </script>
 

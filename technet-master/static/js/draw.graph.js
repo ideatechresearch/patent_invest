@@ -4,6 +4,11 @@ function updateSize() {
     height = window.innerHeight;
     // 更新 SVG 元素的宽度和高度
     svg.attr("width", width).attr("height", height);
+    // 更新 CY 元素的宽度和高度
+    var cyElement = document.getElementById('cy');
+    cyElement.style.width = width + 'px';
+    cyElement.style.height = height + 'px';
+    cy.resize();
 }
 
 
@@ -233,10 +238,10 @@ function fetchDataAndDraw(url) {
                 edge.source = nodes.find(node => node.id === edge.source.id || node.id === edge.source) || edge.source;
                 edge.target = nodes.find(node => node.id === edge.target.id || node.id === edge.target) || edge.target;
             });
+            drawGraph(nodes, edges);
             //在浏览器的控制台输出
             console.log(nodes);
             console.log(edges);
-            drawGraph(nodes, edges);
         })
         .catch(error => {
             console.error('数据请求错误:', error);
@@ -306,26 +311,45 @@ function fetchNodeRelations(url) {
 }
 
 function fetchCytoscape(url) {
-    // <div id="cy" style="width: 800px; height: 600px;"></div>
-    fetch('/query', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ query: 'MATCH (n)-[r]->(m) RETURN n, r, m' })
-    })
+    // fetch(url, 
+    //     {
+    //     method: 'POST',
+    //     headers: {
+    //         'Content-Type': 'application/json'
+    //     },
+    //     body: JSON.stringify({ query: 'MATCH (n)-[r]->(m) RETURN n, r, m' })
+    // })
+    // elements: [
+    //     ...data.nodes.map(node => ({
+    //         data: { id: node.id, label: node.labels[0], ...node.properties }
+    //     })),
+    //     ...data.relationships.map(rel => ({
+    //         data: { id: rel.id, source: rel.start, target: rel.end, label: rel.type, ...rel.properties }
+    //     }))
+    // ],
+    // 如果正在进行数据请求，则不执行新的请求
+    if (fetchingData) {
+        console.log("数据请求正在进行中...");
+        return;
+    }
+
+    // 将标志变量设置为true，表示开始进行数据请求
+    fetchingData = true;
+
+    fetch(url)
         .then(response => response.json())
         .then(data => {
-            var cy = cytoscape({
+            nodes = data.nodes.map(node => ({
+                data: { id: node.id, label: node.label, ...node.properties }
+            }));
+            const nodeIds = new Set(data.nodes.map(node => node.id));
+            edges = data.edges
+                .filter(edge => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+                .map(edge => ({ data: edge }));
+
+            cy = cytoscape({
                 container: document.getElementById('cy'),
-                elements: [
-                    ...data.nodes.map(node => ({
-                        data: { id: node.id, label: node.labels[0], ...node.properties }
-                    })),
-                    ...data.relationships.map(rel => ({
-                        data: { id: rel.id, source: rel.start, target: rel.end, label: rel.type, ...rel.properties }
-                    }))
-                ],
+                elements: [...nodes, ...edges],
                 style: [
                     {
                         selector: 'node',
@@ -333,25 +357,51 @@ function fetchCytoscape(url) {
                             'label': 'data(label)',
                             'text-valign': 'center',
                             'text-halign': 'center',
-                            'background-color': '#61bffc'
+                            // 'content': 'data(label)',
+                            'background-color': '#87CEEB',
+                            'border-color': (ele) => colorscale(ele.data('depth')) || '#808080',
+                            'border-width': 1,
+                            'font-size': '12px'
                         }
                     },
                     {
                         selector: 'edge',
                         style: {
                             'label': 'data(label)',
-                            'width': 3,
-                            'line-color': '#ccc',
+                            'width': 1,
+                            'line-color': (ele) => ele.data('rank') === 0 ? '#377ba8' : '#ccc',
                             'target-arrow-color': '#ccc',
-                            'target-arrow-shape': 'triangle'
+                            'target-arrow-shape': 'triangle',
+                            'font-size': '8px'
                         }
                     }
                 ],
                 layout: {
-                    name: 'grid',
-                    rows: 1
+                    name: 'cose', // 使用 'cose' 布局
+                    fit: true,
+                    padding: 20,
+                    animate: true,
+                    animationDuration: data.nodes.length > 300 ? 0 : 300 - data.nodes.length
                 }
             });
+            cy.on('tap', 'node', function (evt) {
+                var node = evt.target;
+                alert('Node data:\n' + JSON.stringify(node.data(), null, 2));
+            });
+
+            cy.on('tap', 'edge', function (evt) {
+                var edge = evt.target;
+                alert('Edge data:\n' + JSON.stringify(edge.data(), null, 2));
+            });
+            console.log(nodes);
+            console.log(edges);
+        })
+        .catch(error => {
+            console.error('数据请求错误:', error);
+        })
+        .finally(() => {
+            // 无论请求成功或失败，都将标志变量设置为false，以便允许新的请求
+            fetchingData = false;
         });
 }
 

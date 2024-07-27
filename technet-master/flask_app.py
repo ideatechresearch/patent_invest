@@ -213,8 +213,8 @@ def relationship_params(args_form, uid, key_prefix=''):
 
     params = dict()
     params['vdb_key'] = key_prefix + args_form.get('hy', 'all')
-    params['max_calc'] = 30 if uid < 0 else 300
-    params['max_node'] = 300 if uid < 0 else 3000
+    params['max_calc'] = 100 if uid < 0 else 300
+    params['max_node'] = 1000 if uid < 0 else 3000
     params['layers'] = [i for i in nums if i >= 1 and i <= params['max_node']]
     params['batch'] = int(args_form.get('batch', 1))
     params['width'] = int(args_form.get('width', 3))
@@ -233,9 +233,9 @@ def relationship_params(args_form, uid, key_prefix=''):
 @app.route('/show_relationships', methods=['GET', 'POST'])
 def show_relationships():
     uid, inf = swg.get_user(session.get("username"))
-    name = request.args.get('create_relationships', '').strip(string.punctuation).strip().lower()
+    name = request.args.get('name', '').strip(string.punctuation).strip().lower()
     params = relationship_params(request.args, uid, key_prefix=request.args.get('key_prefix', ''))
-    data = vdr.SimilarRelations(name, draw=0, **params)
+    data = vdr.SimilarRelations(name, draw=int(request.args.get('draw', 0)), **params)
 
     # names_depth, relationships_edges = vdr.SimilarRelationships(name, create=0, **params)
     #
@@ -248,48 +248,23 @@ def show_relationships():
     return jsonify(data)
 
 
-@app.route('/node_relations/<node_name>', methods=['GET', 'POST'])
-def node_relations(node_name):
+@app.route('/node_relations/<int:node_id>/<string:node_name>', methods=['GET', 'POST'])
+def node_relations(node_id, node_name):
     request_data = request.get_json()
     existing_nodes = request_data.get('existingNodes', [])
-    names_depth = {n['name']: n['depth'] for n in existing_nodes}
     # print(f"Node name: {node_name}  Existing nodes: {existing_nodes} \n {names_depth}")
 
     key_prefix = request.args.get('key_prefix', '')
     params = {}
     params['vdb_key'] = key_prefix + request.args.get('hy', 'all')
     params['width'] = int(request.args.get('nodewidth', 1))
-    params['depth'] = names_depth.get(node_name, 1)
     params['duplicate'] = int(request.args.get('duplicate', 3))
-    params['exclude'] = swg.stop_words if request.args.get('exclude') == '1' else []
     params['score_threshold'] = float(request.args.get('score_threshold', 0.0))
+    if key_prefix == 'Word_':
+        params['exclude'] = swg.stop_words if request.args.get('exclude') == '1' else []
 
-    new_depth, new_relationships = vdr.create_relationship(params['width'], params['depth'], node_name,
-                                                           names_depth=names_depth,
-                                                           vdb_key=params['vdb_key'],
-                                                           exclude_all=(params['duplicate'] > 0),
-                                                           create=0,
-                                                           score_threshold=params['score_threshold'],
-                                                           exclude=params['exclude'])
-
-    if not len(new_relationships):
-        nodes = [{"name": node_name, "id": 1, "depth": params['depth']}]
-        return jsonify({"nodes": nodes, "edges": []})
-
-    # i_payloads = vdr.get_payload(params['vdb_key'], list(new_depth)+list(names_depth), fields=['word', 'df'])
-    # radius = scale_to_range([p.get('df', 1) for i, p in i_payloads], 10, 30)
-    # nodes = [{"id": i, "name": p['word'], "depth": new_depth[p['word']], "radius": radius[idx]} for idx, (i, p) in
-    #          enumerate(i_payloads)]
-
-    nodes = [{"id": vdr.get_id(params['vdb_key'], n), "name": n, 'depth': d, "radius": 20} for n, d in
-             new_depth.items()]
-
-    edges = new_relationships.copy()
-    for r in edges:
-        r['source'] = vdr.get_id(params['vdb_key'], r['source'])  # get_ids
-        r['target'] = vdr.get_id(params['vdb_key'], r['target'])
-
-    return jsonify({"nodes": nodes, "edges": edges})
+    data = vdr.SimilarRelation(node_id, node_name, existing_nodes, **params)
+    return jsonify(data)
 
 
 @app.route('/similar/<string:id>/<string:name>', methods=['POST'])
@@ -901,7 +876,7 @@ def logout():
     return redirect(url_for('login'))
 
 
-@app.route('/home', methods=['GET'], endpoint='home_page')
+@app.route('/home', methods=['GET'], endpoint='home')
 def home():
     # 获取当前登录用户的用户名
     username = session.get("username")

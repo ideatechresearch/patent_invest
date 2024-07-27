@@ -43,40 +43,42 @@ class W2vLda:
     suffix = ''
 
     #导入数据及分词 
-    def __init__(self, sentences,wd_data=None,co_data=None,suffix='',stop_words=None,**kwargs)-> None:
+    def __init__(self, sentences,patent_data=None,co_data=None,suffix='',stop_words=None,**kwargs)-> None:
         self.args = {**self.args, **kwargs}
         self.suffix = suffix
 
         if stop_words:
             self.stop_words = set(stop_words)#self.reset_stop_words(stop_words)
 
-        if wd_data is None:  #导入分词数据
+        if patent_data is None:  #导入分词数据
             self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)].dropna()
         else:
-            # self.wd_data=wd_data.dropna().apply(lambda x:
+            # self.patent_data=patent_data.dropna().apply(lambda x:
             # [w.strip() for w in jieba.lcut(clean_doc(x)) if len(w) >= self.args.get('len_below',2) and w not in self.stop_words]).dropna()
-            # flag_data=wd_data.dropna().apply(lambda x:
+            # flag_data=patent_data.dropna().apply(lambda x:
             # [ i.flag for i in jieba.posseg.cut(clean_doc(x.lower())) if not i.word.isdigit()]).dropna()
-            assert '序号' in wd_data.columns,'需要索引!'
-                
-            self.sentences = wd_data['标题 (中文)'].str.cat(wd_data['摘要 (中文)'].replace(np.nan,'')).dropna().apply(lambda x: [w.strip().lower() for w in jieba.lcut(clean_doc(x))
-                                                   if not (len(w) < self.args.get('len_below', 2) or
-                                                           w.isdigit() or re.match('\d+\.\d+$', w) or
-                                                           w in self.stop_words)]).dropna()
+            assert '序号' in patent_data.columns,'需要索引!'
 
-            self.id_data = wd_data['序号'].copy()
-            pd.concat([self.id_data, self.sentences.rename('词语')], axis=1).to_parquet(
-                f'data\patent_cut_doc_{self.suffix}.parquet', index=False)  # 序号,[word,]
-            # .to_pickle('data\patent_cut_doc.pkl') #to_csv('data\patent_cut_doc.csv',encoding="utf_8_sig")
-            self.sentences = self.sentences[self.sentences.apply(len) >= self.args.get('count_fifter', 0)]
-
-            if not co_data:
-                co_data=wd_data['申请人'].str.split(';',expand=True).stack().str.strip().reset_index(level=1,drop=True).rename('Co')
-                
-            co_unstack = pd.merge(co_data, wd_data.loc[self.sentences.index,'序号'], left_index=True,
-                                  right_index=True)  # Co,序号(wd_data dropna)
-            
            
+
+            if sentences is None: 
+                sentences = patent_data['标题 (中文)'].str.cat(patent_data['摘要 (中文)'].replace(np.nan,'')).dropna().apply(lambda x: [w.strip().lower() for w in jieba.lcut(clean_doc(x))
+                                                       if not (len(w) < self.args.get('len_below', 2) or
+                                                               w.isdigit() or re.match('\d+\.\d+$', w) or
+                                                               w in self.stop_words)]).dropna()
+    
+                pd.concat([patent_data['序号'], sentences.rename('词语')], axis=1).to_parquet( f'data\patent_cut_doc_{self.suffix}.parquet', index=False) 
+                # 序号,[word,].to_pickle('data\patent_cut_doc.pkl') #to_csv('data\patent_cut_doc.csv',encoding="utf_8_sig")
+            
+            
+            self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)]
+            self.id_data = patent_data.loc[self.sentences.index,'序号'].copy()
+
+            if co_data is None:
+                co_data=patent_data['申请人'].str.split(';',expand=True).stack().str.strip().reset_index(level=1,drop=True).rename('Co')
+                
+            co_unstack = pd.merge(co_data, self.id_data, left_index=True, right_index=True)  # Co,序号(patent_data dropna)
+            
             self.group_ids = co_unstack.groupby('Co')['序号'].apply(lambda x: x.to_list()).reset_index()  # Co,['序号',]
             self.group_ids.to_parquet(f'data\patent_co_ids_{self.suffix}.parquet', index=False)
     
@@ -229,13 +231,13 @@ class W2vLda:
         co_ids_vec.index = self.group_ids['Co']
         return co_ids_vec[co_ids_vec.sum(axis=1) != 0]  # Co:vec,以此做group相似度计算
 
-    def docs_vec(self, documents_vec,wd_data=None):
+    def docs_vec(self, documents_vec,patent_data=None):
         doc_lda_w2v = pd.DataFrame(documents_vec, index=self.sentences.index)
         doc_lda_w2v = doc_lda_w2v[doc_lda_w2v.sum(axis=1) != 0]
         if wd_data is not None:
-            doc_lda_w2v=doc_lda_w2v.join(wd_data['序号']).set_index('序号')
-            # doc_lda_w2v.merge(wd_data['序号'], left_index=True, right_index=True, how='left')
-            # doc_lda_w2v['序号'] = wd_data.loc[doc_lda_w2v.index,'序号'] 
+            doc_lda_w2v=doc_lda_w2v.join(patent_data['序号']).set_index('序号')
+            # doc_lda_w2v.merge(id_data['序号'], left_index=True, right_index=True, how='left')
+            # doc_lda_w2v['序号'] = patent_data.loc[doc_lda_w2v.index,'序号'] 
             # doc_lda_w2v.set_index('序号', inplace=True)
   
         doc_lda_w2v.to_parquet(f'data\\documents_vec_{self.suffix}.parquet')    
@@ -467,6 +469,14 @@ def average_jensen_shannon_kl_distance(distributions):  # 计算多个概率分�
     average_distance = total_distance / (k ** 2)
     return average_distance
 
+def closeness(ndarr):
+    div_tech = np.linalg.norm(ndarr, axis=1)
+    denominator_tech = np.outer(div_tech, div_tech)
+    numerator_tech = np.dot(ndarr, ndarr.T)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tech_closeness = np.where(denominator_tech != 0, numerator_tech / denominator_tech, 0)
+    np.fill_diagonal(tech_closeness, 0)
+    return tech_closene
 
 def calc_entropy(class_probs):  # 计算类别间的信息熵,类别内的信息熵。(类别概率,样本概率)
     return -np.sum(class_probs * np.log2(class_probs + 1e-10))  # np.multiply
