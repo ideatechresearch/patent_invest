@@ -476,7 +476,7 @@ def closeness(ndarr):
     with np.errstate(divide='ignore', invalid='ignore'):
         tech_closeness = np.where(denominator_tech != 0, numerator_tech / denominator_tech, 0)
     np.fill_diagonal(tech_closeness, 0)
-    return tech_closene
+    return tech_closeness
 
 def calc_entropy(class_probs):  # 计算类别间的信息熵,类别内的信息熵。(类别概率,样本概率)
     return -np.sum(class_probs * np.log2(class_probs + 1e-10))  # np.multiply
