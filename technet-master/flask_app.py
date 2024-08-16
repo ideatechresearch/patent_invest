@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-from flask import session, request, redirect, url_for, render_template, render_template_string
-from flask import jsonify, send_file, g, send_from_directory, Response
+from flask import session, request, redirect, url_for, render_template, render_template_string, stream_with_context
+from flask import jsonify, send_file, g, current_app, send_from_directory, Response
 from flask import Flask
 from database import *
 from select_stop_words import *
-from qdrant_net import QdrantClient, Graph, VDBRelationships, most_similar_embeddings, field_match, empty_match, \
-    qdrant_livez
+from qdrant_net import QdrantClient, Graph, VDBRelationships, most_similar_embeddings, moonshot_chat, \
+    moonshot_chat_stream, field_match, empty_match, qdrant_livez
 import plotly.express as px
 import plotly.io as pio
 import pandas as pd
-import string, time, os, re
+import string, time, os, re, uuid
 import inspect
 from lda_topics import LdaTopics
 import logging
@@ -20,9 +20,9 @@ class IgnoreHeadRequestsFilter(logging.Filter):
         return "HEAD / HTTP/1.0" not in record.getMessage()
 
 
-lt = LdaTopics()
 swg = StopWordsFlag()
 vdr = VDBRelationships()
+ldt = LdaTopics()
 
 DEBUG_MODE = False  # .getenv('PYCHARM_HOSTED', '0') == '1'  # -e PYCHARM_HOSTED=0
 if DEBUG_MODE:
@@ -37,8 +37,16 @@ app.config["SQLALCHEMY_DATABASE_URI"] = Config.SQLALCHEMY_DATABASE_URI
 app.config['SQLALCHEMY_COMMIT_ON_TEARDOWN'] = Config.SQLALCHEMY_COMMIT_ON_TEARDOWN  # false
 app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600  # 适用于SQLAlchemy的连接池,设置连接重用时间为1小时
 
-client = QdrantClient(url=Config.QDRANT_URL)
 Baidu_Access_Token = get_baidu_access_token()
+client = QdrantClient(url=Config.QDRANT_URL)
+
+try:
+    from openai import OpenAI
+
+    ai_client = OpenAI(api_key=Config.AI_API_key, base_url="https://api.moonshot.cn/v1")
+except Exception as e:
+    print(f"An error occurred while initializing the OpenAI client: {e}")
+    ai_client = None
 
 
 # app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -107,10 +115,10 @@ def search():
 
         if action == 'search_topic':
             txt = request.form['search_topic'].strip()
-            if lt.notload():
-                lt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
+            if ldt.notload():
+                ldt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
             if txt:
-                vec = lt.encode(txt)
+                vec = ldt.encode(txt)
                 search_hit = client.search(collection_name='专利_先进制造_w2v_lda_120',
                                            query_vector=vec,
                                            score_threshold=float(request.form.get('score_threshold', 0.0)),
@@ -412,6 +420,34 @@ def words_detail_absrtact(words, table, absrtact=1):
     return df.drop(columns=['index', '阅读标记', '停用标记'])
 
 
+def retrieval_patent_abstract(query, topn=10, score_threshold=0):
+    # Retrieval-Augmented Generation
+    docs = []
+
+    result = most_similar_embeddings(query, '专利_bge_189', client,
+                                     topn=topn, match=[], not_match=empty_match(field_key='摘要长度'),
+                                     score_threshold=score_threshold, access_token=Baidu_Access_Token)
+
+    if result:
+        payloads, scores = zip(*result)
+        df = pd.DataFrame(payloads).rename(columns={'标题 (中文)': '标题'})
+        id_key = '公开（公告）号'
+        ids = tuple(df[id_key].unique()) if df.shape[0] > 1 else (df.iloc[0, id_key],)  # df['序号'].to_list()
+        query = text(f'SELECT `{id_key}`,`摘要 (中文)` FROM `融资公司专利-202406` WHERE `{id_key}` in :ids')
+        result = db.session.execute(query, {'ids': ids})
+        result_dict = {row[0]: row[1] for row in result.fetchall()}  # result.fetchone()
+        df['摘要'] = df[id_key].map(result_dict)
+        docs = [f"{index + 1}、《{row['标题'].strip()}》\t{row.get('摘要', '').strip()}\n" for
+                index, row in df.drop_duplicates(id_key).iterrows()]
+        # for item in zip(df.index, df[['标题', '摘要']].to_dict(orient='records')):
+        #     docs.append(f'{item[0]}\t' + '*'.join(
+        #         f'{k}#{v.strip() if isinstance(v, str) else v}' for k, v in item[1].items() if pd.notna(v)).strip())
+        # print(docs, scores)
+        print(np.mean(scores))
+
+    return docs
+
+
 @app.route('/details/<string:to>/<string:id>')
 def details(to, id):
     uid, inf = swg.get_user(session.get("username"))
@@ -478,16 +514,239 @@ def details(to, id):
 
 @app.route('/chat')
 def chat():
-    return render_template('chat.html')
+    user_name = session.get('username', '')
+    if not user_name:
+        session['username'] = str(uuid.uuid1())
+
+    uid, inf = swg.get_user(user_name)
+    if uid < 0:
+        return render_template('chat.html', uuid=session['username'])
+
+    return render_template('chat.html', username=user_name)
 
 
-@app.route('/ask', methods=['POST'])
-def ask():
-    data = request.get_json()  # await
-    question = data['question']
+Chat_history = []
+System_content = {'0': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
+                  '1': ('你是一位金融和专利领域专家，请回答下面的问题。\n'
+                        '（注意：1、材料可能与问题无关，请忽略无关材料，并基于已有知识回答问题。'
+                        '2、尽量不要直接复制材料内容作为答案，而应将其作为参考，用于补充事件背景或启发分析）。'
+                        '3、请直接提供分析和答案，无需详细引用具体文档。）'),
+                  '2': ('你是一位领域内的技术专家，擅长于分析和解构复杂的技术概念。'
+                        '我会向你提出一些问题，请你根据相关技术领域的最佳实践和前沿研究，对问题进行深度解析。'
+                        '请基于相关技术领域进行扩展，并为每个技术点提供简要且精确的描述。'
+                        '请将这些技术和其描述性文本整理成JSON格式，具体结构为 `{ "技术点1": "描述1",  ...}`，请确保JSON结构清晰且易于解析。'
+                        '我将根据这些描述的语义进一步查找资料，并开展深入研究。')}
+
+Agent_functions = {
+    '1': retrieval_patent_abstract,
+}
+
+
+@app.route('/get_messages', methods=['GET'])
+def get_messages():
+    user_name = session.get('username')
+    uid, inf = swg.get_user(user_name)
+    filter_time = int(request.args.get('filter_time', 0)) / 1000.0
+    user_history = [msg for msg in Chat_history if msg['username'] == user_name and msg['timestamp'] > filter_time]
+
+    if uid >= 0:
+        filter_time = inf.get('chatcut', 0)
+        user_history.extend(ChatHistory.user_history(user_name, agent=None, filter_time=filter_time, all_payload=True))
+
+    return jsonify(sorted(user_history, key=lambda x: x['timestamp']))
+
+
+@app.route('/cut_messages', methods=['GET'])
+def cut_messages():
+    user_name = session.get('username')  # 'default_user' or uuid
+    current_timestamp = time.time()
+    uid, inf = swg.get_user(user_name)
+    inf = swg.set_user(uid=uid, chatcut=current_timestamp)
+    ChatHistory.sequential_insert(Chat_history, db.session, user_name, agent=None)
+    user = User.query.filter_by(user_id=uid).first()
+    if user:
+        user.chatcut_at = current_timestamp  # datetime.fromtimestamp(inf['chatcut'])
+        db.session.commit()
+    return jsonify({'ChatCleanTime': current_timestamp, 'username': user_name, 'info': inf})
+
+
+@app.route('/send_message', methods=['POST'])
+def send_message():
+    data = request.get_json()
+
+    agent = data.get('agent', '1')
+    user_message = data['question']  # unquote()
+    uuid = data.get('uuid', None)
+    user_name = data.get('username', None)
+    filter_time = data.get('filter_time', 0) / 1000.0
+    current_timestamp = time.time()
+
+    history = [{"role": "system", "content": System_content.get(agent)}]
+    user_history = [msg for msg in Chat_history if
+                    msg['agent'] == agent and msg['username'] == (user_name or uuid) and msg['timestamp'] > filter_time]
+    if user_name:
+        if not filter_time:
+            uid, inf = swg.get_user(user_name)
+            filter_time = inf.get('chatcut', 0)
+
+        user_history.extend(ChatHistory.user_history(user_name, agent, filter_time))
+
+    history.extend([{'role': msg['role'], 'content': msg['content']} for msg in
+                    sorted(user_history, key=lambda x: x['timestamp'])])
+    # history.extend(data.get('messages', []))
+
+    function_call = Agent_functions.get(agent, lambda *args, **kwargs: [])
+    refer = function_call(user_message, topn=data.get('topn', 10), score_threshold=data.get('score_threshold', 0))
+
+    history.append({'role': 'user',
+                    'content': f'参考材料:{refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}' if refer else user_message})
+
+    bot_response = moonshot_chat(messages=history, temperature=data.get('temperature', 0.4), client=ai_client,
+                                 api_key=Config.AI_API_key)
+
+    # print(f"This is a response:{bot_response} from the bot to your question: {user_message}(User Name: {user_name})")
+    reference = '\n'.join(refer)
+
+    new_history = [
+        {'role': 'user', 'content': user_message, 'username': user_name or uuid, 'agent': agent,
+         'index': len(history) - 1, 'timestamp': current_timestamp},
+        {'role': 'assistant', 'content': bot_response, 'username': user_name or uuid, 'agent': agent,
+         'index': len(history), 'reference': reference, 'timestamp': time.time()}]
+
+    try:
+        if user_name:
+            ChatHistory.history_insert(new_history, db.session)
+        else:
+            raise Exception
+    except:
+        Chat_history.extend(new_history)
+
+    # re.sub(r'\n+', '\n', bot_response.strip())
+    return jsonify({'answer': bot_response, 'refer': reference})
+
+
+@app.route('/stream_response', methods=['GET'])
+def stream_response():
+    agent = request.args.get('agent', '1')
+    uuid = request.args.get('uuid', None)
+    user_name = request.args.get('username', None)
+    user_message = request.args.get('question')
+    temperature = float(request.args.get('temperature', 0.4))
+    filter_time = int(request.args.get('filter_time', 0)) / 1000.0
+    current_timestamp = time.time()
+
+    if not filter_time:
+        uid, inf = swg.get_user(user_name)
+        filter_time = inf.get('chatcut', 0)
+
+    user_history = [msg for msg in Chat_history if
+                    msg['agent'] == agent and msg['username'] == (user_name or uuid) and msg['timestamp'] > filter_time]
+    if user_name:
+        user_history.extend(ChatHistory.user_history(user_name, agent, filter_time))
+
+    history = [{'role': msg['role'], 'content': msg['content']} for msg in
+               sorted(user_history, key=lambda x: x['timestamp'])]
+
+    history.insert(0, {"role": "system", "content": System_content.get(agent)})
+
+    # Assume this is the document retrieved from RAG
+    function_call = Agent_functions.get(agent, lambda *args, **kwargs: [])
+    refer = function_call(user_message, topn=int(request.args.get('topn', 10)),
+                          score_threshold=float(request.args.get('score_threshold', 0)))
+
+    history.append({'role': 'user',
+                    'content': f'参考材料:\n{refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}' if refer else user_message})
+
+    # print(history)
+
+    def generate():
+        reference = '\n'.join(refer)
+        if refer:
+            first_data = json.dumps({'content': reference, 'role': 'reference'})
+            yield f'data: {first_data}\n\n'
+
+        assistant_response = []
+        for content in moonshot_chat_stream(history, temperature=temperature, client=ai_client,
+                                            api_key=Config.AI_API_key):
+            yield f'data: {content}\n\n'
+            assistant_response.append(content)
+
+        bot_response = ''.join(assistant_response)
+        last_data = json.dumps({'content': bot_response, 'role': 'assistant'})
+        yield f'data: {last_data}\n\n'
+        yield 'data: [DONE]\n\n'
+
+        new_history = [
+            {'role': 'user', 'content': user_message, 'username': user_name or uuid, 'agent': agent,
+             'index': len(history) - 1, 'timestamp': current_timestamp},
+            {'role': 'assistant', 'content': bot_response, 'username': user_name or uuid, 'agent': agent,
+             'index': len(history), 'reference': reference, 'timestamp': time.time()}]
+
+        try:
+            if user_name:
+                ChatHistory.history_insert(new_history, db.session)
+            else:
+                raise Exception
+        except:
+            Chat_history.extend(new_history)
+
+    return Response(stream_with_context(generate()), content_type='text/event-stream')
+
+
+Task_queue = {}
+
+
+@app.route('/stream_response/<task_id>', methods=['GET'])
+def stream_response_task(task_id):
+    task = Task_queue.get(task_id)
+    if not task:
+        err_data = "data: " + jsonify({"error": "Invalid task ID", 'content': task_id}) + "\n\n"
+        return Response(err_data, mimetype='text/event-stream')
+
+    reference = task.get('reference', [])
+    history = task.get('messages', [])
+
+    def generate():
+        if reference:
+            first_data = json.dumps({'content': '\n'.join(reference), 'role': 'reference'})
+            yield f'data: {first_data}\n\n'
+
+        assistant_response = []
+        for content in moonshot_chat_stream(history, temperature=0.8, client=ai_client, api_key=Config.AI_API_key):
+            yield f'data: {content}\n\n'
+            assistant_response.append(content)
+
+        bot_response = json.dumps({'content': ''.join(assistant_response), 'role': 'assistant'})
+        yield f'data: {bot_response}\n\n'
+        yield 'data: [DONE]\n\n'
+        del Task_queue[task_id]
+
+    return Response(generate(), content_type='text/event-stream')
+
+
+@app.route('/send_message/<task_id>', methods=['GET'])
+def send_message_task(task_id):
+    task = Task_queue.get(task_id)
+    if not task:
+        return jsonify({'answer': "Invalid task ID", 'refer': task_id})
+
+    reference = task.get('reference', [])
+    history = task.get('messages', [])
+
+    bot_response = moonshot_chat(messages=history, temperature=0.8, client=ai_client, api_key=Config.AI_API_key)
+
+    del Task_queue[task_id]
+
+    return jsonify({'answer': bot_response, 'refer': '\n'.join(reference)})
+
+
+@app.route('/submit_messages', methods=['POST'])
+def submit_messages():
     # content_info = request.data.decode('utf-8')
     # content_json = json.loads(content_info)
-    # import openai
+    data = request.get_json()  # await
+    # Here you can add the logic to get a response from your AI model.这里可以添加聊天机器人的逻辑
+    # 为通用文本生成设计的，适用于从给定的提示生成连续的文本
     # response = openai.Completion.create(
     #     engine="davinci",  # Choose the engine (e.g., davinci, curie, etc.)
     #     prompt=question,
@@ -495,8 +754,30 @@ def ask():
     # )
     #
     # answer = response.choices[0].text.strip()
+    filter_time = data.get('filter_time', 0) / 1000.0
+    user_name = data.get('username') or data.get('uuid') or session.get('username')
+    user_chat_history = data.get('messages', [msg for msg in Chat_history if
+                                              msg['username'] == user_name and msg['timestamp'] > filter_time])
 
-    return jsonify({'answer': question})
+    history = [{"role": "system", "content": System_content['0']}]
+    history.extend(user_chat_history)
+    # history.append({'role': 'user', 'content': user_message})
+
+    user_message = data.get('question', history[-1]['content'])
+    # function_call = Agent_functions.get(agent, lambda *args, **kwargs: [])
+    # refer = function_call(user_message, topn=int(request.args.get('topn', 10)),
+    #                       score_threshold=float(request.args.get('score_threshold', 0)))
+
+    task_id = str(uuid.uuid4())
+    Task_queue[task_id] = {
+        "status": "pending",
+        'username': user_name,
+        "messages": history,
+        'user_message': user_message,
+        'filter_time': filter_time,
+        'reference': [],
+    }
+    return jsonify({'task_id': task_id})  # f'/stream_response/{task_id}'} jsonify(user_chat_history)
 
 
 def get_function_parameters(func):
@@ -531,12 +812,15 @@ def get_user_info():
     if request.method == 'POST':
         swg.reset_user_data()
         swg.get_stop_words(uid=-1)
-    table = pd.DataFrame(swg.user_data)
+    table = pd.DataFrame(swg.user_data)[['uid', 'name', 'readn', 'stopn', 'cross', 'chatcut']]
     if not table.empty:
         table.sort_values('readn', inplace=True, ascending=False)  # table['readn'].sum()
+        table['chatcut'] = pd.to_datetime(table['chatcut'], errors='coerce', unit='s')  # .apply(pd.Timestamp)
+
+    inf = ''
     count = len(swg.stop_words)
-    inf = ','.join(np.random.choice(swg.stop_words, size=min(300, count), replace=False)) \
-        if count > 0 else ''
+    if count > 0:
+        inf = ','.join(sorted(np.random.choice(swg.stop_words, size=min(500, count), replace=False)))
     return render_template('user_info.html',
                            table=table.to_html(classes='custom-table', index=False),
                            num=f'{count}/{swg.word_data.shape[0]}',
@@ -563,10 +847,10 @@ def set_user():
             inf = swg.set_user(uid=uid,
                                cross=1 if request.form['cross'].lower() == "true" else 0)
 
-            users = User.query.filter_by(user_id=uid)  # .first()
-            users.update({User.username: inf['name'], User.cross: inf['cross']})
-            db.session.commit()
-            # db.session.close()
+            user = User.query.filter_by(user_id=uid).first()
+            if inf and user:
+                user.cross = inf['cross']
+                db.session.commit()
 
         if action == 'set_words':
             inf = {}
@@ -589,17 +873,18 @@ def set_user():
                     else:
                         db.session.merge(StopWords(**record))  # 使用 merge 合并来添加或更新对象
                 db.session.commit()  # session.flush()
+                # db.session.close()
             else:
                 inf['找不到词'] = words
 
         return render_template('user.html', username=username, inform=f'{inf}')
 
+    inf2 = ''
     stop_words = swg.get_stop_words(uid=uid)
     if stop_words.shape[0] > 0:
-        return render_template('user.html', username=username,
-                               inform=f'当前用户已标记停用词：{",".join(np.random.choice(stop_words, size=min(300, stop_words.shape[0]), replace=False))}')
+        inf2 = f'当前用户已标记停用词：{",".join(sorted(np.random.choice(stop_words, size=min(500, stop_words.shape[0]), replace=False)))}'
 
-    return render_template('user.html', username=username)
+    return render_template('user.html', username=username, inform=inf2)
 
     # return f'''
     #   <html>
@@ -625,11 +910,11 @@ def admin():
         else:
             return "非管理员！<a href='/'>首页</a>"
     return '''
-        <form method="post">
-            <p><input type=password name=password>
-            <p><input type=submit value=Login>
-        </form>
-        '''
+    <form method="post">
+        <p><input type=password name=password>
+        <p><input type=submit value=Login>
+    </form>
+    '''
 
 
 host_index = 0
@@ -637,8 +922,8 @@ host_index = 0
 
 @app.route('/admin/do', methods=['GET', 'POST'])
 def admin_do():
-    checklist = ['测试用户', '重置清零', '导入标记', '保存标记', '记录停用词', '导入用户', '导入数据库', '备份数据库',
-                 '切换向量库', '检测向量库', '连接图库']
+    checklist = ['测试用户', '重置清零', '导入标记', '保存标记', '记录停用词', '导入用户', '导入数据库',
+                 '备份数据库', '切换向量库', '检测向量库', '连接图库', '保存对话', '清空任务']
     hosts = [Config.QDRANT_HOST, '47.110.156.41', '10.10.10.5', ]
 
     if request.method == 'POST':
@@ -660,7 +945,9 @@ def admin_do():
             swg.save_data()
         if '导入用户' in selected:
             table = pd.read_sql(f'select * from users', con=db.engine).set_index('user_id')
-            table = table[['username', 'cross']].rename(columns={'username': 'name'})
+            table = table[['user_id', 'username', 'cross', 'chatcut_at']].rename(
+                columns={'user_id': 'uid', 'username': 'name', 'chatcut_at': 'chatcut'})
+            table['chatcut'] = table['chatcut'].fillna(0)  # (pd.Timestamp(0)).apply(lambda x: x.timestamp())
             table['readn'] = 0
             table['stopn'] = 0
             swg.user_data = table.to_dict(orient='records')
@@ -707,10 +994,19 @@ def admin_do():
             ret += str(res)
         if '连接图库' in selected:
             try:
-                graph = Graph(f"bolt://{Config.NEO4J_HOST}:7687", auth=(Config.NEO4J_USERNAME, Config.NEO4J_PASSWORD))
+                graph = Graph(f"bolt://{Config.NEO4J_HOST}:7687",
+                              auth=(Config.NEO4J_USERNAME, Config.NEO4J_PASSWORD))
                 vdr.graph = graph
             except:
                 ret += 'neo4j graph connection unavailable'
+        if '保存对话' in selected:
+            count = len(Chat_history)
+            ChatHistory.sequential_insert(Chat_history, db.session)
+            ret += f"insert chat history to db: {count, len(Chat_history)}"
+        if '清空任务' in selected:
+            count = len(Task_queue)
+            Task_queue.clear()
+            ret += f"clear chat task queue: {count}"
 
             # if action == 'set_words':
         #     if request.form['reset']:
@@ -759,8 +1055,8 @@ def downloads(path):
     """ 下载 """
     """
         重写download方法，根据前端点击的文件传送过来的path，下载文件
-		send_from_directory：用于下载文件
-		flask.send_from_directory(所有文件的存储目录，相对于要下载的目录的文件名，as_attachment：设置为True是否要发送带有标题的文件)
+        send_from_directory：用于下载文件
+        flask.send_from_directory(所有文件的存储目录，相对于要下载的目录的文件名，as_attachment：设置为True是否要发送带有标题的文件)
     """
     if session.get("username") == 'admin':
         return send_from_directory(app.config['DATA_FOLDER'], path, as_attachment=True)
@@ -948,14 +1244,15 @@ if __name__ == "__main__":
     with app.app_context():  # init_db
         db.create_all()  # 根据继承的Model的类创建表，如果表名已经存在，则不创建也不更改
 
-        table = pd.read_sql(f'select * from users', con=db.engine).set_index('id')
-        table = table[['user_id', 'username', 'cross']].rename(
-            columns={'user_id': 'uid', 'username': 'name'})
+        table = pd.read_sql('users', con=db.engine).set_index('id')
+        table = table[['user_id', 'username', 'cross', 'chatcut_at']].rename(
+            columns={'user_id': 'uid', 'username': 'name', 'chatcut_at': 'chatcut'})
+        table['chatcut'] = table['chatcut'].fillna(0)
         table['readn'] = 0
         table['stopn'] = 0
         swg.user_data = table.to_dict(orient='records')
 
-        table = pd.read_sql(f'select * from word_tf_df_sc', con=db.engine).set_index('word')
+        table = pd.read_sql('word_tf_df_sc', con=db.engine).set_index('word')
         swg.load(table)
         table = pd.read_sql(f'select word,read_flag,stop_flag from stop_words', con=db.engine).set_index('word')
         table.columns = ['阅读标记', '停用标记']
@@ -971,5 +1268,6 @@ if __name__ == "__main__":
 
     with app.app_context():
         # 在应用上下文中执行数据库操作
+        ChatHistory.sequential_insert(Chat_history, db.session)
         db.session.commit()
         db.session.close()

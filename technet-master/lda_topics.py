@@ -30,7 +30,7 @@ class LdaTopics:
         self.dictionary = corpora.Dictionary.load(f'data/patent_dictionary_{self.suffix}.dict')
         self.lda = LdaModel.load(f'data/patent_lda_{self.suffix}.model')
         self.topics_vec = np.load(f"data/topics_vec_{self.suffix}.npy")
-        print('load lda topics...', self.topics_vec.shape)
+        print('load lda topics:', self.topics_vec.shape)
 
     def notload(self):
         return self.lda is None

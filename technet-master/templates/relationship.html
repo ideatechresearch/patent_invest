@@ -37,13 +37,15 @@
             cursor: pointer;
             z-index: 100;
             font-size: 12px;
-            user-select: none;
+            /* user-select: none; */
         }
 
         .fullscreen {
             position: fixed;
             top: 0;
             left: 0;
+            width: 100%;
+            height: 100%;
             overflow: auto;
             background-color: white;
             z-index: 99;
@@ -229,7 +231,7 @@
             height = +svg.attr("height");
         var g = svg.append("g")
             .attr("transform", "translate(" + marge.top + "," + marge.left + ")");
-        var cy = cytoscape({container: document.getElementById('cy')});
+        var cy = cytoscape({ container: document.getElementById('cy') });
         // 初始化调整大小
         updateSize();
 
@@ -264,7 +266,7 @@
             else {
                 event.preventDefault();
                 last_key = 'Word_';
-                const url = `/show_relationships?name=${document.getElementById("create_relationships").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&draw=${draw}&key_radius=${document.getElementById("radius").value}&exclude=${document.getElementById("exclude").value}`;
+                const url = `/show_relationships?name=${document.getElementById("create_relationships").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&score_threshold=${document.getElementById("score_threshold").value}&draw=${draw}&key_radius=${document.getElementById("radius").value}&exclude=${document.getElementById("exclude").value}`;
                 if (draw == '0') {
                     document.getElementById('cy').style.display = 'none';
                     document.querySelector('svg').style.display = 'block';
@@ -285,7 +287,7 @@
             else {
                 event.preventDefault();
                 last_key = 'Co_';
-                const url = `/show_relationships?name=${document.getElementById("create_relationships_co").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&draw=${draw}`;
+                const url = `/show_relationships?name=${document.getElementById("create_relationships_co").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&score_threshold=${document.getElementById("score_threshold").value}&draw=${draw}`;
                 if (draw == '0') {
                     document.getElementById('cy').style.display = 'none';
                     document.querySelector('svg').style.display = 'block';
@@ -319,7 +321,7 @@
 
         // Function to handle node click
         function ClickNode(event, d) {
-            const url = `/node_relations/${d.id}/${d.name}?key_prefix=${last_key}&hy=${document.getElementById("hy").value}&duplicate=${document.getElementById("duplicate").value}&exclude=${document.getElementById("exclude").value}&nodewidth=${document.getElementById("nodewidth").value}`;//id
+            const url = `/node_relations/${d.id}/${d.name}?key_prefix=${last_key}&hy=${document.getElementById("hy").value}&duplicate=${document.getElementById("duplicate").value}&exclude=${document.getElementById("exclude").value}&nodewidth=${document.getElementById("nodewidth").value}&score_threshold=${document.getElementById("score_threshold").value}`;//id
             fetchNodeRelations(url);
         };
 

@@ -3,7 +3,7 @@ from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasId
     PayloadField, SearchRequest, SearchParams, RecommendRequest, QuantizationSearchParams, VectorParams, \
     CollectionStatus, PointStruct, OrderBy, Batch, Distance, Range
 from py2neo import Graph, Node, Relationship, Subgraph
-import requests, json, httpx
+import requests, json
 import numpy as np
 
 
@@ -154,123 +154,17 @@ def get_bge_embeddings(texts=[], access_token=''):
 
 def most_similar_embeddings(query, collection_name, client, topn=10, score_threshold=0.0,
                             match=[], not_match=[], access_token=''):
-    try:
-        query_vector = get_bge_embeddings(query, access_token)
-        if not query_vector:
-            return []
-
-        query_filter = Filter(must=match, must_not=not_match)
-        search_hit = client.search(collection_name=collection_name,
-                                   query_vector=query_vector,  # tolist()
-                                   query_filter=query_filter,
-                                   limit=topn,
-                                   score_threshold=score_threshold,
-                                   )
-        return [(p.payload, p.score) for p in search_hit]
-    except Exception as e:
-        print('Error:', e)
+    query_vector = get_bge_embeddings(query, access_token)
+    if not query_vector:
         return []
-
-
-def moonshot_chat(messages, temperature=0.4, payload=None, client=None, api_key=''):
-    if not payload:
-        payload = {
-            "model": "moonshot-v1-32k",  # moonshot-v1-8k,moonshot-v1-128k
-            "messages": messages,
-            "temperature": temperature,
-        }
-
-    if client:
-        completion = client.chat.completions.create(**payload)
-        return completion.choices[0].message.content
-
-    url = "https://api.moonshot.cn/v1/chat/completions"
-    headers = {
-        'Content-Type': 'application/json',
-        "Authorization": f'Bearer {api_key}'
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=payload)  # data=json.dumps(payload)
-        response.raise_for_status()  # 如果请求失败，则抛出异常
-        data = response.json().get('choices')
-        return data[0].get('message').get('content')
-    except requests.exceptions.RequestException as e:
-        print(f"Request failed: {e}")
-        return None
-
-
-def moonshot_chat_stream(messages, temperature=0.4, payload=None, client=None, api_key=''):
-    if not payload:
-        payload = {
-            "model": "moonshot-v1-32k",  # moonshot-v1-8k,moonshot-v1-128k
-            "messages": messages,
-            "temperature": temperature,
-            "stream": True,
-        }
-
-    if client:
-        stream = client.chat.completions.create(**payload)
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                yield delta.content  # completion.append(delta.content)
-            # if chunk.choices[0].finish_reason == 'stop':
-            #     break
-        # yield '[DONE]'
-        return
-
-    url = "https://api.moonshot.cn/v1/chat/completions"
-    headers = {
-        'Content-Type': 'text/event-stream',
-        "Authorization": f'Bearer {api_key}'
-    }
-
-    try:
-        # httpx.post(url, headers=headers, json=payload)   sse HTTP 响应 data=json.dumps(payload)
-        with httpx.Client() as cx:
-            response = cx.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            yield from process_line_stream(response)
-    except httpx.RequestError as e:
-        yield str(e)
-
-    # yield "[DONE]"
-
-
-def process_data_chunk(data):
-    try:
-        chunk = json.loads(data)
-        delta = chunk.get('choices')[0]["delta"]
-        content = delta.get("content")
-        if content:
-            return content
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        return str(e)
-
-
-def process_line_stream(response):
-    data = ""
-    for line in response.iter_lines():
-        line = line.strip()
-        if len(line) == 0:  # 开头的行 not line
-            if data:
-                yield process_data_chunk(data)  # 一个数据块的结束 yield from + '\n'
-                data = ""
-            continue
-        if line.startswith("data: "):
-            line_data = line.lstrip("data: ")
-            if line_data == "[DONE]":
-                # print(data)
-                break
-            content = process_data_chunk(line_data)
-            if content:
-                yield content
-        else:
-            data += "\n" + line
-
-    if data:
-        yield process_data_chunk(data)
+    query_filter = Filter(must=match, must_not=not_match)
+    search_hit = client.search(collection_name=collection_name,
+                               query_vector=query_vector,  # tolist()
+                               query_filter=query_filter,
+                               limit=topn,
+                               score_threshold=score_threshold,
+                               )
+    return [(p.payload, p.score) for p in search_hit]
 
 
 def most_similar_by_name(name, collection_name, client, match=[], exclude=[], topn=10, score_threshold=0.5):
@@ -641,10 +535,10 @@ class VDBSimilar:
         not_match_ids = [HasIdCondition(has_id=not_ids)]
         query_filter = Filter(must=self.match_first, must_not=not_match_ids + not_match_name)  # [match_name] + 缩小查询范围
         hit = self.client.search(collection_name=self.collection_name,
-                                 query_vector=query_vector,  # neighbor_vector then result_vector tolist()
+                                 query_vector=query_vector,  # tolist()
                                  query_filter=query_filter,
                                  with_payload=True,
-                                 limit=topn,  # max_neighbors
+                                 limit=topn,
                                  score_threshold=score_threshold,
                                  offset=(0 if name in exclude else 1),
                                  # search_params=SearchParams(exact=True,  # Turns on the exact search mode
@@ -1108,7 +1002,6 @@ class VDBRelationships:
 
         # 老方法:self.SimulationNodes(names_depth, relationships_edges, params['vdb_key'], params.get('key_radius', ''))
 
-    # 多层次关系探索:max_neighbors max_depth search_tree append(children)
     def SimilarRelations(self, name, vdb_key='Word_all', key_radius='', width=3, max_depth=3, layers=[], batch=True,
                          duplicate=3, draw=0, max_calc=30, max_node=0, score_threshold=0.0, exclude=[]):
 
@@ -1148,21 +1041,23 @@ class VDBRelationships:
             key_nodes = {n['id']: n for n in nodes}
             edges = relationships_edges.copy()
             for rel in edges:
-                rel['source'] = key_nodes.get(rel['source'], rel['source'])
-                rel['target'] = key_nodes.get(rel['target'], rel['target'])
+                rel['source'] = key_nodes.get(rel['source'])
+                rel['target'] = key_nodes.get(rel['target'])
 
             return {"nodes": nodes, "edges": edges}
 
         if draw == 1:  # Cytoscape
             key_name = self.vdb[vdb_key].get_keyname()
             payloads = self.get_payload(vdb_key, names=[], ids=list(ids_depth))
-            nodes = [{"id": i, 'label': p[key_name], 'properties': {**p, 'depth': ids_depth[i]}}
+            nodes = [{"id": str(i), 'label': p[key_name], 'properties': {**p, 'depth': ids_depth[i]}}
                      for i, p in payloads]
 
             edges = relationships_edges.copy()
             for i, rel in enumerate(edges):
                 rel['id'] = str(i)
-                rel['label'] = rel.pop('relation', 'none')
+                rel['source'] = str(rel['source'])
+                rel['target'] = str(rel['target'])
+                rel['label'] = rel.pop('relation')
                 rel['rank'] = rel.get('rank', 0)
                 # edges[i] = {"data": rel}
 
@@ -1362,15 +1257,3 @@ if __name__ == '__main__':
 
     SP = client.search(collection_name='专利_先进制造_w2v_lda_120', query_vector=vec, limit=5)
     print(SP)
-    api_key = "sk-7"
-    messages = [{"role": "user", "content": '你好我的朋友'}, ]
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key, base_url="https://api.moonshot.cn/v1")
-    except Exception as e:
-        print(f"An error occurred while initializing the OpenAI client: {e}")
-        client = None
-
-    for content in moonshot_chat_stream(messages, temperature=0.4, payload=None, client=None, api_key=api_key):
-        print(content)

@@ -107,12 +107,12 @@
       })
         .then(response => response.json())
         .then(data => {
-          console.log(cellContent, ' Received data:', data);
           const informElement = document.getElementById('inform');
           if (informElement) {
             informElement.textContent = `${cellContent}: ${JSON.stringify(data.similar_next)}`;
             // informElement.innerHTML = `<text>${JSON.stringify(data.similar_next)}</text>`;
           }
+          console.log(cellContent, ' Received data:', data);
         })
         .catch(error => {
           console.error('数据请求错误:', error);

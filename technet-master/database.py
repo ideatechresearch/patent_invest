@@ -1,7 +1,9 @@
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import Column, TIMESTAMP, ForeignKey, func, text, create_engine
+from sqlalchemy import Column, TIMESTAMP, ForeignKey, func, or_, text, create_engine
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from datetime import datetime
+import time
 
 db = SQLAlchemy()
 
@@ -29,12 +31,13 @@ class Base(db.Model):
 class User(db.Model):
     __tablename__ = 'users'
     id: Mapped[int] = db.Column(db.Integer, primary_key=True)
-    user_id: Mapped[int] = db.Column(db.Integer, unique=True, nullable=False)
-    username: Mapped[str] = db.Column(db.String(99), unique=True, nullable=False)
-    password = db.Column(db.String(128), nullable=False)
+    user_id: Mapped[int] = db.Column(db.Integer, unique=True, nullable=False, index=True)
+    username: Mapped[str] = mapped_column(db.String(99), unique=True, nullable=False, index=True)
+    password: Mapped[str] = mapped_column(db.String(128), nullable=False)
     # role_id = db.Column(db.Integer, db.ForeignKey('roles.id'))
-    created_at: Mapped[datetime] = db.Column(db.DateTime(timezone=True), default=func.now())
-    updated_at = mapped_column(TIMESTAMP, onupdate=func.utc_timestamp(), default=func.utc_timestamp())
+    created_at: Mapped[datetime] = mapped_column(db.DateTime(timezone=True), default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, onupdate=func.utc_timestamp(), default=func.utc_timestamp())
+    chatcut_at: Mapped[int] = mapped_column(db.BigInteger, nullable=True)
     cross = mapped_column(db.Boolean)
 
     def __repr__(self):
@@ -45,8 +48,8 @@ class UserLog(db.Model):
     id = Column(db.Integer, primary_key=True)
     # username: Mapped[str] = db.Column(db.String(99), nullable=False)
     user_id: Mapped[int] = mapped_column(db.Integer, ForeignKey('users.user_id'))
-    word: Mapped[str] = db.Column(db.String(255), nullable=False)
-    updated_at = db.Column(TIMESTAMP, onupdate=func.utc_timestamp(), default=func.utc_timestamp())
+    word: Mapped[str] = mapped_column(db.String(255), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, onupdate=func.utc_timestamp(), default=func.utc_timestamp())
     stoped = db.Column(db.Boolean, default=False)
     action = db.Column(db.String(255))
 
@@ -79,6 +82,76 @@ class StopWords(db.Model):
     #         WHERE username = ?
     #         AND password = ?
     #         '''
+
+
+class ChatHistory(db.Model):
+    __tablename__ = 'chat_history'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    role = db.Column(db.String(20), nullable=False)  # 'user' 或 'assistant'
+    content = db.Column(MEDIUMTEXT, nullable=False)
+    username = db.Column(db.String(99), nullable=False, index=True)
+    model = db.Column(db.String(50), nullable=True, default='kimi')  # 模型名称
+    agent = db.Column(db.String(50), nullable=False, default='0', index=True)  # 代理名称或角色
+    index = db.Column(db.Integer, nullable=False)  # 消息索引
+    reference = db.Column(MEDIUMTEXT, nullable=True)  # 参考信息，仅对'assistant'有用 db.Text
+    timestamp = db.Column(db.BigInteger, nullable=False, index=True)  # 消息 Unix 时间戳
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)  # 消息创建时间
+
+    __table_args__ = (
+        db.Index('idx_agent_username_time', 'agent', 'username', 'timestamp'),
+    )
+
+    def __init__(self, role, content, username, model='kimi', agent='0', index=0, reference=None, timestamp=0):
+        self.role = role
+        self.content = content
+        self.username = username
+        self.model = model
+        self.agent = agent
+        self.index = index
+        self.reference = reference
+        self.timestamp = timestamp or time.time()
+
+    def asdict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}  # vars()
+
+    @classmethod
+    def history_insert(cls, new_history, session):
+        if len(new_history) > 0:
+            session.add_all([cls(**msg) for msg in new_history])
+            session.commit()
+
+    @classmethod
+    def user_history(cls, user_name, agent=None, filter_time=0, all_payload=True):
+        query = cls.query.filter(or_(cls.agent == agent, agent is None),
+                                 cls.username == user_name, cls.timestamp > filter_time)
+        if all_payload:
+            return [record.asdict() for record in query.all()]
+        records = query.with_entities(cls.role, cls.content).all()
+        return [{'role': record.role, 'content': record.content} for record in records]
+
+    @classmethod
+    def sequential_insert(cls, chat_history, session, user_name=None, agent=None):
+        i = 0
+        while i < len(chat_history):
+            try:
+                msg = chat_history[i]
+                if (not agent or msg['agent'] == agent) and (not user_name or msg['username'] == user_name):
+                    record = cls(**msg)
+                    session.add(record)
+                    session.commit()
+
+                    del chat_history[i]  # pop(0)
+                    if not any((not agent or m['agent'] == agent) and (not user_name or m['username'] == user_name)
+                               for m in chat_history[i:]):
+                        break
+                else:
+                    i += 1
+
+            except Exception as e:
+                session.rollback()
+                print(f"Error inserting chat history: {e}")
+                break
 
 
 # def fetch_by_ids(engine,table_name, id_column, ids,columns=None):

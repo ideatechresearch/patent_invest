@@ -16,10 +16,11 @@ class Config(object):
     NEO4J_HOST = '10.10.10.5'
     NEO4J_USERNAME = "dooven"
     NEO4J_PASSWORD = "7777"
-    QDRANT_HOST = '10.10.10.5' #'qdrant'
+    QDRANT_HOST = '10.10.10.5'  # 'qdrant'
     QDRANT_URL = "http://10.10.10.5:6333"
     BAIDU_API_Key = 'apikey'
     BAIDU_Secret_Key = 'secretkey'
+    AI_API_key = 'apikey'
 
     def load_from_file(self, filename='config.ini'):
         import configparser

@@ -28,7 +28,7 @@ def set_stop_flag(word_data, words, stops, uid=0):  # stop>0
 
 
 class StopWordsFlag:
-    user_data = []  # [{:,:[(,),]}]#"name": "abc", "cross": 0, "readn": 91, "stopn": 12, "task":[]
+    user_data = []  # [{:,:[(,),]}]#"name": "abc", "cross": 0, "readn": 91, "stopn": 12, "chatcut":0,"task":[]
 
     def __init__(self):
         self.word_data = None
@@ -95,7 +95,7 @@ class StopWordsFlag:
         elif len(names) < 128:
             uid = len(self.user_data)
             inf = kwargs if len(kwargs) else {'uid': uid, 'name': name,
-                                              'cross': 0, 'readn': 0, 'stopn': 0, 'task': []}
+                                              'cross': 0, 'readn': 0, 'stopn': 0, 'chatcut': 0, 'task': []}
             self.user_data.append(inf)
             return uid, inf
 
