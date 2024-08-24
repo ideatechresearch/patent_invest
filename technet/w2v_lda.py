@@ -26,8 +26,7 @@ class W2vLda:
     }
     # 初始化数据，不随改变参数改变
     sentences = pd.Series() # cleaned document
-    id_data = None  # index
-    group_ids = None # values,[arr.tolist() for arr in array_data]
+    group_ids = None # values,[index.tolist() for index  in array_data]
     # public
     stop_words = set()
     dictionary = None
@@ -42,7 +41,6 @@ class W2vLda:
     new_filter = False  # 控制停用词筛选
     suffix = ''
 
-    #导入数据及分词 
     def __init__(self, sentences,patent_data=None,co_data=None,suffix='',stop_words=None,**kwargs)-> None:
         self.args = {**self.args, **kwargs}
         self.suffix = suffix
@@ -50,40 +48,42 @@ class W2vLda:
         if stop_words:
             self.stop_words = set(stop_words)#self.reset_stop_words(stop_words)
 
-        if patent_data is None:  #导入分词数据
-            self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)].dropna()
-        else:
+        if sentences is not None:  #导入分词数据
+            self.on_init(sentences)
+        elif patent_data is not None:
             # self.patent_data=patent_data.dropna().apply(lambda x:
             # [w.strip() for w in jieba.lcut(clean_doc(x)) if len(w) >= self.args.get('len_below',2) and w not in self.stop_words]).dropna()
             # flag_data=patent_data.dropna().apply(lambda x:
             # [ i.flag for i in jieba.posseg.cut(clean_doc(x.lower())) if not i.word.isdigit()]).dropna()
-            assert '序号' in patent_data.columns,'需要索引!'
-
-           
+            if patent_data.index.name!='公开（公告）号':
+                assert '公开（公告）号' in patent_data.columns,'需要索引!'
+                patent_data = patent_data.set_index('公开（公告）号')
 
             if sentences is None: 
                 sentences = patent_data['标题 (中文)'].str.cat(patent_data['摘要 (中文)'].replace(np.nan,'')).dropna().apply(lambda x: [w.strip().lower() for w in jieba.lcut(clean_doc(x))
-                                                       if not (len(w) < self.args.get('len_below', 2) or
-                                                               w.isdigit() or re.match('\d+\.\d+$', w) or
-                                                               w in self.stop_words)]).dropna()
+                                                       if not (len(w) < self.args.get('len_below', 2) or w.isdigit() or re.match('\d+\.\d+$', w) or w in self.stop_words)]).rename('词语').dropna()
     
-                pd.concat([patent_data['序号'], sentences.rename('词语')], axis=1).to_parquet( f'data\patent_cut_doc_{self.suffix}.parquet', index=False) 
+                sentences.to_frame().to_parquet( f'data\patent_cut_doc_{self.suffix}.parquet', index=True) 
                 # 序号,[word,].to_pickle('data\patent_cut_doc.pkl') #to_csv('data\patent_cut_doc.csv',encoding="utf_8_sig")
             
-            
             self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)]
-            self.id_data = patent_data.loc[self.sentences.index,'序号'].copy()
+            # self.id_data = patent_data.loc[self.sentences.index,'公开（公告）号'].copy()
 
             if co_data is None:
-                co_data=patent_data['申请人'].str.split(';',expand=True).stack().str.strip().reset_index(level=1,drop=True).rename('Co')
-                
-            co_unstack = pd.merge(co_data, self.id_data, left_index=True, right_index=True)  # Co,序号(patent_data dropna)
-            
-            self.group_ids = co_unstack.groupby('Co')['序号'].apply(lambda x: x.to_list()).reset_index()  # Co,['序号',]
+                co_data=patent_data['申请人'].str.split(';',expand=True).stack().str.strip().rename('Co').reset_index(level=1,drop=True)#看是否已分离公司
+                # co_data=patent_data.set_index('公开（公告）号')['申请人'].str.split(';').explode().str.strip().rename('Co')
+                           
+            self.group_ids = co_data.groupby(co_data).apply(lambda x: x.index.tolist()).reset_index(name='index_list')  # Co,['序号',]
             self.group_ids.to_parquet(f'data\patent_co_ids_{self.suffix}.parquet', index=False)
     
             self.new_filter = False
-
+        elif self.suffix: #load文件
+            sentences=pd.read_parquet(f'data\patent_cut_doc_{self.suffix}.parquet')#.set_index('序号')
+            sentences['词语']=sentences['词语'].dropna().map(lambda x: x.tolist())
+            self.on_init(sentences)
+            self.group_ids=pd.read_parquet(f'data\patent_co_{self.suffix}.parquet')
+            self.group_ids['index_list']=self.group_ids['index_list'].dropna().apply(lambda x: x.tolist())
+        
         
     # 中途可能推出，需要备份
     def save(self):
@@ -94,13 +94,15 @@ class W2vLda:
         if self.lda:
             self.lda.save(f'data\patent_lda_{self.suffix}.model')
 
-    def load(self,dictionary=True, wo=True, lda=True):
+    def load(self,suffix='',dictionary=True, wo=True, lda=True):
+        if not suffix:
+            suffix=self.suffix
         if dictionary:
-            self.dictionary = corpora.Dictionary.load(f'data\patent_dictionary_{self.suffix}.dict')
+            self.dictionary = corpora.Dictionary.load(f'data\patent_dictionary_{suffix}.dict')
         if wo:
-            self.wo = Word2Vec.load(f'data\patent_w2v_{self.suffix}.model')
+            self.wo = Word2Vec.load(f'data\patent_w2v_{suffix}.model')
         if lda:
-            self.lda = LdaModel.load(f'data\patent_lda_{self.suffix}.model')
+            self.lda = LdaModel.load(f'data\patent_lda_{suffix}.model')
 
     def update(self, params: dict):  # argparse.ArgumentParser() add_argument
         self.args.update(params)
@@ -108,7 +110,7 @@ class W2vLda:
     def params(self):  # parser.parse_args()
         return self.args  # |.__dict__
 
-    def on_init(self,sentences,suffix=''):
+    def on_init(self,sentences,suffix=''): #重置corpus
         self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)].dropna()
         self.new_filter = True
         if suffix:
@@ -153,8 +155,8 @@ class W2vLda:
                                             no_above=self.args.get('no_above', 0.97),
                                             keep_n=self.args.get('keep_n', 800000))  # 删除出现少于3个文档的单词或在95％以上文档中出现的单词
 
-        self.corpus = [self.dictionary.doc2bow(text) for text in
-                       processed_doc]  # new_corpus,整个语料库的词袋表示,文档集合,[(字典中词索引,词频)]：Counter(model.sentences[i])
+        self.corpus = [self.dictionary.doc2bow(text) for text in processed_doc]  
+        # new_corpus,整个语料库的词袋表示,文档集合,[(字典中词索引,词频)]：Counter(model.sentences[i])
         print(self.args)
 
         if not self.wo:
@@ -199,18 +201,21 @@ class W2vLda:
             v_topic = (w_distribute * v_words).sum(axis=0)  # 词向量分别乘以其权重并加和
             topics_vec.append(v_topic)
 
-        self.topic_documents_dict = {}  # 每个主题的文档集合的索引 topic:[index]
+        weight_threshold_topics = self.args.get('weight_threshold_topics', 0.0)
+        minimum_probability = self.args.get('minimum_probability', 0.05)
+        
+        self.topic_documents_dict = defaultdict(list)  # 每个主题的文档集合的索引 {topic:[index]}
         documents_vec = []  # 基于词向量的专利文档向量
         for doc_index, topic_weight in enumerate(self.document_topics):
             for topic, prob in topic_weight:
-                self.topic_documents_dict.setdefault(topic, []).append(doc_index)  # idx:0++
+                self.topic_documents_dict[topic].append(doc_index)  # .setdefault(topic, []) idx:0++
             if len(topic_weight) == 0:  # get 不到主题：空摘要,'',nan,[],去除停用词后词太少
                 documents_vec.append(np.zeros(self.args['vector_size']))
                 continue
 
             topic_n = sorted(topic_weight, key=lambda x: x[1], reverse=True)[:self.args.get('top_n_topics', None)]
             distribute = np.array(topic_n)[:, 1]
-            mask = distribute >= self.args.get('weight_threshold_topics', 0.0)  # 主题权重大于阈值
+            mask = distribute >= weight_threshold_topics if weight_threshold_topics > minimum_probability else slice(None)
 
             v_topics = np.array([topics_vec[t[0]] for t in topic_n])[mask]  # 主题向量
             w_distribute = (distribute[mask] / np.sum(distribute[mask])).reshape(-1, 1)  # 将归一化结果作为每个技术主题的权重
@@ -221,21 +226,21 @@ class W2vLda:
 
 
     def union_vec(self, documents_vec):
-        df_lda_w2v = pd.DataFrame({'vec': [vec for vec in documents_vec]}, index=self.sentences.index)
+        df_lda_w2v = pd.DataFrame({'vec': documents_vec}, index=self.sentences.index)
         df_lda_w2v = df_lda_w2v[df_lda_w2v['vec'].apply(np.sum) != 0]
-        df_lda_w2v['序号'] = self.id_data.loc[df_lda_w2v.index]  # iloc
-        df_lda_w2v.set_index('序号', inplace=True)
-
+        # df_lda_w2v['序号'] = self.id_data.loc[df_lda_w2v.index] 
+        # df_lda_w2v.set_index('序号', inplace=True)
         #.apply(lambda x: df_lda_w2v.loc[df_lda_w2v['序号'].isin(x), 0: self.args['vector_size'] - 1].mean(axis=0)) 
-        co_ids_vec = self.group_ids['序号'].apply(lambda x: df_lda_w2v.loc[df_lda_w2v.index.isin(x),'vec'].apply(pd.Series).mean(axis=0))
+        #.group_ids['index_list'].apply(lambda x: df_lda_w2v.loc[df_lda_w2v.index.isin(x),'vec'].apply(pd.Series).mean(axis=0))
+        co_ids_vec = self.group_ids['index_list'].apply(lambda x: np.mean([df_lda_w2v.loc[i, 'vec'] for i in x if i in df_lda_w2v.index], axis=0)) # 计算公司级别的向量表示
         co_ids_vec.index = self.group_ids['Co']
-        return co_ids_vec[co_ids_vec.sum(axis=1) != 0]  # Co:vec,以此做group相似度计算
+        return co_ids_vec[co_ids_vec.sum(axis=1) != 0]  # Co:vec,过滤有效向量,以此做group相似度计算
 
     def docs_vec(self, documents_vec,patent_data=None):
         doc_lda_w2v = pd.DataFrame(documents_vec, index=self.sentences.index)
         doc_lda_w2v = doc_lda_w2v[doc_lda_w2v.sum(axis=1) != 0]
-        if wd_data is not None:
-            doc_lda_w2v=doc_lda_w2v.join(patent_data['序号']).set_index('序号')
+        if patent_data is not None:
+            doc_lda_w2v=doc_lda_w2v.join(patent_data['公开（公告）号']).set_index('公开（公告）号')
             # doc_lda_w2v.merge(id_data['序号'], left_index=True, right_index=True, how='left')
             # doc_lda_w2v['序号'] = patent_data.loc[doc_lda_w2v.index,'序号'] 
             # doc_lda_w2v.set_index('序号', inplace=True)
@@ -244,7 +249,7 @@ class W2vLda:
         return doc_lda_w2v
 
     def group_vec(self, df_documents_vec,group_ids):
-        ids_vec = group_ids['序号'].apply(lambda x: df_documents_vec.loc[df_documents_vec.index.isin(x)].mean(axis=0))
+        ids_vec = group_ids['index_list'].apply(lambda x: df_documents_vec.loc[df_documents_vec.index.isin(x)].mean(axis=0))
         ids_vec.index = group_ids['Co']
         return ids_vec[ids_vec.sum(axis=1) != 0]
 
@@ -407,7 +412,14 @@ def similarity_topic(model,doc,topics_vec,df_lda_w2v):
     scores_2d = cosine_similarity(df_lda_w2v.values,v_doc.reshape(1, -1))
     scores = pd.DataFrame(scores_2d,index=df_lda_w2v.index,columns=['score'])
     return scores.sort_values(by='score', ascending=False)
-    
+
+def fill_matrix(cosine_sim):
+    # rows, cols = cosine_sim.shape
+    # for i in range(rows):
+    #     for j in range(i + 1, cols):
+    #         cosine_sim.iloc[i, j] = cosine_sim.iloc[j, i]
+    cosine_sim = cosine_sim + cosine_sim.T - np.diag(cosine_sim.values.diagonal())
+    return cosine_sim
 
 def restore_matrix(cosine_sim_arr):
     n = np.sqrt(2 * len(cosine_sim_arr) + 1 / 4) + 1 / 2  # 阶数
@@ -445,6 +457,8 @@ def get_max_count(word, word_counter, doc=None):
         print(word, doc[max_values_index])
         pass
     return max_values, max_values_2, max_index
+
+
 
 
 def similar_by_words(words, model, topn=10, exclude=[]):
@@ -510,16 +524,17 @@ def clean_doc(text):
     pure_text = text.replace('\n', " ")
     pure_text = re.sub(r"-", " ", pure_text)
 
-    pure_text = re.sub(r"\d+/\d+/\d+", "", pure_text)  # 剔除IP
+    pure_text = re.sub(r"\d+/\d+/\d+", "", pure_text)# 剔除日期 re.sub(r"\d{1,2}/\d{1,2}/\d{2,4}", "", pure_text) 
     pure_text = re.sub(r"[0-2]?[0-9]:[0-6][0-9]", "", pure_text)  # 剔除时间
 
+    pure_text = re.sub(r"\S+@\S+", "", pure_text)# 去除电子邮件
+    # pure_text = re.sub(r"https?://\S+|www\.\S+", "", pure_text)# 去除URL
     # #URL，为了防止对中文的过滤，所以使用[a-zA-Z0-9]而不是\w
     url_regex = re.compile(r"""
-        (https?://)?
-        ([a-zA-Z0-9]+)
-        (\.[a-zA-Z0-9]+)
-        (\.[a-zA-Z0-9]+)*
-        (/[a-zA-Z0-9]+)*
+        (https?://)?             # 协议部分可选
+        ([a-zA-Z0-9-]+\.)+       # 域名部分
+        [a-zA-Z]{2,}             # 顶级域名
+        (/[a-zA-Z0-9-]*)*        # 路径部分可选
     """, re.VERBOSE | re.IGNORECASE)
     pure_text = url_regex.sub(r"", pure_text)
 
@@ -532,14 +547,18 @@ def clean_doc(text):
     # space_regex = re.compile(r"\s+")    # 剔除空格
 
     # pure_text = re.sub("@([\s\S]*?):","",pure_text)  # 去除@ ...：
-    # pure_text = re.sub("\[([\S\s]*?)\]","",pure_text)  # [...]：
     # pure_text = re.sub("@([\s\S]*?)","",pure_text)  # 去除@...
+    # pure_text = re.sub("\[([\S\s]*?)\]","",pure_text)  # [...]：
     # pure_text = re.sub("[\s+\.\!\/_,$%^*(+\"\']+|[+——！，。？、~@#￥%……&*（）]+","",pure_text)  # 去除标点及特殊符号
     # pure_text = re.sub("[^\u4e00-\u9fa5]","",pure_text)  #  去除所有非汉字内容（英文数字）
 
     # cn_regex=re.compile(pattern='[\u4e00-\u9fa5]+')
     # pure_text =re.findall(pattern=cn_regex,string=pure_text)
 
+    # ip_regex = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+    # pure_text = ip_regex.sub("", pure_text)
+
+    pure_text = re.sub(r"\s+", " ", pure_text).strip()#多余空格合并
     # pure_text[~pure_text.isin(stopwords)]不对原始文本处理停用词，分词后再排除
     return pure_text  # ' '.join(pure_text)
 
