@@ -5,12 +5,11 @@ from flask import Flask
 from database import *
 from select_stop_words import *
 from qdrant_net import QdrantClient, Graph, VDBRelationships, most_similar_embeddings, moonshot_chat, \
-    moonshot_chat_stream, field_match, empty_match, qdrant_livez
+    moonshot_chat_sync, field_match, empty_match, qdrant_livez
 import plotly.express as px
 import plotly.io as pio
 import pandas as pd
 import string, time, os, re, uuid
-import inspect
 from lda_topics import LdaTopics
 import logging
 
@@ -43,7 +42,7 @@ client = QdrantClient(url=Config.QDRANT_URL)
 try:
     from openai import OpenAI
 
-    ai_client = OpenAI(api_key=Config.AI_API_key, base_url="https://api.moonshot.cn/v1")
+    ai_client = OpenAI(api_key=Config.Moonshot_API_Key, base_url="https://api.moonshot.cn/v1")
 except Exception as e:
     print(f"An error occurred while initializing the OpenAI client: {e}")
     ai_client = None
@@ -535,8 +534,34 @@ System_content = {'0': '你是一个知识广博且乐于助人的助手，擅�
                         '我会向你提出一些问题，请你根据相关技术领域的最佳实践和前沿研究，对问题进行深度解析。'
                         '请基于相关技术领域进行扩展，并为每个技术点提供简要且精确的描述。'
                         '请将这些技术和其描述性文本整理成JSON格式，具体结构为 `{ "技术点1": "描述1",  ...}`，请确保JSON结构清晰且易于解析。'
-                        '我将根据这些描述的语义进一步查找资料，并开展深入研究。')}
-
+                        '我将根据这些描述的语义进一步查找资料，并开展深入研究。'),
+                  '3': ('我有一个数据集，已经安装了以下Python包：`plotly.express`、`pandas`、以及系统自带的包如`os`、`sys`等。'
+                        '数据包含以下字段：{`date`（日期）}。'
+                        '请帮我生成一个Python脚本代码，使用`pandas`读取数据并进行简单的数据分析，然后使用`plotly.express`生成一个可视化图表。分析可以包括（但不限于）：'
+                        '1、统计描述（如均值、中位数、最大值、最小值等）。'
+                        '2、对某些字段的分组统计或聚合。'
+                        '3、创建一个图表（如折线图、条形图、散点图等），展示数据的主要趋势或关系。'
+                        '确保代码可以直接运行，并包括必要的注释以便理解。你可以假设数据已经被加载到一个`pandas` DataFrame中，变量名为`df'),
+                  '4': ('你是一位信息提取专家，能够从文本中精准提取信息，并将其组织为结构化的JSON格式。'
+                        '1、提取文本中的关键信息，确保信息的准确性和完整性。'
+                        '2、按照指定的类别（如“人”包括姓名和职位、“时间”、“事件”、“地点”）对信息进行分类。'
+                        '3、将提取的信息以JSON格式输出，确保结构清晰且易于理解。'),
+                  '5': ('你是一位SQL转换器，精通SQL语言，能够准确地理解和解析用户的日常语言描述，并将其转换为高效、可执行的SQL查询语句。'
+                        '1、理解用户的自然语言描述，保持其意图和目标的完整性。'
+                        '2、根据描述内容，将其转换为对应的SQL查询语句。'
+                        '3、确保生成的SQL查询语句准确、有效，并符合最佳实践。'
+                        '4、输出经过优化的SQL查询语句。'),
+                  '6': ('你是一位领域专家，我正在编写一本书，我会向你提供各章节的段落、相关技术资料或其他参考内容。'
+                        '你的任务是根据以下要求进行处理，并用中文输出：'
+                        '1、内容扩展和总结: 根据提供的关键字和描述，扩展和丰富每个章节的内容，使之更为详细和具体。'
+                        '确保内容逻辑连贯，使整章文本流畅自然。必要时，总结已有内容和核心观点，确保信息全面，形成有机衔接的连贯段落，避免生成分散的句子。'
+                        '2、描述与资料引用:  当提供具体的技术资料或引用段落时，准确引用这些内容，结合具体的技术细节和应用案例，并将其自然融入到文本中。'
+                        '避免使用“作者认为”等主观描述，直接陈述观点和分析，保持见解鲜明，确保段落的整体逻辑性和一致性。'
+                        '3、最佳实践和前沿研究: 提供与主题相关技术领域的最佳实践和前沿研究，结合实际应用场景，对关键问题进行深入解析，帮助读者理解复杂概念。'
+                        '4、背景知识和技术细节: 扩展背景知识，结合具体技术细节和应用场景进，提供实际案例和应用方法，增强内容的深度和实用性。'
+                        '5、连贯段落: 组织生成的所有内容成连贯的段落，确保每段文字自然延续上一段，避免使用孤立的标题或关键词，形成完整的章节内容。'
+                        '6、适应书籍风格: 确保内容更加适合书中的阅读风格，符合中文读者的阅读习惯和文化背景，语言流畅，结构清晰，描述条理分明，易于理解和参考。')
+                  }
 Agent_functions = {
     '1': retrieval_patent_abstract,
 }
@@ -602,7 +627,7 @@ def send_message():
                     'content': f'参考材料:{refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}' if refer else user_message})
 
     bot_response = moonshot_chat(messages=history, temperature=data.get('temperature', 0.4), client=ai_client,
-                                 api_key=Config.AI_API_key)
+                                 api_key=Config.Moonshot_API_Key)
 
     # print(f"This is a response:{bot_response} from the bot to your question: {user_message}(User Name: {user_name})")
     reference = '\n'.join(refer)
@@ -612,7 +637,6 @@ def send_message():
          'index': len(history) - 1, 'timestamp': current_timestamp},
         {'role': 'assistant', 'content': bot_response, 'username': user_name or uuid, 'agent': agent,
          'index': len(history), 'reference': reference, 'timestamp': time.time()}]
-
     try:
         if user_name:
             ChatHistory.history_insert(new_history, db.session)
@@ -666,8 +690,8 @@ def stream_response():
             yield f'data: {first_data}\n\n'
 
         assistant_response = []
-        for content in moonshot_chat_stream(history, temperature=temperature, client=ai_client,
-                                            api_key=Config.AI_API_key):
+        for content in moonshot_chat_sync(history, temperature=temperature, client=ai_client,
+                                          api_key=Config.Moonshot_API_Key):
             yield f'data: {content}\n\n'
             assistant_response.append(content)
 
@@ -712,7 +736,7 @@ def stream_response_task(task_id):
             yield f'data: {first_data}\n\n'
 
         assistant_response = []
-        for content in moonshot_chat_stream(history, temperature=0.8, client=ai_client, api_key=Config.AI_API_key):
+        for content in moonshot_chat_sync(history, temperature=0.8, client=ai_client, api_key=Config.Moonshot_API_Key):
             yield f'data: {content}\n\n'
             assistant_response.append(content)
 
@@ -733,7 +757,7 @@ def send_message_task(task_id):
     reference = task.get('reference', [])
     history = task.get('messages', [])
 
-    bot_response = moonshot_chat(messages=history, temperature=0.8, client=ai_client, api_key=Config.AI_API_key)
+    bot_response = moonshot_chat(messages=history, temperature=0.8, client=ai_client, api_key=Config.Moonshot_API_Key)
 
     del Task_queue[task_id]
 
@@ -780,12 +804,6 @@ def submit_messages():
     return jsonify({'task_id': task_id})  # f'/stream_response/{task_id}'} jsonify(user_chat_history)
 
 
-def get_function_parameters(func):
-    signature = inspect.signature(func)
-    parameters = signature.parameters
-    return [param for param in parameters]
-
-
 @app.route('/plot', methods=['GET', 'POST'])
 def plot():
     patent_types = ['发明授权', '发明申请', '实用新型', '外观设计']  # df['occupation'].unique()
@@ -797,6 +815,8 @@ def plot():
         results = pd.read_sql(query, con=db.engine)
         # params = get_function_parameters(px.scatter)
         fig = px.histogram(results, x=col, title=f'Distribution for {patent_type}')
+        # px.scatter,px.pie,px.bar,px.box,px.imshow
+        # px.bar(df, x='类别', y=['组1', '组2', '组3'], title='堆积条形图', labels={'value': '值', '类别': '类别'}, barmode='stack')
         graph_html = pio.to_html(fig, full_html=False)
 
         return render_template('plot.html', patent_type=patent_types, columns=columns, graph_html=graph_html)
@@ -805,6 +825,11 @@ def plot():
     # text("SELECT 权利要求数量 FROM patent202309 WHERE `专利类型` = :patent_type")
     # with db.engine.connect() as connection:
     #     results = connection.execute(query.params(patent_type=patent_type)).fetchall()
+
+
+@app.route('/plot_data', methods=['GET', 'POST'])
+def plot_png():
+    return jsonify({'path': 'png'})
 
 
 @app.route('/get_user_info', methods=['GET', 'POST'])

@@ -568,6 +568,7 @@ def read2list(file, encoding='UTF-8', **kwargs):
         l = [line.strip('\n') for line in file.readlines()]
     return l
 
+
 #TF-IDF 改进
 class BM25:
     def __init__(self, corpus, k1=1.5, b=0.75):

@@ -91,7 +91,7 @@ class ChatHistory(db.Model):
     role = db.Column(db.String(20), nullable=False)  # 'user' 或 'assistant'
     content = db.Column(MEDIUMTEXT, nullable=False)
     username = db.Column(db.String(99), nullable=False, index=True)
-    model = db.Column(db.String(50), nullable=True, default='kimi')  # 模型名称
+    model = db.Column(db.String(50), nullable=True, default='moonshot')  # 模型名称
     agent = db.Column(db.String(50), nullable=False, default='0', index=True)  # 代理名称或角色
     index = db.Column(db.Integer, nullable=False)  # 消息索引
     reference = db.Column(MEDIUMTEXT, nullable=True)  # 参考信息，仅对'assistant'有用 db.Text
@@ -102,7 +102,7 @@ class ChatHistory(db.Model):
         db.Index('idx_agent_username_time', 'agent', 'username', 'timestamp'),
     )
 
-    def __init__(self, role, content, username, model='kimi', agent='0', index=0, reference=None, timestamp=0):
+    def __init__(self, role, content, username, model='moonshot', agent='0', index=0, reference=None, timestamp=0):
         self.role = role
         self.content = content
         self.username = username

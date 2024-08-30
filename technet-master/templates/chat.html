@@ -161,6 +161,13 @@
             overflow-x: auto;
         }
 
+        img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 5px;
+            /* margin-top: 10px; */
+        }
+
         .highlight {
             background-color: yellow;
             border-radius: 3px;
@@ -174,16 +181,24 @@
             font-style: italic;
         }
 
+        .large-text {
+            font-size: 1.2em;
+        }
+
+        .small-caps {
+            font-variant: small-caps;
+        }
+
+        .uppercase {
+            text-transform: uppercase;
+        }
+
         .important {
             color: #00f;
         }
 
         .underline {
             text-decoration: underline;
-        }
-
-        .uppercase {
-            text-transform: uppercase;
         }
 
         .hover-area {
@@ -232,6 +247,8 @@
 
 <body>
     {% include 'navbar.html' %}
+    <div id="zoomBtn">Zoom</div>
+
     <label for="topn">检索数量:</label>
     <select name="topn" id="topn" class="selectBox group6">
         {% for i in range(1, 33) %}
@@ -246,12 +263,12 @@
         {% endfor %}
     </select>
 
-    <label for="temperature">温度系数:</label>
-    <input type="number" id="temperature" name="temperature" min="0" max="0.99" step="0.01" value="0.4"
+    <label for="score_threshold">得分阈值:</label>
+    <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0.6"
         style="width: 50px;">
 
-    <label for="score_threshold">得分阈值:</label>
-    <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0"
+    <label for="temperature">温度系数:</label>
+    <input type="number" id="temperature" name="temperature" min="0" max="0.99" step="0.01" value="0.4"
         style="width: 50px;">
 
     <label for="stream">流式输出:</label>
@@ -265,10 +282,25 @@
         <option value="0">问题助手</option>
         <option value="1" selected>专利技术</option>
         <option value="2">技术专家</option>
+        <option value="4">信息提取</option>
+        <option value="5">SQL转换</option>
+        <option value="6">著作助手</option>
+    </select>
+
+    <label for="model">语言模型:</label>
+    <select name="model" id="model" class="selectBox group6">
+        <option value="moonshot" selected>Kimi</option>
+        <option value="qwen">千问</option>
+        <option value="qianfan">文心</option>
+        <option value="glm">智谱</option>
+        <option value="hunyuan">混元</option>
+        <option value="doubao">豆包</option>
+        <option value="llama">Llama</option>
+        <option value="openai">GPT</option>
     </select>
 
     <button type="button" id="clean">清空上下文</button>
-    <button type="button" id="save" class="submitButton" data-group="group6">Save</button>
+    <button type="button" id="save" class="submitButton" data-group="group6">保存参数</button>
 
     <div class="header-container">
         <h1>AIGC</h1>
@@ -278,7 +310,7 @@
         <p>{{ uuid }}</p>
         {% endif %}
     </div>
-    <div id="zoomBtn">Zoom</div>
+
     <div class="chat-container">
         <div class="chat-box" id="chat-box">
             <div class="message ai-message">
@@ -288,6 +320,7 @@
                 I'm looking for information on creating a chat interface.
             </div> -->
             <!-- More messages can be added here -->
+            <!-- <img src="https://via.placeholder.com/150" alt="Example Image" /> -->
         </div>
         <div class="loading-bar" id="loading-bar">
             <div class="progress"></div>
@@ -422,7 +455,8 @@
 
         function formatToSpans(text, codes = false) {
             const formatText = (t) => t.replace(/\n+/g, '\n').trim()
-                .replace(/###\s(.*?)(\n|$)/g, '<span class="bold">$1</span>\n') //### 标题 $2
+                .replace(/^(#{4,7})\s+(.*?)(\n|$)/gm, '<span class="bold important small-caps">$2</span>\n') // 处理#### 标题 $2
+                .replace(/###\s(.*?)(\n|$)/g, '<span class="bold large-text uppercase">$1</span>\n') //### 标题
                 .replace(/\*\*(.*?)\*\*/g, '<span class="bold">$1</span>') //  **粗体** bold
                 .replace(/!!(.*?)!!/g, '<span class="important">$1</span>')  // !!重要!! important 
                 .replace(/__(.*?)__/g, '<span class="italic">$1</span>') // __斜体__
@@ -603,7 +637,9 @@
             }
 
             const chatBox = document.getElementById('chat-box');
-            chatBox.innerHTML = '';
+            if (messages && messages.length > 0) {
+                chatBox.innerHTML = '';
+            }
 
             messages.forEach(message => {
                 //addMessage(message.content, message.role === 'user' ? 'user-message' : 'ai-message');
