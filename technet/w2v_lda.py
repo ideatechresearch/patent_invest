@@ -459,8 +459,6 @@ def get_max_count(word, word_counter, doc=None):
     return max_values, max_values_2, max_index
 
 
-
-
 def similar_by_words(words, model, topn=10, exclude=[]):
     eidx = [model.wv.key_to_index[w] for w in words + exclude]
     sim = pd.DataFrame(cosine_similarity(model.wv[words], np.delete(model.wv.vectors, eidx, axis=0)).T,
@@ -491,6 +489,15 @@ def closeness(ndarr):
         tech_closeness = np.where(denominator_tech != 0, numerator_tech / denominator_tech, 0)
     np.fill_diagonal(tech_closeness, 0)
     return tech_closeness
+
+def closeness_similarity(ndarr1, ndarr2):
+    div1 = np.linalg.norm(ndarr1, axis=1)
+    div2 = np.linalg.norm(ndarr2, axis=1)
+    denominator = np.outer(div1, div2)
+    dot_product = np.dot(ndarr1, ndarr2.T)  
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarity = np.where(denominator != 0, dot_product /denominator, 0)
+    return similarity
 
 def calc_entropy(class_probs):  # 计算类别间的信息熵,类别内的信息熵。(类别概率,样本概率)
     return -np.sum(class_probs * np.log2(class_probs + 1e-10))  # np.multiply
