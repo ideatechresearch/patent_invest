@@ -194,23 +194,113 @@ AI_Models = [
     {'name': 'glm', "model": ["glm-4-air", "glm-4-flash", "glm-4", "glm-4v", "glm-4-0520"],
      'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
      'base_url': "https://open.bigmodel.cn/api/paas/v4/"},
+    # https://dashscope.console.aliyun.com/overview
     {'name': 'qwen', "model": ["qwen-turbo", "qwen-plus", "qwen-vl-plus", "qwen-max"],
+     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v3"],
+     'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
      'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1"},
     {'name': 'doubao', "model": ["Doubao-pro-32k", "Doubao-lite-32k", "Doubao-pro-4k", "Doubao-pro-128k"],
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
      'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1"},
-    {'name': 'llama', 'model': 'llama_3_8b',
+    {'name': 'ernie', "model": ["ERNIE-4.0-8K", "ERNIE-3.5-8K", "ERNIE-4.0-8K-Preview"],
+     'url': ' "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions_pro',
+     'base_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/"},
+    {'name': 'llama',
+     'model': ['llama_3_8b', 'Qianfan-Chinese-Llama-2-7B', 'Qianfan-Chinese-Llama-2-7B-32K', 'Llama-2-13B-Chat'],
      'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
      'base_url': ''},
     {'name': 'hunyuan', 'model': ["hunyuan-pro", 'hunyuan-functioncall'],
      'url': 'hunyuan.tencentcloudapi.com',
      'base_url': ''},
     {'name': 'gpt', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
+     'completion': ["text-davinci-003", "text-davinci-002", "text-davinci-004"],
      'url': 'https://api.openai.com/v1/chat/completions',
      'base_url': "https://api.openai.com/v1"},
 ]
 
+
+def find_ai_model(name):
+    for model in AI_Models:
+        if model['name'] == name:
+            return model # next((model for model in AI_Models if model['name'] == model_name), None)
+    raise ValueError(f"Model with name {name} not found.")
+
+
+def ai_chat(messages, model_name='moonshot', model_id=0, temperature=0.4, top_p=0.8, payload=None, client=None, api_key=''):
+    model_info = find_ai_model(model_name)
+    model_id = model_id if abs(model_id)  < len(model_info['model']) else 0;
+
+    if not payload:
+        payload = {
+            "model": model_info['model'][model_id],  # 默认选择第一个模型
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+
+    if client:
+        completion = client.chat.completions.create(**payload)
+        return completion.choices[0].message.content
+
+    # 通过 requests 库直接发起 HTTP POST 请求
+    url = model_info['url']
+    headers = {
+        'Content-Type': 'application/json',
+        "Authorization": f'Bearer {api_key}'
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()  # 如果请求失败，则抛出异常
+        data = response.json().get('choices')
+        return data[0].get('message').get('content')
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
+        return None
+
+
+def ai_chat_sync(messages, temperature=0.4, model_name='moonshot', model_id=0, payload=None,
+                 client=None, api_key=''):
+    model_info = find_ai_model(model_name)
+    model_id = model_id if abs(model_id)  < len(model_info['model']) else 0
+
+    if not payload:
+        payload = {
+            "model": model_info['model'][model_id],
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+    if client:
+        stream = client.chat.completions.create(**payload)
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
+                yield delta.content  # completion.append(delta.content)
+            # if chunk.choices[0].finish_reason == 'stop':
+            #     break
+        # yield '[DONE]'
+        return
+
+    url = model_info['url']
+    headers = {
+        'Content-Type': 'text/event-stream',
+        "Authorization": f'Bearer {api_key}'
+    }
+
+    try:
+        # async with httpx.AsyncClient() as cx:
+        #     async with cx.stream("POST", url, headers=headers, json=payload) as response:
+        with httpx.Client() as cx:  # sse HTTP 响应 data=json.dumps(payload)
+            response = cx.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            yield from process_line_stream(response)
+    except httpx.RequestError as e:
+        yield str(e)
+
+    # yield "[DONE]"
 
 # ?access_token=
 def get_tool_response(messages, tools, client=None):
@@ -301,11 +391,9 @@ def moonshot_chat_sync(messages, temperature=0.4, payload=None, client=None, api
     }
 
     try:
-        # httpx.post(url, headers=headers, json=payload)   sse HTTP 响应 data=json.dumps(payload)
-        with httpx.Client() as cx:
-            response = cx.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            yield from process_line_stream(response)
+        response = httpx.post(url, headers=headers, json=payload)  # sse HTTP 响应 data=json.dumps(payload)
+        response.raise_for_status()
+        yield from process_line_stream(response)
     except httpx.RequestError as e:
         yield str(e)
 

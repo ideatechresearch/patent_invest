@@ -164,13 +164,13 @@ import pymysql
 
 
 class OperationMysql:
-    def __init__(self, host, user, password, db, port=3306):
+    def __init__(self, host, user, password, db_name, port=3306):
         self.conn = pymysql.connect(
             host=host,  # 外网
-            port=3306,
+            port=port,
             user=user,
             password=password,
-            db=db,
+            db=db_name,
             charset="utf8mb4",
             cursorclass=pymysql.cursors.DictCursor  # 这个定义使数据库里查出来的值为字典类型
         )
@@ -199,6 +199,16 @@ class OperationMysql:
         self.conn.commit()
         self.cur.close()
         self.conn.close()
+
+    def insert_table(self, sql):
+        try:
+            self.cur.execute(sql)
+            # 提交
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+        finally:
+            self.conn.close()
 
 
 if __name__ == "__main__":
