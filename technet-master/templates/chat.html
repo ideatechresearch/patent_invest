@@ -49,12 +49,13 @@
         .user-message {
             /* #ffff99
             display: inline-block;
-            margin-left: auto; */
+            text-align: right;*/
             align-self: flex-end;
-            text-align: right;
+            margin-left: auto; 
             background-color: #d0eaff;
             font-size: 15px;
-            /* max-width: 50%; */
+            max-width: 80%;
+
         }
 
         .ai-message {
@@ -273,14 +274,14 @@
 
     <label for="stream">流式输出:</label>
     <select name="stream" id="stream" class="selectBox group6">
-        <option value="0" selected>False</option>
-        <option value="1">True</option>
+        <option value="0">False</option>
+        <option value="1" selected>True</option>
     </select>
 
     <label for="agent">代理角色:</label>
     <select name="agent" id="agent" class="selectBox group6">
-        <option value="0">问题助手</option>
-        <option value="1" selected>专利技术</option>
+        <option value="0" selected>问题助手</option>
+        <option value="1">专利技术</option>
         <option value="2">技术专家</option>
         <option value="4">信息提取</option>
         <option value="5">SQL转换</option>
@@ -289,12 +290,13 @@
 
     <label for="model">语言模型:</label>
     <select name="model" id="model" class="selectBox group6">
-        <option value="moonshot" selected>Kimi</option>
-        <option value="qwen">千问</option>
-        <option value="qianfan">文心</option>
+        <option value="qwen" selected>千问</option>
+        <option value="moonshot">Kimi</option>
         <option value="glm">智谱</option>
+        <option value="ernie">文心</option>
         <option value="hunyuan">混元</option>
         <option value="doubao">豆包</option>
+        <option value="deepseek-ai/DeepSeek-V2-Chat">DeepSeek</option>
         <option value="llama">Llama</option>
         <option value="openai">GPT</option>
     </select>
@@ -420,6 +422,7 @@
                 username: username, uuid: uuid,
                 question: message,//encodeURIComponent()
                 agent: document.getElementById("agent").value,
+                model: document.getElementById("model").value,
                 topn: parseInt(document.getElementById("topn").value, 10),
                 depth: parseInt(document.getElementById("depth").value, 10),
                 temperature: parseFloat(document.getElementById("temperature").value),
@@ -458,10 +461,10 @@
                 .replace(/^(#{4,7})\s+(.*?)(\n|$)/gm, '<span class="bold important small-caps">$2</span>\n') // 处理#### 标题 $2
                 .replace(/###\s(.*?)(\n|$)/g, '<span class="bold large-text uppercase">$1</span>\n') //### 标题
                 .replace(/\*\*(.*?)\*\*/g, '<span class="bold">$1</span>') //  **粗体** bold
-                .replace(/!!(.*?)!!/g, '<span class="important">$1</span>')  // !!重要!! important 
+                .replace(/!!(.*?)!!/g, '<span class="highlight">$1</span>')  // !!高亮!!  
                 .replace(/__(.*?)__/g, '<span class="italic">$1</span>') // __斜体__
                 .replace(/~~(.*?)~~/g, '<span class="underline">$1</span>') // ~~下划线~~
-                .replace(/\^\^(.*?)\^\^/g, '<span class="highlight">$1</span>'); // ^^高亮^^
+                .replace(/\^\^(.*?)\^\^/g, '<span class="important">$1</span>'); // ^^重要^^ important
 
             //.replace(/```([^`]+)```/g, '<pre><code>$1</code></pre>')
             //.replace(/\[([^\]]+)\]\((https?:\/\/[^\s]+)\)/g, '<a href="$2" target="_blank">$1</a>'); // [链接文字](链接地址)

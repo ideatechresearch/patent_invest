@@ -5,6 +5,7 @@ from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasId
 from py2neo import Graph, Node, Relationship, Subgraph
 import requests, json, httpx
 import numpy as np
+from enum import Enum as PyEnum
 
 
 # from neo4j import Graph,GraphDatabase driver = GraphDatabase.driver(uri, auth=(username, password))
@@ -172,71 +173,99 @@ def most_similar_embeddings(query, collection_name, client, topn=10, score_thres
         return []
 
 
-def web_search_sync(text, api_key, request_id):  # str(uuid.uuid4())
+def web_search(text: str, api_key: str) -> list:
     msg = [{"role": "user", "content": text}]
-    tool = "web-search-pro"
     url = "https://open.bigmodel.cn/api/paas/v4/tools"
     data = {
-        "request_id": request_id,
-        "tool": tool,
+        "request_id": str(np.random.randint(1, 1e9)),
+        "tool": "web-search-pro",
         "stream": False,
         "messages": msg
     }
 
-    resp = requests.post(url, json=data, headers={'Authorization': api_key}, timeout=300)
-    return resp.content.decode()
+    headers = {'Authorization': api_key}
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        data = response.json()
+        search_result = data.get('choices', [{}])[0].get('message', {}).get('tool_calls', [{}])[1].get('search_result')
+        if search_result:
+            return [{
+                'title': result.get('title'),
+                'content': result.get('content'),
+                'link': result.get('link'),
+                'media': result.get('media')
+            } for result in search_result]
+        return [{'content': response.content.decode()}]
+    except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+        return [{'error': str(e)}]
 
 
 # 模型编码:0默认，1小，-1最大
 AI_Models = [
-    {'name': 'moonshot', "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-128k"],
+    # https://platform.moonshot.cn/console/api-keys
+    {'name': 'moonshot', 'type': 'default', 'api_key': '',
+     "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
      'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1"},
-    {'name': 'glm', "model": ["glm-4-air", "glm-4-flash", "glm-4", "glm-4v", "glm-4-0520"],
+
+    # https://open.bigmodel.cn/console/overview
+    {'name': 'glm', 'type': 'default', 'api_key': '',
+     "model": ["glm-4-air", "glm-4-flash", "glm-4-air", "glm-4", "glm-4v", "glm-4-0520"],
      'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
      'base_url': "https://open.bigmodel.cn/api/paas/v4/"},
+
     # https://dashscope.console.aliyun.com/overview
-    {'name': 'qwen', "model": ["qwen-turbo", "qwen-plus", "qwen-vl-plus", "qwen-max"],
-     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v3"],
+    {'name': 'qwen', 'type': 'default', 'api_key': '',
+     "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
+               'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max"],  # "qwen-vl-plus"
+     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
      'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
      'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1"},
-    {'name': 'doubao', "model": ["Doubao-pro-32k", "Doubao-lite-32k", "Doubao-pro-4k", "Doubao-pro-128k"],
-     'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1"},
-    {'name': 'ernie', "model": ["ERNIE-4.0-8K", "ERNIE-3.5-8K", "ERNIE-4.0-8K-Preview"],
-     'url': ' "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions_pro',
-     'base_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/"},
-    {'name': 'llama',
-     'model': ['llama_3_8b', 'Qianfan-Chinese-Llama-2-7B', 'Qianfan-Chinese-Llama-2-7B-32K', 'Llama-2-13B-Chat'],
-     'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
-     'base_url': ''},
-    {'name': 'hunyuan', 'model': ["hunyuan-pro", 'hunyuan-functioncall'],
-     'url': 'hunyuan.tencentcloudapi.com',
-     'base_url': ''},
-    {'name': 'gpt', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
-     'completion': ["text-davinci-003", "text-davinci-002", "text-davinci-004"],
-     'url': 'https://api.openai.com/v1/chat/completions',
-     'base_url': "https://api.openai.com/v1"},
+
+    # https://cloud.siliconflow.cn/playground/chat
+    {'name': 'silicon', 'type': 'default', 'api_key': '',
+     'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat",
+               "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat",
+               "Pro/THUDM/glm-4-9b-chat", "deepseek-ai/deepseek-llm-67b-chat", "deepseek-ai/DeepSeek-V2-Chat",
+               "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
+     'reranker': ['BAAI/bge-reranker-v2-m3'],
+     'url': 'https://api.siliconflow.cn/v1/chat/completions',
+     'base_url': 'https://api.siliconflow.cn'},
 ]
 
 
-def find_ai_model(name):
-    for model in AI_Models:
-        if model['name'] == name:
-            return model # next((model for model in AI_Models if model['name'] == model_name), None)
-    raise ValueError(f"Model with name {name} not found.")
+class ModelNameEnum(str, PyEnum):
+    moonshot = "moonshot"
+    glm = "glm"
+    qwen = "qwen"
+    ernie = "ernie"
+    hunyuan = "hunyuan"
+    doubao = "doubao"
+    silicon = "silicon"
 
 
-def ai_chat(messages, model_name='moonshot', model_id=0, temperature=0.4, top_p=0.8, payload=None, client=None, api_key=''):
-    model_info = find_ai_model(model_name)
-    model_id = model_id if abs(model_id)  < len(model_info['model']) else 0;
+AI_Client = {}
 
+
+def find_ai_model(name: str, model_i: int = 0):
+    model = next((model for model in AI_Models if model['name'] == name), None)
+    if model:
+        model_i = model_i if abs(model_i) < len(model['model']) else 0  # 默认选择第一个模型
+        return model, model['model'][model_i]
+    return None, None
+
+
+def ai_chat(messages, model_id, temperature=0.4, top_p=0.8, max_tokens=1024, payload=None,
+            client=None, model_info={}):
     if not payload:
         payload = {
-            "model": model_info['model'][model_id],  # 默认选择第一个模型
+            "model": model_id,
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
+            "max_tokens": max_tokens,
         }
 
     if client:
@@ -245,6 +274,7 @@ def ai_chat(messages, model_name='moonshot', model_id=0, temperature=0.4, top_p=
 
     # 通过 requests 库直接发起 HTTP POST 请求
     url = model_info['url']
+    api_key = model_info['api_key']
     headers = {
         'Content-Type': 'application/json',
         "Authorization": f'Bearer {api_key}'
@@ -260,16 +290,15 @@ def ai_chat(messages, model_name='moonshot', model_id=0, temperature=0.4, top_p=
         return None
 
 
-def ai_chat_sync(messages, temperature=0.4, model_name='moonshot', model_id=0, payload=None,
-                 client=None, api_key=''):
-    model_info = find_ai_model(model_name)
-    model_id = model_id if abs(model_id)  < len(model_info['model']) else 0
-
+def ai_chat_async(messages, model_id, temperature=0.4, top_p=0.8, max_tokens=1024,
+                  payload=None, client=None, model_info={}):
     if not payload:
         payload = {
-            "model": model_info['model'][model_id],
+            "model": model_id,
             "messages": messages,
             "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
             "stream": True,
         }
 
@@ -284,6 +313,7 @@ def ai_chat_sync(messages, temperature=0.4, model_name='moonshot', model_id=0, p
         # yield '[DONE]'
         return
 
+    api_key = model_info['api_key']
     url = model_info['url']
     headers = {
         'Content-Type': 'text/event-stream',
@@ -301,38 +331,6 @@ def ai_chat_sync(messages, temperature=0.4, model_name='moonshot', model_id=0, p
         yield str(e)
 
     # yield "[DONE]"
-
-# ?access_token=
-def get_tool_response(messages, tools, client=None):
-    if client:
-        completion = client.chat.completions.create(
-            model="qwen-max",
-            messages=messages,
-            tools=tools
-        )
-        response = completion.model_dump()
-        return response['choices'][0]['message']  # assistant_output['content']/['tool_calls']
-    # assistant_output['tool_calls'][0]['function']['name']
-
-
-def get_file_response(messages, file_path='.pdf', client=None, api_key=''):
-    from pathlib import Path
-    if client:
-        file_object = client.files.create(file=Path(file_path), purpose="file-extract")  # .is_file()
-        messages.append({"role": "system", "content": f"fileid://{file_object.id}"})
-        completion = client.chat.completions.create(model="qwen-long", messages=messages, )
-        return completion.model_dump_json(), file_object.id
-    url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/files'
-    headers = {
-        'Content-Type': 'application/json',
-        "Authorization": f'Bearer {api_key}',
-    }
-    files = {
-        'file': open(file_path, 'rb'),
-        'purpose': (None, 'file-extract'),
-    }
-    file_response = requests.post(url, headers=headers, files=files)
-    file_object = file_response.json()
 
 
 def moonshot_chat(messages, temperature=0.4, top_p=0.8, payload=None, client=None, api_key=''):
@@ -364,7 +362,7 @@ def moonshot_chat(messages, temperature=0.4, top_p=0.8, payload=None, client=Non
         return None
 
 
-def moonshot_chat_sync(messages, temperature=0.4, payload=None, client=None, api_key=''):
+def moonshot_chat_async(messages, temperature=0.4, payload=None, client=None, api_key=''):
     if not payload:
         payload = {
             "model": "moonshot-v1-32k",  # moonshot-v1-8k,moonshot-v1-128k
@@ -433,47 +431,6 @@ def process_line_stream(response):
 
     if data:
         yield process_data_chunk(data)
-
-
-def tencent_chat(messages, temperature=0.4, payload=None, client=None, api_key=''):
-    url = "https://hunyuan.tencentcloudapi.com"
-    headers = {
-        "Host": "hunyuan.tencentcloudapi.com",
-        "Content-Type": "application/json",
-        "X-TC-Action": "ChatCompletions",
-        # 这里还需要添加一些认证相关的Header，例如：
-        # "X-TC-Timestamp": "<请求时间戳>",
-        # "X-TC-Version": "<API版本号>",
-        # "X-TC-Region": "<区域>",
-        # "Authorization": "<认证信息>"
-    }
-
-    # 请求的主体内容
-    data = {
-        "TopP": 1,
-        "Temperature": temperature,
-        "Model": "hunyuan-pro",
-        "Stream": True,
-        "Messages": [
-            {
-                "Role": "system",
-                "Content": "将英文单词转换为包括中文翻译、英文释义和一个例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。"
-            },
-            {
-                "Role": "user",
-                "Content": "nice"
-            }
-        ]
-    }
-
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(data))
-        response.raise_for_status()
-        data = response.json().get('Choices')
-        return data[0].get('Message').get('Content')
-    except requests.exceptions.RequestException as e:
-        print(f"Request failed: {e}")
-        return None
 
 
 def most_similar_by_name(name, collection_name, client, match=[], exclude=[], topn=10, score_threshold=0.5):
@@ -1575,5 +1532,5 @@ if __name__ == '__main__':
         print(f"An error occurred while initializing the OpenAI client: {e}")
         client = None
 
-    for content in moonshot_chat_sync(messages, temperature=0.4, payload=None, client=None, api_key=api_key):
+    for content in moonshot_chat_async(messages, temperature=0.4, payload=None, client=None, api_key=api_key):
         print(content)

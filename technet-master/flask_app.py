@@ -4,14 +4,15 @@ from flask import jsonify, send_file, g, current_app, send_from_directory, Respo
 from flask import Flask
 from database import *
 from select_stop_words import *
-from qdrant_net import QdrantClient, Graph, VDBRelationships, most_similar_embeddings, moonshot_chat, \
-    moonshot_chat_sync, field_match, empty_match, qdrant_livez
+from qdrant_net import *
+from request_session import *
 import plotly.express as px
 import plotly.io as pio
 import pandas as pd
 import string, time, os, re, uuid
 from lda_topics import LdaTopics
 import logging
+from openai import OpenAI
 
 
 class IgnoreHeadRequestsFilter(logging.Filter):
@@ -38,14 +39,6 @@ app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600  # 适用于SQLAlchemy的连接池,
 
 Baidu_Access_Token = get_baidu_access_token()
 client = QdrantClient(url=Config.QDRANT_URL)
-
-try:
-    from openai import OpenAI
-
-    ai_client = OpenAI(api_key=Config.Moonshot_API_Key, base_url="https://api.moonshot.cn/v1")
-except Exception as e:
-    print(f"An error occurred while initializing the OpenAI client: {e}")
-    ai_client = None
 
 
 # app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -597,17 +590,18 @@ def cut_messages():
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.get_json()
-
     agent = data.get('agent', '1')
     user_message = data['question']  # unquote()
-    uuid = data.get('uuid', None)
     user_name = data.get('username', None)
+    user_id = user_name or data.get('uuid', None)
     filter_time = data.get('filter_time', 0) / 1000.0
+    model_name = data.get('model', 'moonshot')
+    model_info, model_id = find_ai_model(model_name, model_i=0)
     current_timestamp = time.time()
 
     history = [{"role": "system", "content": System_content.get(agent)}]
     user_history = [msg for msg in Chat_history if
-                    msg['agent'] == agent and msg['username'] == (user_name or uuid) and msg['timestamp'] > filter_time]
+                    msg['agent'] == agent and msg['username'] == user_id and msg['timestamp'] > filter_time]
     if user_name:
         if not filter_time:
             uid, inf = swg.get_user(user_name)
@@ -625,16 +619,23 @@ def send_message():
     history.append({'role': 'user',
                     'content': f'参考材料:{refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}' if refer else user_message})
 
-    bot_response = moonshot_chat(messages=history, temperature=data.get('temperature', 0.4), client=ai_client,
-                                 api_key=Config.Moonshot_API_Key)
+    if model_id:
+        ai_client = AI_Client.get(model_info['name'], None)
+        bot_response = ai_chat(messages=history, model_id=model_id, temperature=data.get('temperature', 0.4),
+                               client=ai_client, model_info=model_info)
+    else:
+        response = request_aigc(messages=history, question=user_message, agent='', model_name=model_name,
+                                host=Config.AIGC_HOST, uuid=user_id)
+        print(response)
+        bot_response = response['answer']
 
     # print(f"This is a response:{bot_response} from the bot to your question: {user_message}(User Name: {user_name})")
     reference = '\n'.join(refer)
 
     new_history = [
-        {'role': 'user', 'content': user_message, 'username': user_name or uuid, 'agent': agent,
+        {'role': 'user', 'content': user_message, 'username': user_id, 'agent': agent,
          'index': len(history) - 1, 'timestamp': current_timestamp},
-        {'role': 'assistant', 'content': bot_response, 'username': user_name or uuid, 'agent': agent,
+        {'role': 'assistant', 'content': bot_response, 'username': user_id, 'agent': agent,
          'index': len(history), 'reference': reference, 'timestamp': time.time()}]
     try:
         if user_name:
@@ -651,9 +652,12 @@ def send_message():
 @app.route('/stream_response', methods=['GET'])
 def stream_response():
     agent = request.args.get('agent', '1')
-    uuid = request.args.get('uuid', None)
     user_name = request.args.get('username', None)
+    user_id = user_name or request.args.get('uuid', None)
     user_message = request.args.get('question')
+    model_name = request.args.get('model', 'moonshot')
+    model_info, model_id = find_ai_model(model_name, model_i=0)
+    ai_client = AI_Client.get(model_info['name'], None) if model_id else None
     temperature = float(request.args.get('temperature', 0.4))
     filter_time = int(request.args.get('filter_time', 0)) / 1000.0
     current_timestamp = time.time()
@@ -663,7 +667,7 @@ def stream_response():
         filter_time = inf.get('chatcut', 0)
 
     user_history = [msg for msg in Chat_history if
-                    msg['agent'] == agent and msg['username'] == (user_name or uuid) and msg['timestamp'] > filter_time]
+                    msg['agent'] == agent and msg['username'] == user_id and msg['timestamp'] > filter_time]
     if user_name:
         user_history.extend(ChatHistory.user_history(user_name, agent, filter_time))
 
@@ -689,10 +693,17 @@ def stream_response():
             yield f'data: {first_data}\n\n'
 
         assistant_response = []
-        for content in moonshot_chat_sync(history, temperature=temperature, client=ai_client,
-                                          api_key=Config.Moonshot_API_Key):
-            yield f'data: {content}\n\n'
-            assistant_response.append(content)
+        if model_id:
+            for content in ai_chat_async(history, model_id=model_id, temperature=temperature, client=ai_client,
+                                         model_info=model_info):
+                yield f'data: {content}\n\n'
+                assistant_response.append(content)
+        else:
+            for chunk in request_aigc(messages=history, question=user_message, agent='', model_name=model_name,
+                                      host=Config.AIGC_HOST, stream=True, uuid=user_id):
+                content = chunk.decode('utf-8')  # json.dumps(response, ensure_ascii=False) + '\n'
+                yield f'data: {content}\n\n'
+                assistant_response.append(content)
 
         bot_response = ''.join(assistant_response)
         last_data = json.dumps({'content': bot_response, 'role': 'assistant'})
@@ -700,9 +711,9 @@ def stream_response():
         yield 'data: [DONE]\n\n'
 
         new_history = [
-            {'role': 'user', 'content': user_message, 'username': user_name or uuid, 'agent': agent,
+            {'role': 'user', 'content': user_message, 'username': user_id, 'agent': agent,
              'index': len(history) - 1, 'timestamp': current_timestamp},
-            {'role': 'assistant', 'content': bot_response, 'username': user_name or uuid, 'agent': agent,
+            {'role': 'assistant', 'content': bot_response, 'username': user_id, 'agent': agent,
              'index': len(history), 'reference': reference, 'timestamp': time.time()}]
 
         try:
@@ -729,15 +740,26 @@ def stream_response_task(task_id):
     reference = task.get('reference', [])
     history = task.get('messages', [])
 
+    model_info, model_id = find_ai_model(task['model_name'], model_i=0)
+    ai_client = AI_Client.get(model_info['name'], None) if model_id else None
+
     def generate():
         if reference:
             first_data = json.dumps({'content': '\n'.join(reference), 'role': 'reference'})
             yield f'data: {first_data}\n\n'
 
         assistant_response = []
-        for content in moonshot_chat_sync(history, temperature=0.8, client=ai_client, api_key=Config.Moonshot_API_Key):
-            yield f'data: {content}\n\n'
-            assistant_response.append(content)
+        if model_id:
+            for content in ai_chat_async(history, model_id=model_id, temperature=0.4, client=ai_client,
+                                         model_info=model_info):
+                yield f'data: {content}\n\n'
+                assistant_response.append(content)
+        else:
+            for chunk in request_aigc(messages=history, question=user_message, agent='', model_name=model_name,
+                                      host=Config.AIGC_HOST, stream=True, uuid=user_id):
+                content = chunk.decode('utf-8')  # json.dumps(response, ensure_ascii=False) + '\n'
+                yield f'data: {content}\n\n'
+                assistant_response.append(content)
 
         bot_response = json.dumps({'content': ''.join(assistant_response), 'role': 'assistant'})
         yield f'data: {bot_response}\n\n'
@@ -755,8 +777,18 @@ def send_message_task(task_id):
 
     reference = task.get('reference', [])
     history = task.get('messages', [])
+    model_info, model_id = find_ai_model(task['model_name'], model_i=0)
 
-    bot_response = moonshot_chat(messages=history, temperature=0.8, client=ai_client, api_key=Config.Moonshot_API_Key)
+    if model_id:
+        ai_client = AI_Client.get(model_info['name'], None)
+        bot_response = ai_chat(messages=history, model_id=model_id, temperature=0.4,
+                               client=ai_client, model_info=model_info)
+    else:
+        response = request_aigc(messages=history, question=task.get('user_message'), agent='',
+                                model_name=task['model_name'], host=Config.AIGC_HOST,
+                                uuid=task.get('username'))
+
+        bot_response = response['answer']
 
     del Task_queue[task_id]
 
@@ -779,6 +811,7 @@ def submit_messages():
     # answer = response.choices[0].text.strip()
     filter_time = data.get('filter_time', 0) / 1000.0
     user_name = data.get('username') or data.get('uuid') or session.get('username')
+    model_name = data.get('model', 'moonshot')
     user_chat_history = data.get('messages', [msg for msg in Chat_history if
                                               msg['username'] == user_name and msg['timestamp'] > filter_time])
 
@@ -797,9 +830,11 @@ def submit_messages():
         'username': user_name,
         "messages": history,
         'user_message': user_message,
+        'model_name': model_name,
         'filter_time': filter_time,
         'reference': [],
     }
+
     return jsonify({'task_id': task_id})  # f'/stream_response/{task_id}'} jsonify(user_chat_history)
 
 
@@ -1258,6 +1293,19 @@ if __name__ == "__main__":
     vdr.append(client, collection_name='专利_w2v_188_37', prefix='Word', match_values=['all'])
     vdr.append(client, collection_name='企业_w2v_lda', prefix='Co',
                match_values=['先进制造', '医疗健康', '金融科技', 'all'])
+
+    for model in AI_Models:
+        api_keys = {
+            'moonshot': Config.Moonshot_Service_Key,
+            'glm': Config.GLM_Service_Key,
+            'qwen': Config.DashScope_Service_Key,
+            'silicon': Config.Silicon_Service_Key,
+        }
+        model_name = model['name']
+        api_key = api_keys.get(model_name, '')
+        if api_key:
+            model['api_key'] = api_key
+            AI_Client[model_name] = OpenAI(api_key=api_key, base_url=model['base_url'])
 
     db.init_app(app)  # Flask对象与QLAlchemy()进行绑定
     with app.app_context():  # init_db
