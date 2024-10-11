@@ -51,7 +51,7 @@
             display: inline-block;
             text-align: right;*/
             align-self: flex-end;
-            margin-left: auto; 
+            margin-left: auto;
             background-color: #d0eaff;
             font-size: 15px;
             max-width: 80%;
@@ -280,25 +280,16 @@
 
     <label for="agent">代理角色:</label>
     <select name="agent" id="agent" class="selectBox group6">
-        <option value="0" selected>问题助手</option>
-        <option value="1">专利技术</option>
-        <option value="2">技术专家</option>
-        <option value="4">信息提取</option>
-        <option value="5">SQL转换</option>
-        <option value="6">著作助手</option>
+        {% for agent in agents %}
+        <option value="{{ agent.value }}" {% if agent.value=='0' %}selected{% endif %}>{{ agent.name }}</option>
+        {% endfor %}
     </select>
 
     <label for="model">语言模型:</label>
     <select name="model" id="model" class="selectBox group6">
-        <option value="qwen" selected>千问</option>
-        <option value="moonshot">Kimi</option>
-        <option value="glm">智谱</option>
-        <option value="ernie">文心</option>
-        <option value="hunyuan">混元</option>
-        <option value="doubao">豆包</option>
-        <option value="deepseek-ai/DeepSeek-V2-Chat">DeepSeek</option>
-        <option value="llama">Llama</option>
-        <option value="openai">GPT</option>
+        {% for model in models %}
+        <option value="{{ model.value }}" {% if model.value=='qwen' %}selected{% endif %}>{{ model.name }}</option>
+        {% endfor %}
     </select>
 
     <button type="button" id="clean">清空上下文</button>
@@ -562,6 +553,7 @@
 
             let accumulatedText = '';
             let reference = '';
+            let lastUpdate = 0;
             eventSource.onmessage = function (event) {
                 if (event.data === '[DONE]') {
                     messageElement.innerHTML = formatToSpans(messageElement.textContent || accumulatedText, true);
@@ -590,8 +582,13 @@
                 }
                 if (!event.data.startsWith('{') && !event.data.startsWith('[')) {
                     accumulatedText += event.data;
-                    messageElement.textContent = accumulatedText.replace(/\n+/g, '\n').trim();
-                    //document.querySelector('.chat-box').innerText += event.data.trim();                    
+                    // messageElement.textContent = accumulatedText.replace(/\n+/g, '\n').trim();
+                    //document.querySelector('.chat-box').innerText += event.data.trim();    
+                    const currentTime = Date.now()
+                    if (currentTime - lastUpdate >= 100) {
+                        messageElement.innerHTML = formatToSpans(accumulatedText, true);
+                        lastUpdate = currentTime;
+                    }
                 }
                 else {
                     try {

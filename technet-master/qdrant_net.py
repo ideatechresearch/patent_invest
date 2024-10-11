@@ -6,6 +6,7 @@ from py2neo import Graph, Node, Relationship, Subgraph
 import requests, json, httpx
 import numpy as np
 from enum import Enum as PyEnum
+from difflib import get_close_matches, SequenceMatcher
 
 
 # from neo4j import Graph,GraphDatabase driver = GraphDatabase.driver(uri, auth=(username, password))
@@ -55,6 +56,17 @@ def scale_to_range(numbers, new_min, new_max):
     ]
 
     return scaled_numbers
+
+
+def find_similar_words(query, word_list):
+    matches = get_close_matches(query, word_list)
+    # 计算每个匹配项与查询词的相似度
+    results = []
+    for match in matches:
+        matcher = SequenceMatcher(None, query, match)
+        results.append((match, matcher.ratio()))
+
+    return results
 
 
 def download_file(url, local_filename):
@@ -421,6 +433,8 @@ def process_line_stream(response):
         if line.startswith("data: "):
             line_data = line.lstrip("data: ")
             if line_data == "[DONE]":
+                # if data:  # 在结束时处理可能的残留数据
+                #     yield process_data_chunk(data)
                 # print(data)
                 break
             content = process_data_chunk(line_data)

@@ -1,4 +1,5 @@
 import os
+import base64
 import requests, json
 
 basedir = os.path.abspath(os.path.dirname(__file__))
@@ -14,13 +15,19 @@ class Config(object):
     SECRET_KEY = '7777'
     DATA_FOLDER = 'data'
     NEO4J_HOST = '10.10.10.5'
-    NEO4J_USERNAME = "dooven"
+    NEO4J_USERNAME = "***"
     NEO4J_PASSWORD = "7777"
+    AIGC_HOST = 'aigc'
     QDRANT_HOST = '10.10.10.5'  # 'qdrant'
     QDRANT_URL = "http://10.10.10.5:6333"
-    BAIDU_API_Key = 'apikey'
-    BAIDU_Secret_Key = 'secretkey'
-    AI_API_key = 'apikey'
+
+    BAIDU_qianfan_API_Key = '***'
+    BAIDU_qianfan_Secret_Key = '***'
+
+    DashScope_Service_Key = '***' 
+    Moonshot_Service_Key = "***"
+    Silicon_Service_Key = '***'
+    GLM_Service_Key = "***"
 
     def load_from_file(self, filename='config.ini'):
         import configparser
@@ -49,13 +56,16 @@ def get_baidu_access_token(API_Key=Config.BAIDU_API_Key, Secret_Key=Config.BAIDU
 
 
 def xor_encrypt_decrypt(data, key):
-    # from itertools import cycle
-    # zip(data, cycle(key))
-    return data
+    return ''.join(chr(ord(c) ^ ord(k)) for c, k in zip(data, key * (len(data) // len(key) + 1)))
 
 
 def encode_id(raw_id):
-    return raw_id
+    return base64.urlsafe_b64encode(raw_id.encode()).decode().rstrip('=')
+
+
+def decode_id(encoded_id):
+    padded_encoded_id = encoded_id + '=' * (-len(encoded_id) % 4)
+    return base64.urlsafe_b64decode(padded_encoded_id.encode()).decode()
 
 
 def decode_id(encoded_id):

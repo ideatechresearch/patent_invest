@@ -11,6 +11,7 @@ import plotly.io as pio
 import pandas as pd
 import string, time, os, re, uuid
 from lda_topics import LdaTopics
+import difflib
 import logging
 from openai import OpenAI
 
@@ -78,7 +79,7 @@ def search():
         action = request.form.get('action')  # get('event_type')
         if action == 'search_words':
             txt = request.form['search_words'].strip()
-            detail = swg.search_words(txt)
+            detail = swg.search_words(txt, fuzzy=True)
             if detail.shape[0] > 0:
                 detail = words_detail_links(detail, '/details')
                 return render_template('search.html', table=detail.to_html(escape=False, classes='custom-table'))
@@ -504,20 +505,6 @@ def details(to, id):
     return render_template_string(detail_template, detail_html=detail_html)
 
 
-@app.route('/chat')
-def chat():
-    user_name = session.get('username', '')
-    if not user_name:
-        session['username'] = str(uuid.uuid1())
-
-    uid, inf = swg.get_user(user_name)
-    if uid < 0:
-        return render_template('chat.html', uuid=session['username'])
-
-    return render_template('chat.html', username=user_name)
-
-
-Chat_history = []
 System_content = {'0': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
                   '1': ('你是一位金融和专利领域专家，请回答下面的问题。\n'
                         '（注意：1、材料可能与问题无关，请忽略无关材料，并基于已有知识回答问题。'
@@ -557,6 +544,41 @@ System_content = {'0': '你是一个知识广博且乐于助人的助手，擅�
 Agent_functions = {
     '1': retrieval_patent_abstract,
 }
+Chat_history = []
+
+
+@app.route('/chat')
+def chat():
+    models = [
+        {"value": "qwen", "name": "千问"},
+        {"value": "moonshot", "name": "Kimi"},
+        {"value": "hunyuan", "name": "混元"},
+        {"value": "doubao", "name": "豆包"},
+        {"value": "ernie", "name": "文心"},
+        {"value": "deepseek-ai/DeepSeek-V2-Chat", "name": "DeepSeek"},
+        {"value": "THUDM/glm-4-9b-chat", "name": "智谱"},
+        {"value": "Baichuan2-13B-Chat", "name": "百川"},
+        {"value": "llama", "name": "Llama"},
+        {"value": "openai", "name": "GPT"}
+    ]
+    agents = [
+        {"value": "0", "name": "问题助手"},
+        {"value": "1", "name": "专利技术"},
+        {"value": "2", "name": "技术专家"},
+        {"value": "4", "name": "信息提取"},
+        {"value": "5", "name": "SQL转换"},
+        {"value": "6", "name": "著作助手"}
+    ]
+
+    user_name = session.get('username', '')
+    if not user_name:
+        session['username'] = str(uuid.uuid1())
+
+    uid, inf = swg.get_user(user_name)
+    if uid < 0:
+        return render_template('chat.html', uuid=session['username'], models=models, agents=agents)
+
+    return render_template('chat.html', username=user_name, models=models, agents=agents)
 
 
 @app.route('/get_messages', methods=['GET'])
@@ -590,7 +612,8 @@ def cut_messages():
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.get_json()
-    agent = data.get('agent', '1')
+    agent = data.get('agent', '0')
+    system = System_content.get(agent)
     user_message = data['question']  # unquote()
     user_name = data.get('username', None)
     user_id = user_name or data.get('uuid', None)
@@ -599,7 +622,7 @@ def send_message():
     model_info, model_id = find_ai_model(model_name, model_i=0)
     current_timestamp = time.time()
 
-    history = [{"role": "system", "content": System_content.get(agent)}]
+    history = [{"role": "system", "content": system}]
     user_history = [msg for msg in Chat_history if
                     msg['agent'] == agent and msg['username'] == user_id and msg['timestamp'] > filter_time]
     if user_name:
@@ -624,9 +647,8 @@ def send_message():
         bot_response = ai_chat(messages=history, model_id=model_id, temperature=data.get('temperature', 0.4),
                                client=ai_client, model_info=model_info)
     else:
-        response = request_aigc(messages=history, question=user_message, agent='', model_name=model_name,
+        response = request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
                                 host=Config.AIGC_HOST, uuid=user_id)
-        print(response)
         bot_response = response['answer']
 
     # print(f"This is a response:{bot_response} from the bot to your question: {user_message}(User Name: {user_name})")
@@ -652,6 +674,7 @@ def send_message():
 @app.route('/stream_response', methods=['GET'])
 def stream_response():
     agent = request.args.get('agent', '1')
+    system = System_content.get(agent)
     user_name = request.args.get('username', None)
     user_id = user_name or request.args.get('uuid', None)
     user_message = request.args.get('question')
@@ -674,7 +697,7 @@ def stream_response():
     history = [{'role': msg['role'], 'content': msg['content']} for msg in
                sorted(user_history, key=lambda x: x['timestamp'])]
 
-    history.insert(0, {"role": "system", "content": System_content.get(agent)})
+    history.insert(0, {"role": "system", "content": system})
 
     # Assume this is the document retrieved from RAG
     function_call = Agent_functions.get(agent, lambda *args, **kwargs: [])
@@ -699,11 +722,16 @@ def stream_response():
                 yield f'data: {content}\n\n'
                 assistant_response.append(content)
         else:
-            for chunk in request_aigc(messages=history, question=user_message, agent='', model_name=model_name,
-                                      host=Config.AIGC_HOST, stream=True, uuid=user_id):
-                content = chunk.decode('utf-8')  # json.dumps(response, ensure_ascii=False) + '\n'
-                yield f'data: {content}\n\n'
-                assistant_response.append(content)
+            for content in request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
+                                        host=Config.AIGC_HOST, stream=True, uuid=user_id):
+                try:
+                    parsed_content = json.loads(content)
+                    yield json.dumps(parsed_content, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    if isinstance(content, bytes):
+                        content = content.decode('utf-8', errors='ignore')
+                    yield content
+                    assistant_response.append(content)
 
         bot_response = ''.join(assistant_response)
         last_data = json.dumps({'content': bot_response, 'role': 'assistant'})
@@ -755,11 +783,17 @@ def stream_response_task(task_id):
                 yield f'data: {content}\n\n'
                 assistant_response.append(content)
         else:
-            for chunk in request_aigc(messages=history, question=user_message, agent='', model_name=model_name,
-                                      host=Config.AIGC_HOST, stream=True, uuid=user_id):
-                content = chunk.decode('utf-8')  # json.dumps(response, ensure_ascii=False) + '\n'
-                yield f'data: {content}\n\n'
-                assistant_response.append(content)
+            for content in request_aigc(messages=history, question=task.get('user_message'), system='',
+                                        model_name=model_name, host=Config.AIGC_HOST, stream=True,
+                                        uuid=task.get('username')):
+                try:
+                    parsed_content = json.loads(content)
+                    yield json.dumps(parsed_content, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    if isinstance(content, bytes):
+                        content = content.decode('utf-8', errors='ignore')
+                    yield content
+                    assistant_response.append(content)
 
         bot_response = json.dumps({'content': ''.join(assistant_response), 'role': 'assistant'})
         yield f'data: {bot_response}\n\n'
@@ -784,7 +818,7 @@ def send_message_task(task_id):
         bot_response = ai_chat(messages=history, model_id=model_id, temperature=0.4,
                                client=ai_client, model_info=model_info)
     else:
-        response = request_aigc(messages=history, question=task.get('user_message'), agent='',
+        response = request_aigc(messages=history, question=task.get('user_message'), system='',
                                 model_name=task['model_name'], host=Config.AIGC_HOST,
                                 uuid=task.get('username'))
 

@@ -1,4 +1,4 @@
-import json, os, re
+import json, os, re, difflib
 import random
 import numpy as np
 import pandas as pd
@@ -117,9 +117,12 @@ class StopWordsFlag:
             self.user_data[uid]['readn'] = sum((self.word_data['阅读标记'] & (1 << uid)) != 0)
             self.user_data[uid]['stopn'] = sum((self.word_data['停用标记'] & (1 << uid)) != 0)
 
-    def search_words(self, words):
-        tokens = re.split(r'[^\w\s]| ', words)
-        tokens = [token.strip().lower() for token in tokens]
+    def search_words(self, words_txt, fuzzy=True):
+        tokens = re.split(r'[^\w\s]| ', words_txt.lower())
+        tokens = [token.strip() for token in tokens]
+        if fuzzy:
+            tokens = list(
+                {match for token in tokens for match in difflib.get_close_matches(token, self.word_data.index)})
         return self.word_data[self.word_data.index.isin(tokens)]
 
     def get_stop_words(self, uid=-1):
