@@ -11,7 +11,6 @@ import plotly.io as pio
 import pandas as pd
 import string, time, os, re, uuid
 from lda_topics import LdaTopics
-import difflib
 import logging
 from openai import OpenAI
 
@@ -39,7 +38,7 @@ app.config['SQLALCHEMY_COMMIT_ON_TEARDOWN'] = Config.SQLALCHEMY_COMMIT_ON_TEARDO
 app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600  # 适用于SQLAlchemy的连接池,设置连接重用时间为1小时
 
 Baidu_Access_Token = get_baidu_access_token()
-client = QdrantClient(url=Config.QDRANT_URL)
+Q_Client = QdrantClient(url=Config.QDRANT_URL)
 
 
 # app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -95,7 +94,7 @@ def search():
                 not_match = empty_abstract
                 match = []
 
-            data = most_similar_embeddings(txt, '专利_bge_189', client,
+            data = most_similar_embeddings(txt, '专利_bge_189', Q_Client,
                                            topn=int(request.form.get('topn', 10)),
                                            match=match, not_match=not_match,
                                            score_threshold=float(request.form.get('score_threshold', 0.0)),
@@ -112,7 +111,7 @@ def search():
                 ldt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
             if txt:
                 vec = ldt.encode(txt)
-                search_hit = client.search(collection_name='专利_先进制造_w2v_lda_120',
+                search_hit = Q_Client .search(collection_name='专利_先进制造_w2v_lda_120',
                                            query_vector=vec,
                                            score_threshold=float(request.form.get('score_threshold', 0.0)),
                                            limit=int(request.form.get('topn', 10)))
@@ -133,7 +132,7 @@ def search():
             else:
                 not_match = empty_abstract
 
-            data = most_similar_embeddings(txt, '行业公司名简介_25k', client,
+            data = most_similar_embeddings(txt, '行业公司名简介_25k', Q_Client,
                                            topn=int(request.form.get('topn', 10)),
                                            score_threshold=float(request.form.get('score_threshold', 0.0)),
                                            match=match, not_match=not_match,
@@ -417,7 +416,7 @@ def retrieval_patent_abstract(query, topn=10, score_threshold=0):
     # Retrieval-Augmented Generation
     docs = []
 
-    result = most_similar_embeddings(query, '专利_bge_189', client,
+    result = most_similar_embeddings(query, '专利_bge_189', Q_Client,
                                      topn=topn, match=[], not_match=empty_match(field_key='摘要长度'),
                                      score_threshold=score_threshold, access_token=Baidu_Access_Token)
 
@@ -557,9 +556,6 @@ def chat():
         {"value": "ernie", "name": "文心"},
         {"value": "deepseek-ai/DeepSeek-V2-Chat", "name": "DeepSeek"},
         {"value": "THUDM/glm-4-9b-chat", "name": "智谱"},
-        {"value": "Baichuan2-13B-Chat", "name": "百川"},
-        {"value": "llama", "name": "Llama"},
-        {"value": "openai", "name": "GPT"}
     ]
     agents = [
         {"value": "0", "name": "问题助手"},
@@ -648,8 +644,8 @@ def send_message():
                                client=ai_client, model_info=model_info)
     else:
         response = request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
-                                host=Config.AIGC_HOST, uuid=user_id)
-        bot_response = response['answer']
+                                stream=False, host=Config.AIGC_HOST, uuid=user_id)
+        bot_response = json.loads(response.content)['answer']
 
     # print(f"This is a response:{bot_response} from the bot to your question: {user_message}(User Name: {user_name})")
     reference = '\n'.join(refer)
@@ -722,16 +718,17 @@ def stream_response():
                 yield f'data: {content}\n\n'
                 assistant_response.append(content)
         else:
-            for content in request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
-                                        host=Config.AIGC_HOST, stream=True, uuid=user_id):
-                try:
-                    parsed_content = json.loads(content)
-                    yield json.dumps(parsed_content, ensure_ascii=False)
-                except json.JSONDecodeError:
-                    if isinstance(content, bytes):
-                        content = content.decode('utf-8', errors='ignore')
-                    yield content
-                    assistant_response.append(content)
+            for content in forward_stream(
+                    request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
+                                 host=Config.AIGC_HOST, stream=True, uuid=user_id)):
+                if 'text' in content:
+                    yield f'data: {content["text"]}\n\n'
+                    assistant_response.append(content["text"])
+                elif 'json' in content:
+                    yield f'data: {json.dumps(content["json"], ensure_ascii=False)}'
+                    # if content["json"].get('content') and content["json"].get('role') == 'assistant':
+                    #     assistant_response = [content["json"].get('content')]
+                time.sleep(0.01)
 
         bot_response = ''.join(assistant_response)
         last_data = json.dumps({'content': bot_response, 'role': 'assistant'})
@@ -777,30 +774,26 @@ def stream_response_task(task_id):
             yield f'data: {first_data}\n\n'
 
         assistant_response = []
-        if model_id:
-            for content in ai_chat_async(history, model_id=model_id, temperature=0.4, client=ai_client,
-                                         model_info=model_info):
-                yield f'data: {content}\n\n'
-                assistant_response.append(content)
-        else:
-            for content in request_aigc(messages=history, question=task.get('user_message'), system='',
-                                        model_name=model_name, host=Config.AIGC_HOST, stream=True,
-                                        uuid=task.get('username')):
-                try:
-                    parsed_content = json.loads(content)
-                    yield json.dumps(parsed_content, ensure_ascii=False)
-                except json.JSONDecodeError:
-                    if isinstance(content, bytes):
-                        content = content.decode('utf-8', errors='ignore')
-                    yield content
-                    assistant_response.append(content)
+
+        for content in ai_chat_async(history, model_id=model_id, temperature=0.4, client=ai_client,
+                                     model_info=model_info):
+            yield f'data: {content}\n\n'
+            assistant_response.append(content)
 
         bot_response = json.dumps({'content': ''.join(assistant_response), 'role': 'assistant'})
         yield f'data: {bot_response}\n\n'
         yield 'data: [DONE]\n\n'
         del Task_queue[task_id]
 
-    return Response(generate(), content_type='text/event-stream')
+    def generate_forward():
+        for line in request_aigc(messages=history, question=task.get('user_message'), system='',
+                           model_name=task['model_name'], host=Config.AIGC_HOST, stream=True,
+                           uuid=task.get('username')).iter_lines(decode_unicode=True):
+            if line and line.startswith("data: "):
+                yield f"{line}\n\n"
+                time.sleep(0.01)
+
+    return Response(generate() if model_id else generate_forward(), content_type='text/event-stream')
 
 
 @app.route('/send_message/<task_id>', methods=['GET'])
@@ -819,10 +812,9 @@ def send_message_task(task_id):
                                client=ai_client, model_info=model_info)
     else:
         response = request_aigc(messages=history, question=task.get('user_message'), system='',
-                                model_name=task['model_name'], host=Config.AIGC_HOST,
+                                model_name=task['model_name'], host=Config.AIGC_HOST, stream=False,
                                 uuid=task.get('username'))
-
-        bot_response = response['answer']
+        bot_response = json.loads(response.content)['answer']
 
     del Task_queue[task_id]
 
@@ -1069,10 +1061,10 @@ def admin_do():
 
         if '切换向量库' in selected:
             global host_index
-            global client
+            global Q_Client
             host_index = (host_index + 1) % len(hosts)  # 循环切换 host 索引
-            client = QdrantClient(host=hosts[host_index], grpc_port=6334, prefer_grpc=True)
-            vdr.switch_clients(client)
+            Q_Client = QdrantClient(host=hosts[host_index], grpc_port=6334, prefer_grpc=True)
+            vdr.switch_clients(Q_Client)
             ret += f"clients change to: {hosts[host_index]}"
         if '检测向量库' in selected:
             global Baidu_Access_Token
@@ -1320,12 +1312,12 @@ if __name__ == "__main__":
 
         # Config.QDRANT_HOST = '47.110.156.41'
 
-    client = QdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
-    vdr.load(graph, client, collection_name='专利_w2v', prefix='Word',
+    Q_Client = QdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
+    vdr.load(graph, Q_Client, collection_name='专利_w2v', prefix='Word',
              match_values=['医疗健康', '先进制造', '传统制造', '金融', '金融科技'])
 
-    vdr.append(client, collection_name='专利_w2v_188_37', prefix='Word', match_values=['all'])
-    vdr.append(client, collection_name='企业_w2v_lda', prefix='Co',
+    vdr.append(Q_Client, collection_name='专利_w2v_188_37', prefix='Word', match_values=['all'])
+    vdr.append(Q_Client, collection_name='企业_w2v_lda', prefix='Co',
                match_values=['先进制造', '医疗健康', '金融科技', 'all'])
 
     for model in AI_Models:
@@ -1335,11 +1327,10 @@ if __name__ == "__main__":
             'qwen': Config.DashScope_Service_Key,
             'silicon': Config.Silicon_Service_Key,
         }
-        model_name = model['name']
-        api_key = api_keys.get(model_name, '')
+        api_key = api_keys.get(model['name'], '')
         if api_key:
             model['api_key'] = api_key
-            AI_Client[model_name] = OpenAI(api_key=api_key, base_url=model['base_url'])
+            AI_Client[model['name']] = OpenAI(api_key=api_key, base_url=model['base_url'])
 
     db.init_app(app)  # Flask对象与QLAlchemy()进行绑定
     with app.app_context():  # init_db

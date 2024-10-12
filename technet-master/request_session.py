@@ -79,17 +79,10 @@ def request_aigc(messages, question, system, model_name, stream=False, host='aig
     }
 
     body.update(kwargs)
-    response = RunMethod().post_main(url, json.dumps(body), headers=headers, timeout=(5, 60), stream=stream)
-    if stream:
-        full_response = ''
-        for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
-            full_response += chunk
-
-        for line in full_response.splitlines():  # response.iter_lines(decode_unicode=True)
-            if line:
-                yield line
-    else:
-        return json.loads(response.content)
+    try:
+        return RunMethod().post_main(url, json.dumps(body), headers=headers, timeout=(10, 60), stream=stream)
+    except Exception as e:
+        return str(e)
 
 # async def request_aigc_async(messages, question, agent, model_name, system=None, stream=False, host='aigc', **kwargs):
 #     url = f"http://{host}:7000/message"
@@ -127,7 +120,7 @@ def request_aigc(messages, question, system, model_name, stream=False, host='aig
 #         # 如果开启了流式返回
 #         if stream:
 #             async with client.stream('POST', url, json=payload, headers=headers) as response:
-#                 async for chunk in response.aiter_text():
+#                 async for chunk in response.aiter_text(): #response.aiter_lines():
 #                     yield chunk
 #         else:
 #             response = await client.post(url, json=payload, headers=headers)

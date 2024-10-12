@@ -106,3 +106,4 @@ web3==7.2.0
 websocket-client==1.8.0
 websockets==13.0.1
 yarl==1.9.8
+rapidfuzz==3.10.0

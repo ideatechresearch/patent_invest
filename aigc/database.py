@@ -217,11 +217,12 @@ def build_chat_history(user_name: str, user_message: str, user_id: Optional[str]
                             sorted(user_history, key=lambda x: x['timestamp'])])
 
         history.append({'role': 'user', 'content': user_message})
-    else:  # 如果提供消息,则使用最后一条user content为问题
+    else:
         history.extend([msg.dict() for msg in user_history])
         if not user_message:
             if history[-1]["role"] == 'user':
                 user_message = history[-1]["content"]
+        # 如果提供消息,则使用最后一条user content为问题
 
     return history, user_message
 

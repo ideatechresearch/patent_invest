@@ -447,6 +447,29 @@ def process_line_stream(response):
         yield process_data_chunk(data)
 
 
+def forward_stream(response):
+    for line in response.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if line.startswith("data: "):
+            line_data = line.lstrip("data: ")
+            if line_data == "[DONE]":
+                break
+            try:
+                parsed_content = json.loads(line_data)
+                yield {"json": parsed_content}
+            except json.JSONDecodeError:
+                yield {"text": line_data}
+
+
+    # for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):  # 二进制数据
+    #     for line in chunk.splitlines():
+    #         if isinstance(line, bytes):
+    #             line = line.decode('utf-8', errors='ignore')
+    #         if line:
+    #             yield line
+
+
 def most_similar_by_name(name, collection_name, client, match=[], exclude=[], topn=10, score_threshold=0.5):
     match_name = FieldCondition(key='word', match=MatchValue(value=name, ), )
     not_match_name = [FieldCondition(key='word', match=MatchValue(value=w), ) for w in exclude]

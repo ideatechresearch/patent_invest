@@ -1,6 +1,6 @@
 import re, json
 import inspect
-
+import xml.etree.ElementTree as ET
 
 def get_function_parameters(func):
     signature = inspect.signature(func)
@@ -208,3 +208,24 @@ def extract_string(text, extract, **kwargs):
         print(e)
 
     return None
+
+def dict_to_xml(tag, d):
+    """将字典转换为 XML 字符串"""
+    elem = ET.Element(tag)
+    for key, val in d.items():
+        child = ET.SubElement(elem, key)
+        if isinstance(val, list):
+            for item in val:
+                item_elem = ET.SubElement(child, "item")
+                item_elem.text = str(item)
+        else:
+            child.text = str(val)
+    return ET.tostring(elem, encoding='unicode')
+
+def list_to_xml(tag, lst):
+    """将列表转换为 XML 字符串"""
+    elem = ET.Element(tag)
+    for item in lst:
+        item_elem = ET.SubElement(elem, "item")
+        item_elem.text = str(item)
+    return ET.tostring(elem, encoding='unicode')

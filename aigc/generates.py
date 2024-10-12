@@ -318,8 +318,11 @@ async def ai_chat(model_info, payload=None, **kwargs):
 
     client = AI_Client.get(model_info['name'], None)
     if client:
-        completion = await asyncio.to_thread(client.chat.completions.create, **payload)
-        return completion.choices[0].message.content
+        try:
+            completion = await asyncio.to_thread(client.chat.completions.create, **payload)
+            return completion.choices[0].message.content
+        except Exception as e:
+            return f"OpenAI error occurred: {e}"
 
     # 通过 requests 库直接发起 HTTP POST 请求
     model_type = model_info['type']
@@ -383,13 +386,14 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
     client = AI_Client.get(model_info['name'], None)
 
     if client:
-        stream = client.chat.completions.create(**payload)
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                yield delta.content  # completion.append(delta.content)
-            # if chunk.choices[0].finish_reason == 'stop':
-            #     break
+        try:
+            stream = client.chat.completions.create(**payload)
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
+                    yield delta.content  # completion.append(delta.content)
+        except Exception as e:
+            yield f"OpenAI error occurred: {e}"
         # yield '[DONE]'
         return
 
@@ -446,6 +450,8 @@ async def process_line_stream(response, model_type='default'):
         if line.startswith("data: "):
             line_data = line.lstrip("data: ")
             if line_data == "[DONE]":
+                # if data:
+                #     yield process_data_chunk(data, model_type)
                 # print(data)
                 break
             if model_type == 'tencent':
@@ -487,6 +493,20 @@ def process_data_chunk(data, model_type='default'):
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         return str(e)
     return None
+
+async def forward_stream(response):
+    async for line in response.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if line.startswith("data: "):
+            line_data = line.lstrip("data: ")
+            if line_data == "[DONE]":
+                break
+            try:
+                parsed_content = json.loads(line_data)
+                yield {"json": parsed_content}
+            except json.JSONDecodeError:
+                yield {"text": line_data}
 
 
 # 生成:conversation or summary
@@ -696,7 +716,7 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en')
     if "trans_result" in data:
         return data["trans_result"][0]["dst"]
 
-    print(response.text)
+    # print(response.text)
     raise HTTPException(status_code=400, detail=f"Baidu API Error: {data.get('error_msg', 'Unknown error')}")
 
 

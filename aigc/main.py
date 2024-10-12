@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
-import string, time, copy, os, io, re, sys, uuid
+import string, difflib, re, time, copy, os, io, sys, uuid
+import rapidfuzz
 import tempfile
 import logging
 import concurrent.futures
@@ -346,6 +347,29 @@ async def embeddings(texts: List[str] = Query(...), platform: str = 'qwen'):
         embedding = await get_bge_embeddings(inputs, access_token=access_token)
         return {"embedding": embedding}
     return {"embedding": ai_embeddings(inputs, model_name=platform, model_id=0)}
+
+
+@app.get("/fuzzy")
+async def fuzzy_matches(texts: List[str] = Query(...), kwlist: List[str] = Query(...),
+                        top_n: int = 1, cutoff: int = 50, platform: str = 'levenshtein_0'):
+    query = [text.replace("\n", " ").strip() for text in texts]
+    terms = [text.replace("\n", " ").strip() for text in kwlist]
+    # tokens = list({match for token in query for match in difflib.get_close_matches(token, terms)})
+    # match, score = process.extractOne(token, terms)
+    # results.append({'token': token, 'match': match, 'score': score})
+    results = []
+    if platform == 'levenshtein_0':
+        results = [{'token': token, 'matchs': rapidfuzz.process.extract(token, terms, limit=top_n, score_cutoff=cutoff)}
+                   for token in query]
+    elif platform == 'levenshtein_1':
+        for token in query:
+            matches = difflib.get_close_matches(token, terms, n=top_n, cutoff=cutoff / 100)
+            matches = [(match, round(difflib.SequenceMatcher(None, token, match).ratio() * 100, 3)) for match in
+                       matches]
+            results.append({'token': token, 'matchs': matches})
+
+    return JSONResponse(content=results, media_type="application/json; charset=utf-8")
+    # Response(content=list_to_xml('results', results), media_type='application/xml; charset=utf-8')
 
 
 @app.post("/text/")  # , response_model=OpenAIResponse
