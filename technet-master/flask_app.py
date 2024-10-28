@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from flask import session, request, redirect, url_for, render_template, render_template_string, stream_with_context
 from flask import jsonify, send_file, g, current_app, send_from_directory, Response
+# from flask_socketio import SocketIO, emit
 from flask import Flask
 from database import *
 from select_stop_words import *
@@ -13,6 +14,7 @@ import string, time, os, re, uuid
 from lda_topics import LdaTopics
 import logging
 from openai import OpenAI
+from urllib.parse import urlparse
 
 
 class IgnoreHeadRequestsFilter(logging.Filter):
@@ -36,7 +38,7 @@ app.config['DATA_FOLDER'] = Config.DATA_FOLDER  # data
 app.config["SQLALCHEMY_DATABASE_URI"] = Config.SQLALCHEMY_DATABASE_URI
 app.config['SQLALCHEMY_COMMIT_ON_TEARDOWN'] = Config.SQLALCHEMY_COMMIT_ON_TEARDOWN  # false
 app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600  # 适用于SQLAlchemy的连接池,设置连接重用时间为1小时
-
+# socketio = SocketIO(app)
 Baidu_Access_Token = get_baidu_access_token()
 Q_Client = QdrantClient(url=Config.QDRANT_URL)
 
@@ -111,10 +113,10 @@ def search():
                 ldt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
             if txt:
                 vec = ldt.encode(txt)
-                search_hit = Q_Client .search(collection_name='专利_先进制造_w2v_lda_120',
-                                           query_vector=vec,
-                                           score_threshold=float(request.form.get('score_threshold', 0.0)),
-                                           limit=int(request.form.get('topn', 10)))
+                search_hit = Q_Client.search(collection_name='专利_先进制造_w2v_lda_120',
+                                             query_vector=vec,
+                                             score_threshold=float(request.form.get('score_threshold', 0.0)),
+                                             limit=int(request.form.get('topn', 10)))
 
                 data = [(p.payload, p.score) for p in search_hit]
                 detail = patents_detail_links(data, base_url='/details')
@@ -454,7 +456,7 @@ def details(to, id):
     elif to == 'patent':
         table_name = '融资公司专利-202406'
         column_name = '申请号'  # '公开（公告）号'
-        query = text('SELECT table_name FROM `融资公司专利-202406` WHERE 申请号 = :id')
+        query = text(f'SELECT table_name FROM `{table_name}` WHERE 申请号 = :id')
         result = db.session.execute(query, {'id': decrypted_id})
         row = result.fetchone()  # [dict(row) for row in result.fetchall()]
         if row:
@@ -462,11 +464,14 @@ def details(to, id):
     elif to == 'company':
         table_name = '公司融资数据修正-20240301'
         column_name = '公司序号'
+    elif to == 'invest':
+        table_name = 'invest_all_2405'
+        column_name = '企业全称'
     elif to == 'patent_invest':
         table_name = 'patent_invest_2024_先进制造_医疗健康'
         column_name = '公司序号'
     elif to in ('patent_incopat_202101_202211', 'patent_incopat_202212_202312',
-                'patent202210', 'patent202309', 'patent202404',):
+                'patent202210', 'patent202309', 'patent202404', 'patent202407', 'patent202408', 'patent202410',):
         table_name = to
         column_name = '申请号'
     else:
@@ -549,13 +554,20 @@ Chat_history = []
 @app.route('/chat')
 def chat():
     models = [
-        {"value": "qwen", "name": "千问"},
-        {"value": "moonshot", "name": "Kimi"},
-        {"value": "hunyuan", "name": "混元"},
+        {"value": "qwen", "name": "通义千问"},
+        {"value": "moonshot", "name": "kimi"},
         {"value": "doubao", "name": "豆包"},
+        {"value": "hunyuan", "name": "混元"},
         {"value": "ernie", "name": "文心"},
         {"value": "deepseek-ai/DeepSeek-V2-Chat", "name": "DeepSeek"},
+        {"value": "01-ai/Yi-1.5-9B-Chat-16K", "name": "零一万物"},
         {"value": "THUDM/glm-4-9b-chat", "name": "智谱"},
+        {"value": "internlm/internlm2_5-7b-chat", "name": "书生"},
+        {"value": "speark", "name": "星火"},
+        {"value": "baichuan", "name": "百川"},
+        {"value": "google/gemma-2-9b-it", "name": "gemma"},
+        {"value": "meta-llama/Meta-Llama-3-8B-Instruct", "name": "llama"},
+        {"value": "deepseek-ai/DeepSeek-Coder-V2-Instruct", "name": "coder"},
     ]
     agents = [
         {"value": "0", "name": "问题助手"},
@@ -579,14 +591,14 @@ def chat():
 
 @app.route('/get_messages', methods=['GET'])
 def get_messages():
-    user_name = session.get('username')
-    uid, inf = swg.get_user(user_name)
+    username = session.get('username')
+    uid, inf = swg.get_user(username)
     filter_time = int(request.args.get('filter_time', 0)) / 1000.0
-    user_history = [msg for msg in Chat_history if msg['username'] == user_name and msg['timestamp'] > filter_time]
+    user_history = [msg for msg in Chat_history if msg['username'] == username and msg['timestamp'] > filter_time]
 
     if uid >= 0:
         filter_time = inf.get('chatcut', 0)
-        user_history.extend(ChatHistory.user_history(user_name, agent=None, filter_time=filter_time, all_payload=True))
+        user_history.extend(ChatHistory.user_history(username, agent=None, filter_time=filter_time, all_payload=True))
 
     return jsonify(sorted(user_history, key=lambda x: x['timestamp']))
 
@@ -608,8 +620,8 @@ def cut_messages():
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.get_json()
-    agent = data.get('agent', '0')
-    system = System_content.get(agent)
+    agent = data.get('agent', None)
+    system = System_content.get(agent, System_content['0'])
     user_message = data['question']  # unquote()
     user_name = data.get('username', None)
     user_id = user_name or data.get('uuid', None)
@@ -644,7 +656,7 @@ def send_message():
                                client=ai_client, model_info=model_info)
     else:
         response = request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
-                                stream=False, host=Config.AIGC_HOST, uuid=user_id)
+                                stream=False, host=Config.AIGC_HOST, user_id=user_id)
         bot_response = json.loads(response.content)['answer']
 
     # print(f"This is a response:{bot_response} from the bot to your question: {user_message}(User Name: {user_name})")
@@ -670,7 +682,7 @@ def send_message():
 @app.route('/stream_response', methods=['GET'])
 def stream_response():
     agent = request.args.get('agent', '1')
-    system = System_content.get(agent)
+    system = System_content.get(agent, System_content['0'])
     user_name = request.args.get('username', None)
     user_id = user_name or request.args.get('uuid', None)
     user_message = request.args.get('question')
@@ -720,7 +732,7 @@ def stream_response():
         else:
             for content in forward_stream(
                     request_aigc(messages=history, question=user_message, system=system, model_name=model_name,
-                                 host=Config.AIGC_HOST, stream=True, uuid=user_id)):
+                                 host=Config.AIGC_HOST, stream=True, user_id=user_id)):
                 if 'text' in content:
                     yield f'data: {content["text"]}\n\n'
                     assistant_response.append(content["text"])
@@ -786,9 +798,9 @@ def stream_response_task(task_id):
         del Task_queue[task_id]
 
     def generate_forward():
-        for line in request_aigc(messages=history, question=task.get('user_message'), system='',
-                           model_name=task['model_name'], host=Config.AIGC_HOST, stream=True,
-                           uuid=task.get('username')).iter_lines(decode_unicode=True):
+        for line in request_aigc(messages=history, question=task.get('user_message'), system=task.get('system'),
+                                 model_name=task['model_name'], host=Config.AIGC_HOST, stream=True,
+                                 user_id=task.get('username')).iter_lines(decode_unicode=True):
             if line and line.startswith("data: "):
                 yield f"{line}\n\n"
                 time.sleep(0.01)
@@ -811,9 +823,9 @@ def send_message_task(task_id):
         bot_response = ai_chat(messages=history, model_id=model_id, temperature=0.4,
                                client=ai_client, model_info=model_info)
     else:
-        response = request_aigc(messages=history, question=task.get('user_message'), system='',
+        response = request_aigc(messages=history, question=task.get('user_message'), system=task.get('system'),
                                 model_name=task['model_name'], host=Config.AIGC_HOST, stream=False,
-                                uuid=task.get('username'))
+                                user_id=task.get('username'))
         bot_response = json.loads(response.content)['answer']
 
     del Task_queue[task_id]
@@ -836,12 +848,12 @@ def submit_messages():
     #
     # answer = response.choices[0].text.strip()
     filter_time = data.get('filter_time', 0) / 1000.0
-    user_name = data.get('username') or data.get('uuid') or session.get('username')
-    model_name = data.get('model', 'moonshot')
+    username = data.get('username') or data.get('uuid') or session.get('username')
     user_chat_history = data.get('messages', [msg for msg in Chat_history if
-                                              msg['username'] == user_name and msg['timestamp'] > filter_time])
+                                              msg['username'] == username and msg['timestamp'] > filter_time])
 
-    history = [{"role": "system", "content": System_content['0']}]
+    system = System_content.get(data.get('agent', '0'), System_content['0'])
+    history = [{"role": "system", "content": system}]
     history.extend(user_chat_history)
     # history.append({'role': 'user', 'content': user_message})
 
@@ -853,10 +865,11 @@ def submit_messages():
     task_id = str(uuid.uuid4())
     Task_queue[task_id] = {
         "status": "pending",
-        'username': user_name,
+        'username': username,
         "messages": history,
         'user_message': user_message,
-        'model_name': model_name,
+        'model_name': data.get('model', 'moonshot'),
+        'system': system,
         'filter_time': filter_time,
         'reference': [],
     }
@@ -1162,20 +1175,103 @@ def uploader():
     return render_template('upload.html')
 
 
-@app.route('/proxy/<path:url>/<string:name>/<string:password>', methods=['GET'])
-def proxy(url, name, password):
+@app.route('/proxy/<path:url>/', methods=['GET', 'POST'])
+def proxy(url: str):
     if session.get("username") != 'admin':
-        return jsonify({'error': 'The user is not admin!'}), 400
+        return jsonify({'error': 'The user is not admin!'}), 403
+
+    if not url.startswith("http"):
+        url = f"https://{url}"
 
     import requests
+    name = request.args.get('name', '')
+    password = request.args.get('password', '')
     auth = (name, password) if name and password else None
-    response = requests.get(f'https://{url}', auth=auth)
 
-    if response.status_code == 200:
-        return Response(response.content, content_type=response.headers['Content-Type'])
-    else:
-        return "Failed to fetch the page", response.status_code
+    headers = dict(request.headers)
+    headers['Host'] = urlparse(url).netloc
+    try:
+        if request.method == 'GET':
+            response = requests.get(url, auth=auth, headers=headers, params=request.args, timeout=60)
+        elif request.method == 'POST':
+            response = requests.post(url, auth=auth, headers=headers, data=request.get_data(), timeout=60)
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': f"Failed to fetch the page: {str(e)}"}), 500
 
+    headers = {key: value for key, value in response.headers.items() if key.lower() != 'content-encoding'}
+    headers['Content-Type'] = response.headers.get('Content-Type', 'text/plain')
+    return Response(response.content, headers=headers, status=response.status_code)
+
+
+@app.before_request
+def log_request_info():
+    app.logger.debug(f'Request Headers: {request.headers}')
+    app.logger.debug(f'Request Path: {request.path}')
+    app.logger.debug(f'Request Args: {request.args}')
+
+
+AIGC_URL = f'http://{Config.AIGC_HOST}:7000'
+
+
+@app.route('/aigc/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+def call_aigc(path):
+    if session.get("username") not in ['admin', 'technet']:
+        return jsonify({'error': 'The user is not admin!'}), 403
+
+    method = request.method
+    data = request.get_json() if method in ['POST', 'PUT', 'PATCH'] else None
+    full_url = f"{AIGC_URL}/{path}"
+    try:
+        response = requests.request(method, full_url, json=data, headers=dict(request.headers))  # 返回响应
+        if response.headers.get('Content-Type') == 'text/event-stream':
+            def generate_text():
+                for line in response.iter_lines(decode_unicode=True):
+                    if line:
+                        yield f"{line}\n\n"  # 处理每一行并格式化为 SSE 格式
+
+            return Response(stream_with_context(generate_text()), content_type='text/event-stream')
+
+        elif response.headers.get('Content-Type') in ['audio/mpeg', 'application/octet-stream']:
+            def generate():
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        yield chunk
+
+            return Response(generate(), content_type=response.headers['Content-Type'])
+
+        return jsonify(response.json()), response.status_code
+
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': f'Failed to connect to the AIGC service.{str(e)}'}), 500
+
+
+# @socketio.on('connect')
+# def handle_connect():
+#     print('Client connected')
+# @socketio.on('disconnect')
+#     def handle_disconnect():
+#         print('Client disconnected')
+# @socketio.on('message')
+# def handle_message(data): # 将消息转发到 FastAPI
+#     response = requests.post(FASTAPI_URL + '/your-endpoint', json=data)
+#     emit('response', response.json())
+
+# @socketio.on('request')
+# def handle_request(data):
+#     path = data.get('path', '')
+#     method = data.get('method', 'GET').upper()
+#     headers = data.get('headers', {})
+#     data = data.get('data', None)
+#     full_url = f"{FASTAPI_URL}/{path}"
+#     response = requests.request(method, full_url, json=data, headers=headers)
+#     if response.headers.get('Content-Type') == 'application/octet-stream':
+#         def generate():
+#             for chunk in response.iter_content(chunk_size=1024):
+#                 if chunk:
+#                     yield chunk
+#         return Response(generate(), content_type=response.headers['Content-Type'])
+#     return jsonify({'status': response.status_code, 'data': response.json()})
+#      emit('response', {'status': response.status_code, 'data': response.json()})
 
 @app.route('/register', methods=['GET', 'POST'], endpoint='register')
 def register():
@@ -1326,6 +1422,7 @@ if __name__ == "__main__":
             'glm': Config.GLM_Service_Key,
             'qwen': Config.DashScope_Service_Key,
             'silicon': Config.Silicon_Service_Key,
+            'baichuan': Config.Baichuan_Service_Key
         }
         api_key = api_keys.get(model['name'], '')
         if api_key:

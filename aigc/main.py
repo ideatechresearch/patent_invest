@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
 import string, difflib, re, time, copy, os, io, sys, uuid
-import rapidfuzz
 import tempfile
 import logging
 import concurrent.futures
@@ -76,7 +75,7 @@ def tick():
     if len(Chat_history):
         print(len(Chat_history), 'Tick! The time is: %s' % datetime.now())
         ChatHistory.sequential_insert(db, Chat_history)
-    db.close()
+    # db.close()
 
 
 def cleanup_tasks(timeout_received=600, timeout=86400):
@@ -115,6 +114,11 @@ def get_db():
     # async with AsyncSessionLocal() as session:
     #     yield session
 
+
+# async def get_db():
+#     async with SessionLocal() as db:
+#         yield db
+#         await db.close()
 
 # @app.on_event("startup")
 # async def startup_event():
@@ -291,27 +295,16 @@ def verify_request_signature(request: Request, API_KEYS):
     return True
 
 
-@app.get('/proxy/{url:path}/{name}/{password}')
-async def proxy(url: str, name: str, password: str, token: str = Depends(authenticate_user)):
-    # if username != 'admin':
-    #     return {'error': 'The user is not admin!'}
-
-    auth = (name, password) if name and password else None
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        try:
-            response = await client.get(f'https://{url}', auth=auth)
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=500, detail=f"Request failed: {exc}")
-
-    if response.status_code == 200:
-        return Response(content=response.content, media_type=response.headers.get('Content-Type', 'text/plain'))
-    else:
-        return Response(content="Failed to fetch the page", status_code=response.status_code)
-
-
 @app.get('/web_search/{text}')
-async def web_search(text: str):
+async def web_search(text: str, platform: str = 'default'):
+    if platform == 'wikipedia':
+        return wikipedia_search(text)
     return JSONResponse(await web_search_async(text))
+
+
+@app.get('/retrieval/{text}')
+async def retrieval(text: str, platform: str = 'default'):
+    return {'knowledge', 'retrieval pass'}
 
 
 @app.get("/admin")
@@ -339,82 +332,105 @@ async def index():
     return {"message": "Hello World", 'history': Chat_history, 'task': Task_queue}
 
 
-@app.get("/embeddings")
-async def embeddings(texts: List[str] = Query(...), platform: str = 'qwen'):
+@app.get("/embeddings/")
+async def embeddings(texts: List[str] = Query(...), model_name: str = 'qwen', model_id: int = 0):
     inputs = [text.replace("\n", " ") for text in texts]
-    if platform == 'baidu':
+    if model_name == 'baidu':
         access_token = get_baidu_access_token()
-        embedding = await get_bge_embeddings(inputs, access_token=access_token)
+        embedding = await get_baidu_embeddings(inputs, access_token=access_token)
         return {"embedding": embedding}
-    return {"embedding": ai_embeddings(inputs, model_name=platform, model_id=0)}
+    return {"embedding": await ai_embeddings(inputs, model_name=model_name, model_id=model_id)}
 
 
-@app.get("/fuzzy")
-async def fuzzy_matches(texts: List[str] = Query(...), kwlist: List[str] = Query(...),
-                        top_n: int = 1, cutoff: int = 50, platform: str = 'levenshtein_0'):
+@app.get("/fuzzy/")
+async def fuzzy_matches(texts: List[str] = Query(...), tokens: List[str] = Query(...),
+                        top_n: int = 3, cutoff: float = 0.6, method: str = 'levenshtein'):
     query = [text.replace("\n", " ").strip() for text in texts]
-    terms = [text.replace("\n", " ").strip() for text in kwlist]
+    terms = [text.replace("\n", " ").strip() for text in tokens]
+    results = []
+    if method == 'levenshtein':
+        for token in query:
+            matches = difflib.get_close_matches(token, terms, n=top_n, cutoff=cutoff)
+            matches = [(match, round(difflib.SequenceMatcher(None, token, match).ratio(), 3), terms.index(match))
+                       for match in matches]
+            results.append({'token': token, 'matches': matches})
+        # results = [{'token': token, 'matches': rapidfuzz.process.extract(token, terms, limit=top_n, score_cutoff=cutoff)}
+        #            for token in query]
+    elif method == 'bm25':
+        bm25 = BM25(terms)  # corpus
+        for token in query:
+            scores = bm25.rank_documents(token)
+            matches = [(terms[match[0]], round(match[1], 3), match[0]) for match in scores[:top_n] if
+                       match[1] >= cutoff]
+            results.append({'token': token, 'matches': matches})
+    elif method == 'reranker':
+        async def process_token(token):
+            scores = await ai_reranker(token, documents=terms, top_n=top_n,
+                                       model_name="BAAI/bge-reranker-v2-m3", model_id=0)
+            matches = [(match[0], round(match[1], 3), match[2]) for match in scores if
+                       match[1] >= cutoff]
+            return {'token': token, 'matches': matches}
+
+        results = await asyncio.gather(*(process_token(token) for token in query))  # [(match,score,index)]
+
     # tokens = list({match for token in query for match in difflib.get_close_matches(token, terms)})
     # match, score = process.extractOne(token, terms)
     # results.append({'token': token, 'match': match, 'score': score})
-    results = []
-    if platform == 'levenshtein_0':
-        results = [{'token': token, 'matchs': rapidfuzz.process.extract(token, terms, limit=top_n, score_cutoff=cutoff)}
-                   for token in query]
-    elif platform == 'levenshtein_1':
-        for token in query:
-            matches = difflib.get_close_matches(token, terms, n=top_n, cutoff=cutoff / 100)
-            matches = [(match, round(difflib.SequenceMatcher(None, token, match).ratio() * 100, 3)) for match in
-                       matches]
-            results.append({'token': token, 'matchs': matches})
-
     return JSONResponse(content=results, media_type="application/json; charset=utf-8")
     # Response(content=list_to_xml('results', results), media_type='application/xml; charset=utf-8')
 
 
-@app.post("/text/")  # , response_model=OpenAIResponse
+@app.get("/nlp/")
+async def nlp():
+    return {"message": "ok"}
+
+
+@app.post("/llm")  # response_model=OpenAIResponse
 async def generate_text(request: CompletionRequest):
     # f"You asked: {query}\nHere are some search results:\n{search_summary}\nBased on these results, here's some information:\n"
     # prompt = "以下是最近的对话内容，请生成一个摘要：\n\n"  # 请根据对话内容将会议的讨论内容整理成纪要,从中提炼出关键信息,将会议内容按照主题或讨论点分组,列出决定事项和待办事项。
     # prompt += "\n".join(str(msg) for msg in conversation),"\n".join(conversation_history[-10:])
     # prompt += "\n\n摘要：",Summary
-    try:
-        if request.stream:
-            async def stream_response():
-                async for chunk in await generate_completion(
-                        prompt=request.prompt,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                        model_name=request.model_name,
-                        model_i=request.model_i,
-                        stream=True,
-                ):
-                    yield chunk
 
-            return StreamingResponse(stream_response(), media_type="text/plain")
-        else:
-            result = await generate_completion(
-                prompt=request.prompt,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                model_name=request.model_name,
-                model_i=request.model_i,
-                stream=False,
-            )
-            return {"completion": result}  # OpenAIResponse(response=generated_text)
+    if request.stream:
+        async def stream_response():
+            async for chunk in await ai_generate(
+                    prompt=request.prompt,
+                    question=request.question,
+                    suffix=request.suffix,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                    model_name=request.model_name,
+                    model_id=request.model_id,
+                    stream=True,
+            ):
+                yield chunk
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating text: {e}")
+        return StreamingResponse(stream_response(), media_type="text/plain")
+    else:
+        result = await ai_generate(
+            prompt=request.prompt,
+            question=request.question,
+            suffix=request.suffix,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            model_name=request.model_name,
+            model_id=request.model_id,
+            stream=False,
+        )
+        return {"completion": result}  # OpenAIResponse(response=generated_text)
 
 
 # ,current_user: User = Depends(get_current_user)
 @app.post("/message/")
-async def generate_message(request: OpenAIRequest, db: Session = Depends(get_db)) -> StreamingResponse or JSONResponse:
+async def generate_message(request: OpenAIRequest,
+                           db: Session = Depends(get_db)) -> StreamingResponse or JSONResponse:
     # data = await request.json()
     # print(request.__dict__)
     if not request.messages and not request.question:
         return JSONResponse(status_code=400,
-                            content={'answer': 'error', 'error': 'Please provide messages or a question to process.'})
+                            content={'answer': 'error',
+                                     'error': 'Please provide messages or a question to process.'})
 
     model_name = request.model_name
     agent = request.agent
@@ -430,7 +446,6 @@ async def generate_message(request: OpenAIRequest, db: Session = Depends(get_db)
             '4': 'json',
             '5': 'code.sql',
             '6': 'header',
-            '9': 'json',
         }
         extract = agent_format.get(agent, extract)
 
@@ -440,17 +455,17 @@ async def generate_message(request: OpenAIRequest, db: Session = Depends(get_db)
 
     system_prompt = request.prompt or System_content.get(agent, '')
     agent_funcalls = [Agent_functions.get(agent, lambda *args, **kwargs: [])]
-    model_info, payload, refer = await get_chat_payload(messages=history, user_message=user_message,
-                                                        system=system_prompt,
-                                                        temperature=request.temperature, top_p=request.top_p,
-                                                        max_tokens=request.max_tokens,
-                                                        model_name=model_name, model_id=request.model_id,
-                                                        generate_calls=agent_funcalls, keywords=request.keywords)
+    model_info, payload, refer = await get_chat_payload(
+        messages=history, user_message=user_message, system=system_prompt,
+        temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens,
+        model_name=model_name, model_id=request.model_id,
+        generate_calls=agent_funcalls, keywords=request.keywords)
 
     if request.stream:
         async def generate_stream() -> AsyncGenerator[str, None]:
             if refer:
-                first_data = json.dumps({'role': 'reference', 'content': refer}, ensure_ascii=False)  # '\n'.join(refer)
+                first_data = json.dumps({'role': 'reference', 'content': refer},
+                                        ensure_ascii=False)  # '\n'.join(refer)
                 yield f'data: {first_data}\n\n'
 
             assistant_response = []
@@ -481,6 +496,99 @@ async def generate_message(request: OpenAIRequest, db: Session = Depends(get_db)
                           current_timestamp, db, refer=refer, transform=transform, request_uuid=request.uuid)
 
         return JSONResponse({'answer': bot_response, 'refer': refer, 'transform': transform})
+
+
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    db = next(get_db())  # async for db in get_db():
+    await websocket.accept()
+    try:
+        while True:
+            request = await websocket.receive_json()  # await websocket.receive_text()
+            if not request.get('messages') and not request.get('question'):
+                await websocket.send_text(
+                    json.dumps({'error': 'Please provide messages or a question to process.'}))
+                continue
+
+            model_name = request.get('model_name', "moonshot")
+            agent = request.get('agent', '0')
+            extract = request.get('extract')
+            user_name = request.get('username')
+            user_id = request.get('user_id')
+            current_timestamp = time.time()
+
+            # 构建聊天历史记录
+            history, user_message = build_chat_history(
+                user_name, request.get('question'), user_id, request.get('filter_time', 0.0), db=db,
+                user_history=request.get('messages', []), use_hist=request.get('use_hist', False),
+                request_uuid=request.get('uuid')
+            )
+
+            # 生成系统提示和模型请求
+            system_prompt = request.get('prompt') or System_content.get(agent, '')
+            agent_funcalls = [Agent_functions.get(agent, lambda *args, **kwargs: [])]
+            model_info, payload, refer = await get_chat_payload(
+                messages=history, user_message=user_message,
+                system=system_prompt, temperature=request.get('temperature', 0.4),
+                top_p=request.get('top_p', 0.8), max_tokens=request.get('max_tokens', 1024),
+                model_name=model_name, model_id=request.get('model_id', 0),
+                generate_calls=agent_funcalls, keywords=request.get('keywords', [])
+            )
+            if request.get('stream', True):
+                async def generate_stream() -> AsyncGenerator[str, None]:
+                    if refer:
+                        first_data = json.dumps({'role': 'reference', 'content': refer}, ensure_ascii=False)
+                        yield f'data: {first_data}\n\n'
+
+                    assistant_response = []
+                    async for content in ai_chat_async(model_info, payload):
+                        if content and content.strip():
+                            yield f'data: {content}\n\n'
+                        assistant_response.append(content)
+                        await asyncio.sleep(0.01)
+
+                    bot_response = ''.join(assistant_response)
+                    transform = extract_string(bot_response, extract)
+                    last_data = json.dumps({'role': 'assistant', 'content': bot_response, 'transform': transform},
+                                           ensure_ascii=False)
+                    yield f'data: {last_data}\n\n'
+                    yield 'data: [DONE]\n\n'
+
+                    # 保存聊天记录
+                    save_chat_history(
+                        user_name, user_message, bot_response, user_id, agent,
+                        len(history), model_name, current_timestamp, db=db,
+                        refer=refer, transform=transform, request_uuid=request.get('uuid'))
+
+                # 流式传输消息到 WebSocket
+                async for stream_chunk in generate_stream():
+                    await websocket.send_text(stream_chunk)
+
+            else:  # 非流式响应处理
+                bot_response = await ai_chat(model_info, payload)
+                transform = extract_string(bot_response, extract)
+
+                # 保存聊天记录
+                save_chat_history(
+                    user_name, user_message, bot_response, user_id, agent,
+                    len(history), model_name, current_timestamp, db=db,
+                    refer=refer, transform=transform, request_uuid=request.get('uuid')
+                )
+
+                await websocket.send_text(
+                    json.dumps({'answer': bot_response, 'refer': refer, 'transform': transform}))
+                # await asyncio.sleep(0.1)
+
+            if system_prompt.lower() == "bye":
+                await websocket.send_text("Closing connection")
+                await websocket.close()
+                break
+
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        print(f"Connection error: {e}")
+        await websocket.close()
 
 
 @app.get("/get_messages")
@@ -582,7 +690,7 @@ async def get_ai_param(
         agent: Optional[str] = Query(default='0',
                                      description="Contextual identifier for different use cases, enabling selection of appropriate system behavior."),
         model_name: str = Query("moonshot",
-                                description="Specify the model to use, e.g., 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao', or custom models."),
+                                description="Specify the model to use, e.g., 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','speark','baichuan' or custom models."),
         model_id: int = Query(0,
                               description="An optional model ID for selecting different versions or configurations of a model."),
         extract: Optional[str] = Query(None,
@@ -685,21 +793,41 @@ async def get_task_status(task_id: str):
     return {"task_id": task_id, "status": task['status'], 'action': task['action']}
 
 
+@app.get("/location/")
+async def search_location(query: str, region: str = Query('', description="Region or city to limit the search"),
+                          platform: str = 'badiu'):
+    if platform == 'badiu':
+        result = await search_bmap_location(query, region) if region else get_bmap_location(query)
+    else:
+        result = await search_amap_location(query, region) if region else get_amap_location(query)
+    return {"result": result}
+
+
 @app.post("/translate")
 async def translate_text(request: TranslateRequest):
     platform = request.platform.lower()
     if platform == "baidu":
         translated_text = await baidu_translate(request.text, request.source, request.target)
         return {"platform": "Baidu", "translated": translated_text}
-
     elif platform == "tencent":
         translated_text = await tencent_translate(request.text, request.source, request.target)
         return {"platform": "Tencent", "translated": translated_text}
-
+    elif platform == "xunfei":
+        translated_text = await xunfei_translate(request.text, request.source, request.target)
+        return {"platform": "XunFei", "translated": translated_text}
     else:
-        raise HTTPException(status_code=400, detail="Unsupported platform.")
+        system_prompt = System_content.get('9')
+        translated_text = await ai_generate(
+            prompt=system_prompt,
+            question=request.text,
+            model_name=platform,
+            model_id=0,
+            stream=False,
+        )
+        if translated_text:
+            return {"platform": platform, "translated": translated_text}
 
-    return {"translation": result}
+    raise HTTPException(status_code=400, detail="Unsupported platform.")
 
 
 @app.post("/ocr")
@@ -808,7 +936,6 @@ async def text_to_audio(sentences: str, platform: str = "baidu"):
 #         # 通过 websocket 发送音频数据
 #         self.websocket.send_bytes(data)
 
-
 # @app.websocket("/ws/speech_synthesis")
 # async def websocket_speech_synthesis(websocket: WebSocket):
 #     await websocket.accept()
@@ -853,7 +980,6 @@ async def text_to_audio(sentences: str, platform: str = "baidu"):
 #         print("Client disconnected")
 
 # let socket = new WebSocket("ws://localhost:8000/ws/speech_synthesis");
-
 
 if __name__ == "__main__":
     import uvicorn

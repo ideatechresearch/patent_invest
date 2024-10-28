@@ -122,9 +122,9 @@ class ChatHistory(db.Model):
             session.commit()
 
     @classmethod
-    def user_history(cls, user_name, agent=None, filter_time=0, all_payload=True):
+    def user_history(cls, username, agent=None, filter_time=0, all_payload=True):
         query = cls.query.filter(or_(cls.agent == agent, agent is None),
-                                 cls.username == user_name, cls.timestamp > filter_time)
+                                 cls.username == username, cls.timestamp > filter_time)
         if all_payload:
             return [record.asdict() for record in query.all()]
         records = query.with_entities(cls.role, cls.content).all()

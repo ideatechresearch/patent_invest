@@ -1,7 +1,8 @@
 import httpx
 import asyncio
 import requests
-
+import websockets
+import json
 
 
 async def call_generate_stream_response(stream: bool = False):
@@ -43,6 +44,57 @@ async def call_generate_stream_response(stream: bool = False):
         print(f"Error response {exc.response.status_code} while requesting {exc.request.url!r}.")
     except Exception as exc:
         print(f"An unexpected error occurred: {exc}")
+
+
+
+async def connect_chat():
+    uri = "ws://127.0.0.1:7000/ws/chat"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            question = input("You: ")
+            if question.lower() == 'exit':
+                print("Exiting the chat.")
+                break
+            try:
+                await websocket.send(json.dumps({"question": question, "username": "test"}))
+                print("AI: ", end="")
+
+                done = False
+                while not done:
+                    response = await websocket.recv()
+                    for line in response.splitlines():  # 逐行读取流式响应
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            line_data = line.lstrip("data: ")
+
+                            # 检查是否为结束标识 [DONE]
+                            if line_data == "[DONE]":
+                                print("\nEnd.")
+                                done = True
+                                break  # 收到结束标识后，终止解析
+                            try:
+                                # 尝试将数据解析为 JSON
+                                parsed_content = json.loads(line_data)
+                                if isinstance(parsed_content, dict):
+                                    print(parsed_content.get("content", ""))
+                                    # 假设服务器发送了结束标识，跳出循环继续下一轮对话
+                                    # if parsed_content.get('role') == 'assistant':
+                                    #     print("\nEnd of response.")
+                                    #     break
+                                else:
+                                    print(f"Received non-dict content: {parsed_content}")
+
+                            except json.JSONDecodeError:
+                                # 如果 JSON 解析失败，返回原始文本数据
+                                print(line_data, end="", flush=True)
+
+            except websockets.ConnectionClosedOK:
+                print("Connection closed normally.")
+                return
+            except websockets.ConnectionClosedError as e:
+                print(f"Connection closed with error: {e}")
+                return
 
 
 def send_request(endpoint: str, data: dict):
@@ -91,7 +143,11 @@ def main():
 if __name__ == "__main__":
     # main()
 
-    asyncio.run(call_generate_stream_response(False))
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(connect_chat())
+
+    # asyncio.run(call_generate_stream_response(False))
+
     # url = "http://localhost:7000/message/"
     # request_data = {
     #     "uuid": "",
@@ -131,53 +187,52 @@ if __name__ == "__main__":
         # 添加更多数据项
     ]
 
-    # 用于存储每个任务的 taskid 和数据
-    tasks = []
-
-    # 上传每个数据并获取对应的 taskid
-    for idx, data_item in enumerate(batch_data):
-        response = requests.post("https://example.com/upload", json=data_item)
-        if response.status_code == 200:
-            taskid = response.json().get("taskid")
-            # 将taskid添加到批量数据中
-            batch_data[idx]['taskid'] = taskid
-            tasks.append({"taskid": taskid, "index": idx})
-            print(f"Uploaded data: {data_item}, Task ID: {taskid}")
-        else:
-            print(f"Failed to upload data: {data_item}")
-
-    # 循环检查每个任务的状态并获取结果
-    while tasks:
-        for task in tasks[:]:  # 使用切片来避免在迭代时修改列表
-            taskid = task['taskid']
-            status_url = "https://example.com/status/{taskid}".format(taskid=taskid)
-            result_url =  "https://example.com/result/{taskid}".format(taskid=taskid)
-
-            # 查询任务状态
-            status_response = requests.get(status_url)
-            if status_response.status_code == 200:
-                status = status_response.json().get("status")
-                print(f"Task {taskid} status: {status}")
-
-                if status == "completed":
-                    # 获取结果
-                    result_response = requests.get(result_url)
-                    if result_response.status_code == 200:
-                        result = result_response.json().get("result")
-                        print(f"Result for task {taskid}: {result}")
-
-                        # 将结果保存回对应的批量数据项
-                        batch_data[task['index']]['result'] = result
-                    else:
-                        print(f"Failed to get result for task {taskid}")
-
-                    # 移除已完成的任务
-                    tasks.remove(task)
-                elif status == "failed":
-                    print(f"Task {taskid} failed.")
-                    tasks.remove(task)
-                else:
-                    print(f"Task {taskid} is still processing.")
-            else:
-                print(f"Failed to check status for task {taskid}")
-
+    # # 用于存储每个任务的 taskid 和数据
+    # tasks = []
+    #
+    # # 上传每个数据并获取对应的 taskid
+    # for idx, data_item in enumerate(batch_data):
+    #     response = requests.post("https://example.com/upload", json=data_item)
+    #     if response.status_code == 200:
+    #         taskid = response.json().get("taskid")
+    #         # 将taskid添加到批量数据中
+    #         batch_data[idx]['taskid'] = taskid
+    #         tasks.append({"taskid": taskid, "index": idx})
+    #         print(f"Uploaded data: {data_item}, Task ID: {taskid}")
+    #     else:
+    #         print(f"Failed to upload data: {data_item}")
+    #
+    # # 循环检查每个任务的状态并获取结果
+    # while tasks:
+    #     for task in tasks[:]:  # 使用切片来避免在迭代时修改列表
+    #         taskid = task['taskid']
+    #         status_url = "https://example.com/status/{taskid}".format(taskid=taskid)
+    #         result_url =  "https://example.com/result/{taskid}".format(taskid=taskid)
+    #
+    #         # 查询任务状态
+    #         status_response = requests.get(status_url)
+    #         if status_response.status_code == 200:
+    #             status = status_response.json().get("status")
+    #             print(f"Task {taskid} status: {status}")
+    #
+    #             if status == "completed":
+    #                 # 获取结果
+    #                 result_response = requests.get(result_url)
+    #                 if result_response.status_code == 200:
+    #                     result = result_response.json().get("result")
+    #                     print(f"Result for task {taskid}: {result}")
+    #
+    #                     # 将结果保存回对应的批量数据项
+    #                     batch_data[task['index']]['result'] = result
+    #                 else:
+    #                     print(f"Failed to get result for task {taskid}")
+    #
+    #                 # 移除已完成的任务
+    #                 tasks.remove(task)
+    #             elif status == "failed":
+    #                 print(f"Task {taskid} failed.")
+    #                 tasks.remove(task)
+    #             else:
+    #                 print(f"Task {taskid} is still processing.")
+    #         else:
+    #             print(f"Failed to check status for task {taskid}")

@@ -238,13 +238,28 @@ AI_Models = [
 
     # https://cloud.siliconflow.cn/playground/chat
     {'name': 'silicon', 'type': 'default', 'api_key': '',
-     'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat",
-               "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat",
-               "Pro/THUDM/glm-4-9b-chat", "deepseek-ai/deepseek-llm-67b-chat", "deepseek-ai/DeepSeek-V2-Chat",
+     'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat", "01-ai/Yi-1.5-9B-Chat-16K",
+               "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "Pro/THUDM/glm-4-9b-chat",
+               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/deepseek-llm-67b-chat",
+               "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "Pro/OpenGVLab/InternVL2-8B",
                "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
-     'reranker': ['BAAI/bge-reranker-v2-m3'],
+     'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1'],
+     'completion': ['Qwen/Qwen2.5-Coder-7B-Instruct', "deepseek-ai/DeepSeek-V2.5",
+                    'deepseek-ai/DeepSeek-Coder-V2-Instruct'],
+     'reranker': ['BAAI/bge-reranker-v2-m3', 'netease-youdao/bce-reranker-base_v1'],
      'url': 'https://api.siliconflow.cn/v1/chat/completions',
-     'base_url': 'https://api.siliconflow.cn'},
+     'base_url': 'https://api.siliconflow.cn/v1',
+     'embeddings_url': "https://api.siliconflow.cn/v1/embeddings",
+     'rerank_url': "https://api.siliconflow.cn/v1/rerank"},
+
+    # https://platform.baichuan-ai.com/docs/api
+    {'name': 'baichuan', 'type': 'default', 'api_key': '',
+     "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', "Baichuan4",
+               "Baichuan-NPC-Turbo"],
+     "embedding": ["Baichuan-Text-Embedding"],
+     'url': 'https://api.baichuan-ai.com/v1/chat/completions',
+     'base_url': "https://api.baichuan-ai.com/v1/",  # assistants,files,threads
+     'embeddings_url': 'https://api.baichuan-ai.com/v1/embeddings'},
 ]
 
 
@@ -460,7 +475,6 @@ def forward_stream(response):
                 yield {"json": parsed_content}
             except json.JSONDecodeError:
                 yield {"text": line_data}
-
 
     # for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):  # 二进制数据
     #     for line in chunk.splitlines():

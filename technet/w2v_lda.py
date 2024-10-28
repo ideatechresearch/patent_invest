@@ -72,6 +72,8 @@ class W2vLda:
             if co_data is None:
                 co_data=patent_data['申请人'].str.split(';',expand=True).stack().str.strip().rename('Co').reset_index(level=1,drop=True)#看是否已分离公司
                 # co_data=patent_data.set_index('公开（公告）号')['申请人'].str.split(';').explode().str.strip().rename('Co')
+            else:
+                co_data.index = patent_data.index
                            
             self.group_ids = co_data.groupby(co_data).apply(lambda x: x.index.tolist()).reset_index(name='index_list')  # Co,['序号',]
             self.group_ids.to_parquet(f'data\patent_co_ids_{self.suffix}.parquet', index=False)
@@ -80,18 +82,18 @@ class W2vLda:
         elif self.suffix: #load文件
             sentences=pd.read_parquet(f'data\patent_cut_doc_{self.suffix}.parquet')#.set_index('序号')
             sentences['词语']=sentences['词语'].dropna().map(lambda x: x.tolist())
-            self.on_init(sentences)
-            self.group_ids=pd.read_parquet(f'data\patent_co_{self.suffix}.parquet')
+            self.on_init(pd.Series(sentences['词语'].dropna()))
+            self.group_ids=pd.read_parquet(f'data\patent_co_ids_{self.suffix}.parquet')
             self.group_ids['index_list']=self.group_ids['index_list'].dropna().apply(lambda x: x.tolist())
         
         
     # 中途可能推出，需要备份
-    def save(self):
-        if self.dictionary:
+    def save(self,dictionary=True, wo=True, lda=True):
+        if self.dictionary and dictionary:
             self.dictionary.save(f'data\patent_dictionary_{self.suffix}.dict')
-        if self.wo:
+        if self.wo and wo:
             self.wo.save(f'data\patent_w2v_{self.suffix}.model')
-        if self.lda:
+        if self.lda and lda:
             self.lda.save(f'data\patent_lda_{self.suffix}.model')
 
     def load(self,suffix='',dictionary=True, wo=True, lda=True):
@@ -111,7 +113,7 @@ class W2vLda:
         return self.args  # |.__dict__
 
     def on_init(self,sentences,suffix=''): #重置corpus
-        self.sentences = sentences[sentences.apply(len) >= self.args.get('count_fifter', 0)].dropna()
+        self.sentences = sentences[sentences.map(len) >= self.args.get('count_fifter', 0)].dropna()
         self.new_filter = True
         if suffix:
             self.suffix = suffix
@@ -575,47 +577,3 @@ def read2list(file, encoding='UTF-8', **kwargs):
         l = [line.strip('\n') for line in file.readlines()]
     return l
 
-
-#TF-IDF 改进
-class BM25:
-    def __init__(self, corpus, k1=1.5, b=0.75):
-        self.k1 = k1
-        self.b = b
-        self.corpus = corpus
-        self.doc_lengths = [len(doc) for doc in corpus]
-        self.avg_doc_length = sum(self.doc_lengths) / len(self.doc_lengths)
-        self.doc_count = len(corpus)
-        self.doc_term_freqs = [Counter(doc) for doc in corpus]
-        self.inverted_index = self.build_inverted_index()
-
-    def build_inverted_index(self):
-        inverted_index = {}
-        for doc_id, doc_term_freq in enumerate(self.doc_term_freqs):
-            for term, freq in doc_term_freq.items():
-                if term not in inverted_index:
-                    inverted_index[term] = []
-                inverted_index[term].append((doc_id, freq))
-        return inverted_index
-
-    def idf(self, term):
-        doc_freq = len(self.inverted_index.get(term, []))
-        if doc_freq == 0:
-            return 0
-        return math.log((self.doc_count - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0)
-
-    def bm25_score(self, query_terms, doc_id):
-        score = 0
-        doc_length = self.doc_lengths[doc_id]
-        for term in query_terms:
-            tf = self.doc_term_freqs[doc_id].get(term, 0)
-            idf = self.idf(term)
-            numerator = tf * (self.k1 + 1)
-            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / self.avg_doc_length))
-            score += idf * (numerator / denominator)
-        return score
-
-    def rank_documents(self, query):
-        query_terms = query.split()
-        scores = [(doc_id, self.bm25_score(query_terms, doc_id)) for doc_id in range(self.doc_count)]
-        sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
-        return sorted_scores

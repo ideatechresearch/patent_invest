@@ -53,17 +53,32 @@ class Config(object):
     ALIYUN_AK_ID = '***'
     ALIYUN_Secret_Key = '***'
     ALIYUN_nls_AppId = '***'
+    # https://console.cloud.tencent.com/hunyuan/api-key
     TENCENT_SecretId = '***'
     TENCENT_Secret_Key = '***'
+    TENCENT_Service_Key = '***'
+
+    # https://console.xfyun.cn/services
+    XF_AppID = '***'
+    XF_API_Key = '***'
+    XF_Secret_Key = '***'  # XF_API_Key:XF_Secret_Key
+    XF_API_Password = ['**', '', '']
+    
+    Silicon_Service_Key = '***'
     Moonshot_Service_Key = "***" 
     # https://open.bigmodel.cn/console/overview
     GLM_Service_Key = "***"
+    Baichuan_Service_Key = '***'
+    HF_Service_Key = '***'
 
     VOLCE_AK_ID = '***' 
     VOLCE_Secret_Key = '***' 
     ARK_Service_Key = '***'
 
-    Silicon_Service_Key = '***'
+    SOCKS_Proxies = {
+        'http': 'socks5://your_socks_proxy_address:port',
+        'https': 'socks5://u:p@proxy_address:port', }
+
 
 
 def md5_sign(q: str, salt: str, appid: str, secret_key: str) -> str:

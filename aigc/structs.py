@@ -86,7 +86,7 @@ class AIParams(BaseModel):
                                    description="The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
 
     model_name: str = Field("moonshot",
-                            description="Specify the name of the model to be used. It can be any available model, such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao', or other models.")
+                            description="Specify the name of the model to be used. It can be any available model, such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','speark','baichuan', or other models.")
     model_id: int = Field(0, description="Model ID to be used")
 
     keywords: Optional[List[str]] = Field(None,
@@ -107,19 +107,21 @@ class AIParams(BaseModel):
 
 
 class CompletionRequest(AIParams):
-    prompt: str
+    suffix: str = None
 
     class Config:
         json_schema_extra = {
             "example": {
-                "prompt": "请解释区块链的原理。",
-                "stream": 0,
+                'prompt': '请解释区块链的原理。',
+                "question": "",
+                "suffix": "",
+                "stream": False,
                 "temperature": 0.7,
                 "top_p": 0.8,
-                "model_name": "gpt",
+                "model_name": "silicon",
                 "model_id": 1,
                 "extract": "code.python",
-                "max_tokens": 1024
+                "max_tokens": 4096,
             }
         }
 

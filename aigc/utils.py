@@ -1,6 +1,51 @@
 import re, json
 import inspect
 import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
+from collections import OrderedDict, Counter
+import math
+import jieba
+
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.stack = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key in self.stack:
+            self.stack.move_to_end(key)
+            return self.stack[key]
+        else:
+            return None
+
+    def put(self, key, value) -> None:
+        if key in self.stack:
+            self.stack[key] = value
+            self.stack.move_to_end(key)
+        else:
+            self.stack[key] = value
+        if len(self.stack) > self.capacity:
+            self.stack.popitem(last=False)
+
+    def change_capacity(self, capacity):
+        self.capacity = capacity
+        for i in range(len(self.stack) - capacity):
+            self.stack.popitem(last=False)
+
+    def delete(self, key):
+        if key in self.stack:
+            del self.stack[key]
+
+    def keys(self):
+        return self.stack.keys()
+
+    def __len__(self):
+        return len(self.stack)
+
+    def __contains__(self, key):
+        return key in self.stack
+
 
 def get_function_parameters(func):
     signature = inspect.signature(func)
@@ -209,6 +254,7 @@ def extract_string(text, extract, **kwargs):
 
     return None
 
+
 def dict_to_xml(tag, d):
     """将字典转换为 XML 字符串"""
     elem = ET.Element(tag)
@@ -222,6 +268,7 @@ def dict_to_xml(tag, d):
             child.text = str(val)
     return ET.tostring(elem, encoding='unicode')
 
+
 def list_to_xml(tag, lst):
     """将列表转换为 XML 字符串"""
     elem = ET.Element(tag)
@@ -229,3 +276,133 @@ def list_to_xml(tag, lst):
         item_elem = ET.SubElement(elem, "item")
         item_elem.text = str(item)
     return ET.tostring(elem, encoding='unicode')
+
+
+def find_similar_word(target_keyword, tokens):
+    max_ratio = 0
+    similar_word_index = -1
+    for i, token in enumerate(tokens):
+        ratio = SequenceMatcher(None, target_keyword, token).ratio()
+        if ratio > max_ratio:
+            max_ratio = ratio
+            similar_word_index = i
+    return similar_word_index
+
+
+def contains_chinese(text):
+    # 检测字符串中是否包含中文字符
+    chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
+    return bool(chinese_pattern.search(text))
+
+
+class BM25:
+    def __init__(self, corpus, k1=1.5, b=0.75):
+        self.k1 = k1
+        self.b = b
+        self.corpus = [jieba.lcut(doc) for doc in corpus]  # 使用 jieba 对文档进行分词
+        self.doc_lengths = [len(doc) for doc in self.corpus]
+        self.avg_doc_length = sum(self.doc_lengths) / len(self.doc_lengths)
+        self.doc_count = len(self.corpus)
+        self.doc_term_freqs = [Counter(doc) for doc in self.corpus]
+        self.inverted_index = self.build_inverted_index()
+        self.idf_cache = {}  # 增加一个 IDF 缓存，提高效率
+
+    def build_inverted_index(self):
+        inverted_index = {}
+        for doc_id, doc_term_freq in enumerate(self.doc_term_freqs):
+            for term, freq in doc_term_freq.items():
+                if term not in inverted_index:
+                    inverted_index[term] = []
+                inverted_index[term].append((doc_id, freq))
+        return inverted_index
+
+    def idf(self, term):
+        if term in self.idf_cache:
+            return self.idf_cache[term]
+        doc_freq = len(self.inverted_index.get(term, []))
+        if doc_freq == 0:
+            self.idf_cache[term] = 0
+        else:
+            self.idf_cache[term] = math.log((self.doc_count - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0)
+        return self.idf_cache[term]
+
+    def bm25_score(self, query_terms, doc_id):
+        score = 0
+        doc_length = self.doc_lengths[doc_id]
+        for term in query_terms:
+            tf = self.doc_term_freqs[doc_id].get(term, 0)
+            idf = self.idf(term)
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / self.avg_doc_length))
+            score += idf * (numerator / denominator)
+        return score
+
+    def rank_documents(self, query):
+        query_terms = list(jieba.cut(query))  # 对查询进行分词
+        scores = [(doc_id, self.bm25_score(query_terms, doc_id)) for doc_id in range(self.doc_count)]
+        return sorted(scores, key=lambda x: x[1], reverse=True)
+
+
+# class BM25:
+#     def __init__(self, corpus, k1=1.5, b=0.75):
+#         self.k1 = k1
+#         self.b = b
+#         self.corpus = [list(jieba.cut(doc)) for doc in corpus]  # doc.split()
+#         self.N = len(self.corpus)  # 语料库中文档总数
+#         self.avgdl = sum(len(doc) for doc in self.corpus) / self.N  # 文档的平均长度
+#         self.df = self._calculate_df()  # 每个词项的文档频率
+#         self.idf = self._calculate_idf()  # 每个词项的逆文档频率
+#
+#     def _calculate_df(self):
+#         """计算词项的文档频率"""
+#         df = {}
+#         for doc in self.corpus:
+#             unique_words = set(doc)
+#             for word in unique_words:
+#                 df[word] = df.get(word, 0) + 1
+#         return df
+#
+#     def _calculate_idf(self):
+#         """计算词项的逆文档频率"""
+#         idf = {}
+#         for word, freq in self.df.items():
+#             idf[word] = math.log((self.N - freq + 0.5) / (freq + 0.5) + 1)
+#         return idf
+#
+#     def _score(self, query, doc):
+#         """计算单个文档对查询的 BM25 得分"""
+#         score = 0.0
+#         doc_len = len(doc)
+#         term_frequencies = Counter(doc)
+#         for word in query:
+#             if word in term_frequencies:
+#                 freq = term_frequencies[word]
+#                 numerator = self.idf.get(word, 0) * freq * (self.k1 + 1)
+#                 denominator = freq + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl)
+#                 score += numerator / denominator
+#         return score
+#
+#     def get_scores(self, query):
+#         """计算语料库中每个文档对查询的 BM25 得分"""
+#         query = list(jieba.cut(query))  # 使用 jieba 对查询进行分词
+#         scores = []
+#         for doc in self.corpus:
+#             scores.append(self._score(query, doc))
+#         return scores
+
+if __name__ == "__main__":
+    # from rank_bm25 import BM25Okapi
+    jieba.initialize()
+    # jieba.load_userdict('data/patent_thesaurus.txt')
+    corpus = [
+            "快速的棕色狐狸跳过了懒狗",
+            "懒狗躺下了",
+            "狐狸很快速并且跳得很高",
+            "快速的棕色狐狸",
+            "猫跳过了狗"
+        ]
+    query = "快速的狐狸"
+    bm25 = BM25(corpus)
+    scores = bm25.rank_documents(query)
+    print(scores, bm25.corpus)
+    # print(BM25(corpus).rank_documents(query))

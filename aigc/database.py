@@ -344,5 +344,4 @@ class OperationMysql:
 #             cls.update_task_status(session, task_id, TaskStatus.FAILED)
 if __name__ == "__main__":
     with OperationMysql(host="localhost", user="root", password="password", db_name="test_db") as db:
-        result = db.search("SELECT * FROM my_table")
-        print(result)
+        print(db.search("SELECT * FROM my_table"))

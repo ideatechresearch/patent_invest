@@ -34,6 +34,22 @@
             overflow-y: auto;
         }
 
+        @media (max-width: 768px) {
+            .chat-container {
+                position: absolute; /*fixed,relative 固定在视口 */
+                width: 99vw; /* 确保在手机上宽度为视口宽度 */
+                max-width: 100vw;
+                left: 0;/* margin-left: -20px;*/
+                border-radius: 0; /* 移动设备上取消圆角 */
+                box-shadow: none; /* 去掉阴影 */
+            }
+
+            .chat-box {
+                padding: 7px; /* 在移动端保留合适的间距 */
+                font-size: 1.2rem; /* 增大字体以便在手机上阅读 */
+            }
+        }
+
         .message {
             /* display: flex;
             flex-direction: column; */
@@ -243,88 +259,90 @@
             pointer-events: auto;
             opacity: 1;
         }
+
+
     </style>
 </head>
 
 <body>
-    {% include 'navbar.html' %}
-    <div id="zoomBtn">Zoom</div>
+{% include 'navbar.html' %}
+<div id="zoomBtn">Zoom</div>
 
-    <label for="topn">检索数量:</label>
-    <select name="topn" id="topn" class="selectBox group6">
-        {% for i in range(1, 33) %}
-        <option value="{{i}}" {% if i==10 %}selected{% endif %}>{{i}}</option>
-        {% endfor %}
-    </select>
+<label for="topn">检索数量:</label>
+<select name="topn" id="topn" class="selectBox group6">
+    {% for i in range(1, 33) %}
+    <option value="{{i}}" {% if i==10 %}selected{% endif %}>{{i}}</option>
+    {% endfor %}
+</select>
 
-    <label for="depth">检索深度:</label>
-    <select name="depth" id="depth" class="selectBox group6">
-        {% for i in range(0, 4) %}
-        <option value="{{i}}" {% if i==1 %}selected{% endif %}>{{i}}</option>
-        {% endfor %}
-    </select>
+<label for="depth">检索深度:</label>
+<select name="depth" id="depth" class="selectBox group6">
+    {% for i in range(0, 4) %}
+    <option value="{{i}}" {% if i==1 %}selected{% endif %}>{{i}}</option>
+    {% endfor %}
+</select>
 
-    <label for="score_threshold">得分阈值:</label>
-    <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0.6"
-        style="width: 50px;">
+<label for="score_threshold">得分阈值:</label>
+<input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0.6"
+       style="width: 50px;">
 
-    <label for="temperature">温度系数:</label>
-    <input type="number" id="temperature" name="temperature" min="0" max="0.99" step="0.01" value="0.4"
-        style="width: 50px;">
+<label for="temperature">温度系数:</label>
+<input type="number" id="temperature" name="temperature" min="0" max="0.99" step="0.01" value="0.4"
+       style="width: 50px;">
 
-    <label for="stream">流式输出:</label>
-    <select name="stream" id="stream" class="selectBox group6">
-        <option value="0">False</option>
-        <option value="1" selected>True</option>
-    </select>
+<label for="stream">流式输出:</label>
+<select name="stream" id="stream" class="selectBox group6">
+    <option value="0">False</option>
+    <option value="1" selected>True</option>
+</select>
 
-    <label for="agent">代理角色:</label>
-    <select name="agent" id="agent" class="selectBox group6">
-        {% for agent in agents %}
-        <option value="{{ agent.value }}" {% if agent.value=='0' %}selected{% endif %}>{{ agent.name }}</option>
-        {% endfor %}
-    </select>
+<label for="agent">代理角色:</label>
+<select name="agent" id="agent" class="selectBox group6">
+    {% for agent in agents %}
+    <option value="{{ agent.value }}" {% if agent.value=='0' %}selected{% endif %}>{{ agent.name }}</option>
+    {% endfor %}
+</select>
 
-    <label for="model">语言模型:</label>
-    <select name="model" id="model" class="selectBox group6">
-        {% for model in models %}
-        <option value="{{ model.value }}" {% if model.value=='qwen' %}selected{% endif %}>{{ model.name }}</option>
-        {% endfor %}
-    </select>
+<label for="model">语言模型:</label>
+<select name="model" id="model" class="selectBox group6">
+    {% for model in models %}
+    <option value="{{ model.value }}" {% if model.value=='qwen' %}selected{% endif %}>{{ model.name }}</option>
+    {% endfor %}
+</select>
 
-    <button type="button" id="clean">清空上下文</button>
-    <button type="button" id="save" class="submitButton" data-group="group6">保存参数</button>
+<button type="button" id="clean">清空上下文</button>
+<button type="button" id="save" class="submitButton" data-group="group6">保存参数</button>
 
-    <div class="header-container">
-        <h1>AIGC</h1>
-        {% if username %}
-        <p>{{ username }}</p>
-        {% elif uuid %}
-        <p>{{ uuid }}</p>
-        {% endif %}
+<div class="header-container">
+    <h1>AIGC</h1>
+    {% if username %}
+    <p>{{ username }}</p>
+    {% elif uuid %}
+    <p>{{ uuid }}</p>
+    {% endif %}
+</div>
+
+<div class="chat-container">
+    <div class="chat-box" id="chat-box">
+        <div class="message ai-message">
+            Hello! How can I help you today?
+        </div>
+        <!-- <div class="message user-message">
+            I'm looking for information on creating a chat interface.
+        </div> -->
+        <!-- More messages can be added here -->
+        <!-- <img src="https://via.placeholder.com/150" alt="Example Image" /> -->
     </div>
-
-    <div class="chat-container">
-        <div class="chat-box" id="chat-box">
-            <div class="message ai-message">
-                Hello! How can I help you today?
-            </div>
-            <!-- <div class="message user-message">
-                I'm looking for information on creating a chat interface.
-            </div> -->
-            <!-- More messages can be added here -->
-            <!-- <img src="https://via.placeholder.com/150" alt="Example Image" /> -->
-        </div>
-        <div class="loading-bar" id="loading-bar">
-            <div class="progress"></div>
-        </div>
-        <div class="input-box">
-            <textarea id="chat-input" rows="3" placeholder="Your message here..."></textarea>
-            <button id="send-button">Send</button>
-        </div>
+    <div class="loading-bar" id="loading-bar">
+        <div class="progress"></div>
     </div>
-    <!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
-    <script>
+    <div class="input-box">
+        <textarea id="chat-input" rows="3" placeholder="Your message here..."></textarea>
+        <button id="send-button">Send</button>
+    </div>
+</div>
+<!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
+<script>
         const username = '{{ username }}' || localStorage.getItem('username');
         const uuid = '{{ uuid }}' || localStorage.getItem('uuid');
 
@@ -408,7 +426,6 @@
             input.value = '';
             const chatBox = document.getElementById('chat-box');
             const filterTimestamp = chatBox.getAttribute('data-timestamp') || localStorage.getItem('ChatCleanTime') || 0;
-            const agent = document.getElementById("agent").value;
             const params = {
                 username: username, uuid: uuid,
                 question: message,//encodeURIComponent()
@@ -421,7 +438,7 @@
                 filter_time: parseInt(filterTimestamp, 10)
             };
             let task_id = null;
-            if (agent === '0' || (!username && !uuid)) {
+            if (!username && !uuid) {
                 let history = Array.from(chatBox.children).map(messageDiv => ({
                     role: messageDiv.classList.contains('user-message') ? 'user' : 'assistant',
                     content: messageDiv.textContent//element.innerText
@@ -691,7 +708,9 @@
         }
 
         //document.addEventListener('DOMContentLoaded', loadMessages);
-    </script>
+
+
+</script>
 
 </body>
 

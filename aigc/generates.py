@@ -1,8 +1,10 @@
 import httpx
 import asyncio
+from pathlib import Path
 from typing import List, Any, Callable
 import random, time
 from openai import OpenAI, Completion
+# import qianfan
 import dashscope
 from dashscope.audio.tts import ResultCallback, SpeechSynthesizer
 from dashscope.audio.asr import Recognition, Transcription
@@ -14,76 +16,122 @@ AI_Models = [
     # https://platform.moonshot.cn/console/api-keys
     {'name': 'moonshot', 'type': 'default', 'api_key': '',
      "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
-     'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1"},
+     'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1",
+     'file_url': "https://api.moonshot.cn/v1/files"},
     # https://open.bigmodel.cn/console/overview
     {'name': 'glm', 'type': 'default', 'api_key': '',
-     "model": ["glm-4-air", "glm-4-flash", "glm-4-air", "glm-4", "glm-4v", "glm-4-0520"],
+     "model": ["glm-4-air", "glm-4-flash", "glm-4-air", "glm-4", 'glm-4-plus', "glm-4v", "glm-4-0520"],
+     "embedding": ["embedding-2", "embedding-3"],
      'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-     'base_url': "https://open.bigmodel.cn/api/paas/v4/"},
+     'base_url': "https://open.bigmodel.cn/api/paas/v4/",
+     'embedding_url': 'https://open.bigmodel.cn/api/paas/v4/embeddings',
+     'tool_url': "https://open.bigmodel.cn/api/paas/v4/tools"},
+    # https://platform.baichuan-ai.com/docs/api
+    {'name': 'baichuan', 'type': 'default', 'api_key': '',
+     "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', "Baichuan4",
+               "Baichuan-NPC-Turbo"],
+     "embedding": ["Baichuan-Text-Embedding"],
+     'url': 'https://api.baichuan-ai.com/v1/chat/completions',
+     'base_url': "https://api.baichuan-ai.com/v1/",  # assistants,files,threads
+     'embedding_url': 'https://api.baichuan-ai.com/v1/embeddings'},
     # https://dashscope.console.aliyun.com/overview
+    # https://bailian.console.aliyun.com/#/home
+    # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
     {'name': 'qwen', 'type': 'default', 'api_key': '',
      "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
-               'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max"],  # "qwen-vl-plus"
+               'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max",
+               'baichuan2-7b-chat-v1', 'baichuan2-turbo', 'abab6.5s-chat', 'chatglm3-6b'],  # "qwen-vl-plus"
+     'generation': ['dolly-12b-v2', 'baichuan2-7b-chat-v1', 'belle-llama-13b-2m-v1', 'billa-7b-sft-v1'],
      'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
      'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
+     'generation_url': 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
+     'embedding_url': 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding'},
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t#%E8%AF%B7%E6%B1%82%E8%AF%B4%E6%98%8E
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/mlm0nonsv#%E5%AF%BC%E5%85%A5hf%E7%B3%BB%E5%88%97%E6%A8%A1%E5%9E%8B
     {'name': 'ernie', 'type': 'baidu', 'api_key': '',
      "model": ["ERNIE-4.0-8K", "ERNIE-3.5-8K", "ERNIE-4.0-8K", "ERNIE-4.0-8K-Preview", "ERNIE-4.0-8K-Latest",
                "ERNIE-3.5-128K"],
      'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions_pro",
-     'base_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/"},
+     'base_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
+     },
+    # https://console.bce.baidu.com/qianfan/ais/console/onlineService
     # https://console.bce.baidu.com/ai/#/ai/nlp/overview/index
     {'name': 'baidu', 'type': 'baidu', 'api_key': '',
-     "model": ["txt_mone", "address", "simnet", "word_emb_sim", "ecnet", "text_correction", "keyword", "topic"],
-     "completions": ['sqlcoder_7b', 'CodeLlama-7b-Instruct', 'Yi-34B'],
-     'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/completions",
-     'base_url': "https://aip.baidubce.com/rpc/2.0/nlp/v1/"},
-    {'name': 'llama', 'type': 'baidu', 'api_key': '',
-     'model': ['llama_3_8b', 'Qianfan-Chinese-Llama-2-7B', 'Qianfan-Chinese-Llama-2-7B-32K', 'llama_3_8b',
-               'Llama-2-13B-Chat', 'ChatGLM3-6B', 'ChatGLM2-6B-32K', 'ChatGLM3-6B-32K', 'Baichuan2-7B-Chat',
-               'Baichuan2-13B-Chat'],
+     'model': ['llama_3_8b', 'Qianfan-Chinese-Llama-2-7B', 'Qianfan-Chinese-Llama-2-7B-32K',
+               'Llama-2-7B-Chat', 'llama_3_8b', 'Llama-2-13B-Chat', 'Llama-2-70B-Chat',
+               'ChatGLM3-6B', 'ChatGLM2-6B-32K', 'ChatGLM3-6B-32K',
+               'Baichuan2-7B-Chat', 'Baichuan2-13B-Chat', 'Fuyu-8B', 'Yi-34B-Chat',
+               'BLOOMZ-7B', 'Qianfan-BLOOMZ-7B-compressed'],
+     "generation": ['sqlcoder_7b', 'CodeLlama-7b-Instruct', 'Yi-34B'],
+     'embedding': ['bge_large_zh'],
+     "nlp": ["txt_mone", "address", "simnet", "word_emb_sim", "ecnet", "text_correction", "keyword", "topic"],
      'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
+     'generation_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/completions",
+     'embedding_url': 'https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/embeddings',
+     'nlp_url': "https://aip.baidubce.com/rpc/2.0/nlp/v1/",
      'base_url': ''},
     # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
     # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
     {'name': 'doubao', 'type': 'default', 'api_key': '',
      "model": ['ep-20240919160005-chzhb', 'ep-20240919160119-7rbsn', 'ep-20240919160005-chzhb',
-               'ep-20240919161410-7k5d8'],
-     # ["doubao-pro-32k", "doubao-lite-4k", "doubao-lite-32k", "doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k"],
+               'ep-20240919161410-7k5d8', 'ep-20241017105930-drfm8', 'ep-20241017110248-fr7z6'],
+     # ["doubao-pro-32k", "doubao-lite-4k", "doubao-lite-32k", "doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k","GLM3-130B",chatglm3-130-fin],
      'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-     'base_url': "https://ark.cn-beijing.volces.com"},  # open.volcengineapi.com
+     'base_url': "https://ark.cn-beijing.volces.com/api/v3"},  # open.volcengineapi.com
     # https://cloud.tencent.com/document/product/1729
-    {'name': 'hunyuan', 'type': 'tencent', 'api_key': '', 'model': ["hunyuan-pro", 'hunyuan-functioncall'],
-     'url': 'https://hunyuan.tencentcloudapi.com',
-     'base_url': 'hunyuan.ap-shanghai.tencentcloudapi.com'},
+    {'name': 'hunyuan', 'type': 'tencent', 'api_key': '',
+     'model': ["hunyuan-pro", "hunyuan-lite", "hunyuan-turbo", "hunyuan-code", 'hunyuan-functioncall'],
+     'embedding': ['hunyuan-embedding'],
+     'url': 'https://hunyuan.tencentcloudapi.com',  # 'hunyuan.ap-shanghai.tencentcloudapi.com'
+     'base_url': "https://api.hunyuan.cloud.tencent.com/v1",
+     'embedding_url': "https://api.hunyuan.cloud.tencent.com/v1/embeddings",
+     'nlp_url': "nlp.tencentcloudapi.com"},
     # https://cloud.siliconflow.cn/playground/chat
     {'name': 'silicon', 'type': 'default', 'api_key': '',
      'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat",
-               "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat",
-               "Pro/THUDM/glm-4-9b-chat", "deepseek-ai/deepseek-llm-67b-chat", "deepseek-ai/DeepSeek-V2-Chat",
+               "Qwen/Qwen2.5-Coder-7B-Instruct",
+               "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "Pro/THUDM/glm-4-9b-chat",
+               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/DeepSeek-Coder-V2-Instruct",
+               "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "Pro/OpenGVLab/InternVL2-8B",
+               "01-ai/Yi-1.5-9B-Chat-16K", 'TeleAI/TeleChat2',
                "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
-     'reranker': ['BAAI/bge-reranker-v2-m3'],
+     'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1'],
+     'generation': ['Qwen/Qwen2.5-Coder-7B-Instruct', "deepseek-ai/DeepSeek-V2.5",
+                    'deepseek-ai/DeepSeek-Coder-V2-Instruct'],
+     'reranker': ['BAAI/bge-reranker-v2-m3', 'netease-youdao/bce-reranker-base_v1'],
      'url': 'https://api.siliconflow.cn/v1/chat/completions',
-     'base_url': 'https://api.siliconflow.cn'},
+     'base_url': 'https://api.siliconflow.cn/v1',
+     'embedding_url': "https://api.siliconflow.cn/v1/embeddings",
+     'reranker_url': "https://api.siliconflow.cn/v1/rerank"},
+    # https://console.xfyun.cn/services/sparkapiCenter
+    {'name': 'speark', 'type': 'default', 'api_key': [],
+     'model': ['pro', 'lite', 'max-32k', 'pro', 'pro-128k', '4.0Ultra', 'generalv3', 'generalv3.5'],
+     'url': 'https://spark-api-open.xf-yun.com/v1/chat/completions',
+     'base_url': 'https://spark-api-open.xf-yun.com/v1',
+     'embedding_url': 'https://emb-cn-huabei-1.xf-yun.com/',
+     'translation_url': 'https://itrans.xf-yun.com/v1/its',
+     'ws_url': 'wss://spark-api.xf-yun.com/v3.5/chat'},
     {'name': 'gpt', 'type': 'default', 'api_key': '', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
-     'completion': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
+     'generation': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
      'embedding': ["text-embedding-ada-002", "text-search-ada-doc-001", "text-similarity-babbage-001",
                    "code-search-ada-code-001", "search-babbage-text-001"],
      'url': 'https://api.openai.com/v1/chat/completions',
-     'embeddings_url': 'https://api.openai.com/v1/embeddings',
+     'embedding_url': 'https://api.openai.com/v1/embeddings',
      'base_url': "https://api.openai.com/v1",
      },
 ]
-# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon
+# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,speark,baichuan
 API_KEYS = {
     'moonshot': Config.Moonshot_Service_Key,
     'glm': Config.GLM_Service_Key,
     'qwen': Config.DashScope_Service_Key,
     'doubao': Config.ARK_Service_Key,
     'silicon': Config.Silicon_Service_Key,
+    'speark': Config.XF_API_Password,
+    'baichuan': Config.Baichuan_Service_Key,
+    'hunyuan': Config.TENCENT_Service_Key
 }
 AI_Client = {}
 
@@ -94,7 +142,7 @@ def init_ai_clients(api_keys=API_KEYS):
         api_key = api_keys.get(model_name)
         if api_key:
             model['api_key'] = api_key
-            if model_name in ('moonshot', 'glm', 'qwen', 'silicon'):  # OpenAI_Client
+            if model_name in ('moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan'):  # OpenAI_Client
                 AI_Client[model_name] = OpenAI(api_key=api_key, base_url=model['base_url'])
 
 
@@ -170,24 +218,7 @@ System_content = {'0': '你是一个知识广博且乐于助人的助手，擅�
                         '2、信息完整: 确保每个句子的核心信息清晰明确，对于过于简短或含糊的句子进行适当扩展，丰富细节。'
                         '3、信息延展: 在不偏离原意的前提下，适当丰富或补充内容，使信息更加明确。'
                         '4、段落整合: 将相关内容整合成连贯的段落，确保各句之间有逻辑关系，避免信息碎片化，避免信息孤立和跳跃。'),
-                  '9': ('你是一位名片助手，请根据以下信息生成一张个人名片。生成一张简洁、专业的名片，适合与他人分享，并附带企业介绍，确保信息完善准确并结构化。'
-                        '如果某个类别信息不完整或缺失时，不做推测或补充，返回空字符串，不生成子内容或嵌套结构。'
-                        '以下是输出格式：'
-                        '{"personal_info": {'
-                        '"name": 姓名,'
-                        '"position": 岗位,'
-                        '"phone": 手机号,'
-                        '"email": 邮箱,'
-                        '"bio": 个人简介,'
-                        '"achievements": 个人所获成就'
-                        '},'
-                        '"company_info": {'
-                        '"name": 企业名称,'
-                        '"address": 企业地址,'
-                        '"about": 企业简介,帮助他人更好了解公司,'
-                        '"products": 公司主要产品介绍'
-                        '}}'),
-                  '10': "将英文单词转换为包括中文翻译、英文释义和一个例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。"
+                  '9': "将英文转换为包括中文翻译、英文释义和一个例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。"
                   }
 
 AI_Tools = [
@@ -196,9 +227,26 @@ AI_Tools = [
         "function": {
             "name": "get_current_time",
             "description": "当你想知道现在的时间时非常有用。",
-            "parameters": {}  # 因为获取当前时间无需输入参数，因此parameters为空字典
+            "parameters": {}  # 此处是函数参数相关描述, 因为获取当前时间无需输入参数，因此parameters为空字典
         }
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'get_weather',
+            'description': 'Get the current weather for a given city.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'city': {
+                        'type': 'string',
+                        'description': 'The name of the city to query weather for.',
+                    },
+                },
+                'required': ['city'],
+            },
+        }
+    }
 ]
 
 
@@ -208,19 +256,74 @@ def get_current_time():
     return f"当前时间：{formatted_time}。"
 
 
-def ai_tool_response(messages, model_name='moonshot', model_id=-1):
+def get_weather(city: str):
+    # 使用 WeatherAPI 的 API 来获取天气信息
+    api_key = Config.Weather_Service_Key
+    base_url = "http://api.weatherapi.com/v1/current.json"
+    params = {
+        'key': api_key,
+        'q': city,
+        'aqi': 'no'  # 不需要空气质量数据
+    }
+    response = requests.get(base_url, params=params)
+
+    if response.status_code == 200:
+        data = response.json()
+        weather = data['current']['condition']['text']
+        temperature = data['current']['temp_c']
+        return f"The weather in {city} is {weather} with a temperature of {temperature}°C."
+    else:
+        return f"Could not retrieve weather information for {city}."
+
+
+def ai_tool_response(messages, model_name='moonshot', model_id=-1, top_p=0.95, temperature=0.01):
     model_info, name = find_ai_model(model_name, model_id)
     client = AI_Client.get(model_info['name'], None)
     if client:
         completion = client.chat.completions.create(
             model=name,
             messages=messages,
-            tools=AI_Tools
+            tools=AI_Tools,
+            # tool_choice="auto",
+            temperature=temperature,
+            top_p=top_p,
         )
-        return completion.model_dump()  # response['choices'][0]['message']
+        return completion.choices[0].message  # response['choices'][0]['message']
+        # return completion.model_dump()
 
 
-def ai_embeddings(inputs, model_name='qwen', model_id=0):
+def ai_tools_messages(response_message):
+    tool_calls = response_message.tool_calls
+    messages = [response_message]
+    for tool_func in tool_calls:
+        func_name = tool_func.function.name  # function_name
+        func_args = tool_func.function.arguments  # function_args = json.loads(tool_call.function.arguments)
+        try:
+            func_out = eval(f'{func_name}(**{func_args})')
+            messages.append({
+                'role': 'tool',
+                'content': f'{func_out}',
+                'tool_call_id': tool_func.id
+            })
+        except:
+            pass
+    return messages  # [*tool_mmessages,]
+
+
+def ai_files_messages(files: List[str], model_name='moonshot'):
+    client = AI_Client.get(model_name, None)
+    messages = []
+    for file in files:
+        file_object = client.files.create(file=Path(file), purpose="file-extract")
+        file_content = client.files.content(file_id=file_object.id).text
+        messages.append({
+            "role": "system",
+            "content": file_content,
+        })
+    return messages
+
+
+async def ai_embeddings(inputs, model_name='qwen', model_id=0):
     model_info, name = find_ai_model(model_name, model_id, 'embedding')
     if not name:
         return []
@@ -235,45 +338,116 @@ def ai_embeddings(inputs, model_name='qwen', model_id=0):
 
         return [item.embedding for item in completion.data]
         # data = json.loads(completion.model_dump_json()
+
+    # dashscope.TextEmbedding.call
+    url = model_info['embedding_url']
+    api_key = model_info['api_key']
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "input": inputs,
+        "model": name,
+        "encoding_format": "float"
+    }
+    max_batch_size = 16  # DASHSCOPE_MAX_BATCH_SIZE = 25
+    embeddings = []
+    async with httpx.AsyncClient() as cx:
+        try:
+            if isinstance(inputs, str) or (isinstance(inputs, list) and len(inputs) < max_batch_size):
+                response = await cx.post(url, headers=headers, json=payload)
+                data = response.json().get('data')
+                embeddings = [emb.get('embedding') for emb in data]
+            elif isinstance(inputs, list):
+                for i in range(0, len(inputs), max_batch_size):
+                    batch = inputs[i:i + max_batch_size]
+                    payload["input"] = batch  # {"texts":batch}
+                    response = await cx.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    data = response.json().get('data')  # "output"
+                    if data and len(data) == len(batch):
+                        embeddings += [emb.get('embedding') for emb in data]
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            print(exc)
+
+    return embeddings
+
+
+async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="BAAI/bge-reranker-v2-m3", model_id=0):
+    model_info, name = find_ai_model(model_name, model_id, 'reranker')
+    if not name:
+        return []
+    url = model_info['reranker_url']
+    api_key = model_info['api_key']
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "query": query,
+        "model": name,
+        "documents": documents,
+        "top_n": top_n,
+        "return_documents": True,
+    }
+    async with httpx.AsyncClient() as cx:
+        response = await cx.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            results = response.json().get('results')
+            matches = [(match.get("document")["text"], match["relevance_score"], match["index"]) for match in results]
+            return matches
+        else:
+            print(response.text)
     return []
 
 
-async def get_chat_payload(messages, user_message: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
-                           max_tokens: int = 1024, model_name='moonshot', model_id=0,
-                           generate_calls: List[Callable[[str], Any]] = lambda x: [],
-                           keywords: List[str] = None, **kwargs):
-    model_info, name = find_ai_model(model_name, model_id, 'model')
-    model_type = model_info['type']
+# 生成:conversation or summary
+async def ai_generate(prompt: str, question: str = '', suffix: str = None, stream=False, temperature=0.7,
+                      max_tokens=4096, model_name='silicon', model_id=0):
+    model_info, name = find_ai_model(model_name, model_id, "generation")
+    if not name:
+        return ai_chat(messages=None, user_message=question, system=prompt, temperature=temperature,
+                       max_tokens=max_tokens, top_p=0.8, model_name=model_name, model_id=model_id)
 
-    if isinstance(messages, list) and messages:
-        if model_type in ('baidu', 'tencent'):
-            if messages[0].get('role') != 'user':  # user（tool）
-                del messages[0]  # the role of first message must be user
+    if question:
+        prompt += '\n\n' + question
 
-        if model_type != 'baidu' and system:
-            messages.insert(0, {"role": "system", "content": system})
-            # messages[-1]['content'] = messages[0]['content'] + '\n' + messages[-1]['content']
+    if model_info['name'] == 'qwen':
+        response = dashscope.Generation.call(model=name, prompt=prompt)
+        return response.output.text
 
-        if user_message:
-            if messages[-1]["role"] != 'user':
-                messages.append({'role': 'user', 'content': user_message})
-            else:
-                pass  # messages[-1]['content'] = user_message
-        else:
-            if messages[-1]["role"] == 'user':
-                user_message = messages[-1]["content"]
-    else:
-        if model_type != 'baidu':
-            messages = [{"role": "system", "content": system}]
-        messages.append({'role': 'user', 'content': user_message})
+    client = AI_Client.get(model_info['name'], None)
+    response = client.completions.create(
+        # engine=name,
+        model=name,
+        prompt=prompt,
+        suffix=suffix,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stream=stream,
+        # n=1,
+        stop=None,
+    )
+    if stream:
+        async def stream_data():
+            for chunk in response:
+                yield chunk.choices[0].text
 
+        return stream_data()
+
+    return response.choices[0].text.strip()
+
+
+async def retrieved_reference(user_message: str, keywords: List[str] = None,
+                              generate_calls: List[Callable[[str], Any]] = lambda x: [], **kwargs):
     # Assume this is the document retrieved from RAG
     # function_call = Agent_functions.get(agent, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
-    if generate_calls is None:
-        generate_calls = []
 
-    if keywords and not any(callable(func) for func in generate_calls if func is not None):  # not in agent_funcalls
+    generate_calls = generate_calls or []
+    if keywords and all(not (callable(func) and func.__name__ == '<lambda>' and func()) for func in
+                        generate_calls):  # not in agent_funcalls
         generate_calls.append(web_search_async)
 
     async def wrap_sync(func, *args, **kwargs):
@@ -281,32 +455,96 @@ async def get_chat_payload(messages, user_message: str, system: str = '', temper
 
     tasks = []
     items_to_process = keywords if keywords else [user_message]  # ','.join(keywords)
-    for func in generate_calls:
-        if not callable(func):
-            print(getattr(func, '__name__', 'Unknown function'))
+
+    for func in filter(callable, generate_calls):
+        if func.__name__ == '<lambda>' and func() == []:  # empty_lambda
             continue
-        for w in items_to_process:
+        for item in items_to_process:
             if inspect.iscoroutinefunction(func):
-                tasks.append(func(w, **kwargs))
+                tasks.append(func(item, **kwargs))
             else:
-                tasks.append(wrap_sync(func, w, **kwargs))
+                tasks.append(wrap_sync(func, item, **kwargs))
 
     refer = await asyncio.gather(*tasks)  # gather 收集所有异步调用的结果
+    return [item for sublist in refer for item in sublist]  # 展平嵌套结果
 
+
+async def get_chat_payload(messages, user_message: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
+                           max_tokens: int = 1024, model_name='moonshot', model_id=0,
+                           generate_calls: List[Callable[[str], Any]] = lambda x: [],
+                           keywords: List[str] = None, images: List[str] = None, **kwargs):
+    model_info, name = find_ai_model(model_name, model_id, 'model')
+    model_type = model_info['type']
+
+    if isinstance(messages, list) and messages:
+        if model_type in ('baidu', 'tencent'):
+            if messages[0].get('role') == 'system':
+                system = messages[0].get('content')
+                del messages[0]
+
+            # the role of first message must be user
+            if messages[0].get('role') != 'user':  # user（tool）
+                messages.insert(0, {'role': 'user', 'content': user_message or '请问您有什么问题？'})
+
+            # 确保 user 和 assistant 消息交替出现
+            for i, message in enumerate(messages[:-1]):
+                next_message = messages[i + 1]
+                if message['role'] == next_message['role']:  # messages.insert(0, messages.pop(i))
+                    if i % 2 == 0:
+                        if message['role'] == 'user':
+                            messages.insert(i + 1, {'role': 'assistant', 'content': '这是一个默认的回答。'})
+                        else:
+                            messages.insert(i + 1, {'role': 'user', 'content': '请问您有什么问题？'})
+                    else:
+                        del messages[i + 1]
+
+        if model_type != 'baidu' and system:
+            if messages[0].get('role') != 'system':
+                messages.insert(0, {"role": "system", "content": system})
+            # messages[-1]['content'] = messages[0]['content'] + '\n' + messages[-1]['content']
+
+        if user_message:
+            if messages[-1]["role"] != 'user':
+                messages.append({'role': 'user', 'content': user_message})
+            else:
+                pass
+                # if messages[-1]["role"] == 'user':
+                #     messages[-1]['content'] = user_message
+        else:
+            if messages[-1]["role"] == 'user':
+                user_message = messages[-1]["content"]
+    else:
+        if messages is None:
+            messages = []
+        if model_type != 'baidu' and system:
+            messages = [{"role": "system", "content": system}]
+        messages.append({'role': 'user', 'content': user_message})
+
+    refer = await retrieved_reference(user_message, keywords, generate_calls, **kwargs)
     if refer:
-        refer = [item for sublist in refer for item in sublist]
-        messages[-1]['content'] = f'参考材料:\n{refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}'
+        formatted_refer = '\n'.join(map(str, refer))
+        messages[-1][
+            'content'] = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}'
+
+    if images:
+        messages[-1]['content'] = [{"type": "text", "text": user_message}]  # text-prompt 请详细描述一下这几张图片。
+        messages[-1]['content'] += [{"type": "image_url", "image_url": {"url": image}} for image in images]
 
     payload = {
         "model": name,  # 默认选择第一个模型
         "messages": messages,
         "temperature": temperature,
         "top_p": top_p,
+        # "top_k": 50,
         "max_tokens": max_tokens,
+        # extra_body = {"prefix": "```python\n", "suffix":"后缀内容"} 希望的前缀内容,基于用户提供的前缀信息来补全其余的内容
+        # response_format={"type": "json_object"}
+        # "tools":retrieval、web_search、function
     }
     if model_type == 'baidu':
         payload['system'] = system
 
+    # print(payload)
     return model_info, payload, refer
 
 
@@ -330,6 +568,10 @@ async def ai_chat(model_info, payload=None, **kwargs):
     api_key = model_info['api_key']
     # body = payload
     if api_key:
+        if isinstance(api_key, list):
+            idx = model_info['model'].index(payload["model"])
+            api_key = model_info['api_key'][idx]
+
         headers = {'Content-Type': 'application/json',
                    "Authorization": f'Bearer {api_key}'}
     if model_type == 'baidu':
@@ -344,7 +586,7 @@ async def ai_chat(model_info, payload=None, **kwargs):
         # payload['system'] = system
     if model_type == 'tencent':
         service = 'hunyuan'
-        host = url.split("//")[-1]  # model_info['base_url'].split("//")[-1]
+        host = url.split("//")[-1]
         payload = convert_keys_to_pascal_case(payload)
         payload.pop('MaxTokens', None)
         headers = get_tencent_signature(service, host, payload, action='ChatCompletions',
@@ -352,7 +594,12 @@ async def ai_chat(model_info, payload=None, **kwargs):
                                         secret_key=Config.TENCENT_Secret_Key)
 
         # headers["X-TC-Region"] = 'ap-shanghai'
-
+    # if model_info['name'] == 'silicon':
+    #     headers = {
+    #         "accept": "application/json",
+    #         "content-type": "application/json",
+    #         "authorization": "Bearer sk-tokens"
+    #     }
     # print(headers, payload)
 
     parse_rules = {
@@ -382,7 +629,7 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
         payload.update(kwargs)
 
     payload["stream"] = True
-    # payload"stream"]= {"include_usage": True}        # 可选，配置以后会在流式输出的最后一行展示token使用信息
+    # payload["stream"]= {"include_usage": True}        # 可选，配置以后会在流式输出的最后一行展示token使用信息
     client = AI_Client.get(model_info['name'], None)
 
     if client:
@@ -401,6 +648,9 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
     url = model_info['url']
     api_key = model_info['api_key']
     if api_key:
+        if isinstance(api_key, list):
+            idx = model_info['model'].index(payload["model"])
+            api_key = model_info['api_key'][idx]
         headers = {
             'Content-Type': 'text/event-stream',
             "Authorization": f'Bearer {api_key}'
@@ -419,12 +669,7 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
                                         secret_id=Config.TENCENT_SecretId,
                                         secret_key=Config.TENCENT_Secret_Key)
         headers['X-TC-Version'] = '2023-09-01'
-    # if model_name == 'silicon':
-    #     headers = {
-    #         "accept": "application/json",
-    #         "content-type": "application/json",
-    #         "authorization": "Bearer sk-tokens"
-    #     }
+
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=10)
     try:
         async with httpx.AsyncClient(limits=limits) as cx:
@@ -494,6 +739,7 @@ def process_data_chunk(data, model_type='default'):
         return str(e)
     return None
 
+
 async def forward_stream(response):
     async for line in response.iter_lines(decode_unicode=True):
         if not line:
@@ -507,32 +753,6 @@ async def forward_stream(response):
                 yield {"json": parsed_content}
             except json.JSONDecodeError:
                 yield {"text": line_data}
-
-
-# 生成:conversation or summary
-async def generate_completion(prompt, stream=False, temperature=0.7, max_tokens=300, model_name='gpt', model_id=0):
-    model_info, name = find_ai_model(model_name, model_id, 'completion')
-    if not name:
-        return None  # ai_chat(messages, temperature=0.4, top_p=0.8, model_name='moonshot')
-
-    response = Completion.create(
-        engine=name,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        n=1,
-        stop=None,
-        stream=stream
-    )
-    if stream:
-        async def stream_data():
-            for chunk in response:
-                yield chunk.choices[0].text
-
-        return stream_data()
-
-    generated_text = response.choices[0].text.strip()
-    return generated_text
 
 
 def web_search(text: str, api_key: str = Config.GLM_Service_Key) -> list:
@@ -647,31 +867,33 @@ def baidu_search(query, baidu_api_key, baidu_secret_key):
 
 
 def wikipedia_search(query):
-    response = requests.get(f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json")
-    search_results = response.json()['query']['search']
+    response = requests.get(f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json",
+                            timeout=Config.HTTP_TIMEOUT_SEC)  # proxies=
+    search_results = response.json().get('query', {}).get('search', [])
     if search_results:
         page_id = search_results[0]['pageid']
         page_response = requests.get(
             f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&pageids={page_id}&format=json")
         page_data = page_response.json()['query']['pages'][str(page_id)]
-        return page_data['extract']
+        return page_data.get('extract', 'No extract found.')
     return "No information found."
 
 
-async def get_bge_embeddings(texts: List[str], access_token: str = '') -> List:
+# （1）文本数量不超过 16。 （2）每个文本长度不超过 512 个 token，超出自动截断，token 统计信息，token 数 = 汉字数+单词数*1.3 （仅为估算逻辑，以实际返回为准)。
+async def get_baidu_embeddings(texts: List[str], access_token: str, model_name='bge_large_zh') -> List:
     if not isinstance(texts, list):
         texts = [texts]
 
-    url = f"https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/embeddings/bge_large_zh?access_token={access_token}"
+    url = f"https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/embeddings/{model_name}?access_token={access_token}"
     headers = {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        # "Authorization: Bearer $BAICHUAN_API_KEY"
     }
     batch_size = 16
     embeddings = []
-
     async with httpx.AsyncClient() as cx:
         if len(texts) < batch_size:
-            payload = json.dumps({"input": texts})
+            payload = json.dumps({"input": texts})  # "model":
             response = await cx.post(url, headers=headers, data=payload)
             data = response.json().get('data')
             # if len(texts) == 1:
@@ -691,6 +913,106 @@ async def get_bge_embeddings(texts: List[str], access_token: str = '') -> List:
                     print(exc)
 
     return embeddings
+
+
+def get_hf_embeddings(texts, model_name='BAAI/bge-large-zh-v1.5', access_token=Config.HF_Service_Key):
+    # "https://api-inference.huggingface.co/models/BAAI/bge-reranker-large"
+    url = f"https://api-inference.huggingface.co/models/{model_name}"
+    headers = {"Authorization": f'Bearer {access_token}'}
+    payload = {"inputs": texts}
+    response = requests.post(url, headers=headers, json=payload)
+    data = response.json().get('data')
+    return [emb.get('embedding') for emb in data]
+
+
+def is_city(city, region='全国'):
+    response = requests.get(url="http://api.map.baidu.com/place/v2/suggestion",
+                            params={'query': city, 'region': region,
+                                    "output": "json", "ak": Config.BMAP_API_Key, })
+    data = response.json()
+
+    # 判断返回结果中是否有城市匹配
+    for result in data.get('result', []):
+        if result.get('city') == city:
+            return True
+    return False
+
+
+def get_bmap_location(address):
+    response = requests.get(url="https://api.map.baidu.com/geocoding/v3",
+                            params={"address": address,
+                                    "output": "json",
+                                    "ak": Config.BMAP_API_Key, })
+    if response.status_code == 200:
+        locat = response.json()['result']['location']
+        return round(locat['lng'], 6), round(locat['lat'], 6)
+    else:
+        print(response.text)
+    return None, None
+
+
+async def search_bmap_location(query, region=''):
+    url = "http://api.map.baidu.com/place/v2/suggestion"
+    params = {
+        "query": query,
+        "region": region,
+        "city_limit": 'true' if region else 'false',
+        "output": "json",
+        "ak": Config.BMAP_API_Key,
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, params=params)
+        res = []
+        if response.status_code == 200:
+            js = response.json()
+            for result in js.get('result', []):
+                res.append((round(result['location']['lng'], 6), round(result['location']['lat'], 6),
+                            result["name"], result['address']))
+        else:
+            print(response.text)
+        return res
+
+
+def get_amap_location(address):
+    response = requests.get(url="https://restapi.amap.com/v3/geocode/geo?parameters",
+                            params={"address": address,
+                                    "output": "json",
+                                    "key": Config.AMAP_API_Key, })
+
+    if response.status_code == 200:
+        js = response.json()
+        if js['status'] == '1':
+            s1, s2 = js['geocodes'][0]['location'].split(',')
+            return float(s1), float(s2)  # js['geocodes'][0]['formatted_address']
+    else:
+        print(response.text)
+
+    return None, None
+
+
+async def search_amap_location(query, region=''):
+    url = "https://restapi.amap.com/v5/place/text?parameters"
+    params = {
+        "keywords": query,
+        "region": region,
+        "city_limit": 'true' if region else 'false',
+        "output": "json",
+        "key": Config.AMAP_API_Key,
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, params=params)
+        res = []
+        if response.status_code == 200:
+            js = response.json()
+            if js['status'] == '1' and int(js['count']) > 0:
+                for result in js.get('pois', []):
+                    s1, s2 = result['location'].split(',')
+                    res.append((float(s1), float(s2), result["name"], result['address']))
+            else:
+                print(response.text)
+        return res
 
 
 # https://console.bce.baidu.com/ai/#/ai/machinetranslation/overview/index
@@ -755,6 +1077,56 @@ async def tencent_translate(text: str, source: str, target: str):
         return data["TargetText"]
     else:
         raise HTTPException(status_code=400, detail=f"Tencent API Error: {data.get('Message', 'Unknown error')}")
+
+
+async def xunfei_translate(text: str, source: str = 'en', target: str = 'cn'):
+    # 将文本进行base64编码
+    encoded_text = base64.b64encode(text.encode('utf-8')).decode('utf-8')
+
+    # 构造请求数据
+    request_data = {
+        "header": {
+            "app_id": Config.XF_AppID,  # 你在平台申请的appid
+            "status": 3,
+            # "res_id": "your_res_id"  # 可选：自定义术语资源id
+        },
+        "parameter": {
+            "its": {
+                "from": source,
+                "to": target,
+                "result": {}
+            }
+        },
+        "payload": {
+            "input_data": {
+                "encoding": "utf8",
+                "status": 3,
+                "text": encoded_text
+            }
+        }
+    }
+
+    headers = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
+                                      host="itrans.xf-yun.com", path="/v1/its", method='POST')
+    url = 'https://itrans.xf-yun.com/v1/its'  # f"https://{host}{path}?"+ urlencode(headers)
+
+    # 异步发送请求
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=request_data, headers=headers)
+        if response.status_code == 200:
+            response_data = await response.json()
+
+            # 解码返回结果中的text字段
+            if "payload" in response_data and "result" in response_data["payload"]:
+                result_text = response_data["payload"]["result"]["text"]
+                decoded_result = base64.b64decode(result_text).decode('utf-8')
+                data = json.loads(decoded_result)
+                if "trans_result" in data:
+                    return data["trans_result"]["dst"]
+            else:
+                return {"error": "Unexpected response format"}
+        else:
+            return {"error": f"HTTP Error: {response.status_code}"}
 
 
 # https://ai.baidu.com/ai-doc/OCR/Ek3h7y961
@@ -970,8 +1342,7 @@ def dashscope_file_response(messages, file_path='.pdf', client=None, api_key='')
 
 Agent_functions = {
     'default': lambda *args, **kwargs: [],
-    '2': web_search,
-    '9': web_search_async,
+    '2': web_search,  # web_search_async
 }
 
 if __name__ == "__main__":
