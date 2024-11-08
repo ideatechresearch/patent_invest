@@ -14,7 +14,8 @@ import string, time, os, re, uuid
 from lda_topics import LdaTopics
 import logging
 from openai import OpenAI
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
 
 
 class IgnoreHeadRequestsFilter(logging.Filter):
@@ -1155,7 +1156,15 @@ def downloads(path):
         return send_from_directory(app.config['DATA_FOLDER'], path, as_attachment=True)
     else:
         return "非管理员！<a href='/'>首页</a>"
-
+# import databases
+# @app.get("/query/")
+# async def execute_query(query: str, api_key: str = Depends(authenticate_api_key)):
+#     try:
+#         # 执行安全检查，确保 query 符合要求
+#         result = await database.fetch_all(text(query))
+#         return result
+#     except Exception as e:
+#         raise HTTPException(status_code=400, detail=str(e))
 
 @app.route('/uploader', methods=['GET', 'POST'])
 def uploader():
@@ -1188,19 +1197,44 @@ def proxy(url: str):
     password = request.args.get('password', '')
     auth = (name, password) if name and password else None
 
-    headers = dict(request.headers)
-    headers['Host'] = urlparse(url).netloc
+    session_requests = requests.Session()  # 创建一个会话对象
+    # headers = dict(request.headers)
+    headers = {
+        'Host': urlparse(url).netloc,
+        'Referer': url,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36'
+    }
+    session_requests.headers.update(headers)
     try:
         if request.method == 'GET':
-            response = requests.get(url, auth=auth, headers=headers, params=request.args, timeout=60)
+            response = session_requests.get(url, auth=auth, params=request.args, timeout=60)  # headers=headers
         elif request.method == 'POST':
-            response = requests.post(url, auth=auth, headers=headers, data=request.get_data(), timeout=60)
+            response = session_requests.post(url, auth=auth, headers=headers, data=request.get_data(), timeout=60)
     except requests.exceptions.RequestException as e:
         return jsonify({'error': f"Failed to fetch the page: {str(e)}"}), 500
 
-    headers = {key: value for key, value in response.headers.items() if key.lower() != 'content-encoding'}
-    headers['Content-Type'] = response.headers.get('Content-Type', 'text/plain')
-    return Response(response.content, headers=headers, status=response.status_code)
+    if response.status_code == 202:
+        return jsonify({'error': 'The request is being processed or the website has limitations.'}), 202
+
+    if 'text/html' in response.headers.get('Content-Type', ''):
+        soup = BeautifulSoup(response.content, 'html.parser')
+        for tag in soup.find_all(['script', 'link', 'img']):
+            attr = 'src' if tag.name == 'script' or tag.name == 'img' else 'href'
+            if tag.has_attr(attr):
+                resource_url = tag[attr]
+                tag[attr] = urljoin(url, resource_url)
+                # if not resource_url.startswith(('http', '//')):
+                #     tag[attr] = f"http://{urlparse(url).netloc}{resource_url}"
+
+        response_content = str(soup)
+    else:  # 'application/json'
+        response_content = response.content
+
+    headers = {key: value for key, value in response.headers.items() if
+               key.lower() not in ['content-encoding', 'transfer-encoding']}
+    headers['Content-Type'] = response.headers.get('Content-Type', 'text/html; charset=utf-8')  # 'text/plain'
+
+    return Response(response_content, headers=headers, status=response.status_code)
 
 
 @app.before_request

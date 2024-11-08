@@ -46,7 +46,6 @@ async def call_generate_stream_response(stream: bool = False):
         print(f"An unexpected error occurred: {exc}")
 
 
-
 async def connect_chat():
     uri = "ws://127.0.0.1:7000/ws/chat"
     async with websockets.connect(uri) as websocket:
@@ -138,13 +137,148 @@ def main():
                 st.experimental_rerun()
 
 
+# def hmac_sha256(secret_key: str, message: str) -> str:
+#     # HMAC-SHA256 生成签名
+#     return hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+async def send_authenticated():
+    api_key, secret_key = '6b01600d-5162-4709-997c-d6fc3274c3b0', b'8g4bri8oVRCHbvEyURk20LQX5P1gRAcnL5Phl3vJz3s'
+
+    method = "POST"
+    data = {"key": "value"}
+    body = json.dumps(data)
+    url = "http://127.0.0.1:7000/protected"
+    timestamp = str(int(time.time()))
+    message = f"{method}{url}{body}{timestamp}"
+    signature = hmac_sha256(secret_key, message).hex()
+    headers = {
+        "X-API-KEY": api_key,
+        "X-SIGNATURE": signature,
+        "X-TIMESTAMP": timestamp,
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(verify=False) as client:
+        response = await client.post(url, headers=headers, json=data)
+        print(response.text)
+        return response
+    #
+    # duration = 60
+    # success_count = 0
+    # failure_count = 0
+    #
+    # start_time = time.time()
+    # end_time = start_time + duration
+    #
+    # async with httpx.AsyncClient(verify=False) as client:
+    #     while time.time() < end_time:
+    #         # 每次请求生成新的时间戳和签名
+    #         timestamp = str(int(time.time()))
+    #         message = f"{method}{url}{body}{timestamp}"
+    #         signature = hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).hexdigest()
+    #
+    #         headers = {
+    #             "X-API-KEY": api_key,
+    #             "X-SIGNATURE": signature,
+    #             "X-TIMESTAMP": timestamp,
+    #             "Content-Type": "application/json",
+    #         }
+    #
+    #         try:
+    #             response = await client.post(url, headers=headers, json=data)
+    #             if response.status_code == 200:
+    #                 success_count += 1
+    #             else:
+    #                 failure_count += 1
+    #
+    #         except Exception as e:
+    #             failure_count += 1
+    #             print(f"Request failed: {e}")
+    #
+    # print(response.text, success_count, failure_count)
+
+
+async def authenticate_user():
+    original_message = f"Authenticate request at {int(time.time())}"
+    # 生成 ECDSA 私钥 (SECP256k1 曲线)
+    # private_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+    # private_key_hex = private_key.to_string().hex()
+
+    # public_key_hex='83e2c687a44f839f6b3414d63e1a54ad32d8dbe4706cdd58dc6bd4233a592f78367ee1bff0e081ba678a5dfdf068d4b4c72f03085aa6ba5f0678e157fc15d305'
+    private_key_hex = "20f0"  # 请使用安全的方式存储和获取私钥
+    private_key = ecdsa.SigningKey.from_string(bytes.fromhex(private_key_hex), curve=ecdsa.SECP256k1)
+    signature = private_key.sign(original_message.encode('utf-8'), hashfunc=hashlib.sha256)
+    # 将签名转换为Base64格式
+    signed_message = base64.b64encode(signature).decode('utf-8')
+
+    # 生成公钥并转为十六进制
+    public_key_hex = private_key.get_verifying_key().to_string().hex()
+    print(f"Private Key: {private_key_hex}")
+    print(f"Public Key: {public_key_hex}")
+
+    data = {
+        "username": "admin",
+        "password": "",
+        # "eth_address": "",
+        "public_key": public_key_hex,
+        "signed_message": signed_message,
+        "original_message": original_message,
+    }
+
+    url = "http://127.0.0.1:7000/authenticate"
+    headers = {
+        "Content-Type": "application/json",
+    }
+    token = None
+    async with httpx.AsyncClient(verify=False) as client:
+        response = await client.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            # 假设返回的响应数据包含 token
+            token_data = response.json()
+            token = token_data.get("access_token")
+            print(response.text)
+        else:
+            print("Response:", response.text)
+
+    if not token:
+        return
+
+    duration = 60
+    success_count = 0
+    failure_count = 0
+
+    start_time = time.time()
+    end_time = start_time + duration
+    headers = {
+        "Authorization": f"Bearer {token}"  # 设置Bearer Token
+    }
+    url = "http://127.0.0.1:7000/secure"
+    async with httpx.AsyncClient(verify=False) as client:
+        while time.time() < end_time:
+            try:
+                response = await client.post(url, headers=headers)
+                if response.status_code == 200:
+                    success_count += 1
+                else:
+                    failure_count += 1
+
+            except Exception as e:
+                failure_count += 1
+                print(f"Request failed: {e}")
+
+    print(response.text, success_count, failure_count)
+
+
 # 如果你在异步环境中，例如 FastAPI 应用程序中
 # 否则你可以直接运行
 if __name__ == "__main__":
     # main()
+    from config import *
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(connect_chat())
+    #asyncio.run(send_authenticated())
+    asyncio.run(authenticate_user())
+    # loop = asyncio.get_event_loop()
+    # loop.run_until_complete(connect_chat())
 
     # asyncio.run(call_generate_stream_response(False))
 

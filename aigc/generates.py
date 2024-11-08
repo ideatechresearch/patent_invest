@@ -1,138 +1,19 @@
 import httpx
 import asyncio
 from pathlib import Path
-from typing import List, Any, Callable
+from typing import List, Any, Union, Tuple, Callable
 import random, time
 from openai import OpenAI, Completion
 # import qianfan
 import dashscope
 from dashscope.audio.tts import ResultCallback, SpeechSynthesizer
 from dashscope.audio.asr import Recognition, Transcription
+from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue
+from fastapi import HTTPException
+import numpy as np
 from config import *
 from utils import *
 
-# 模型编码:0默认，1小，-1最大
-AI_Models = [
-    # https://platform.moonshot.cn/console/api-keys
-    {'name': 'moonshot', 'type': 'default', 'api_key': '',
-     "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
-     'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1",
-     'file_url': "https://api.moonshot.cn/v1/files"},
-    # https://open.bigmodel.cn/console/overview
-    {'name': 'glm', 'type': 'default', 'api_key': '',
-     "model": ["glm-4-air", "glm-4-flash", "glm-4-air", "glm-4", 'glm-4-plus', "glm-4v", "glm-4-0520"],
-     "embedding": ["embedding-2", "embedding-3"],
-     'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-     'base_url': "https://open.bigmodel.cn/api/paas/v4/",
-     'embedding_url': 'https://open.bigmodel.cn/api/paas/v4/embeddings',
-     'tool_url': "https://open.bigmodel.cn/api/paas/v4/tools"},
-    # https://platform.baichuan-ai.com/docs/api
-    {'name': 'baichuan', 'type': 'default', 'api_key': '',
-     "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', "Baichuan4",
-               "Baichuan-NPC-Turbo"],
-     "embedding": ["Baichuan-Text-Embedding"],
-     'url': 'https://api.baichuan-ai.com/v1/chat/completions',
-     'base_url': "https://api.baichuan-ai.com/v1/",  # assistants,files,threads
-     'embedding_url': 'https://api.baichuan-ai.com/v1/embeddings'},
-    # https://dashscope.console.aliyun.com/overview
-    # https://bailian.console.aliyun.com/#/home
-    # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
-    {'name': 'qwen', 'type': 'default', 'api_key': '',
-     "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
-               'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max",
-               'baichuan2-7b-chat-v1', 'baichuan2-turbo', 'abab6.5s-chat', 'chatglm3-6b'],  # "qwen-vl-plus"
-     'generation': ['dolly-12b-v2', 'baichuan2-7b-chat-v1', 'belle-llama-13b-2m-v1', 'billa-7b-sft-v1'],
-     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
-     'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
-     'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
-     'generation_url': 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
-     'embedding_url': 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding'},
-    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t#%E8%AF%B7%E6%B1%82%E8%AF%B4%E6%98%8E
-    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/mlm0nonsv#%E5%AF%BC%E5%85%A5hf%E7%B3%BB%E5%88%97%E6%A8%A1%E5%9E%8B
-    {'name': 'ernie', 'type': 'baidu', 'api_key': '',
-     "model": ["ERNIE-4.0-8K", "ERNIE-3.5-8K", "ERNIE-4.0-8K", "ERNIE-4.0-8K-Preview", "ERNIE-4.0-8K-Latest",
-               "ERNIE-3.5-128K"],
-     'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions_pro",
-     'base_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
-     },
-    # https://console.bce.baidu.com/qianfan/ais/console/onlineService
-    # https://console.bce.baidu.com/ai/#/ai/nlp/overview/index
-    {'name': 'baidu', 'type': 'baidu', 'api_key': '',
-     'model': ['llama_3_8b', 'Qianfan-Chinese-Llama-2-7B', 'Qianfan-Chinese-Llama-2-7B-32K',
-               'Llama-2-7B-Chat', 'llama_3_8b', 'Llama-2-13B-Chat', 'Llama-2-70B-Chat',
-               'ChatGLM3-6B', 'ChatGLM2-6B-32K', 'ChatGLM3-6B-32K',
-               'Baichuan2-7B-Chat', 'Baichuan2-13B-Chat', 'Fuyu-8B', 'Yi-34B-Chat',
-               'BLOOMZ-7B', 'Qianfan-BLOOMZ-7B-compressed'],
-     "generation": ['sqlcoder_7b', 'CodeLlama-7b-Instruct', 'Yi-34B'],
-     'embedding': ['bge_large_zh'],
-     "nlp": ["txt_mone", "address", "simnet", "word_emb_sim", "ecnet", "text_correction", "keyword", "topic"],
-     'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
-     'generation_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/completions",
-     'embedding_url': 'https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/embeddings',
-     'nlp_url': "https://aip.baidubce.com/rpc/2.0/nlp/v1/",
-     'base_url': ''},
-    # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
-    # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
-    {'name': 'doubao', 'type': 'default', 'api_key': '',
-     "model": ['ep-20240919160005-chzhb', 'ep-20240919160119-7rbsn', 'ep-20240919160005-chzhb',
-               'ep-20240919161410-7k5d8', 'ep-20241017105930-drfm8', 'ep-20241017110248-fr7z6'],
-     # ["doubao-pro-32k", "doubao-lite-4k", "doubao-lite-32k", "doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k","GLM3-130B",chatglm3-130-fin],
-     'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-     'base_url': "https://ark.cn-beijing.volces.com/api/v3"},  # open.volcengineapi.com
-    # https://cloud.tencent.com/document/product/1729
-    {'name': 'hunyuan', 'type': 'tencent', 'api_key': '',
-     'model': ["hunyuan-pro", "hunyuan-lite", "hunyuan-turbo", "hunyuan-code", 'hunyuan-functioncall'],
-     'embedding': ['hunyuan-embedding'],
-     'url': 'https://hunyuan.tencentcloudapi.com',  # 'hunyuan.ap-shanghai.tencentcloudapi.com'
-     'base_url': "https://api.hunyuan.cloud.tencent.com/v1",
-     'embedding_url': "https://api.hunyuan.cloud.tencent.com/v1/embeddings",
-     'nlp_url': "nlp.tencentcloudapi.com"},
-    # https://cloud.siliconflow.cn/playground/chat
-    {'name': 'silicon', 'type': 'default', 'api_key': '',
-     'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat",
-               "Qwen/Qwen2.5-Coder-7B-Instruct",
-               "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "Pro/THUDM/glm-4-9b-chat",
-               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/DeepSeek-Coder-V2-Instruct",
-               "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "Pro/OpenGVLab/InternVL2-8B",
-               "01-ai/Yi-1.5-9B-Chat-16K", 'TeleAI/TeleChat2',
-               "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
-     'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1'],
-     'generation': ['Qwen/Qwen2.5-Coder-7B-Instruct', "deepseek-ai/DeepSeek-V2.5",
-                    'deepseek-ai/DeepSeek-Coder-V2-Instruct'],
-     'reranker': ['BAAI/bge-reranker-v2-m3', 'netease-youdao/bce-reranker-base_v1'],
-     'url': 'https://api.siliconflow.cn/v1/chat/completions',
-     'base_url': 'https://api.siliconflow.cn/v1',
-     'embedding_url': "https://api.siliconflow.cn/v1/embeddings",
-     'reranker_url': "https://api.siliconflow.cn/v1/rerank"},
-    # https://console.xfyun.cn/services/sparkapiCenter
-    {'name': 'speark', 'type': 'default', 'api_key': [],
-     'model': ['pro', 'lite', 'max-32k', 'pro', 'pro-128k', '4.0Ultra', 'generalv3', 'generalv3.5'],
-     'url': 'https://spark-api-open.xf-yun.com/v1/chat/completions',
-     'base_url': 'https://spark-api-open.xf-yun.com/v1',
-     'embedding_url': 'https://emb-cn-huabei-1.xf-yun.com/',
-     'translation_url': 'https://itrans.xf-yun.com/v1/its',
-     'ws_url': 'wss://spark-api.xf-yun.com/v3.5/chat'},
-    {'name': 'gpt', 'type': 'default', 'api_key': '', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
-     'generation': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
-     'embedding': ["text-embedding-ada-002", "text-search-ada-doc-001", "text-similarity-babbage-001",
-                   "code-search-ada-code-001", "search-babbage-text-001"],
-     'url': 'https://api.openai.com/v1/chat/completions',
-     'embedding_url': 'https://api.openai.com/v1/embeddings',
-     'base_url': "https://api.openai.com/v1",
-     },
-]
-# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,speark,baichuan
-API_KEYS = {
-    'moonshot': Config.Moonshot_Service_Key,
-    'glm': Config.GLM_Service_Key,
-    'qwen': Config.DashScope_Service_Key,
-    'doubao': Config.ARK_Service_Key,
-    'silicon': Config.Silicon_Service_Key,
-    'speark': Config.XF_API_Password,
-    'baichuan': Config.Baichuan_Service_Key,
-    'hunyuan': Config.TENCENT_Service_Key
-}
 AI_Client = {}
 
 
@@ -172,118 +53,16 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
     raise ValueError(f"Model with name {name} not found.")
 
 
-System_content = {'0': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
-                  '1': ('你是一位领域专家，请回答以下问题。\n'
-                        '（注意：1、材料可能与问题无关，请忽略无关材料，并基于已有知识回答问题。'
-                        '2、尽量避免直接复制材料，将其作为参考来补充背景或启发分析。'
-                        '3、请直接提供分析和答案，请准确引用，并结合技术细节与实际应用案例，自然融入回答。'
-                        '4、避免使用“作者认为”等主观表达，直接陈述观点，保持分析的清晰和逻辑性。）'),
-                  '2': ('你是一位领域内的技术专家，擅长于分析和解构复杂的技术概念。'
-                        '我会向你提出一些问题，请你根据相关技术领域的最佳实践和前沿研究，对问题进行深度解析。'
-                        '请基于相关技术领域进行扩展，集思广益，并为每个技术点提供简要且精确的描述。'
-                        '请将这些技术和其描述性文本整理成JSON格式，具体结构为 `{ "技术点1": "描述1",  ...}`，请确保JSON结构清晰且易于解析。'
-                        '我将根据这些描述的语义进一步查找资料，并开展深入研究。'),
-                  '3': (
-                      '我有一个数据集，可能是JSON数据、表格文件或文本描述。你需要从中提取并处理数据，现已安装以下Python包：plotly.express、pandas、seaborn、matplotlib，以及系统自带的包如os、sys等。'
-                      '请根据我的要求生成一个Python脚本，涵盖以下内容：'
-                      '1、数据读取和处理：使用pandas读取数据，并对指定字段进行分组统计、聚合或其他处理操作。'
-                      '2、数据可视化分析：生成如折线图、条形图、散点图等，用以展示特定字段的数据趋势或关系。'
-                      '3、灵活性：脚本应具备灵活性，可以根据不同字段或分析需求快速调整。例如，当我要求生成某个字段的折线图时，可以快速修改代码实现。'
-                      '4、注释和可执行性：确保代码能够直接运行，并包含必要的注释以便理解。'
-                      '假设数据已被加载到pandas的DataFrame中，变量名为df。脚本应易于扩展，可以根据需要调整不同的可视化或数据处理逻辑。'),
-                  '4': ('你是一位信息提取专家，能够从文本中精准提取信息，并将其组织为结构化的JSON格式。你的任务是：'
-                        '1、提取文本中的关键信息，确保信息的准确性和完整性。'
-                        '2、根据用户的请求，按照指定的类别对信息进行分类（例如：“人名”、“职位”、“时间”、“事件”、“地点”、“目的”、“计划”等）。'
-                        '3、默认情况下，如果某个类别信息不完整或缺失时，不做推测或补充，返回空字符串。如果明确要求，可根据上下文进行适度的推测或补全。'
-                        '4、如果明确指定了输出类别或返回格式，请严格按照要求输出，不生成子内容或嵌套结构。'
-                        '5、将提取的信息以JSON格式输出，确保结构清晰、格式正确、易于理解。'),
-                  '5': ('你是一位SQL转换器，精通SQL语言，能够准确地理解和解析用户的日常语言描述，并将其转换为高效、可执行的SQL查询语句,Generate a SQL query。'
-                        '1、理解用户的自然语言描述，保持其意图和目标的完整性。'
-                        '2、根据描述内容，将其转换为对应的SQL查询语句。'
-                        '3、确保生成的SQL查询语句准确、有效，并符合最佳实践。'
-                        '4、输出经过优化的SQL查询语句。'),
-                  '6': ('你是一位领域专家，我正在编写一本书，请按照以下要求处理并用中文输出：'
-                        '1、内容扩展和总结: 根据提供的关键字和描述，扩展和丰富每个章节的内容，确保细节丰富、逻辑连贯，使整章文本流畅自然。'
-                        '必要时，总结已有内容和核心观点，形成有机衔接的连贯段落，避免生成分散或独立的句子。'
-                        '2、最佳实践和前沿研究: 提供相关技术领域的最佳实践和前沿研究，结合实际应用场景，深入解析关键问题，帮助读者理解复杂概念。'
-                        '3、背景知识和技术细节: 扩展背景知识，结合具体技术细节和应用场景进，提供实际案例和应用方法，增强内容的深度和实用性。保持见解鲜明，确保信息全面和确保段落的逻辑一致性。'
-                        '4、连贯段落: 组织生成的所有内容成连贯的段落，确保每段文字自然延续上一段，避免使用孤立的标题或关键词，形成完整的章节内容。'
-                        '5、适应书籍风格: 确保内容符合书籍的阅读风格，适应中文读者的阅读习惯与文化背景，语言流畅、结构清晰、易于理解并具参考价值。'),
-                  '7': ('请根据以下对话内容生成一个清晰且详细的摘要，帮我总结一下，转换成会议纪要\n：'
-                        '1、 提炼出会议的核心讨论点和关键信息。'
-                        '2、 按照主题或讨论点对内容进行分组和分类。'
-                        '3、 列出所有决定事项及后续的待办事项。'),
-                  '8': ('你是一位专业的文本润色专家，擅长处理短句和语音口述转换的内容。请根据以下要求对内容进行润色并用中文输出：'
-                        '1、语言优化: 对短句进行适当润色，确保句子流畅、自然，避免生硬表达，提升整体可读性。保持统一的语气和风格，确保文本适应场景，易于理解且专业性强。'
-                        '2、信息完整: 确保每个句子的核心信息清晰明确，对于过于简短或含糊的句子进行适当扩展，丰富细节。'
-                        '3、信息延展: 在不偏离原意的前提下，适当丰富或补充内容，使信息更加明确。'
-                        '4、段落整合: 将相关内容整合成连贯的段落，确保各句之间有逻辑关系，避免信息碎片化，避免信息孤立和跳跃。'),
-                  '9': "将英文转换为包括中文翻译、英文释义和一个例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。"
-                  }
-
-AI_Tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "当你想知道现在的时间时非常有用。",
-            "parameters": {}  # 此处是函数参数相关描述, 因为获取当前时间无需输入参数，因此parameters为空字典
-        }
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'get_weather',
-            'description': 'Get the current weather for a given city.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'city': {
-                        'type': 'string',
-                        'description': 'The name of the city to query weather for.',
-                    },
-                },
-                'required': ['city'],
-            },
-        }
-    }
-]
-
-
-def get_current_time():
-    current_datetime = datetime.now()
-    formatted_time = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
-    return f"当前时间：{formatted_time}。"
-
-
-def get_weather(city: str):
-    # 使用 WeatherAPI 的 API 来获取天气信息
-    api_key = Config.Weather_Service_Key
-    base_url = "http://api.weatherapi.com/v1/current.json"
-    params = {
-        'key': api_key,
-        'q': city,
-        'aqi': 'no'  # 不需要空气质量数据
-    }
-    response = requests.get(base_url, params=params)
-
-    if response.status_code == 200:
-        data = response.json()
-        weather = data['current']['condition']['text']
-        temperature = data['current']['temp_c']
-        return f"The weather in {city} is {weather} with a temperature of {temperature}°C."
-    else:
-        return f"Could not retrieve weather information for {city}."
-
-
-def ai_tool_response(messages, model_name='moonshot', model_id=-1, top_p=0.95, temperature=0.01):
+def ai_tool_response(messages, tools=[], model_name='moonshot', model_id=-1, top_p=0.95, temperature=0.01):
     model_info, name = find_ai_model(model_name, model_id)
     client = AI_Client.get(model_info['name'], None)
+    if not tools:
+        tools = AI_Tools
     if client:
         completion = client.chat.completions.create(
             model=name,
             messages=messages,
-            tools=AI_Tools,
+            tools=tools,
             # tool_choice="auto",
             temperature=temperature,
             top_p=top_p,
@@ -306,6 +85,7 @@ def ai_tools_messages(response_message):
                 'tool_call_id': tool_func.id
             })
         except:
+            # exec(code)
             pass
     return messages  # [*tool_mmessages,]
 
@@ -329,12 +109,10 @@ async def ai_embeddings(inputs, model_name='qwen', model_id=0):
         return []
 
     client = AI_Client.get(model_info['name'], None)
-    if client:
-        completion = client.embeddings.create(
-            model=name,
-            input=inputs,
-            encoding_format="float"
-        )  # openai.Embedding.create
+    if client:  # openai.Embedding.create
+        completion = await asyncio.to_thread(client.embeddings.create,
+                                             model=name, input=inputs,
+                                             encoding_format="float")
 
         return [item.embedding for item in completion.data]
         # data = json.loads(completion.model_dump_json()
@@ -403,15 +181,15 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
 
 
 # 生成:conversation or summary
-async def ai_generate(prompt: str, question: str = '', suffix: str = None, stream=False, temperature=0.7,
+async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, stream=False, temperature=0.7,
                       max_tokens=4096, model_name='silicon', model_id=0):
     model_info, name = find_ai_model(model_name, model_id, "generation")
     if not name:
-        return ai_chat(messages=None, user_message=question, system=prompt, temperature=temperature,
+        return ai_chat(messages=None, user_request=user_request, system=prompt, temperature=temperature,
                        max_tokens=max_tokens, top_p=0.8, model_name=model_name, model_id=model_id)
 
-    if question:
-        prompt += '\n\n' + question
+    if user_request:
+        prompt += '\n\n' + user_request
 
     if model_info['name'] == 'qwen':
         response = dashscope.Generation.call(model=name, prompt=prompt)
@@ -426,8 +204,8 @@ async def ai_generate(prompt: str, question: str = '', suffix: str = None, strea
         max_tokens=max_tokens,
         temperature=temperature,
         stream=stream,
-        # n=1,
         stop=None,
+        # n=1,
     )
     if stream:
         async def stream_data():
@@ -439,24 +217,40 @@ async def ai_generate(prompt: str, question: str = '', suffix: str = None, strea
     return response.choices[0].text.strip()
 
 
-async def retrieved_reference(user_message: str, keywords: List[str] = None,
-                              generate_calls: List[Callable[[str], Any]] = lambda x: [], **kwargs):
+async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple[str, Any]]] = None,
+                              tool_calls: List[Callable[[...], Any]] = None, **kwargs):
     # Assume this is the document retrieved from RAG
-    # function_call = Agent_functions.get(agent, lambda *args, **kwargs: [])
+    # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
-
-    generate_calls = generate_calls or []
-    if keywords and all(not (callable(func) and func.__name__ == '<lambda>' and func()) for func in
-                        generate_calls):  # not in agent_funcalls
-        generate_calls.append(web_search_async)
 
     async def wrap_sync(func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
 
-    tasks = []
-    items_to_process = keywords if keywords else [user_message]  # ','.join(keywords)
+    items_to_process = []
+    user_calls = {'map_search': search_amap_location,
+                  'web_search': web_search_async, }
 
-    for func in filter(callable, generate_calls):
+    tool_calls = tool_calls or []
+    if keywords:
+        if all(not (callable(func) and func.__name__ == '<lambda>' and func()) for func in tool_calls):
+            tool_calls.append(web_search_async)  # not in agent_funcalls
+    else:
+        items_to_process = [user_request]  # ','.join(keywords)
+
+    tasks = []
+    for item in keywords:
+        if isinstance(item, tuple) and len(item) > 1:
+            func = user_calls.get(item[0])  # 函数
+            if func:
+                func_args = item[1:]  # 剩下的参数
+                if inspect.iscoroutinefunction(func):
+                    tasks.append(func(*func_args, **kwargs))
+                else:
+                    tasks.append(wrap_sync(func, *func_args, **kwargs))
+        else:  # isinstance(keyword, str)
+            items_to_process.append(item)  # keyword
+
+    for func in filter(callable, tool_calls):
         if func.__name__ == '<lambda>' and func() == []:  # empty_lambda
             continue
         for item in items_to_process:
@@ -465,14 +259,17 @@ async def retrieved_reference(user_message: str, keywords: List[str] = None,
             else:
                 tasks.append(wrap_sync(func, item, **kwargs))
 
-    refer = await asyncio.gather(*tasks)  # gather 收集所有异步调用的结果
-    return [item for sublist in refer for item in sublist]  # 展平嵌套结果
+    refer = await asyncio.gather(*tasks, return_exceptions=True)  # gather 收集所有异步调用的结果
+    # for f, r in zip(tasks, refer):
+    #     print(f.__name__, r)
+    return [item for result in refer if not isinstance(result, Exception) for item in result]  # 展平嵌套结果
 
 
-async def get_chat_payload(messages, user_message: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
+# Callable[[参数类型], 返回类型]
+async def get_chat_payload(messages, user_request: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
                            max_tokens: int = 1024, model_name='moonshot', model_id=0,
-                           generate_calls: List[Callable[[str], Any]] = lambda x: [],
-                           keywords: List[str] = None, images: List[str] = None, **kwargs):
+                           tool_calls: List[Callable[[...], Any]] = None,
+                           keywords: List[Union[str, Tuple[str, Any]]] = None, images: List[str] = None, **kwargs):
     model_info, name = find_ai_model(model_name, model_id, 'model')
     model_type = model_info['type']
 
@@ -484,7 +281,7 @@ async def get_chat_payload(messages, user_message: str, system: str = '', temper
 
             # the role of first message must be user
             if messages[0].get('role') != 'user':  # user（tool）
-                messages.insert(0, {'role': 'user', 'content': user_message or '请问您有什么问题？'})
+                messages.insert(0, {'role': 'user', 'content': user_request or '请问您有什么问题？'})
 
             # 确保 user 和 assistant 消息交替出现
             for i, message in enumerate(messages[:-1]):
@@ -503,31 +300,31 @@ async def get_chat_payload(messages, user_message: str, system: str = '', temper
                 messages.insert(0, {"role": "system", "content": system})
             # messages[-1]['content'] = messages[0]['content'] + '\n' + messages[-1]['content']
 
-        if user_message:
+        if user_request:
             if messages[-1]["role"] != 'user':
-                messages.append({'role': 'user', 'content': user_message})
+                messages.append({'role': 'user', 'content': user_request})
             else:
                 pass
                 # if messages[-1]["role"] == 'user':
-                #     messages[-1]['content'] = user_message
+                #     messages[-1]['content'] = user_request
         else:
             if messages[-1]["role"] == 'user':
-                user_message = messages[-1]["content"]
+                user_request = messages[-1]["content"]
     else:
         if messages is None:
             messages = []
         if model_type != 'baidu' and system:
             messages = [{"role": "system", "content": system}]
-        messages.append({'role': 'user', 'content': user_message})
+        messages.append({'role': 'user', 'content': user_request})
 
-    refer = await retrieved_reference(user_message, keywords, generate_calls, **kwargs)
+    refer = await retrieved_reference(user_request, keywords, tool_calls, **kwargs)
     if refer:
         formatted_refer = '\n'.join(map(str, refer))
         messages[-1][
-            'content'] = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_message}'
+            'content'] = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请根据上下文回答下面的问题:{user_request}'
 
     if images:
-        messages[-1]['content'] = [{"type": "text", "text": user_message}]  # text-prompt 请详细描述一下这几张图片。
+        messages[-1]['content'] = [{"type": "text", "text": user_request}]  # text-prompt 请详细描述一下这几张图片。
         messages[-1]['content'] += [{"type": "image_url", "image_url": {"url": image}} for image in images]
 
     payload = {
@@ -925,7 +722,156 @@ def get_hf_embeddings(texts, model_name='BAAI/bge-large-zh-v1.5', access_token=C
     return [emb.get('embedding') for emb in data]
 
 
+async def most_similar_embeddings(query, collection_name, client, topn=10, score_threshold=0.0,
+                                  match=[], not_match=[], query_vector=[],
+                                  embeddings_calls: List[Callable[[str], Any]] = lambda x: [], **kwargs):
+    try:
+        if not query_vector:
+            query_vector = await embeddings_calls(query, **kwargs)
+            if not query_vector:
+                return []
+
+        query_filter = Filter(must=match, must_not=not_match)
+        search_hit = await client.search(collection_name=collection_name,
+                                         query_vector=query_vector,  # tolist()
+                                         query_filter=query_filter,
+                                         limit=topn,
+                                         score_threshold=score_threshold, )
+        return [(p.payload, p.score) for p in search_hit]
+    except Exception as e:
+        print('Error:', e)
+        return []
+
+
+def cosine_sim(A, B):
+    dot_product = np.dot(A, B)
+    similarity = dot_product / (np.linalg.norm(A) * np.linalg.norm(B))
+    return similarity
+
+
+def cosine_similarity_np(ndarr1, ndarr2):
+    div1 = np.linalg.norm(ndarr1, axis=1)
+    div2 = np.linalg.norm(ndarr2, axis=1)
+    denominator = np.outer(div1, div2)
+    dot_product = np.dot(ndarr1, ndarr2.T)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarity = np.where(denominator != 0, dot_product / denominator, 0)
+    return similarity
+
+
+async def similarity_embeddings(query, tokens, filter_idx=[], tokens_vector=None,
+                                embeddings_calls: List[Callable[[str], Any]] = ai_embeddings, **kwargs):
+    """
+    计算查询与一组标记之间的相似度。
+        filter_idx (List[int], optional): 要过滤的标记索引。默认为 []。
+    返回：
+        np.ndarray: 一个相似度得分的数组。
+    """
+    if filter_idx is None:
+        filter_idx = list(range(len(tokens)))
+    similarity = np.full(len(filter_idx), np.nan)
+    if not query:
+        return similarity
+
+    idx_tokens = [(i, x) for i, x in enumerate(tokens) if x]
+    query_vector = await embeddings_calls(query, **kwargs)
+    if tokens_vector is None:
+        # list(np.array(idx_tokens)[:, 1])
+        tokens_vector = await embeddings_calls([token for _, token in idx_tokens], **kwargs)
+
+    matching_indices = np.isin([j[0] for j in tokens], filter_idx)
+    filter_embeddings = np.array(tokens_vector)[matching_indices]
+
+    if len(filter_embeddings):
+        # cosine_similarity_np(np.array(query_vector).reshape(1, -1), filter_embeddings).T
+        sim_2d = np.array(query_vector).reshape(1, -1) @ filter_embeddings.T
+        matching_indices = np.isin(filter_idx, [j[0] for j in tokens])
+        similarity[matching_indices] = sim_2d.reshape(-1)
+
+    return similarity
+
+
+def get_similar_vectors(data, querys, exclude, topn=10, cutoff=0.0):
+    '''
+    {
+      "name": ["word1", "word2"],
+      "vectors": [[0.1, 0.2, ...], [0.3, 0.4, ...]]
+    }
+    '''
+    index_to_key = data['name']
+    vectors = np.array(data['vectors'])
+
+    # 获取索引
+    query_mask = np.array([w in index_to_key for w in querys])
+    exclude_mask = np.array([w in querys + exclude for w in index_to_key])
+    # np.delete(vectors, exclude_indices, axis=0)
+
+    # 计算余弦相似度
+    sim_matrix = cosine_similarity_np(vectors[query_mask], vectors[~exclude_mask].T)
+
+    results = []
+    for i, w in enumerate(querys):
+        if not query_mask[i]:
+            continue
+        sim_scores = sim_matrix[i]
+        top_indices = np.argsort(sim_scores)[::-1][:topn]  # 获取前 topn 个索引
+        top_scores = sim_scores[top_indices]
+
+        valid_indices = top_scores > cutoff  # 保留大于 cutoff 的相似度
+        top_words = [index_to_key[j] for j in np.where(~exclude_mask)[0][top_indices[valid_indices]]]
+        top_scores = top_scores[valid_indices]
+        results.append((w, list(zip(top_words, top_scores))))
+
+    return results  # [(w, list(sim[w].sort_values(ascending=False)[:topn].items())) for w in querys]
+
+
+async def get_similar_embeddings(querys, tokens, embeddings_calls: List[Callable[[str], Any]] = ai_embeddings,
+                                 topn=10, **kwargs):
+    """
+    使用嵌入计算查询与标记之间的相似度。
+    返回：
+        List[Tuple[str, List[Tuple[str, float]]]]: 查询词与相似标记及其分数的映射。
+    """
+    query_vector, tokens_vector = await asyncio.gather(
+        embeddings_calls(querys, **kwargs),
+        embeddings_calls(tokens, **kwargs))
+
+    sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
+    results = []
+    for i, w in enumerate(querys):
+        sim_scores = sim_matrix[i]
+        top_indices = np.argsort(sim_scores)[::-1][:topn]
+        top_scores = sim_scores[top_indices]
+        top_words = [tokens[j] for j in top_indices]
+        results.append((w, list(zip(top_words, top_scores))))
+
+    return results
+
+
+async def find_closest_matches_embeddings(querys, tokens,
+                                          embeddings_calls: List[Callable[[str], Any]] = ai_embeddings, **kwargs):
+    """
+    使用嵌入计算查询与标记之间的最近匹配。
+    返回：
+        Dict[str, Tuple[str, float]]: 查询与最近匹配标记的映射字典。
+    """
+    matchs = {x: (x, 1.0) for x in querys if x in tokens}
+    unmatched_queries = list(set(querys) - matchs.keys())
+    if not unmatched_queries:
+        return matchs
+    query_vector, tokens_vector = await asyncio.gather(
+        embeddings_calls(unmatched_queries, **kwargs),
+        embeddings_calls(tokens, **kwargs))
+
+    sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
+    closest_matches = tokens[sim_matrix.argmax(axis=1)]  # 找到每个查询的最佳匹配标记 idxmax
+    closest_scores = sim_matrix.max(axis=1)
+    matchs.update(zip(unmatched_queries, zip(closest_matches, closest_scores)))
+    return matchs
+
+
 def is_city(city, region='全国'):
+    # https://restapi.amap.com/v3/geocode/geo?parameters
     response = requests.get(url="http://api.map.baidu.com/place/v2/suggestion",
                             params={'query': city, 'region': region,
                                     "output": "json", "ak": Config.BMAP_API_Key, })
@@ -938,9 +884,10 @@ def is_city(city, region='全国'):
     return False
 
 
-def get_bmap_location(address):
+def get_bmap_location(address, city=''):
     response = requests.get(url="https://api.map.baidu.com/geocoding/v3",
                             params={"address": address,
+                                    "city": city,
                                     "output": "json",
                                     "ak": Config.BMAP_API_Key, })
     if response.status_code == 200:
@@ -951,12 +898,13 @@ def get_bmap_location(address):
     return None, None
 
 
-async def search_bmap_location(query, region=''):
-    url = "http://api.map.baidu.com/place/v2/suggestion"
+# https://lbsyun.baidu.com/faq/api?title=webapi/place-suggestion-api
+async def search_bmap_location(query, region='', limit=True):
+    url = "http://api.map.baidu.com/place/v2/suggestion"  # 100
     params = {
         "query": query,
         "region": region,
-        "city_limit": 'true' if region else 'false',
+        "city_limit": 'true' if (region and limit) else 'false',
         "output": "json",
         "ak": Config.BMAP_API_Key,
     }
@@ -967,16 +915,17 @@ async def search_bmap_location(query, region=''):
         if response.status_code == 200:
             js = response.json()
             for result in js.get('result', []):
-                res.append((round(result['location']['lng'], 6), round(result['location']['lat'], 6),
-                            result["name"], result['address']))
+                res.append({'lng_lat': (round(result['location']['lng'], 6), round(result['location']['lat'], 6)),
+                            'name': result["name"], 'address': result['address']})
         else:
             print(response.text)
         return res
 
 
-def get_amap_location(address):
+def get_amap_location(address, city=''):
     response = requests.get(url="https://restapi.amap.com/v3/geocode/geo?parameters",
                             params={"address": address,
+                                    "city": city,
                                     "output": "json",
                                     "key": Config.AMAP_API_Key, })
 
@@ -991,12 +940,13 @@ def get_amap_location(address):
     return None, None
 
 
-async def search_amap_location(query, region=''):
-    url = "https://restapi.amap.com/v5/place/text?parameters"
+# https://lbs.amap.com/api/webservice/guide/api-advanced/search
+async def search_amap_location(query, region='', limit=True):
+    url = "https://restapi.amap.com/v5/place/text?parameters"  # 100
     params = {
         "keywords": query,
         "region": region,
-        "city_limit": 'true' if region else 'false',
+        "city_limit": 'true' if (region and limit) else 'false',
         "output": "json",
         "key": Config.AMAP_API_Key,
     }
@@ -1009,7 +959,8 @@ async def search_amap_location(query, region=''):
             if js['status'] == '1' and int(js['count']) > 0:
                 for result in js.get('pois', []):
                     s1, s2 = result['location'].split(',')
-                    res.append((float(s1), float(s2), result["name"], result['address']))
+                    res.append({'lng_lat': (float(s1), float(s2)),
+                                'name': result["name"], 'address': result['address']})
             else:
                 print(response.text)
         return res
@@ -1171,6 +1122,43 @@ def baidu_ocr_recognise(image_data, image_url, access_token, ocr_sign='accurate_
         return None
 
 
+# https://help.aliyun.com/zh/ocr/developer-reference/api-ocr-api-2021-07-07-dir/?spm=a2c4g.11186623.help-menu-252763.d_2_2_4.3aba47bauq0U2j
+async def ali_ocr_recognise(image_data, image_url, access_token, ocr_sign='accurate_basic'):
+    headers = {
+        'Content-Type': "application/x-www-form-urlencoded",
+        'charset': "utf-8"
+    }
+    # accurate,general_basic,webimage
+    url = 'ocr-api.cn-hangzhou.aliyuncs.com'
+    try:
+        # 将图像数据编码为base64
+        # image_b64 = base64.b64encode(image_data).decode().replace("\r", "")
+        params = {
+            "access_token": access_token,
+            "language_type": 'CHN_ENG',
+        }
+        if image_data:
+            params["image"] = base64.b64encode(image_data)  # quote(image_b64.encode("utf8"))
+        if url:
+            params["url"] = image_url
+
+        # if template_sign:
+        #     params["templateSign"] = template_sign
+        # if classifier_id:
+        #     params["classifierId"] = classifier_id
+        # # 请求模板的bodys
+        # recognise_bodys = "access_token=" + access_token + "&templateSign=" + template_sign + "&image=" + quote(image_b64.encode("utf8"))
+        # # 请求分类器的bodys
+        # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
+        # request_body = "&".join(f"{key}={value}" for key, value in params.items())
+        response = requests.post(url, data=params, headers=headers)
+        response.raise_for_status()
+
+        return response.json()
+    except:
+        pass
+
+
 # https://nls-portal.console.aliyun.com/overview
 async def ali_speech_to_text(audio_data, format='pcm'):
     """阿里云语音转文字"""
@@ -1186,7 +1174,8 @@ async def ali_speech_to_text(audio_data, format='pcm'):
     }
     signature = generate_hmac_signature(Config.ALIYUN_Secret_Key, "POST", params)
     params["signature"] = signature
-    token, _ = get_aliyun_access_token(Config.ALIYUN_AK_ID, Config.ALIYUN_Secret_Key)
+    token, _ = get_aliyun_access_token(Config.ALIYUN_AK_ID, Config.ALIYUN_Secret_Key, service="nls-meta",
+                                       region="cn-shanghai")
     if not token:
         print("No permission!")
 
@@ -1340,10 +1329,65 @@ def dashscope_file_response(messages, file_path='.pdf', client=None, api_key='')
         files['file'][1].close()
 
 
-Agent_functions = {
+Agent_Functions = {
     'default': lambda *args, **kwargs: [],
     '2': web_search,  # web_search_async
 }
+
+AI_Tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "当你想知道现在的时间时非常有用。",
+            "parameters": {}  # 此处是函数参数相关描述, 因为获取当前时间无需输入参数，因此parameters为空字典
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'get_weather',
+            'description': 'Get the current weather for a given city.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'city': {
+                        'type': 'string',
+                        'description': 'The name of the city to query weather for.',
+                    },
+                },
+                'required': ['city'],
+            },
+        }
+    }
+]
+
+
+def get_current_time():
+    current_datetime = datetime.now()
+    formatted_time = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
+    return f"当前时间：{formatted_time}。"
+
+
+def get_weather(city: str):
+    # 使用 WeatherAPI 的 API 来获取天气信息
+    api_key = Config.Weather_Service_Key
+    base_url = "http://api.weatherapi.com/v1/current.json"
+    params = {
+        'key': api_key,
+        'q': city,
+        'aqi': 'no'  # 不需要空气质量数据
+    }
+    response = requests.get(base_url, params=params)
+
+    if response.status_code == 200:
+        data = response.json()
+        weather = data['current']['condition']['text']
+        temperature = data['current']['temp_c']
+        return f"The weather in {city} is {weather} with a temperature of {temperature}°C."
+    else:
+        return f"Could not retrieve weather information for {city}."
+
 
 if __name__ == "__main__":
     AccessToken = 'd04149e455d44ac09432f0f89c3e0a41'

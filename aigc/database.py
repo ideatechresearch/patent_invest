@@ -1,45 +1,81 @@
-from sqlalchemy import create_engine, Column, ForeignKey, String, Integer, BigInteger, Float, DateTime, Index, TEXT
+from sqlalchemy import create_engine, Column, ForeignKey, String, Integer, BigInteger, Boolean, Float, DateTime, Index, \
+    TEXT
 from sqlalchemy import func, or_, and_, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, mapped_column, Mapped, Session
-from datetime import datetime
+from datetime import datetime, timedelta
 import pymysql
-import hashlib
+import hashlib, secrets, uuid
 from typing import List, Optional
 import json, time
+
+# from sqlalchemy.ext.asyncio import create_async_engine,AsyncSession
+
+# async_engine = create_engine(Config.SQLALCHEMY_DATABASE_URI) #,echo=True 仅用于调试
+# AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False,expire_on_commit=False, bind=async_engine,class_=AsyncSession)
 
 Base = declarative_base()
 Chat_history = []
 
 
+# async def get_db()-> AsyncSession:
+#     async with AsyncSessionLocal() as session:
+#         yield session
+#         await session.close() # finally:
+
 class User(Base):
     __tablename__ = 'agent_users'
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    uuid: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, unique=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     username: Mapped[str] = mapped_column(String(99), unique=True, nullable=False, index=True)
     password: Mapped[str] = mapped_column(String(128), nullable=True)
     eth_address: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, unique=True)
     public_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, unique=True)
 
+    api_key: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, unique=True, index=True)
+    secret_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     group: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default='0')
     role: Mapped[str] = mapped_column(String(50), nullable=True, default='user')
+    disabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=False, default=False)
 
     parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey('agent_users.id'), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.utc_timestamp(),
                                                  default=func.utc_timestamp())
-
+    expires_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     chatcut_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, default=0)
-    disabled_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     def __repr__(self):
         return f"<User {self.username}>"
 
     def is_primary_account(self):
         return self.parent_id is None
+
+    def update(self, db: Session, eth_address: Optional[str] = None, public_key: Optional[str] = None,
+               expires_day: Optional[int] = 0, **kwargs):
+        update_data = {}
+        if eth_address is not None:
+            update_data['eth_address'] = eth_address
+        if public_key is not None:
+            update_data['public_key'] = public_key
+        if expires_day:
+            update_data['expires_at'] = int((datetime.utcnow() + timedelta(days=expires_day)).timestamp())
+
+        for key, value in kwargs.items():
+            if hasattr(self, key):  # in cls.__mapper__.c:
+                update_data[key] = value
+
+        if update_data:
+            db.query(User).filter_by(id=self.id).update(update_data)
+            db.commit()
+            db.refresh(self)
+            return self
+
+        return None
 
     @classmethod
     def create_user(cls, db: Session, username: str, password: str, role: str = 'user', group: str = '0',
@@ -61,13 +97,13 @@ class User(Base):
         return new_user
 
     @classmethod
-    def get_user(cls, db: Session, username: Optional[str] = None, uuid: Optional[str] = None,
+    def get_user(cls, db: Session, username: Optional[str] = None, user_id: Optional[str] = None,
                  public_key: Optional[str] = None, eth_address: Optional[str] = None):
         query = db.query(cls)
         if username:
             return query.filter_by(username=username).first()
-        if uuid:
-            return query.filter_by(uuid=uuid).first()
+        if user_id:
+            return query.filter_by(user_id=user_id).first()
         if public_key:
             return query.filter_by(public_key=public_key).first()
         if eth_address:
@@ -75,20 +111,27 @@ class User(Base):
         return None
 
     @classmethod
-    def update_user(cls, user_id: int, eth_address: Optional[str] = None, public_key: Optional[str] = None, **kwargs):
-        update_data = {}
-        if eth_address is not None:
-            update_data['eth_address'] = eth_address
-        if public_key is not None:
-            update_data['public_key'] = public_key
+    def update_user(cls, _id: int, db: Session, eth_address: Optional[str] = None, public_key: Optional[str] = None,
+                    expires_day: Optional[int] = 0, **kwargs):
+        user = db.query(cls).filter_by(id=_id).first()
+        if user:
+            return user.update(db, eth_address=eth_address, public_key=public_key, expires_day=expires_day, **kwargs)
+        return None
 
-        for key, value in kwargs.items():
-            if hasattr(cls, key):
-                update_data[key] = value
+    @classmethod
+    def create_api_key(cls, _id: int, db: Session):
+        while True:
+            api_key = str(uuid.uuid4())
+            if not db.query(cls).filter_by(api_key=api_key).first():
+                break
+        secret_key = secrets.token_urlsafe(32)
+        cls.update_user(_id, db, api_key=api_key, secret_key=secret_key)
+        return api_key, secret_key
 
-        if update_data:
-            db.query(cls).filter_by(id=user_id).update(update_data)
-            db.commit()
+    @classmethod
+    def get_api_keys(cls, db: Session):
+        api_keys = db.query(cls.api_key, cls.secret_key).all()
+        return {api_key: secret_key for api_key, secret_key in api_keys}
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -109,7 +152,7 @@ class User(Base):
         return None
 
 
-class ChatHistory(Base):
+class BaseChatHistory(Base):
     __tablename__ = 'agent_history'
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -117,9 +160,10 @@ class ChatHistory(Base):
     content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     username: Mapped[str] = mapped_column(String(99), nullable=False, index=True)
 
+    robot_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
     user_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
     model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    agent: Mapped[str] = mapped_column(String(50), nullable=True, default='0', index=True)
+    agent: Mapped[str] = mapped_column(String(50), nullable=True, default='0')
 
     index: Mapped[int] = mapped_column(Integer, nullable=False)
     reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
@@ -129,14 +173,15 @@ class ChatHistory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     __table_args__ = (
-        Index('idx_agent_username_time', 'agent', 'username', 'timestamp'),
+        Index('idx_username_time', 'username', 'robot_id', 'user_id', 'timestamp'),
     )
 
-    def __init__(self, role, content, username, user_id=None, model=None, agent='0', index=0,
-                 reference=None, summary=None, transform=None, timestamp=0):
+    def __init__(self, role, content, username, robot_id=None, user_id=None, model=None, agent='0', index=0,
+                 reference=None, summary=None, transform=None, timestamp: int = 0):
         self.role = role
         self.content = content
         self.username = username
+        self.robot_id = robot_id
         self.user_id = user_id
         self.model = model
         self.agent = agent
@@ -150,16 +195,25 @@ class ChatHistory(Base):
     def asdict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
-    @classmethod
-    def history_insert(cls, new_history, db: Session):
-        if len(new_history) > 0:
-            db.add_all([cls(**msg) for msg in new_history])
-            db.commit()
+    def display(self):
+        print(f"Role: {self.role}, Content: {self.content}, Timestamp: {self.timestamp}")
 
     @classmethod
-    def user_history(cls, db: Session, username: str, user_id: str = None, agent: str = None, filter_time: float = 0,
-                     all_payload: bool = True):
-        query = db.query(cls).filter(cls.username == username, or_(cls.user_id == user_id, user_id is None),
+    def history_insert(cls, new_history, db: Session):
+        try:
+            if len(new_history) > 0:
+                db.add_all([cls(**msg) for msg in new_history])
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Error inserting history: {e}")
+
+    @classmethod
+    def user_history(cls, db: Session, username: str, robot_id: str = None, user_id: str = None, agent: str = None,
+                     filter_time: float = 0, all_payload: bool = True):
+        query = db.query(cls).filter(cls.username == username,
+                                     or_(cls.robot_id == robot_id, robot_id is None),
+                                     or_(cls.user_id == user_id, user_id is None),
                                      cls.timestamp > filter_time)
         if agent:  # or_(cls.agent == agent, agent is None)
             query = query.filter(cls.agent == agent)
@@ -191,43 +245,71 @@ class ChatHistory(Base):
                 break
 
 
-def get_user_history(user_name: str, user_id: Optional[str], filter_time: float, db: Session, agent: str = None,
-                     request_uuid: Optional[str] = None) -> List[dict]:
-    user_history = [msg for msg in Chat_history if msg['username'] == (user_name or request_uuid)
-                    and (not user_id or msg['user_id'] == user_id) and (not agent or msg['agent'] == agent)
+def get_user_history(user_name: str, robot_id: Optional[str], user_id: Optional[str], filter_time: float, db: Session,
+                     agent: str = None, request_uuid: Optional[str] = None) -> List[dict]:
+    user_history = [msg for msg in Chat_history
+                    if msg['username'] == (user_name or request_uuid)
+                    and (not robot_id or msg['robot_id'] == robot_id)
+                    and (not user_id or msg['user_id'] == user_id)
+                    and (not agent or msg['agent'] == agent)
                     and msg['timestamp'] > filter_time]
 
     if user_name and db:  # 从数据库中补充历史记录
         user_history.extend(
-            ChatHistory.user_history(db, user_name, user_id, agent=agent, filter_time=filter_time,
-                                     all_payload=True))
+            BaseChatHistory.user_history(db, user_name, robot_id, user_id, agent=agent, filter_time=filter_time,
+                                         all_payload=True))
 
     return user_history
 
 
-def build_chat_history(user_name: str, user_message: str, user_id: Optional[str],
-                       filter_time: float, db: Session, user_history: List[str], use_hist: bool = False,
-                       request_uuid: Optional[str] = None):
+def cut_chat_history(user_history, max_len_limit_count=33000):
+    last_records = []
+    total_len = 0
+    if max_len_limit_count > 0:
+        for i in range(len(user_history) - 2, -1, -2):
+            pair = user_history[i:i + 2]
+            pair_len = sum(len(record['content']) for record in pair)  # 计算这一对消息的总长度
+
+            if total_len + pair_len > max_len_limit_count:
+                break
+
+            last_records = pair + last_records
+            total_len += pair_len
+
+    elif max_len_limit_count < 0:
+        last_records = user_history[max_len_limit_count * 2:]  # -(filter_limit * 2):
+    else:
+        last_records = user_history
+
+    return last_records
+
+
+def build_chat_history(user_name: str, user_request: str, robot_id: Optional[str], user_id: Optional[str],
+                       db: Session, user_history: List[str], use_hist=False,
+                       filter_limit: int = -500, filter_time: float = 0, request_uuid: Optional[str] = None):
     # 构建用户的聊天历史记录，并生成当前的用户消息。
     history = []
     if not user_history:
-        if use_hist:  # 如果没有消息提供，过滤现有的聊天记录，user_message为问题
-            user_history = get_user_history(user_name, user_id, filter_time, db, agent=None, request_uuid=request_uuid)
-            history.extend([{'role': msg['role'], 'content': msg['content']} for msg in
-                            sorted(user_history, key=lambda x: x['timestamp'])])
+        if use_hist:
+            user_history = get_user_history(user_name, robot_id, user_id, filter_time, db, agent=None,
+                                            request_uuid=request_uuid)
+            last_records = cut_chat_history(sorted(user_history, key=lambda x: x['timestamp']),
+                                            max_len_limit_count=filter_limit)
+            history.extend([{'role': msg['role'], 'content': msg['content']} for msg in last_records])
 
-        history.append({'role': 'user', 'content': user_message})
+        history.append({'role': 'user', 'content': user_request})
     else:
-        history.extend([msg.dict() for msg in user_history])
-        if not user_message:
+        last_records = cut_chat_history(user_history, max_len_limit_count=filter_limit)
+        history.extend([msg.dict() for msg in last_records])
+        if not user_request:
             if history[-1]["role"] == 'user':
-                user_message = history[-1]["content"]
-        # 如果提供消息,则使用最后一条user content为问题
+                user_request = history[-1]["content"]
 
-    return history, user_message
+    return history, user_request, len(user_history)
 
 
-def save_chat_history(user_name: str, user_message: str, bot_response: str, user_id: Optional[str],
+def save_chat_history(user_name: str, user_message: str, bot_response: str,
+                      robot_id: Optional[str], user_id: Optional[str],
                       agent: str, hist_size: int, model_name: str, timestamp: float,
                       db: Session, refer: List[str], transform=None, request_uuid: Optional[str] = None):
     if not user_message or not bot_response:
@@ -236,21 +318,110 @@ def save_chat_history(user_name: str, user_message: str, bot_response: str, user
     if not username:
         return
     new_history = [
-        {'role': 'user', 'content': user_message, 'username': username, 'user_id': user_id,
-         'agent': agent, 'index': hist_size - 1, 'timestamp': timestamp},
-        {'role': 'assistant', 'content': bot_response, 'username': username, 'user_id': user_id,
-         'agent': agent, 'index': hist_size, 'model': model_name,  # 'timestamp': time.time(),
+        {'role': 'user', 'content': user_message, 'username': username, 'robot_id': robot_id, 'user_id': user_id,
+         'agent': agent, 'index': hist_size + 1, 'timestamp': timestamp},
+        {'role': 'assistant', 'content': bot_response, 'username': username, 'robot_id': robot_id, 'user_id': user_id,
+         'agent': agent, 'index': hist_size + 2, 'model': model_name,  # 'timestamp': time.time(),
          'reference': json.dumps(refer, ensure_ascii=False) if refer else None,  # '\n'.join(refer)
          'transform': json.dumps(transform, ensure_ascii=False) if transform else None}
     ]
     # 保存聊天记录到数据库，或者保存到内存中当数据库不可用时。
     try:
         if user_name and db:
-            ChatHistory.history_insert(new_history, db)
+            BaseChatHistory.history_insert(new_history, db)
         else:
             raise Exception
     except:
         Chat_history.extend(new_history)
+
+
+class ChatHistory(BaseChatHistory):
+    def __init__(self, user_name: str, robot_id: Optional[str], user_id: Optional[str],
+                 agent: str, model_name: str, timestamp: float, db: Session, request_uuid: Optional[str] = None):
+        super().__init__(
+            role='user',
+            content="",
+            username=user_name,
+            robot_id=robot_id,
+            user_id=user_id,
+            model=model_name,
+            agent=agent,
+            index=0,
+            timestamp=timestamp
+        )
+        self.db = db
+        self.request_uuid = request_uuid
+        self.user_history: List[dict] = []
+
+    def get(self, filter_time: float = 0):
+        user_history = [msg for msg in Chat_history
+                        if msg['username'] == (self.username or self.request_uuid)
+                        and (not self.robot_id or msg['robot_id'] == self.robot_id)
+                        and (not self.user_id or msg['user_id'] == self.user_id)
+                        and (not self.agent or msg['agent'] == self.agent)
+                        and msg['timestamp'] > filter_time]
+
+        if self.username and self.db:  # 从数据库中补充历史记录
+            user_history.extend(
+                BaseChatHistory.user_history(self.db, self.username, self.robot_id, self.user_id, agent=self.agent,
+                                             filter_time=filter_time, all_payload=True))
+
+        return user_history
+
+    def build(self, user_request: str, user_history: List[dict], use_hist=False,
+              filter_limit: int = -500, filter_time: float = 0):
+        history = []
+        if not user_history:
+            if use_hist:  # 如果 use_hist 为真，可以根据 filter_limit 和 filter_time 筛选出历史记录，如果没有消息提供，过滤现有的聊天记录，user_message为问题
+                self.user_history = self.get(filter_time)
+                message_records = cut_chat_history(sorted(self.user_history, key=lambda x: x['timestamp']),
+                                                   max_len_limit_count=filter_limit)
+                history.extend([{'role': msg['role'], 'content': msg['content']} for msg in message_records])
+
+            if user_request:
+                history.append({'role': 'user', 'content': user_request})
+        else:
+            self.user_history = user_history
+            message_records = cut_chat_history(self.user_history, max_len_limit_count=filter_limit)
+            history.extend([msg.dict() for msg in message_records])
+
+            if not user_request:
+                if history[-1]["role"] == 'user':
+                    user_request = history[-1]["content"]
+                    # 如果提供消息,则使用最后一条user content为问题
+
+        return history, user_request
+
+    def save(self, user_request: str, bot_response: str, refer: List[str], transform=None, model_name: str = None):
+        if not user_request or not bot_response:
+            return
+
+        username = self.username or self.request_uuid
+        if not username:
+            return
+
+        hist_size = len(self.user_history)
+        new_history = [
+            {'role': 'user', 'content': user_request, 'username': username,
+             'robot_id': self.robot_id, 'user_id': self.user_id, 'agent': self.agent,
+             'index': hist_size + 1, 'model': self.model, 'timestamp': self.timestamp
+             },
+            {'role': 'assistant', 'content': bot_response, 'username': username,
+             'robot_id': self.robot_id, 'user_id': self.user_id, 'agent': self.agent,
+             'index': hist_size + 2, 'model': model_name or self.model,
+             'reference': json.dumps(refer, ensure_ascii=False) if refer else None,  # '\n'.join(refer)
+             'transform': json.dumps(transform, ensure_ascii=False) if transform else None
+             # 'timestamp': time.time(),
+             }
+        ]
+        # 保存聊天记录到数据库，或者保存到内存中当数据库不可用时。
+        try:
+            if self.username and self.db:
+                BaseChatHistory.history_insert(new_history, self.db)
+            else:
+                raise Exception
+        except:
+            Chat_history.extend(new_history)
 
 
 class OperationMysql:
@@ -343,5 +514,5 @@ class OperationMysql:
 #         except Exception as e:
 #             cls.update_task_status(session, task_id, TaskStatus.FAILED)
 if __name__ == "__main__":
-    with OperationMysql(host="localhost", user="root", password="password", db_name="test_db") as db:
-        print(db.search("SELECT * FROM my_table"))
+    with OperationMysql(host="localhost", user="root", password="password", db_name="test_db") as db111:
+        print(db111.search("SELECT * FROM my_table"))

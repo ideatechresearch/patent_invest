@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-from datetime import datetime
 import string, difflib, re, time, copy, os, io, sys, uuid
 import tempfile
 import logging
@@ -20,9 +19,6 @@ from apscheduler.executors.pool import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from passlib.context import CryptContext
 from qdrant_client import AsyncQdrantClient
-
-# from sqlalchemy.orm import sessionmaker
-# from sqlalchemy.ext.asyncio import create_async_engine,AsyncSession
 
 from structs import *
 from generates import *
@@ -48,7 +44,7 @@ async def lifespan(app: FastAPI):
 scheduler = BackgroundScheduler(executors={'default': ThreadPoolExecutor(2)})  # 设置线程池大小, AsyncIOScheduler()
 # executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)  # echo=True
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)  # class_=AsyncSession
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=Config.SECRET_KEY)
 # logging.basicConfig(level=logging.INFO)
@@ -57,9 +53,9 @@ w3 = Web3(Web3.HTTPProvider(f'https://mainnet.infura.io/v3/{Config.INFURA_PROJEC
 Task_queue = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
 
 dashscope.api_key = Config.DashScope_Service_Key
-# 密码哈希上下文
+# 加密配置,密码哈希上下文
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-# OAuth2 密码令牌
+# OAuth2 密码令牌,设置 tokenUrl
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
@@ -111,14 +107,7 @@ def get_db():
         yield db
     finally:
         db.close()
-    # async with AsyncSessionLocal() as session:
-    #     yield session
 
-
-# async def get_db():
-#     async with SessionLocal() as db:
-#         yield db
-#         await db.close()
 
 # @app.on_event("startup")
 # async def startup_event():
@@ -129,28 +118,6 @@ def get_db():
 # @app.on_event("shutdown")
 # async def shutdown_event():
 #     print("Shutting down...")
-
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    try:
-        username = verify_access_token(token)
-        user = User.get_user(db, username=username, uuid=username)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        if user.disabled_at > 0:
-            raise HTTPException(status_code=400, detail="Inactive user")
-        return user
-    except HTTPException as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-
-@app.post("/secure")
-async def secure_route(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    try:
-        user = get_current_user(token, db)
-        return {"message": "Access granted", "user": user.username}
-    except HTTPException:
-        # 如果 Access Token 验证失败，执行身份验证
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
 
 
 # 用户验证后的数据
@@ -168,12 +135,12 @@ fake_users_db = {
 # 如果提供了 eth_address 或 public_key，则不强制提供密码。
 # 如果提供了 username 或 uuid，并且没有提供 eth_address 或 public_key，则需要提供密码进行注册。
 @app.post("/register")
-async def register_user(registration: Registration, db: Session = Depends(get_db)):
-    username = registration.username
-    public_key = registration.public_key
-    eth_address = registration.eth_address
-    signed_message = registration.signed_message
-    original_message = registration.original_message
+async def register_user(request: Registration, db: Session = Depends(get_db)):
+    username = request.username
+    public_key = request.public_key
+    eth_address = request.eth_address
+    signed_message = request.signed_message
+    original_message = request.original_message
 
     if not (username or eth_address or public_key):
         raise HTTPException(status_code=400,
@@ -195,8 +162,8 @@ async def register_user(registration: Registration, db: Session = Depends(get_db
                 raise HTTPException(status_code=400, detail="Public key authentication failed")
 
     # 注册新用户
-    db_user = User.create_user(db=db, username=username, password=registration.password, role=registration.role,
-                               group=registration.group, eth_address=eth_address, public_key=public_key)
+    db_user = User.create_user(db=db, username=username, password=request.password, role=request.role,
+                               group=request.group, eth_address=eth_address, public_key=public_key)
 
     if not db_user:
         raise HTTPException(status_code=400,
@@ -206,16 +173,18 @@ async def register_user(registration: Registration, db: Session = Depends(get_db
     # User.update_user(user_id=db_user.id, eth_address=eth_address)
 
 
-# 令牌生成 login_for_access_token
-# 如果 eth_address 或 public_key 认证成功，签名验证则不需要密码。
-# 使用 username 或 uuid 和密码登录。
-@app.post("/authenticate")  # , response_model=Token
-async def authenticate_user(auth_request: AuthRequest, db: Session = Depends(get_db)):
-    eth_address = auth_request.eth_address
-    public_key = auth_request.public_key
-    signed_message = auth_request.signed_message
-    original_message = auth_request.original_message
-    username = auth_request.username
+@app.post("/authenticate", response_model=Token)
+async def authenticate_user(request: AuthRequest, db: Session = Depends(get_db)):
+    '''
+    登录路由，颁发访问令牌和刷新令牌,令牌生成 login_for_access_token,
+    如果 eth_address 或 public_key 认证成功，通过公钥验证签名则不需要密码。
+    使用 username 或 uuid 和密码登录。
+    '''
+    eth_address = request.eth_address
+    public_key = request.public_key  # 用户的公钥
+    signed_message = request.signed_message  # 签名的消息，Base64 编码格式（确保已正确编码）
+    original_message = request.original_message  # 要验证的原始消息内容
+    username = request.username
     is_verified = 0
     db_user = None
     # 验证签名
@@ -236,32 +205,34 @@ async def authenticate_user(auth_request: AuthRequest, db: Session = Depends(get
             is_verified |= 1 << 1
 
         if is_verified and db_user:
-            access_token = create_access_token(data={"sub": db_user.username or db_user.uuid})
+            access_token = create_access_token(data={"sub": db_user.username or db_user.user_id},
+                                               expires_minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES)
             return {"access_token": access_token, "token_type": "bearer"}
 
-    if auth_request.password and (username or uuid):
-        db_user = User.get_user(db=db, username=username, uuid=auth_request.uuid)  # User.validate_credentials(
+    if request.password and username:
+        db_user = User.get_user(db=db, username=username)  # user_id=request.uuid ,User.validate_credentials(
         if not db_user:
             raise HTTPException(status_code=400, detail="User not found")
 
-        if not User.verify_password(auth_request.password, db_user.password):
+        if not User.verify_password(request.password, db_user.password):
             raise HTTPException(status_code=400, detail="Invalid credentials")
 
         is_verified |= 1 << 2
-        access_token = create_access_token(data={"sub": username or auth_request.uuid},
+        access_token = create_access_token(data={"sub": username},
                                            expires_minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES)
         return {"access_token": access_token, "token_type": "bearer"}
 
     raise HTTPException(status_code=400, detail="Invalid authentication request")
 
 
-def verify_request_signature(request: Request, API_KEYS):
+async def verify_request_signature(request: Request, api_secret_keys):
+    # 请求签名验证的函数，主要用于确保请求的来源可信，防止请求在传输过程中被篡改
     api_key = request.headers.get("X-API-KEY")
     signature = request.headers.get("X-SIGNATURE")
     timestamp = request.headers.get("X-TIMESTAMP")
 
-    if not timestamp:
-        raise HTTPException(status_code=400, detail="Missing timestamp")
+    if not all([api_key, signature, timestamp]):
+        raise HTTPException(status_code=400, detail="Missing authentication headers")
 
     # 检查时间戳是否超时
     current_time = int(time.time())
@@ -269,18 +240,15 @@ def verify_request_signature(request: Request, API_KEYS):
     if abs(current_time - request_time) > 300:  # 5分钟的时间窗口
         raise HTTPException(status_code=403, detail="Request timestamp expired")
 
-    if not api_key or not signature or not timestamp:
-        raise HTTPException(status_code=400, detail="Missing authentication headers")
-
     # 检查API Key是否合法
-    secret = API_KEYS.get(api_key)
+    secret = api_secret_keys.get(api_key)
     if not secret:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
     # 从请求中构造签名字符串
     method = request.method
     url = str(request.url)
-    body = request.body() if request.method in ["POST", "PUT"] else b""
+    body = await request.body() if request.method in ["POST", "PUT"] else b""
 
     # 拼接签名字符串
     message = f"{method}{url}{body.decode()}{timestamp}"
@@ -288,11 +256,81 @@ def verify_request_signature(request: Request, API_KEYS):
     # 使用 HMAC-SHA256 生成服务器端的签名
     server_signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
-    # 比较签名
     if not hmac.compare_digest(server_signature, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     return True
+
+
+@app.post("/protected")
+async def protected(request: Request, db: Session = Depends(get_db)):
+    # api_key, secret_key = User.create_api_key(1, db)
+    # User.update_user(1, db,public_key='83e2c687a44f839f6b3414d63e1a54ad32d8dbe4706cdd58dc6bd4233a592f78367ee1bff0e081ba678a5dfdf068d4b4c72f03085aa6ba5f0678e157fc15d305')
+    api_keys = User.get_api_keys(db)
+    await verify_request_signature(request, api_keys)
+    return {"message": "Request authenticated successfully"}
+
+
+# 检查该用户是否在数据库中有效或是否具备某些标志位
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    username = verify_access_token(token)
+    if username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials,Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = User.get_user(db, username=username, user_id=username)
+    if not user:
+        raise HTTPException(status_code=404, detail="Access forbidden,User not found")
+    if user.disabled:  # or user.expires_at <= time.time()
+        raise HTTPException(status_code=400, detail="Access forbidden,Inactive user")
+    return user
+
+
+@app.post("/secure")
+async def secure_route(user: User = Depends(get_current_user)):
+    return {"message": "Access granted", "user": user.username}
+
+
+@app.post("/refresh_token", response_model=Token)  # dict
+async def refresh_access_token(username: str = Depends(verify_access_token)):
+    if username is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    new_access_token = create_access_token(data={"sub": username},
+                                           expires_minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return {"access_token": new_access_token, "token_type": "bearer"}
+
+
+@app.get("/admin/")
+async def admin(username: str = Depends(verify_access_token)):
+    if username == 'admin':
+        return {'history': Chat_history, 'task': Task_queue}
+    return {"message": "Access denied: Admin privileges required"}
+
+
+@app.get('/user/')
+async def user(request: Request, token: str = None, db: Session = Depends(get_db)):
+    if token:
+        username = verify_access_token(token)
+        if username is None:
+            return {"error": "Invalid credentials"}
+        user = User.get_user(db, username=username, user_id=username)
+        if user and not user.disabled:
+            return {"user": username}
+        return {"error": "Access forbidden for virtual users"}
+
+    user_id = request.session.get('user_id', '')
+    if not user_id:
+        user_id = str(uuid.uuid1())
+        request.session['user_id'] = user_id  # 伪用户信息用于 session,临时用户标识
+
+    return {"user": user_id}
+
+
+@app.get("/")
+async def index():
+    return {"message": "Hello World"}
 
 
 @app.get('/web_search/{text}')
@@ -307,31 +345,6 @@ async def retrieval(text: str, platform: str = 'default'):
     return {'knowledge', 'retrieval pass'}
 
 
-@app.get("/admin")
-async def admin(token: str = Depends(authenticate_user)):  # Depends(verify_access_token)
-    return {"message": "Welcome"}
-
-
-@app.get('/user')
-async def user(request: Request):
-    user_id = request.session.get('user_id', '')
-    if not user_id:
-        user_id = str(uuid.uuid1())
-        request.session['user_id'] = user_id  # 伪用户信息用于 session,临时用户标识
-
-    return {"user": user_id}
-
-
-@app.get("/test")
-async def test():
-    return {"message": "ok"}
-
-
-@app.get("/")
-async def index():
-    return {"message": "Hello World", 'history': Chat_history, 'task': Task_queue}
-
-
 @app.get("/embeddings/")
 async def embeddings(texts: List[str] = Query(...), model_name: str = 'qwen', model_id: int = 0):
     inputs = [text.replace("\n", " ") for text in texts]
@@ -343,38 +356,45 @@ async def embeddings(texts: List[str] = Query(...), model_name: str = 'qwen', mo
 
 
 @app.get("/fuzzy/")
-async def fuzzy_matches(texts: List[str] = Query(...), tokens: List[str] = Query(...),
+async def fuzzy_matches(texts: List[str] = Query(...), terms: List[str] = Query(...),
                         top_n: int = 3, cutoff: float = 0.6, method: str = 'levenshtein'):
-    query = [text.replace("\n", " ").strip() for text in texts]
-    terms = [text.replace("\n", " ").strip() for text in tokens]
+    querys = [text.replace("\n", " ").strip() for text in texts]
+    tokens = [text.replace("\n", " ").strip() for text in terms]
     results = []
     if method == 'levenshtein':
-        for token in query:
-            matches = difflib.get_close_matches(token, terms, n=top_n, cutoff=cutoff)
-            matches = [(match, round(difflib.SequenceMatcher(None, token, match).ratio(), 3), terms.index(match))
+        for token in querys:
+            matches = difflib.get_close_matches(token, tokens, n=top_n, cutoff=cutoff)
+            matches = [(match, round(difflib.SequenceMatcher(None, token, match).ratio(), 3), tokens.index(match))
                        for match in matches]
-            results.append({'token': token, 'matches': matches})
-        # results = [{'token': token, 'matches': rapidfuzz.process.extract(token, terms, limit=top_n, score_cutoff=cutoff)}
-        #            for token in query]
+            results.append({'query': token, 'matches': matches})
+        # results = [{'token': token, 'matches': rapidfuzz.process.extract(token, tokens, limit=top_n, score_cutoff=cutoff)}
+        #            for token in querys]
+        # fuzzywuzzy.process.extractOne(token,choices,scorer=fuzzywuzzy.fuzz.token_sort_ratio)
     elif method == 'bm25':
-        bm25 = BM25(terms)  # corpus
-        for token in query:
+        bm25 = BM25(tokens)  # corpus
+        for token in querys:
             scores = bm25.rank_documents(token)
-            matches = [(terms[match[0]], round(match[1], 3), match[0]) for match in scores[:top_n] if
+            matches = [(tokens[match[0]], round(match[1], 3), match[0]) for match in scores[:top_n] if
                        match[1] >= cutoff]
-            results.append({'token': token, 'matches': matches})
+            results.append({'query': token, 'matches': matches})
     elif method == 'reranker':
         async def process_token(token):
-            scores = await ai_reranker(token, documents=terms, top_n=top_n,
+            scores = await ai_reranker(token, documents=tokens, top_n=top_n,
                                        model_name="BAAI/bge-reranker-v2-m3", model_id=0)
             matches = [(match[0], round(match[1], 3), match[2]) for match in scores if
                        match[1] >= cutoff]
-            return {'token': token, 'matches': matches}
+            return {'query': token, 'matches': matches}
 
-        results = await asyncio.gather(*(process_token(token) for token in query))  # [(match,score,index)]
+        results = await asyncio.gather(*(process_token(token) for token in querys))  # [(match,score,index)]
+    elif method == 'embeddings':
+        similars = await get_similar_embeddings(querys, tokens, ai_embeddings, topn=top_n, cutoff=cutoff,
+                                                model_name='qwen', model_id=0)
+        results = [{'query': token, 'matches':
+            [(match[0], round(match[1], 3), tokens.index(match[0])) for match in matches if match[1] >= cutoff]} for
+                   token, matches in similars]
 
-    # tokens = list({match for token in query for match in difflib.get_close_matches(token, terms)})
-    # match, score = process.extractOne(token, terms)
+    # tokens = list({match for token in querys for match in difflib.get_close_matches(token, tokens)})
+    # match, score = process.extractOne(token, tokens)
     # results.append({'token': token, 'match': match, 'score': score})
     return JSONResponse(content=results, media_type="application/json; charset=utf-8")
     # Response(content=list_to_xml('results', results), media_type='application/xml; charset=utf-8')
@@ -386,7 +406,7 @@ async def nlp():
 
 
 @app.post("/llm")  # response_model=OpenAIResponse
-async def generate_text(request: CompletionRequest):
+async def generate_text(request: CompletionParams):
     # f"You asked: {query}\nHere are some search results:\n{search_summary}\nBased on these results, here's some information:\n"
     # prompt = "以下是最近的对话内容，请生成一个摘要：\n\n"  # 请根据对话内容将会议的讨论内容整理成纪要,从中提炼出关键信息,将会议内容按照主题或讨论点分组,列出决定事项和待办事项。
     # prompt += "\n".join(str(msg) for msg in conversation),"\n".join(conversation_history[-10:])
@@ -396,7 +416,7 @@ async def generate_text(request: CompletionRequest):
         async def stream_response():
             async for chunk in await ai_generate(
                     prompt=request.prompt,
-                    question=request.question,
+                    user_request=request.question,
                     suffix=request.suffix,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
@@ -408,9 +428,15 @@ async def generate_text(request: CompletionRequest):
 
         return StreamingResponse(stream_response(), media_type="text/plain")
     else:
-        result = await ai_generate(
+        user_request = request.question
+        refer = await retrieved_reference(request.question, request.keywords, tool_calls=None)
+        if refer:
+            formatted_refer = '\n'.join(map(str, refer))
+            user_request = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请回答下面的问题:{request.question}'
+
+        bot_response = await ai_generate(
             prompt=request.prompt,
-            question=request.question,
+            user_request=user_request,
             suffix=request.suffix,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
@@ -418,7 +444,8 @@ async def generate_text(request: CompletionRequest):
             model_id=request.model_id,
             stream=False,
         )
-        return {"completion": result}  # OpenAIResponse(response=generated_text)
+        return {"completion": bot_response, 'reference': refer,
+                'transform': extract_string(bot_response, request.extract)}  # OpenAIResponse(response=generated_text)
 
 
 # ,current_user: User = Depends(get_current_user)
@@ -435,9 +462,8 @@ async def generate_message(request: OpenAIRequest,
     model_name = request.model_name
     agent = request.agent
     extract = request.extract
-    user_name = request.username
-    user_id = request.user_id
-    current_timestamp = time.time()
+    chat_history = ChatHistory(request.username, request.robot_id, request.user_id, agent, model_name,
+                               timestamp=time.time(), db=db, request_uuid=request.uuid)
 
     if not extract:
         agent_format = {
@@ -449,17 +475,16 @@ async def generate_message(request: OpenAIRequest,
         }
         extract = agent_format.get(agent, extract)
 
-    history, user_message = build_chat_history(user_name, request.question, user_id,
-                                               request.filter_time, db, user_history=request.messages,
-                                               use_hist=request.use_hist, request_uuid=request.uuid)
+    history, user_request = chat_history.build(request.question, request.messages, request.use_hist,
+                                               request.filter_limit, request.filter_time)
 
     system_prompt = request.prompt or System_content.get(agent, '')
-    agent_funcalls = [Agent_functions.get(agent, lambda *args, **kwargs: [])]
+    agent_funcalls = [Agent_Functions.get(agent, lambda *args, **kwargs: [])]
     model_info, payload, refer = await get_chat_payload(
-        messages=history, user_message=user_message, system=system_prompt,
+        messages=history, user_request=user_request, system=system_prompt,
         temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens,
         model_name=model_name, model_id=request.model_id,
-        generate_calls=agent_funcalls, keywords=request.keywords)
+        tool_calls=agent_funcalls, keywords=request.keywords)
 
     if request.stream:
         async def generate_stream() -> AsyncGenerator[str, None]:
@@ -483,8 +508,7 @@ async def generate_message(request: OpenAIRequest,
             yield f'data: {last_data}\n\n'
             yield 'data: [DONE]\n\n'
 
-            save_chat_history(user_name, user_message, bot_response, user_id, agent, len(history), model_name,
-                              current_timestamp, db, refer=refer, transform=transform, request_uuid=request.uuid)
+            chat_history.save(user_request, bot_response, refer, transform, payload['model'])
 
         # generate() , media_type="text/plain"
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
@@ -492,10 +516,9 @@ async def generate_message(request: OpenAIRequest,
         bot_response = await ai_chat(model_info, payload)
         # print(bot_response)
         transform = extract_string(bot_response, extract)
-        save_chat_history(user_name, user_message, bot_response, user_id, agent, len(history), model_name,
-                          current_timestamp, db, refer=refer, transform=transform, request_uuid=request.uuid)
+        chat_history.save(user_request, bot_response, refer, transform, payload['model'])
 
-        return JSONResponse({'answer': bot_response, 'refer': refer, 'transform': transform})
+        return JSONResponse({'answer': bot_response, 'reference': refer, 'transform': transform})
 
 
 @app.websocket("/ws/chat")
@@ -514,25 +537,27 @@ async def websocket_chat(websocket: WebSocket):
             agent = request.get('agent', '0')
             extract = request.get('extract')
             user_name = request.get('username')
+            robot_id = request.get('robot_id')
             user_id = request.get('user_id')
             current_timestamp = time.time()
 
             # 构建聊天历史记录
-            history, user_message = build_chat_history(
-                user_name, request.get('question'), user_id, request.get('filter_time', 0.0), db=db,
-                user_history=request.get('messages', []), use_hist=request.get('use_hist', False),
+            history, user_request, hist_size = build_chat_history(
+                user_name, request.get('question'), robot_id, user_id, db=db,
+                user_history=request.get('messages', []), use_hist=request.get('use_hist', True),
+                filter_limit=request.get('filter_limit', -500), filter_time=request.get('filter_time', 0.0),
                 request_uuid=request.get('uuid')
             )
 
             # 生成系统提示和模型请求
             system_prompt = request.get('prompt') or System_content.get(agent, '')
-            agent_funcalls = [Agent_functions.get(agent, lambda *args, **kwargs: [])]
+            agent_funcalls = [Agent_Functions.get(agent, lambda *args, **kwargs: [])]
             model_info, payload, refer = await get_chat_payload(
-                messages=history, user_message=user_message,
+                messages=history, user_request=user_request,
                 system=system_prompt, temperature=request.get('temperature', 0.4),
                 top_p=request.get('top_p', 0.8), max_tokens=request.get('max_tokens', 1024),
                 model_name=model_name, model_id=request.get('model_id', 0),
-                generate_calls=agent_funcalls, keywords=request.get('keywords', [])
+                tool_calls=agent_funcalls, keywords=request.get('keywords', [])
             )
             if request.get('stream', True):
                 async def generate_stream() -> AsyncGenerator[str, None]:
@@ -556,8 +581,8 @@ async def websocket_chat(websocket: WebSocket):
 
                     # 保存聊天记录
                     save_chat_history(
-                        user_name, user_message, bot_response, user_id, agent,
-                        len(history), model_name, current_timestamp, db=db,
+                        user_name, user_request, bot_response, robot_id, user_id, agent,
+                        hist_size, model_name, current_timestamp, db=db,
                         refer=refer, transform=transform, request_uuid=request.get('uuid'))
 
                 # 流式传输消息到 WebSocket
@@ -570,13 +595,13 @@ async def websocket_chat(websocket: WebSocket):
 
                 # 保存聊天记录
                 save_chat_history(
-                    user_name, user_message, bot_response, user_id, agent,
-                    len(history), model_name, current_timestamp, db=db,
+                    user_name, user_request, bot_response, robot_id, user_id, agent,
+                    hist_size, model_name, current_timestamp, db=db,
                     refer=refer, transform=transform, request_uuid=request.get('uuid')
                 )
 
                 await websocket.send_text(
-                    json.dumps({'answer': bot_response, 'refer': refer, 'transform': transform}))
+                    json.dumps({'answer': bot_response, 'reference': refer, 'transform': transform}))
                 # await asyncio.sleep(0.1)
 
             if system_prompt.lower() == "bye":
@@ -591,42 +616,51 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.close()
 
 
-@app.get("/get_messages")
-async def get_messages(request: Request, user_id: str = Query(""), filter_time: float = Query(0.0),
+@app.get("/get_messages/")
+async def get_messages(request: Request, user_name: str = Query(""), robot_id: str = Query(""),
+                       user_id: str = Query(""), filter_time: float = Query(0.0),
                        agent: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    user_name = request.session.get('username', '')
-    if not user_name:
+    request_uuid = request.session.get('user_id', '')
+    if not user_name and not request_uuid:
         return JSONResponse(status_code=400, content={"error": "No username found in session"})
-
     # filter_time = filter_time / 1000.0
-    user_history = get_user_history(user_name, user_id, filter_time, db, agent=agent, request_uuid=None)
-
+    user_history = get_user_history(user_name, robot_id, user_id, filter_time, db, agent=agent,
+                                    request_uuid=request_uuid)
     return JSONResponse(content=sorted(user_history, key=lambda x: x['timestamp']))
 
 
 @app.post("/submit_messages")
 async def submit_messages(request: SubmitMessagesRequest, background_tasks: BackgroundTasks,
                           db: Session = Depends(get_db)):
-    user_name = request.username
     if len(Task_queue) > Config.MAX_TASKS:
         return JSONResponse(status_code=400, content={'task_id': '', "error": "任务队列已满"})
     if not request.messages and not request.params:
         return JSONResponse(status_code=400,
                             content={'task_id': '', 'error': 'Please provide messages or a question to process.'})
 
-    history, user_message = build_chat_history(user_name, request.question, request.user_id,
-                                               request.filter_time, db, user_history=request.messages,
-                                               use_hist=request.use_hist, request_uuid=request.uuid)
+    user_name = request.username
+    current_timestamp = time.time()
+    chat_history = ChatHistory(user_name, request.robot_id, request.user_id, agent=None, model_name=None,
+                               timestamp=current_timestamp, db=db, request_uuid=request.uuid)
+
+    history, user_request = chat_history.build('', request.messages, request.use_hist,
+                                               request.filter_limit, request.filter_time)
+
+    # history, user_request, hist_size = build_chat_history(
+    #     user_name, "", request.robot_id, request.user_id, db, user_history=request.messages,
+    #     use_hist=request.use_hist, filter_limit=request.filter_limit, filter_time=request.filter_time,
+    #     request_uuid=request.uuid)
 
     task_id = str(uuid.uuid4())
     Task_queue[task_id] = {
         "status": TaskStatus.PENDING,
-        'action': 'message',
+        "action": 'message',
         'username': user_name,
         "messages": history,
-        'user_message': user_message,
+        "chat_history": chat_history,
+        "user_request": user_request,
 
-        "timestamp": time.time(),
+        "timestamp": current_timestamp,
         "response": None,
     }
     if request.params:
@@ -636,35 +670,35 @@ async def submit_messages(request: SubmitMessagesRequest, background_tasks: Back
     return JSONResponse(content={'task_id': task_id})
 
 
-async def process_task_ai(task_id: str, params: List[AIParams]):
+async def process_task_ai(task_id: str, params: List[CompletionParams]):
     task = Task_queue.get(task_id)
     if not task:
         return
     task['status'] = TaskStatus.IN_PROGRESS
     history: List[dict] = task.get('messages', [])
-    user_message = task['user_message']
+    user_request = task['user_request']
 
-    async def single_param(i: int, param: AIParams):
+    async def single_param(i: int, param: CompletionParams):
         if param.stream:
             pass
         if not param.question:
-            param.question = user_message
+            param.question = user_request
 
         local_history = copy.deepcopy(history)  # history.copy()
         if local_history[-1]["role"] == 'user':
             local_history[-1]['content'] = param.question
 
-        agent_funcalls = [Agent_functions.get(param.agent, lambda *args, **kwargs: [])]
+        agent_funcalls = [Agent_Functions.get(param.agent, lambda *args, **kwargs: [])]
         system_prompt = param.prompt or System_content.get(param.agent, '')
-        model_info, payload, refer = await get_chat_payload(messages=local_history, user_message=param.question,
+        model_info, payload, refer = await get_chat_payload(messages=local_history, user_request=param.question,
                                                             system=system_prompt, temperature=param.temperature,
                                                             top_p=param.top_p, max_tokens=param.max_tokens,
                                                             model_name=param.model_name, model_id=param.model_id,
-                                                            generate_calls=agent_funcalls, keywords=param.keywords)
+                                                            tool_calls=agent_funcalls, keywords=param.keywords)
         # **param.asdict(),payload=param.payload()
         bot_response = await ai_chat(model_info, payload)
         transform = extract_string(bot_response, param.extract)
-        return {'answer': bot_response, 'refer': refer, 'transform': transform, 'id': i}
+        return {'answer': bot_response, 'reference': refer, 'transform': transform, 'id': i}
 
     tasks = [single_param(i, p) for i, p in enumerate(params) if not p.stream]
     results = await asyncio.gather(*tasks)
@@ -696,12 +730,12 @@ async def get_ai_param(
         extract: Optional[str] = Query(None,
                                        description="Specify the type of content to extract from the AI's response (e.g., key phrases, summaries)."),
         keywords: Optional[List[str]] = Query(None,
-                                              description="A list of keywords used to guide the retrieval of relevant information or sources based on search terms.")
-) -> AIParams:
+                                              description="A list of keywords used to guide the retrieval of relevant information or sources based on search terms."),
+) -> CompletionParams:
     """
-     Asynchronously retrieves the AI parameters based on user input and returns them as an AIParams object.
+     Asynchronously retrieves the AI parameters based on user input and returns them as an CompletionParams object.
      """
-    return AIParams(
+    return CompletionParams(
         stream=stream,
         temperature=temperature,
         top_p=top_p,
@@ -712,13 +746,13 @@ async def get_ai_param(
         model_name=model_name,
         model_id=model_id,
         extract=extract,
-        keywords=keywords
+        keywords=keywords,
     )
 
 
 @app.get("/message/{task_id}")
 async def response_message(task_id: str,
-                           param: AIParams = Depends(get_ai_param)) -> StreamingResponse or JSONResponse:
+                           param: CompletionParams = Depends(get_ai_param)) -> StreamingResponse or JSONResponse:
     task = Task_queue.get(task_id)
     if not task:
         error_data = {"error": "Invalid task ID", 'content': task_id}
@@ -737,19 +771,19 @@ async def response_message(task_id: str,
         return JSONResponse(content=error_data, status_code=409)
 
     task['status'] = TaskStatus.IN_PROGRESS
-
-    history = task.get('messages', [])
+    history: List[dict] = task.get('messages', [])
+    chat_history: ChatHistory = task['chat_history']
 
     if not param.question:
-        param.question = task['user_message']
+        param.question = task['user_request']
 
-    agent_funcalls = [Agent_functions.get(param.agent, lambda *args, **kwargs: [])]
+    agent_funcalls = [Agent_Functions.get(param.agent, lambda *args, **kwargs: [])]
     system_prompt = param.prompt or System_content.get(param.agent, '')
-    model_info, payload, refer = await get_chat_payload(messages=history, user_message=param.question,
+    model_info, payload, refer = await get_chat_payload(messages=history, user_request=param.question,
                                                         system=system_prompt, temperature=param.temperature,
                                                         top_p=param.top_p, max_tokens=param.max_tokens,
                                                         model_name=param.model_name, model_id=param.model_id,
-                                                        generate_calls=agent_funcalls, keywords=param.keywords)
+                                                        tool_calls=agent_funcalls, keywords=param.keywords)
 
     if param.stream:
         async def generate():
@@ -771,16 +805,18 @@ async def response_message(task_id: str,
                                    ensure_ascii=False)
             yield f'data: {last_data}\n\n'
             yield 'data: [DONE]\n\n'
+
+            chat_history.save(param.question, bot_response, refer, transform, payload['model'])
             task['status'] = TaskStatus.RECEIVED
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     bot_response = await ai_chat(model_info, payload)
     transform = extract_string(bot_response, param.extract)
-    # save_chat_history(task['username'], task['user_message'], bot_response, user_id, param.agent, len(history), param.model_name,
-    #                   task["timestamp"], db, refer=refer, transform=transform, request_uuid=request.uuid)
+
+    chat_history.save(param.question, bot_response, refer, transform, payload['model'])
     # del Task_queue[task_id]
-    task["response"] = [{'answer': bot_response, 'refer': refer, 'transform': transform, 'id': 0}]
+    task["response"] = [{'answer': bot_response, 'reference': refer, 'transform': transform, 'id': 0}]
     task['status'] = TaskStatus.RECEIVED
     return JSONResponse(content=task["response"])
 
@@ -819,7 +855,7 @@ async def translate_text(request: TranslateRequest):
         system_prompt = System_content.get('9')
         translated_text = await ai_generate(
             prompt=system_prompt,
-            question=request.text,
+            user_request=request.text,
             model_name=platform,
             model_id=0,
             stream=False,

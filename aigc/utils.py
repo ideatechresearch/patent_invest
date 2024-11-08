@@ -1,7 +1,7 @@
 import re, json
 import inspect
 import xml.etree.ElementTree as ET
-from difflib import SequenceMatcher
+from difflib import get_close_matches, SequenceMatcher
 from collections import OrderedDict, Counter
 import math
 import jieba
@@ -228,6 +228,67 @@ def extract_italic(text):
     return [italic[0] or italic[1] for italic in italic_texts]  # 处理两个捕获组
 
 
+def ordinal_generator():
+    ordinals = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
+    for ordinal in ordinals:
+        yield ordinal
+
+
+def remove_markdown(text):
+    # 去除 Markdown 的常见标记
+    """
+    **粗体文本**
+    _斜体文本_
+    ![图片描述](image_url)
+    [链接文本](url)
+    ### 标题文本
+    > 引用块
+    * 无序列表项
+    1. 有序列表项
+    ~~删除线文本~~
+    __下划线文本__
+    """
+    text = re.sub(r'(`{1,3})(.*?)\1', r'\2', text)  # 去除反引号代码块
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # 去除粗体
+    text = re.sub(r'\*(.*?)\*', r'\1', text)  # 去除斜体
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)  # 去除图片
+    text = re.sub(r'\[.*?\]\((.*?)\)', r'\1', text)  # 去除链接，但保留 URL
+    text = re.sub(r'#{1,6}\s*(.*)', r'\1', text)  # 去除标题
+    text = re.sub(r'>\s*(.*)', r'\1', text)  # 去除引用块
+    text = re.sub(r'(\*|-|\+)\s+(.*)', r'\2', text)  # 去除无序列表符号
+    text = re.sub(r'\d+\.\s+(.*)', r'\1', text)  # 去除有序列表符号
+    text = re.sub(r'~~(.*?)~~', r'\1', text)  # 去除删除线
+    text = re.sub(r'_{2}(.*?)_{2}', r'\1', text)  # 去除下划线标记
+    text = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1', text)  # 去除链接和 URL
+    text = re.sub(r'\n{2,}', '\n', text)  # 将多余的空行替换为单个换行符
+    return text.strip()
+
+
+def format_for_wechat(text):
+    formatted_text = text
+    formatted_text = re.sub(r'\*\*(.*?)\*\*', r'✦\1✦', formatted_text)  # **粗体** 转换为 ✦粗体✦样式
+    formatted_text = re.sub(r'__(.*?)__', r'※\1※', formatted_text)  # __斜体__ 转换为星号包围的样式
+    formatted_text = re.sub(r'!!(.*?)!!', r'❗\1❗', formatted_text)  # !!高亮!! 转换为 ❗符号包围
+    formatted_text = re.sub(r'~~(.*?)~~', r'_\1_', formatted_text)  # ~~下划线~~ 转换为下划线包围
+    formatted_text = re.sub(r'\^\^(.*?)\^\^', r'||\1||', formatted_text)  # ^^重要^^ 转换为 ||重要|| 包围
+    formatted_text = re.sub(r'######\s+(.*?)(\n|$)', r'[\1]\n', formatted_text)  # ###### 六级标题
+    formatted_text = re.sub(r'#####\s+(.*?)(\n|$)', r'《\1》\n', formatted_text)  # ##### 五级标题
+    formatted_text = re.sub(r'####\s+(.*?)(\n|$)', r'【\1】\n', formatted_text)  # #### 标题转换
+    formatted_text = re.sub(r'###\s+(.*?)(\n|$)', r'— \1 —\n', formatted_text)  # ### 三级标题
+    formatted_text = re.sub(r'##\s+(.*?)(\n|$)', r'—— \1 ——\n', formatted_text)  # ## 二级标题
+    formatted_text = re.sub(r'#\s+(.*?)(\n|$)', r'——— \1 ———\n', formatted_text)  # # 一级标题
+    # formatted_text = re.sub(r'```([^`]+)```',
+    #                         lambda m: '\n'.join([f'｜ {line}' for line in m.group(1).splitlines()]) + '\n',
+    #                         formatted_text)
+    # formatted_text = re.sub(r'`([^`]+)`', r'「\1」', formatted_text)  # `代码` 转换为「代码」样式
+    # formatted_text = re.sub(r'>\s?(.*)', r'💬 \1', formatted_text)  # > 引用文本，转换为聊天符号包围
+    # formatted_text = re.sub(r'^\s*[-*+]\s+', '• ', formatted_text, flags=re.MULTILINE)  # 无序列表项
+    # formatted_text = re.sub(r'^\s*\d+\.\s+',f"{next(ordinal_iter)} ", formatted_text, flags=re.MULTILINE)  # 有序列表项
+    formatted_text = re.sub(r'\n{2,}', '\n\n', formatted_text)  # 转换换行以避免多余空行
+
+    return formatted_text.strip()
+
+
 def extract_string(text, extract, **kwargs):
     if not extract:
         return None
@@ -238,6 +299,7 @@ def extract_string(text, extract, **kwargs):
         "links": extract_links,
         "bold": extract_bold,
         "italic": extract_italic,
+        "wechat": format_for_wechat,
     }
     try:
         if extract in funcs:
@@ -287,6 +349,17 @@ def find_similar_word(target_keyword, tokens):
             max_ratio = ratio
             similar_word_index = i
     return similar_word_index
+
+
+def find_similar_words(query, tokens, top_n=3):
+    matches = get_close_matches(query, tokens, n=top_n)
+    # 计算每个匹配项与查询词的相似度
+    results = []
+    for match in matches:
+        matcher = SequenceMatcher(None, query, match)
+        results.append((match, matcher.ratio(), tokens.index(match)))
+
+    return results
 
 
 def contains_chinese(text):
@@ -395,12 +468,12 @@ if __name__ == "__main__":
     jieba.initialize()
     # jieba.load_userdict('data/patent_thesaurus.txt')
     corpus = [
-            "快速的棕色狐狸跳过了懒狗",
-            "懒狗躺下了",
-            "狐狸很快速并且跳得很高",
-            "快速的棕色狐狸",
-            "猫跳过了狗"
-        ]
+        "快速的棕色狐狸跳过了懒狗",
+        "懒狗躺下了",
+        "狐狸很快速并且跳得很高",
+        "快速的棕色狐狸",
+        "猫跳过了狗"
+    ]
     query = "快速的狐狸"
     bm25 = BM25(corpus)
     scores = bm25.rank_documents(query)

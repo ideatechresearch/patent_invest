@@ -6,7 +6,6 @@ from py2neo import Graph, Node, Relationship, Subgraph
 import requests, json, httpx
 import numpy as np
 from enum import Enum as PyEnum
-from difflib import get_close_matches, SequenceMatcher
 
 
 # from neo4j import Graph,GraphDatabase driver = GraphDatabase.driver(uri, auth=(username, password))
@@ -56,17 +55,6 @@ def scale_to_range(numbers, new_min, new_max):
     ]
 
     return scaled_numbers
-
-
-def find_similar_words(query, word_list):
-    matches = get_close_matches(query, word_list)
-    # 计算每个匹配项与查询词的相似度
-    results = []
-    for match in matches:
-        matcher = SequenceMatcher(None, query, match)
-        results.append((match, matcher.ratio()))
-
-    return results
 
 
 def download_file(url, local_filename):
@@ -203,12 +191,11 @@ def web_search(text: str, api_key: str) -> list:
         data = response.json()
         search_result = data.get('choices', [{}])[0].get('message', {}).get('tool_calls', [{}])[1].get('search_result')
         if search_result:
-            return [{
-                'title': result.get('title'),
-                'content': result.get('content'),
-                'link': result.get('link'),
-                'media': result.get('media')
-            } for result in search_result]
+            return [{'title': result.get('title'),
+                     'content': result.get('content'),
+                     'link': result.get('link'),
+                     'media': result.get('media')
+                     } for result in search_result]
         return [{'content': response.content.decode()}]
     except (requests.exceptions.RequestException, KeyError, IndexError) as e:
         return [{'error': str(e)}]
@@ -460,28 +447,6 @@ def process_line_stream(response):
 
     if data:
         yield process_data_chunk(data)
-
-
-def forward_stream(response):
-    for line in response.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        if line.startswith("data: "):
-            line_data = line.lstrip("data: ")
-            if line_data == "[DONE]":
-                break
-            try:
-                parsed_content = json.loads(line_data)
-                yield {"json": parsed_content}
-            except json.JSONDecodeError:
-                yield {"text": line_data}
-
-    # for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):  # 二进制数据
-    #     for line in chunk.splitlines():
-    #         if isinstance(line, bytes):
-    #             line = line.decode('utf-8', errors='ignore')
-    #         if line:
-    #             yield line
 
 
 def most_similar_by_name(name, collection_name, client, match=[], exclude=[], topn=10, score_threshold=0.5):
