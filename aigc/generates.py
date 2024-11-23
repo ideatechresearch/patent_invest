@@ -1,8 +1,9 @@
 import httpx
 import asyncio
+import oss2
 from pathlib import Path
-from typing import List, Any, Union, Tuple, Callable
-import random, time
+from typing import List, Dict, Any, Union, Tuple, Callable, Optional
+import random, time, io, os
 from openai import OpenAI, Completion
 # import qianfan
 import dashscope
@@ -13,17 +14,19 @@ from fastapi import HTTPException
 import numpy as np
 from config import *
 from utils import *
+from ai_tools import *
 
 AI_Client = {}
 
 
 def init_ai_clients(api_keys=API_KEYS):
+    SUPPORTED_MODELS = {'moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan'}
     for model in AI_Models:
-        model_name = model['name']
+        model_name = model.get('name')
         api_key = api_keys.get(model_name)
         if api_key:
             model['api_key'] = api_key
-            if model_name in ('moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan'):  # OpenAI_Client
+            if model_name not in AI_Client and model_name in SUPPORTED_MODELS:
                 AI_Client[model_name] = OpenAI(api_key=api_key, base_url=model['base_url'])
 
 
@@ -54,6 +57,10 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
 
 
 def ai_tool_response(messages, tools=[], model_name='moonshot', model_id=-1, top_p=0.95, temperature=0.01):
+    """
+      调用 AI 模型接口，使用提供的工具集和对话消息，返回模型的响应。
+        :return: 模型响应的消息对象
+    """
     model_info, name = find_ai_model(model_name, model_id)
     client = AI_Client.get(model_info['name'], None)
     if not tools:
@@ -69,25 +76,7 @@ def ai_tool_response(messages, tools=[], model_name='moonshot', model_id=-1, top
         )
         return completion.choices[0].message  # response['choices'][0]['message']
         # return completion.model_dump()
-
-
-def ai_tools_messages(response_message):
-    tool_calls = response_message.tool_calls
-    messages = [response_message]
-    for tool_func in tool_calls:
-        func_name = tool_func.function.name  # function_name
-        func_args = tool_func.function.arguments  # function_args = json.loads(tool_call.function.arguments)
-        try:
-            func_out = eval(f'{func_name}(**{func_args})')
-            messages.append({
-                'role': 'tool',
-                'content': f'{func_out}',
-                'tool_call_id': tool_func.id
-            })
-        except:
-            # exec(code)
-            pass
-    return messages  # [*tool_mmessages,]
+    return None
 
 
 def ai_files_messages(files: List[str], model_name='moonshot'):
@@ -104,17 +93,42 @@ def ai_files_messages(files: List[str], model_name='moonshot'):
 
 
 async def ai_embeddings(inputs, model_name='qwen', model_id=0):
-    model_info, name = find_ai_model(model_name, model_id, 'embedding')
-    if not name:
+    if not model_name:
+        return []
+    try:
+        model_info, name = find_ai_model(model_name, model_id, 'embedding')
+    except:
         return []
 
+    batch_size = 16  # DASHSCOPE_MAX_BATCH_SIZE = 25
     client = AI_Client.get(model_info['name'], None)
     if client:  # openai.Embedding.create
-        completion = await asyncio.to_thread(client.embeddings.create,
-                                             model=name, input=inputs,
-                                             encoding_format="float")
+        if isinstance(inputs, list) and len(inputs) > batch_size:
+            tasks = [asyncio.to_thread(
+                client.embeddings.create,
+                model=name, input=inputs[i:i + batch_size],
+                encoding_format="float"
+            ) for i in range(0, len(inputs), batch_size)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        return [item.embedding for item in completion.data]
+            embeddings = [None] * len(inputs)
+            input_idx = 0
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"Error encountered: {result}")
+                    continue
+                for idx, item in enumerate(result.data):
+                    embeddings[input_idx] = item.embedding
+                    input_idx += 1
+
+        else:
+            completion = await asyncio.to_thread(client.embeddings.create,
+                                                 model=name, input=inputs,
+                                                 encoding_format="float")
+
+            embeddings = [item.embedding for item in completion.data]
+
+        return embeddings
         # data = json.loads(completion.model_dump_json()
 
     # dashscope.TextEmbedding.call
@@ -129,23 +143,22 @@ async def ai_embeddings(inputs, model_name='qwen', model_id=0):
         "model": name,
         "encoding_format": "float"
     }
-    max_batch_size = 16  # DASHSCOPE_MAX_BATCH_SIZE = 25
     embeddings = []
     async with httpx.AsyncClient() as cx:
         try:
-            if isinstance(inputs, str) or (isinstance(inputs, list) and len(inputs) < max_batch_size):
-                response = await cx.post(url, headers=headers, json=payload)
-                data = response.json().get('data')
-                embeddings = [emb.get('embedding') for emb in data]
-            elif isinstance(inputs, list):
-                for i in range(0, len(inputs), max_batch_size):
-                    batch = inputs[i:i + max_batch_size]
+            if isinstance(inputs, list) and len(inputs) > batch_size:
+                for i in range(0, len(inputs), batch_size):
+                    batch = inputs[i:i + batch_size]
                     payload["input"] = batch  # {"texts":batch}
                     response = await cx.post(url, headers=headers, json=payload)
                     response.raise_for_status()
                     data = response.json().get('data')  # "output"
                     if data and len(data) == len(batch):
                         embeddings += [emb.get('embedding') for emb in data]
+            else:
+                response = await cx.post(url, headers=headers, json=payload)
+                data = response.json().get('data')
+                embeddings = [emb.get('embedding') for emb in data]
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             print(exc)
 
@@ -153,8 +166,11 @@ async def ai_embeddings(inputs, model_name='qwen', model_id=0):
 
 
 async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="BAAI/bge-reranker-v2-m3", model_id=0):
-    model_info, name = find_ai_model(model_name, model_id, 'reranker')
-    if not name:
+    if not model_name:
+        return []
+    try:
+        model_info, name = find_ai_model(model_name, model_id, 'reranker')
+    except:
         return []
     url = model_info['reranker_url']
     api_key = model_info['api_key']
@@ -185,8 +201,9 @@ async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, s
                       max_tokens=4096, model_name='silicon', model_id=0):
     model_info, name = find_ai_model(model_name, model_id, "generation")
     if not name:
-        return ai_chat(messages=None, user_request=user_request, system=prompt, temperature=temperature,
-                       max_tokens=max_tokens, top_p=0.8, model_name=model_name, model_id=model_id)
+        return await ai_chat(model_info=None, messages=None, user_request=user_request, system=prompt,
+                             temperature=temperature, max_tokens=max_tokens, top_p=0.8, model_name=model_name,
+                             model_id=model_id)
 
     if user_request:
         prompt += '\n\n' + user_request
@@ -226,29 +243,29 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
     async def wrap_sync(func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
 
-    items_to_process = []
     user_calls = {'map_search': search_amap_location,
                   'web_search': web_search_async, }
 
     tool_calls = tool_calls or []
-    if keywords:
+    items_to_process = []
+    tasks = []
+    if not keywords:
+        items_to_process = [user_request]  # ','.join(keywords)
+    else:
         if all(not (callable(func) and func.__name__ == '<lambda>' and func()) for func in tool_calls):
             tool_calls.append(web_search_async)  # not in agent_funcalls
-    else:
-        items_to_process = [user_request]  # ','.join(keywords)
 
-    tasks = []
-    for item in keywords:
-        if isinstance(item, tuple) and len(item) > 1:
-            func = user_calls.get(item[0])  # 函数
-            if func:
-                func_args = item[1:]  # 剩下的参数
-                if inspect.iscoroutinefunction(func):
-                    tasks.append(func(*func_args, **kwargs))
-                else:
-                    tasks.append(wrap_sync(func, *func_args, **kwargs))
-        else:  # isinstance(keyword, str)
-            items_to_process.append(item)  # keyword
+        for item in keywords:
+            if isinstance(item, tuple) and len(item) > 1:
+                func = user_calls.get(item[0])  # 函数
+                if func:
+                    func_args = item[1:]  # 剩下的参数
+                    if inspect.iscoroutinefunction(func):
+                        tasks.append(func(*func_args, **kwargs))
+                    else:
+                        tasks.append(wrap_sync(func, *func_args, **kwargs))
+            else:  # isinstance(keyword, str)
+                items_to_process.append(item)  # keyword
 
     for func in filter(callable, tool_calls):
         if func.__name__ == '<lambda>' and func() == []:  # empty_lambda
@@ -389,8 +406,9 @@ async def ai_chat(model_info, payload=None, **kwargs):
         headers = get_tencent_signature(service, host, payload, action='ChatCompletions',
                                         secret_id=Config.TENCENT_SecretId,
                                         secret_key=Config.TENCENT_Secret_Key)
-
+        headers['X-TC-Version'] = '2023-09-01'
         # headers["X-TC-Region"] = 'ap-shanghai'
+
     # if model_info['name'] == 'silicon':
     #     headers = {
     #         "accept": "application/json",
@@ -462,7 +480,7 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
         host = url.split("//")[-1]
         payload = convert_keys_to_pascal_case(payload)
         payload.pop('MaxTokens', None)
-        headers = get_tencent_signature(payload, service, host, action='ChatCompletions',
+        headers = get_tencent_signature(service, host, payload, action='ChatCompletions',
                                         secret_id=Config.TENCENT_SecretId,
                                         secret_key=Config.TENCENT_Secret_Key)
         headers['X-TC-Version'] = '2023-09-01'
@@ -553,6 +571,13 @@ async def forward_stream(response):
 
 
 def web_search(text: str, api_key: str = Config.GLM_Service_Key) -> list:
+    """
+    通过提供的查询文本执行网络搜索。
+
+    :param text: 查询文本。
+    :param api_key: 用于访问网络搜索工具的API密钥（默认为配置中的密钥）。
+    :return: 搜索结果列表或错误信息。
+    """
     msg = [{"role": "user", "content": text}]
     url = "https://open.bigmodel.cn/api/paas/v4/tools"
     data = {
@@ -759,44 +784,57 @@ def cosine_similarity_np(ndarr1, ndarr2):
     return similarity
 
 
-async def similarity_embeddings(query, tokens, filter_idx=[], tokens_vector=None,
+async def similarity_embeddings(query, tokens: List[str], filter_idx: List[int] = None, tokens_vector=None,
                                 embeddings_calls: List[Callable[[str], Any]] = ai_embeddings, **kwargs):
     """
     计算查询与一组标记之间的相似度。
-        filter_idx (List[int], optional): 要过滤的标记索引。默认为 []。
-    返回：
-        np.ndarray: 一个相似度得分的数组。
+    参数:
+        query (str): 查询字符串。
+        tokens (List[str]): 要比较的标记列表。
+        filter_idx (List[int], optional): 要过滤出的标记索引。默认为 `None`，表示不进行过滤。
+        tokens_vector (np.ndarray, optional): 预计算的标记向量数组。默认为 `None`。
+        embeddings_calls (Callable, optional): 用于生成嵌入的异步函数，默认为 `None`。
+        **kwargs: 传递给 `embeddings_calls` 的额外参数。
+
+    返回:
+        np.ndarray: 相似度得分数组（与 `tokens` 长度一致）。
     """
     if filter_idx is None:
         filter_idx = list(range(len(tokens)))
-    similarity = np.full(len(filter_idx), np.nan)
+    else:
+        filter_idx = [i for i in filter_idx if i < len(tokens)]
+    similarity = np.full(len(tokens), np.nan)
     if not query:
         return similarity
 
-    idx_tokens = [(i, x) for i, x in enumerate(tokens) if x]
+    tokens_idx = [(i, token) for i, token in enumerate(tokens) if token]
     query_vector = await embeddings_calls(query, **kwargs)
     if tokens_vector is None:
         # list(np.array(idx_tokens)[:, 1])
-        tokens_vector = await embeddings_calls([token for _, token in idx_tokens], **kwargs)
+        tokens_vector = await embeddings_calls([token for _, token in tokens_idx], **kwargs)
 
-    matching_indices = np.isin([j[0] for j in tokens], filter_idx)
+    matching_indices = np.isin([j[0] for j in tokens_idx], filter_idx)
     filter_embeddings = np.array(tokens_vector)[matching_indices]
 
     if len(filter_embeddings):
         # cosine_similarity_np(np.array(query_vector).reshape(1, -1), filter_embeddings).T
         sim_2d = np.array(query_vector).reshape(1, -1) @ filter_embeddings.T
-        matching_indices = np.isin(filter_idx, [j[0] for j in tokens])
-        similarity[matching_indices] = sim_2d.reshape(-1)
+        # matching_indices = np.isin(filter_idx, [j[0] for j in tokens_idx])
+        # similarity[matching_indices] = sim_2d.reshape(-1)
+        for idx, score in zip(filter_idx, sim_2d.flatten()):
+            similarity[idx] = score
 
     return similarity
 
 
-def get_similar_vectors(data, querys, exclude, topn=10, cutoff=0.0):
+def get_similar_vectors(querys, data, exclude: List[str] = None, topn: int = 10, cutoff: float = 0.0):
     '''
-    {
+    data={
       "name": ["word1", "word2"],
       "vectors": [[0.1, 0.2, ...], [0.3, 0.4, ...]]
     }
+    返回：
+        List[Tuple[str, List[Tuple[str, float]]]]: 查询词与相似标记及其分数的映射。
     '''
     index_to_key = data['name']
     vectors = np.array(data['vectors'])
@@ -814,7 +852,10 @@ def get_similar_vectors(data, querys, exclude, topn=10, cutoff=0.0):
         if not query_mask[i]:
             continue
         sim_scores = sim_matrix[i]
-        top_indices = np.argsort(sim_scores)[::-1][:topn]  # 获取前 topn 个索引
+        if topn > 0:
+            top_indices = np.argsort(sim_scores)[::-1][:topn]  # 获取前 topn 个索引
+        else:
+            top_indices = np.arange(sim_scores.shape[0])  # 获取全部索引，不排序
         top_scores = sim_scores[top_indices]
 
         valid_indices = top_scores > cutoff  # 保留大于 cutoff 的相似度
@@ -825,8 +866,8 @@ def get_similar_vectors(data, querys, exclude, topn=10, cutoff=0.0):
     return results  # [(w, list(sim[w].sort_values(ascending=False)[:topn].items())) for w in querys]
 
 
-async def get_similar_embeddings(querys, tokens, embeddings_calls: List[Callable[[str], Any]] = ai_embeddings,
-                                 topn=10, **kwargs):
+async def get_similar_embeddings(querys: List[str], tokens: List[str],
+                                 embeddings_calls: List[Callable[[str], Any]] = ai_embeddings, topn=10, **kwargs):
     """
     使用嵌入计算查询与标记之间的相似度。
     返回：
@@ -836,22 +877,25 @@ async def get_similar_embeddings(querys, tokens, embeddings_calls: List[Callable
         embeddings_calls(querys, **kwargs),
         embeddings_calls(tokens, **kwargs))
 
+    if not query_vector or not tokens_vector:
+        return []
+
     sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
     results = []
     for i, w in enumerate(querys):
         sim_scores = sim_matrix[i]
-        top_indices = np.argsort(sim_scores)[::-1][:topn]
+        top_indices = np.argsort(sim_scores)[::-1][:topn] if topn > 0 else np.arange(sim_scores.shape[0])
         top_scores = sim_scores[top_indices]
-        top_words = [tokens[j] for j in top_indices]
-        results.append((w, list(zip(top_words, top_scores))))
+        top_match = [tokens[j] for j in top_indices]
+        results.append((w, list(zip(top_match, top_scores, top_indices))))
 
-    return results
+    return results  # [(q,[(match,score,index),])]
 
 
 async def find_closest_matches_embeddings(querys, tokens,
                                           embeddings_calls: List[Callable[[str], Any]] = ai_embeddings, **kwargs):
     """
-    使用嵌入计算查询与标记之间的最近匹配。
+    使用嵌入计算查询与标记之间的最近匹配,找到每个查询的最佳匹配标记。
     返回：
         Dict[str, Tuple[str, float]]: 查询与最近匹配标记的映射字典。
     """
@@ -864,7 +908,7 @@ async def find_closest_matches_embeddings(querys, tokens,
         embeddings_calls(tokens, **kwargs))
 
     sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
-    closest_matches = tokens[sim_matrix.argmax(axis=1)]  # 找到每个查询的最佳匹配标记 idxmax
+    closest_matches = tokens[sim_matrix.argmax(axis=1)]  # idxmax
     closest_scores = sim_matrix.max(axis=1)
     matchs.update(zip(unmatched_queries, zip(closest_matches, closest_scores)))
     return matchs
@@ -1080,50 +1124,152 @@ async def xunfei_translate(text: str, source: str = 'en', target: str = 'cn'):
             return {"error": f"HTTP Error: {response.status_code}"}
 
 
-# https://ai.baidu.com/ai-doc/OCR/Ek3h7y961
+# https://cloud.baidu.com/doc/NLP/s/al631z295
+async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
+    '''
+    address:地址识别
+    sentiment_classify:情感倾向分析
+    emotion:对话情绪识别
+    entity_analysis:实体分析,text,mention
+    simnet:短文本相似度,text_1,text_2,
+    ecnet,text_correction:文本纠错,搜索引擎、语音识别、内容审查等功能
+    txt_keywords_extraction:关键词提取,text[],num
+    txt_monet:文本信息提取,content_list[{content,query_lis[{query}]}]
+    sentiment_classify:
+    depparser:依存句法分析,利用句子中词与词之间的依存关系来表示词语的句法结构信息
+    lexer:词法分析,提供分词、词性标注、专名识别三大功能
+    keyword:文章标签,title,content
+    topic:文章分类,title,content
+    news_summary:新闻摘要,title,content,max_summary_len
+    titlepredictor,文章标题生成,doc
+    '''
+    # https://aip.baidubce.com/rpc/2.0/ernievilg/v1/txt2imgv2
+    url = f'https://aip.baidubce.com/rpc/2.0/nlp/v1/{nlp_type}'
+    access_token = get_baidu_access_token(Config.BAIDU_nlp_API_Key, Config.BAIDU_nlp_Secret_Key)
+    url = build_url(url, access_token, charset='UTF-8')  # f"{url}&access_token={access_token}"
+    headers = {
+        'Content-Type': 'application/json',  # 'application/x-www-form-urlencoded'
+        # 'host': 'aip.baidubce.com',
+        # 'authorization': 'bce-auth',
+        # 'x-bce-date': '2015-03-24T13: 02:00Z',
+        # 'x-bce-request-id':'',
+    }
+    body = {**kwargs}
+
+    async with httpx.AsyncClient() as cx:
+        response = await cx.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        data = response.json()  # .get('items')
+        # 遍历键列表，返回第一个找到的键对应的值
+        for key in ['items', 'item', 'results', 'results_list', 'error_msg']:
+            if key in data:
+                if key == 'error_msg':
+                    print(response.text)
+                return data[key]
+        return data
+
+
+# https://ai.baidu.com/ai-doc/OCR/Ek3h7y961,  https://aip.baidubce.com/rest/2.0/solution/v1/iocr/recognise"
 # https://console.bce.baidu.com/ai/#/ai/ocr/overview/index
 # with open(image_path, 'rb') as f:
 #    image_data = f.read()
-def baidu_ocr_recognise(image_data, image_url, access_token, ocr_sign='accurate_basic'):
+async def baidu_ocr_recognise(image_data, image_url, ocr_type='accurate_basic'):
+    '''
+    general:通用文字识别(含位置)
+    accurate:通用文字识别(高进度含位置)
+    accurate_basic:通用文字识别（高进度）
+    general_basic:通用文字识别
+    doc_analysis_office:办公文档识别
+    idcard:身份证识别
+    table:表格文字识别
+    numbers:数字识别
+    qrcode:二维码识别
+    account_opening:开户许可证识别
+    handwriting:手写文字识别
+    webimage:
+    '''
     headers = {
         'Content-Type': "application/x-www-form-urlencoded",
-        'charset': "utf-8"
+        'Accept': 'application/json',
+        # 'charset': "utf-8",
     }
-    # accurate,general_basic,webimage
-    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/{ocr_sign}"  # https://aip.baidubce.com/rest/2.0/solution/v1/iocr/recognise"
-    try:
-        # 将图像数据编码为base64
-        # image_b64 = base64.b64encode(image_data).decode().replace("\r", "")
-        params = {
-            "access_token": access_token,
-            "language_type": 'CHN_ENG',
-        }
-        if image_data:
-            params["image"] = base64.b64encode(image_data)  # quote(image_b64.encode("utf8"))
-        if url:
-            params["url"] = image_url
-
-        # if template_sign:
-        #     params["templateSign"] = template_sign
-        # if classifier_id:
-        #     params["classifierId"] = classifier_id
-        # # 请求模板的bodys
-        # recognise_bodys = "access_token=" + access_token + "&templateSign=" + template_sign + "&image=" + quote(image_b64.encode("utf8"))
-        # # 请求分类器的bodys
-        # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
-        # request_body = "&".join(f"{key}={value}" for key, value in params.items())
-        response = requests.post(url, data=params, headers=headers)
+    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/{ocr_type}"
+    access_token = get_baidu_access_token(Config.BAIDU_ocr_API_Key, Config.BAIDU_ocr_Secret_Key)
+    params = {
+        "access_token": access_token,
+        "language_type": 'CHN_ENG',
+    }
+    if image_url:
+        params["url"] = image_url
+    if image_data:
+        params["image"] = base64.b64encode(image_data).decode("utf-8")
+    # 将图像数据编码为base64
+    # image_b64 = base64.b64encode(image_data).decode().replace("\r", "")
+    # if template_sign:
+    #     params["templateSign"] = template_sign
+    # if classifier_id:
+    #     params["classifierId"] = classifier_id
+    # # 请求模板的bodys
+    # recognise_bodys = "access_token=" + access_token + "&templateSign=" + template_sign + "&image=" + quote(image_b64.encode("utf8"))
+    # # 请求分类器的bodys
+    # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
+    # request_body = "&".join(f"{key}={value}" for key, value in params.items())
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.post(url, headers=headers, data=params)
         response.raise_for_status()
+        data = response.json()
+        for key in ['result', 'results', 'error_msg']:
+            if key in data:
+                return data[key]
+        return data
 
-        return response.json()
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return None
+# https://cloud.tencent.com/document/product/866/36210
+async def tencent_ocr_recognise(image_data, image_url, ocr_type='GeneralBasicOCR'):
+    '''
+    GeneralBasicOCR:通用印刷体识别,TextDetections
+    RecognizeTableDDSNOCR: 表格识别,TableDetections
+    RecognizeGeneralTextImageWarn:证件有效性检测告警
+    GeneralAccurateOCR:通用印刷体识别（高精度版）
+    VatInvoiceOCR:增值税发票识别
+    VatInvoiceVerifyNew:增值税发票核验
+    ImageEnhancement:文本图像增强,包括切边增强、图像矫正、阴影去除、摩尔纹去除等；
+    QrcodeOCR:条形码和二维码的识别
+    SmartStructuralOCRV2:智能结构化识别,智能提取各类证照、票据、表单、合同等结构化场景的key:value字段信息
+    '''
+    service = 'ocr'
+    url = 'https://ocr.tencentcloudapi.com'
+    host = url.split("//")[-1]
+    payload = {
+        # 'Action': ocr_type,
+        # 'Version': '2018-11-19'
+        # 'Region': 'ap-shanghai',
+        # 'ImageBase64': '',
+        # 'ImageUrl': image_url,
+    }
+    if image_url:
+        payload['ImageUrl'] = image_url
+    else:
+        if isinstance(image_data, bytes):
+            payload['ImageBase64'] = base64.b64encode(image_data).decode("utf-8")
+        else:
+            payload['ImageBase64'] = base64.b64encode(image_data)
+
+    headers = get_tencent_signature(service, host, params=payload, action=ocr_type,
+                                    secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
+                                    version='2018-11-19')
+
+    # payload = convert_keys_to_pascal_case(params)
+
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["Response"]  # "TextDetections"
 
 
 # https://help.aliyun.com/zh/ocr/developer-reference/api-ocr-api-2021-07-07-dir/?spm=a2c4g.11186623.help-menu-252763.d_2_2_4.3aba47bauq0U2j
-async def ali_ocr_recognise(image_data, image_url, access_token, ocr_sign='accurate_basic'):
+async def ali_ocr_recognise(image_data, image_url, access_token, ocr_type='accurate_basic'):
     headers = {
         'Content-Type': "application/x-www-form-urlencoded",
         'charset': "utf-8"
@@ -1159,6 +1305,28 @@ async def ali_ocr_recognise(image_data, image_url, access_token, ocr_sign='accur
         pass
 
 
+async def ali_nlp(text):
+    url = 'alinlp.cn-hangzhou.aliyuncs.com'
+    token, _ = get_aliyun_access_token(service="alinlp", region="cn-hangzhou", access_key_id=Config.ALIYUN_AK_ID,
+                                       access_key_secret=Config.ALIYUN_Secret_Key)
+    if not token:
+        print("No permission!")
+
+    headers = {
+        "Authorization": f"Bearer {Config.ALIYUN_AK_ID}",
+        'Content-Type': "application/x-www-form-urlencoded",
+        "X-NLS-Token": token,
+
+    }
+    params = {
+        "appkey": Config.ALIYUN_nls_AppId,
+        'ServiceCode': 'alinlp',
+        'Action': 'GetWeChGeneral',
+        'Text': text,
+        'TokenizerId': 'GENERAL_CHN',
+    }
+
+
 # https://nls-portal.console.aliyun.com/overview
 async def ali_speech_to_text(audio_data, format='pcm'):
     """阿里云语音转文字"""
@@ -1174,8 +1342,8 @@ async def ali_speech_to_text(audio_data, format='pcm'):
     }
     signature = generate_hmac_signature(Config.ALIYUN_Secret_Key, "POST", params)
     params["signature"] = signature
-    token, _ = get_aliyun_access_token(Config.ALIYUN_AK_ID, Config.ALIYUN_Secret_Key, service="nls-meta",
-                                       region="cn-shanghai")
+    token, _ = get_aliyun_access_token(service="nls-meta", region="cn-shanghai", access_key_id=Config.ALIYUN_AK_ID,
+                                       access_key_secret=Config.ALIYUN_Secret_Key)
     if not token:
         print("No permission!")
 
@@ -1295,8 +1463,7 @@ async def dashscope_text_to_speech(sentences, model="cosyvoice-v1", voice="longx
     # if result.get_audio_data() is not None:
 
 
-def dashscope_file_response(messages, file_path='.pdf', client=None, api_key=''):
-    from pathlib import Path
+def dashscope_file_upload(messages, file_path='.pdf', client=None, api_key=''):
     if client:
         file_object = client.files.create(file=Path(file_path), purpose="file-extract")  # .is_file()
         messages.append({"role": "system", "content": f"fileid://{file_object.id}"})
@@ -1315,7 +1482,7 @@ def dashscope_file_response(messages, file_path='.pdf', client=None, api_key='')
             'purpose': (None, 'file-extract'),
         }
         file_response = requests.post(url, headers=headers, files=files)
-        file_response.raise_for_status()  # 检查请求是否成功
+        file_response.raise_for_status()
         file_object = file_response.json()
         file_id = file_object.get('id', 'unknown_id')  # 从响应中获取文件ID
 
@@ -1329,44 +1496,26 @@ def dashscope_file_response(messages, file_path='.pdf', client=None, api_key='')
         files['file'][1].close()
 
 
-Agent_Functions = {
-    'default': lambda *args, **kwargs: [],
-    '2': web_search,  # web_search_async
-}
+def upload_large_file_to_oss(bucket, file_path, object_name):
+    total_size = os.path.getsize(file_path)
+    part_size = oss2.determine_part_size(total_size, preferred_size=128 * 1024)
+    upload_id = bucket.init_multipart_upload(object_name).upload_id
+    parts = []
+    with open(file_path, 'rb') as fileobj:
+        part_number = 1
+        offset = 0
+        while offset < total_size:
+            size_to_upload = min(part_size, total_size - offset)
+            result = bucket.upload_part(object_name, upload_id, part_number,
+                                        oss2.SizedFileAdapter(fileobj, size_to_upload))
+            parts.append(oss2.models.PartInfo(part_number, result.etag, size=size_to_upload, part_crc=result.crc))
+            offset += size_to_upload
+            part_number += 1
 
-AI_Tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "当你想知道现在的时间时非常有用。",
-            "parameters": {}  # 此处是函数参数相关描述, 因为获取当前时间无需输入参数，因此parameters为空字典
-        }
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'get_weather',
-            'description': 'Get the current weather for a given city.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'city': {
-                        'type': 'string',
-                        'description': 'The name of the city to query weather for.',
-                    },
-                },
-                'required': ['city'],
-            },
-        }
-    }
-]
-
-
-def get_current_time():
-    current_datetime = datetime.now()
-    formatted_time = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
-    return f"当前时间：{formatted_time}。"
+    # 完成分片上传
+    bucket.complete_multipart_upload(object_name, upload_id, parts)
+    # bucket.get_object(key)
+    # bucket.bucket_name
 
 
 def get_weather(city: str):
@@ -1387,6 +1536,92 @@ def get_weather(city: str):
         return f"The weather in {city} is {weather} with a temperature of {temperature}°C."
     else:
         return f"Could not retrieve weather information for {city}."
+
+
+Agent_Functions = {
+    'default': lambda *args, **kwargs: [],
+    '2': web_search,  # web_search_async
+}
+
+Function_Registry = {
+    "get_week_range": get_week_range,
+    "get_current_time": get_current_time,
+    "get_weather": get_weather,
+    "web_search": web_search,
+    "get_first_day_of_month": get_first_day_of_month,
+    "get_month_range": get_month_range,
+    "get_quarter_range": get_quarter_range,
+    "get_year_range": get_year_range,
+    "get_half_year_range": get_half_year_range,
+    "search_bmap_location": search_bmap_location,
+    # 添加更多可调用函数
+}
+
+
+async def ai_tools_messages(response_message):
+    """
+    解析模型响应，动态调用工具并生成后续消息列表。
+
+    :param response_message: 模型响应的消息对象
+    :return: 包含原始响应和工具调用结果的消息列表
+    """
+    tool_calls = response_message.tool_calls
+    messages = [response_message]
+    for tool in tool_calls:
+        func_name = tool.function.name  # function_name
+        func_args = tool.function.arguments  # function_args = json.loads(tool_call.function.arguments)
+        func = Function_Registry.get(func_name)  # 从注册表中获取函数
+
+        if not func:
+            messages.append({
+                'role': 'tool',
+                'content': f"Error: Function '{func_name}' not found.",
+                'tool_call_id': tool.id,
+            })
+            continue
+        # print(func_args)
+        # 检查并解析 func_args 确保是字典
+        if isinstance(func_args, str):
+            try:
+                func_args = json.loads(func_args)  # 尝试将字符串解析为字典
+            except json.JSONDecodeError as e:
+                messages.append({
+                    "role": "tool",
+                    "content": f"Error in {func_name}: Invalid arguments format ({str(e)}).",
+                    "tool_call_id": tool.id,
+                })
+                continue
+
+        if not isinstance(func_args, dict):
+            messages.append({
+                "role": "tool",
+                "content": f"Error in {func_name}: Arguments must be a mapping type, got {type(func_args).__name__}.",
+                "tool_call_id": tool.id,
+            })
+            continue
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                func_out = await func(**func_args)
+            else:
+                func_out = func(**func_args)
+
+            messages.append({
+                'role': 'tool',
+                'content': f'{func_out}',
+                'tool_call_id': tool.id
+            })
+
+        except Exception as e:
+            # func_out = eval(f'{func_name}(**{func_args})')
+            # exec(code)
+            messages.append({
+                'role': 'tool',
+                'content': f"Error in {func_name}: {str(e)}",
+                'tool_call_id': tool.id,
+            })
+            # print( f"Error in {func_name}: {str(e)}")
+    return messages  # [*tool_mmessages,]
 
 
 if __name__ == "__main__":
@@ -1444,6 +1679,7 @@ if __name__ == "__main__":
         print(result)
 
 
-    asyncio.run(test())
+    # asyncio.run(test())
+    asyncio.run(baidu_nlp("ecnet", text="百度是一家人工只能公司"))
 
     # asyncio.run(tencent_translate('tencent translate is ok', 'en', 'cn'))

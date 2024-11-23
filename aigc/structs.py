@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Tuple, Union, Any
+from typing import Optional, Dict, List, Tuple, Union, Any
 from enum import Enum as PyEnum
 
 
@@ -80,8 +80,37 @@ class IError(Exception):
 class TranslateRequest(BaseModel):
     text: str = "你好我的朋友。"
     source: str = "auto"
-    target: str = "en"
+    target: str = "auto"
     platform: str = "baidu"
+
+
+class ToolRequest(BaseModel):
+    messages: Optional[List[Message]] = Field(None)
+    tools: Optional[List[Any]] = Field(None)
+    prompt: Optional[str] = Field(default=None)
+    model_name: str = 'moonshot'
+    model_id: int = -1
+    top_p: float = 0.95
+    temperature: float = 0.01
+
+    class Config:
+        protected_namespaces = ()
+        json_schema_extra = {
+            "example": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "请告诉我 2023-11-22 前面三周的日期范围。"
+                    }
+                ],
+                "tools": [],
+                "prompt": '',
+                "model_name": "moonshot",
+                "model_id": -1,
+                "top_p": 0.95,
+                "temperature": 0.01
+            }
+        }
 
 
 class PlatformEnum(str, PyEnum):
@@ -99,7 +128,7 @@ class CompletionParams(BaseModel):
     prompt: Optional[str] = Field(default=None,
                                   description="The initial system content or prompt used to guide the AI's response.")
     question: Optional[str] = Field(None, description="The primary question or prompt for the AI to respond to. ")
-    agent: Optional[str] = Field(default='0',
+    agent: Optional[str] = Field(default=None,
                                  description="System content identifier. This index represents different scenarios or contexts for AI responses, allowing the selection of different system content.")
     suffix: Optional[str] = Field(None, description="The suffix for the AI to respond to completion. ")
     extract: Optional[str] = Field(None,
@@ -176,10 +205,10 @@ class SubmitMessagesRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "uuid": "",
+                "uuid": None,
                 "username": "test",
-                "robot_id": "robot_2",
-                "user_id": "test_2",
+                "robot_id": None,
+                "user_id": None,
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
@@ -234,10 +263,11 @@ class OpenAIRequest(CompletionParams):
     class Config:
         json_schema_extra = {
             "example": {
-                "uuid": "",
+                "uuid": None,
                 "username": "test",
-                "robot_id": "robot_1",
-                "user_id": "test_1",
+                "robot_id": None,
+                "user_id": None,
+
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
@@ -256,5 +286,51 @@ class OpenAIRequest(CompletionParams):
                 "max_tokens": 1024,
                 # "score_threshold": 0.0,
                 # "top_n": 10,
+            }
+        }
+
+
+class ClassifyRequest(BaseModel):
+    query: str
+    class_terms: Dict[str, List[str]]
+    class_default: Optional[str] = Field(None, description="default or last history to fallback.")
+
+    # robot_id: str = None
+    # user_id: str = None
+    emb_model: Optional[str] = "text-embedding-v2"
+    rerank_model: Optional[str] = "BAAI/bge-reranker-v2-m3"
+    llm_model: Optional[str] = 'moonshot'
+    prompt: Optional[str] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                'query': '今天几号？',
+                "class_terms": {
+                    "经营数据查询": ["经营数据查询", "经营分析", "公司经营状况", "经营报告"],
+                    "财务报销": ["财务报销", "报销流程", "报销单", "财务审批", "报销申请"],
+                    "跟进记录录入": ["跟进记录", "跟进情况", "客户跟进", "记录跟进", "跟进内容"],
+                    "商机录入": ["商机录入", "商机信息", "录入商机", "商机跟进", "商机记录"],
+                    "新增客户信息": ["新增客户", "添加客户", "客户信息", "客户录入", "客户添加"],
+                    "查询销售额": ["销售额查询", "查询销售额", "销售收入", "销售总额", "销售情况"],
+                    "查询回款额": ["回款额查询", "查询回款额", "回款情况", "回款金额", "回款记录"],
+                    "研发详情": ["研发详细情况", "研发的单据情况", "研发明细", "研发单据", "研发进展"],
+                    "研发进度": ["产研进度", "工作完成进度", "单据完成进度", "研发进展", "工作进度"],
+                    "研发质量": ["产品缺陷", "产品质量", "质量问题", "产品问题", "质量报告"],
+                    "项目情况": ["项目情况", "项目进度", "项目跟进", "项目状态", "项目详情"],
+                    "未验收的项目数": [
+                        "待验收的项目数", "尚未验收的项目数", "未完成验收的项目数", "未交付的项目数",
+                        "验收未完成的项目数"],
+                    "本季度计划验收的项目数": [
+                        "本季度预定验收的项目数量", "本季度预计完成验收的项目数", "本季度计划验收的项目数",
+                        "本季度安排验收的项目数", "本季度计划交付的项目数量"]
+                },
+                "class_default": '聊天',
+                'emb_model': 'text-embedding-v2',
+                "rerank_model": "BAAI/bge-reranker-v2-m3",
+                "llm_model": 'moonshot',
+                'prompt': ('你是群聊中的智能助手。任务是根据给定内容，识别并分类用户的意图，并返回相应的 JSON 格式，例如：{"intent":"xx"}'
+                           '对于意图分类之外的任何内容，请归类为 "聊天",如果用户输入的内容不属于意图类别，直接返回 `{"intent": "聊天"}`，即表示这条内容不涉及明确的工作任务或查询。'
+                           '以下是常见的意图类别与对应可能的关键词或者类似的意思，请帮我判断用户意图:')
             }
         }

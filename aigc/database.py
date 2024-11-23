@@ -4,15 +4,17 @@ from sqlalchemy import func, or_, and_, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, mapped_column, Mapped, Session
+from sqlalchemy.pool import NullPool
 from datetime import datetime, timedelta
 import pymysql
 import hashlib, secrets, uuid
 from typing import List, Optional
 import json, time
+from collections import defaultdict
 
 # from sqlalchemy.ext.asyncio import create_async_engine,AsyncSession
 
-# async_engine = create_engine(Config.SQLALCHEMY_DATABASE_URI) #,echo=True 仅用于调试
+# async_engine = create_engine(Config.SQLALCHEMY_DATABASE_URI) #,echo=True 仅用于调试 poolclass=NullPool
 # AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False,expire_on_commit=False, bind=async_engine,class_=AsyncSession)
 
 Base = declarative_base()
@@ -163,11 +165,11 @@ class BaseChatHistory(Base):
     robot_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
     user_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
     model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    agent: Mapped[str] = mapped_column(String(50), nullable=True, default='0')
+    agent: Mapped[str] = mapped_column(String(99), nullable=True)
 
     index: Mapped[int] = mapped_column(Integer, nullable=False)
     reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
-    summary: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    # summary: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
     transform: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
@@ -176,8 +178,8 @@ class BaseChatHistory(Base):
         Index('idx_username_time', 'username', 'robot_id', 'user_id', 'timestamp'),
     )
 
-    def __init__(self, role, content, username, robot_id=None, user_id=None, model=None, agent='0', index=0,
-                 reference=None, summary=None, transform=None, timestamp: int = 0):
+    def __init__(self, role, content, username, robot_id=None, user_id=None, model=None, agent=None, index=0,
+                 reference=None,  transform=None, timestamp: int = 0):
         self.role = role
         self.content = content
         self.username = username
@@ -187,7 +189,6 @@ class BaseChatHistory(Base):
         self.agent = agent
         self.index = index
         self.reference = reference
-        self.summary = summary
         self.transform = transform
         self.timestamp = timestamp or int(time.time())
         # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
@@ -214,7 +215,7 @@ class BaseChatHistory(Base):
         query = db.query(cls).filter(cls.username == username,
                                      or_(cls.robot_id == robot_id, robot_id is None),
                                      or_(cls.user_id == user_id, user_id is None),
-                                     cls.timestamp > filter_time)
+                                     cls.timestamp >= filter_time)
         if agent:  # or_(cls.agent == agent, agent is None)
             query = query.filter(cls.agent == agent)
 
@@ -252,7 +253,7 @@ def get_user_history(user_name: str, robot_id: Optional[str], user_id: Optional[
                     and (not robot_id or msg['robot_id'] == robot_id)
                     and (not user_id or msg['user_id'] == user_id)
                     and (not agent or msg['agent'] == agent)
-                    and msg['timestamp'] > filter_time]
+                    and msg['timestamp'] >= filter_time]
 
     if user_name and db:  # 从数据库中补充历史记录
         user_history.extend(
@@ -286,12 +287,13 @@ def cut_chat_history(user_history, max_len_limit_count=33000):
 
 def build_chat_history(user_name: str, user_request: str, robot_id: Optional[str], user_id: Optional[str],
                        db: Session, user_history: List[str], use_hist=False,
-                       filter_limit: int = -500, filter_time: float = 0, request_uuid: Optional[str] = None):
+                       filter_limit: int = -500, filter_time: float = 0,
+                       agent: Optional[str] = None, request_uuid: Optional[str] = None):
     # 构建用户的聊天历史记录，并生成当前的用户消息。
     history = []
     if not user_history:
         if use_hist:
-            user_history = get_user_history(user_name, robot_id, user_id, filter_time, db, agent=None,
+            user_history = get_user_history(user_name, robot_id, user_id, filter_time, db, agent=agent,
                                             request_uuid=request_uuid)
             last_records = cut_chat_history(sorted(user_history, key=lambda x: x['timestamp']),
                                             max_len_limit_count=filter_limit)
@@ -359,7 +361,7 @@ class ChatHistory(BaseChatHistory):
                         and (not self.robot_id or msg['robot_id'] == self.robot_id)
                         and (not self.user_id or msg['user_id'] == self.user_id)
                         and (not self.agent or msg['agent'] == self.agent)
-                        and msg['timestamp'] > filter_time]
+                        and msg['timestamp'] >= filter_time]
 
         if self.username and self.db:  # 从数据库中补充历史记录
             user_history.extend(
@@ -422,6 +424,91 @@ class ChatHistory(BaseChatHistory):
                 raise Exception
         except:
             Chat_history.extend(new_history)
+
+
+class BaseRoBot(Base):
+    __tablename__ = 'agent_robot'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    user_content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
+    assistant_content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=True)
+    system_content: Mapped[str] = mapped_column(TEXT, nullable=True)
+    agent: Mapped[str] = mapped_column(String(50), nullable=True, default='0')
+
+    model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    username: Mapped[str] = mapped_column(String(99), nullable=False, index=True)
+    robot_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
+
+    index: Mapped[int] = mapped_column(Integer, nullable=False)
+    reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    transform: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_username_time', 'username', 'robot_id', 'user_id', 'timestamp'),
+    )
+
+    def __init__(self, username, user_content, assistant_content, system_content=None, agent='0', model=None, index=0,
+                 reference=None, summary=None, transform=None, timestamp: int = 0):
+        self.user_content = user_content
+        self.assistant_content = assistant_content
+        self.system_content = system_content
+        self.agent = agent
+        self.username = username
+        # self.robot_id = robot_id
+        # self.user_id = user_id
+        self.model = model
+        self.index = index
+
+        self.reference = reference
+        self.summary = summary
+        self.transform = transform
+        self.timestamp = timestamp or int(time.time())
+        # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
+
+    def asdict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+    def display(self):
+        print(f"User: {self.user_content}, Assistant: {self.assistant_content}, Timestamp: {self.timestamp}")
+
+    @classmethod
+    def insert(cls, content, db: Session):
+        try:
+            if len(content) > 0:
+                db.add_all([cls(**msg) for msg in content])
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Error inserting history: {e}")
+
+
+class IntentHistory:
+    def __init__(self, max_his=5):
+        # 使用 defaultdict 来存储用户和机器人的意图历史
+        self.history = defaultdict(lambda: defaultdict(list))  # {robot_id: {user_id: [intent_history]}}
+        self.max_his = max_his
+
+    def add(self, robot_id, user_id, intent):
+        """添加用户的意图到历史记录"""
+        if not robot_id or not user_id:
+            return
+        self.history[robot_id][user_id].append(intent)
+        # 保持每个用户历史记录最多为 5 条，避免历史记录过长
+        if len(self.history[robot_id][user_id]) > self.max_his:
+            self.history[robot_id][user_id].pop(0)
+
+    def get_last(self, robot_id, user_id):
+        """获取指定用户和机器人的最近意图"""
+        return self.history[robot_id][user_id][-1] if self.history[robot_id][user_id] else None
+
+    def get_history(self, robot_id, user_id):
+        """获取指定用户和机器人的意图"""
+        return self.history.get(robot_id, {}).get(user_id, [])
 
 
 class OperationMysql:

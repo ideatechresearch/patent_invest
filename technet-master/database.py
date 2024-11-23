@@ -1,11 +1,15 @@
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import Column, TIMESTAMP, ForeignKey, func, or_, text, create_engine
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from datetime import datetime
 import time
 
 db = SQLAlchemy()
+
+
+# engine = create_engine(app.config['SQLALCHEMY_DATABASE_URI'])
+# Session = sessionmaker(bind=engine)
 
 
 class Base(db.Model):

@@ -258,7 +258,10 @@ System_content = {'0': '你是一个知识广博且乐于助人的助手，擅�
                         '2、信息完整: 确保每个句子的核心信息清晰明确，对于过于简短或含糊的句子进行适当扩展，丰富细节。'
                         '3、信息延展: 在不偏离原意的前提下，适当丰富或补充内容，使信息更加明确。'
                         '4、段落整合: 将相关内容整合成连贯的段落，确保各句之间有逻辑关系，避免信息碎片化，避免信息孤立和跳跃。'),
-                  '9': "将英文转换为包括中文翻译、英文释义和一个例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。"
+                '9': "根据输入语言（{source_language}）和目标语言（{target_language}），对输入文本进行翻译，并提供目标语言释义和例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。",
+                '10': ('你是群聊中的智能助手。任务是根据给定内容，识别并分类用户的意图，并返回相应的 JSON 格式，例如：{"intent":"xx"}'
+                        '对于意图分类之外的任何内容，请归类为 "聊天",如果用户输入的内容不属于意图类别，直接返回 `{"intent": "聊天"}`，即表示这条内容不涉及明确的工作任务或查询。'
+                        '以下是常见的意图类别与对应可能的关键词或者类似的意思，请帮我判断用户意图:')
                   }
 
 # Api_Tokens = [
@@ -312,8 +315,8 @@ def get_baidu_access_token(secret_id=Config.BAIDU_qianfan_API_Key, secret_key=Co
 
 # 使用 HMAC 进行数据签名 https://ram.console.aliyun.com/users
 # 阿里云服务交互时的身份验证: Base64( HMAC-SHA1(stringToSign, accessKeySecret + "&") );
-def get_aliyun_access_token(access_key_id=Config.ALIYUN_AK_ID, access_key_secret=Config.ALIYUN_Secret_Key,
-                            service="nls-meta", region: str = "cn-shanghai"):
+def get_aliyun_access_token(service="nls-meta", region: str = "cn-shanghai",
+                            access_key_id=Config.ALIYUN_AK_ID, access_key_secret=Config.ALIYUN_Secret_Key):
     parameters = {
         'AccessKeyId': access_key_id,
         'Action': 'CreateToken',
@@ -442,29 +445,32 @@ def get_ark_signature(action: str, service: str, host: str, region: str = "cn-no
 
 def get_tencent_signature(service, host=None, params=None, action='ChatCompletions',
                           secret_id: str = Config.TENCENT_SecretId,
-                          secret_key: str = Config.TENCENT_Secret_Key, timestamp: int = None):
+                          secret_key: str = Config.TENCENT_Secret_Key, timestamp: int = None, version='2023-09-01'):
     if not host:
         host = f"{service}.tencentcloudapi.com"
     if not timestamp:
         timestamp = int(time.time())
+        # 支持 POST 和 GET 方式
     if not params:
         http_request_method = "GET"  # GET 请求签名
-        headers = {
+        params = {
             'Action': action,  # 'DescribeInstances'
             'InstanceIds.0': 'ins-09dx96dg',
             'Limit': 20,
-            'Nonce': 11886,  # 随机数,确保唯一性
+            'Nonce': str(uuid.uuid1().int >> 64),  # 随机数,确保唯一性
             'Offset': 0,
             'Region': 'ap-shanghai',
             'SecretId': secret_id,
             'Timestamp': timestamp,
-            'Version': '2017-03-12'
+            'Version': version  # '2017-03-12'
         }
-        query_string = '&'.join(f"{k}={quote(str(v), safe='')}" for k, v in sorted(headers.items()))
+        # f"{k}={quote(str(v), safe='')}"
+        query_string = '&'.join("%s=%s" % (k, str(v)) for k, v in sorted(params.items()))
         string_to_sign = f"{http_request_method}{host}/?{query_string}"
         signature = hmac.new(secret_key.encode("utf8"), string_to_sign.encode("utf8"), hashlib.sha1).digest()
-        headers["Signature"] = quote_plus(signature)  # base64.b64encode(signature)
-        return headers
+        params["Signature"] = quote_plus(signature)  # 进行 URL 编码
+        # quote_plus(signature.decode('utf8')) if isinstance(signature, bytes)  base64.b64encode(signature)
+        return params
 
     algorithm = "TC3-HMAC-SHA256"
     date = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
@@ -473,7 +479,7 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
     http_request_method = "POST"
     canonical_uri = "/"
     canonical_querystring = ""
-    ct = "application/json; charset=utf-8"
+    ct = "application/json; charset=utf-8"  # 使用签名方法 v3（TC3-HMAC-SHA256）
     payload = json.dumps(params)
     canonical_headers = f"content-type:{ct}\nhost:{host}\nx-tc-action:{action.lower()}\n"
     signed_headers = "content-type;host;x-tc-action"
@@ -506,7 +512,7 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
                      "Signature=" + signature)
 
     # return authorization
-
+    # 公共参数需要统一放到 HTTP Header 请求头部
     headers = {
         "Authorization": authorization,  # "<认证信息>"
         "Content-Type": ct,  # "application/json"
@@ -514,18 +520,19 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
         "X-TC-Action": action,  # "ChatCompletions"
         # 这里还需要添加一些认证相关的Header
         "X-TC-Timestamp": str(timestamp),
-        'X-TC-Version': '2023-09-01'  # version,"<API版本号>",'2017-03-12'
-        # "X-TC-Region": 'ap-shanghai 'region,"<区域>",
+        "X-TC-Version": version,  # "<API版本号>"
+        "X-TC-Region": 'ap-shanghai'  # region,"<区域>",
     }
     return headers
 
 
-def build_url(url: str, access_token: str = get_baidu_access_token()) -> str:
+def build_url(url: str, access_token: str = get_baidu_access_token(), **kwargs) -> str:
     url = url.strip().strip('"')
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
 
     params = {"access_token": access_token}
+    params.update(kwargs)
     query_string = urlencode(params)
     return f"{url}?{query_string}"
 
@@ -624,8 +631,8 @@ def verify_hmac_signature(shared_secret: str, data: str, signature: str):
 #     return base64.urlsafe_b64decode(padded_encoded_id.encode()).decode()
 
 if __name__ == "__main__":
-    key = 'e439bcf5e2b3f706b05a4962aaeac0cc'
-    secret = 'MDRjODdhNDcwYjQyNGIyMjQzOGQ2ZDE4'
+    key = 'e**'
+    secret = 'MDR'
     api_key = f"{key}:{secret}"
     api_key_base64 = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
     print(api_key_base64)

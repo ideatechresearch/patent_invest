@@ -5,6 +5,9 @@ from difflib import get_close_matches, SequenceMatcher
 from collections import OrderedDict, Counter
 import math
 import jieba
+from langdetect import detect, detect_langs
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 
 
 class LRUCache:
@@ -267,8 +270,8 @@ def remove_markdown(text):
 def format_for_wechat(text):
     formatted_text = text
     formatted_text = re.sub(r'\*\*(.*?)\*\*', r'✦\1✦', formatted_text)  # **粗体** 转换为 ✦粗体✦样式
-    formatted_text = re.sub(r'__(.*?)__', r'※\1※', formatted_text)  # __斜体__ 转换为星号包围的样式
     formatted_text = re.sub(r'!!(.*?)!!', r'❗\1❗', formatted_text)  # !!高亮!! 转换为 ❗符号包围
+    # formatted_text = re.sub(r'__(.*?)__', r'※\1※', formatted_text)  # __斜体__ 转换为星号包围的样式
     formatted_text = re.sub(r'~~(.*?)~~', r'_\1_', formatted_text)  # ~~下划线~~ 转换为下划线包围
     formatted_text = re.sub(r'\^\^(.*?)\^\^', r'||\1||', formatted_text)  # ^^重要^^ 转换为 ||重要|| 包围
     formatted_text = re.sub(r'######\s+(.*?)(\n|$)', r'[\1]\n', formatted_text)  # ###### 六级标题
@@ -276,7 +279,7 @@ def format_for_wechat(text):
     formatted_text = re.sub(r'####\s+(.*?)(\n|$)', r'【\1】\n', formatted_text)  # #### 标题转换
     formatted_text = re.sub(r'###\s+(.*?)(\n|$)', r'— \1 —\n', formatted_text)  # ### 三级标题
     formatted_text = re.sub(r'##\s+(.*?)(\n|$)', r'—— \1 ——\n', formatted_text)  # ## 二级标题
-    formatted_text = re.sub(r'#\s+(.*?)(\n|$)', r'——— \1 ———\n', formatted_text)  # # 一级标题
+    formatted_text = re.sub(r'#\s+(.*?)(\n|$)', r'※ \1 ※\n', formatted_text)  # # 一级标题
     # formatted_text = re.sub(r'```([^`]+)```',
     #                         lambda m: '\n'.join([f'｜ {line}' for line in m.group(1).splitlines()]) + '\n',
     #                         formatted_text)
@@ -366,6 +369,298 @@ def contains_chinese(text):
     # 检测字符串中是否包含中文字符
     chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
     return bool(chinese_pattern.search(text))
+    # detect(text)=='zh-cn'
+
+
+def split_sentences(text, pattern=r'(?<=[。！？])'):  # r'(?<=。|！|？|\r\n)'
+    # 基于句号、感叹号、问号进行分句
+    sentences = re.split(pattern, text)
+    # 去掉空白句子并返回
+    return [sentence for sentence in sentences if sentence.strip()]
+
+
+def split_paragraphs(sentences, max_length=256):
+    paragraphs = []
+    current_paragraph = ""
+
+    for sentence in sentences:
+        # 如果当前段落加上新句子的长度未超标，直接添加
+        if len(current_paragraph) + len(sentence) <= max_length:
+            current_paragraph += sentence
+        else:
+            # 超过 max_length，优先寻找标点符号处分割
+            if len(current_paragraph) > 0:
+                paragraphs.append(current_paragraph)
+            current_paragraph = sentence
+
+    # 添加最后一段
+    if current_paragraph:
+        paragraphs.append(current_paragraph)
+
+    return paragraphs
+
+
+#
+# def split_paragraphs(text, max_length=256):
+#     sentences = split_sentences(text)
+#     paragraphs = []
+#     current_paragraph = ""
+#
+#     for sentence in sentences:
+#         # 如果当前段落加上新句子的长度未超标，直接添加
+#         if len(current_paragraph) + len(sentence) <= max_length:
+#             current_paragraph += sentence
+#         else:
+#             # 超过 max_length，优先寻找标点符号处分割
+#             if len(current_paragraph) > 0:
+#                 paragraphs.append(current_paragraph)
+#             current_paragraph = sentence
+#
+#     # 最后一段加入
+#     if current_paragraph:
+#         paragraphs.append(current_paragraph)
+#
+#     # 处理超过长度的段落，优先按标点或换行分段
+#     final_paragraphs = []
+#     for paragraph in paragraphs:
+#         if len(paragraph) > max_length:
+#             # 查找标点或换行符位置
+#             sub_paragraphs = re.split(r'(?<=[。！？])', paragraph)
+#             buffer = ""
+#             for sub in sub_paragraphs:
+#                 if len(buffer) + len(sub) <= max_length:
+#                     buffer += sub
+#                 else:
+#                     final_paragraphs.append(buffer.strip())
+#                     buffer = sub
+#             if buffer:
+#                 final_paragraphs.append(buffer.strip())
+#         else:
+#             final_paragraphs.append(paragraph.strip())
+#
+#     return final_paragraphs
+
+# 实现小到大分块逻辑
+def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int = 512, overlap: int = 20):
+    '''
+    小块适合用于查询匹配，提高查询的精准度。
+    大块划分，将包含上下文信息的多个小块合并为较大的片段。
+    滑动窗口：为了保持上下文关系，在小块和大块之间添加一定的重叠区域，确保边缘信息不丢失。这样，查询结果能保持更高的连贯性。
+    '''
+
+    # 小块分割
+    small_chunks = []
+    for i in range(0, len(tokens), small_chunk_size - overlap):
+        small_chunks.append(tokens[i:i + small_chunk_size])
+
+    # 组织大片段
+    large_chunks = []
+    for i in range(0, len(small_chunks), large_chunk_size // small_chunk_size):
+        large_chunk = []
+        for j in range(i, min(i + large_chunk_size // small_chunk_size, len(small_chunks))):
+            large_chunk.extend(small_chunks[j])
+        large_chunks.append(large_chunk[:large_chunk_size])
+
+    return small_chunks, large_chunks
+
+
+def format_date(date_str):
+    # 直接使用 strptime 来解析日期并格式化为目标格式
+    return datetime.strptime(date_str, "%Y/%m/%d %H:%M:%S").date().strftime("%Y-%m-%d")
+
+
+def format_date_type(date=None):
+    # 如果没有传入日期，使用当前日期
+    if not date:
+        date = datetime.now()
+    elif isinstance(date, str):
+        supported_formats = [
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+        ]
+        for date_format in supported_formats:
+            try:
+                date = datetime.strptime(date, date_format)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"Invalid date format: {date}. Supported formats are {supported_formats}.")
+
+    return date
+
+
+def get_current_time():
+    current_datetime = datetime.now()
+    formatted_time = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
+    return formatted_time
+
+
+def get_week_range(date=None, shift: int = 0, count: int = 1):
+    """
+    获取指定日期所在周的开始和结束日期。
+    支持通过 shift 参数偏移周。
+
+    :param date: 指定的日期（默认为当前日期）。
+    :param shift: 偏移周数，>0 表示未来的周，<0 表示过去的周，0 表示当前周。
+    :param count: 控制返回的周数范围，默认为 1，表示返回一个周的日期范围。
+    :return: 返回指定周的开始和结束日期，格式为 ('YYYY-MM-DD', 'YYYY-MM-DD')
+    """
+    date = format_date_type(date)
+    # 根据 shift 参数调整日期
+    date = date + relativedelta(weeks=shift)
+    # 获取今天是周几 (0 是周一, 6 是周日)
+    weekday = date.weekday()
+    # 计算周一的日期 (开始日期)
+    start_of_week = date - timedelta(days=weekday)
+    # 计算周日的日期 (结束日期)
+    # end_of_week = start_of_week + timedelta(days=6)
+
+    end_date = start_of_week + timedelta(weeks=count) - timedelta(days=1)  # start_of_week + timedelta(days=6)
+
+    return start_of_week.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+
+
+def get_first_day_of_month(date=None, shift: int = 0):
+    """
+     获取指定日期所在月的第一天
+     如果没有传入日期，默认为当前日期
+     """
+    date = format_date_type(date)
+
+    # 获取当前月份的第一天
+    first_day_of_month = (date + relativedelta(months=shift)).replace(day=1)
+
+    # 将日期格式化为字符串
+    return first_day_of_month.strftime("%Y-%m-%d")
+
+
+def get_month_range(date=None, shift: int = 0, count: int = 1):
+    """
+    获取指定日期所在月的开始和结束日期。
+    支持通过 shift 参数偏移月数，和通过 count 控制返回的月份范围。
+
+    :param date: 指定的日期（默认为当前日期）。
+    :param shift: 偏移的月数，>0 表示未来的月，<0 表示过去的月，0 表示当前月。
+    :param count: 控制返回的月份范围，默认为 1，表示返回一个月的开始和结束日期。
+    :return: 返回指定月份的开始和结束日期，格式为 ('YYYY-MM-DD', 'YYYY-MM-DD')
+      """
+    date = format_date_type(date)
+    # 根据 shift 参数调整日期
+    start_date = (date + relativedelta(months=shift)).replace(day=1)
+    # 计算下个月的第一天，然后减去一天
+    end_date = (start_date + relativedelta(months=count)).replace(day=1) - timedelta(days=1)  # + timedelta(days=32)
+    return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')  # '%Y-%m-01'
+
+
+def get_quarter_range(date=None, shift: int = 0, count: int = 1):
+    """
+    获取指定日期所在季度的开始和结束日期。
+    支持通过 shift 参数偏移季度数，和通过 count 控制返回的季度范围。
+
+    :param date: 指定的日期（默认为当前日期）。
+    :param shift: 偏移的季度数，>0 表示未来的季度，<0 表示过去的季度，0 表示当前季度。
+    :param count: 控制返回的季度范围，默认为 1，表示返回一个季度的开始和结束日期。
+    :return: 返回指定季度的开始和结束日期，格式为 ('YYYY-MM-DD', 'YYYY-MM-DD')
+    """
+    date = format_date_type(date)
+
+    # 确定当前日期所在季度的起始月份
+    start_month = 3 * ((date.month - 1) // 3) + 1
+    start_date = (date.replace(month=start_month, day=1)
+                  + relativedelta(months=3 * shift))
+
+    # 计算季度结束日期
+    end_date = (start_date + relativedelta(months=3 * count)).replace(day=1) - timedelta(days=1)
+
+    return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+
+
+def get_quarter_month_range(date=None, shift: int = 0, count: int = 1):
+    """
+    获取指定日期所在季度的月份范围。
+    支持通过 shift 参数偏移季度数，和通过 count 控制返回的季度范围。
+
+    :param date: 指定的日期（默认为当前日期）。
+    :param shift: 偏移季度数，>0 表示未来的季度，<0 表示过去的季度，0 表示当前季度。
+    :param count: 控制返回的季度范围，默认为 1，表示返回一个季度的开始和结束日期。
+    :return: 返回季度的开始月和结束月以及起始年份，格式为 ('YYYY','MM', 'MM')
+    """
+    date = format_date_type(date)
+
+    current_year = date.year
+
+    # 计算当前季度的起始月份
+    quarter_start = (date.month - 1) // 3 * 3 + 1
+
+    # 根据 shift 偏移季度
+    quarter_start += shift * 3
+
+    # 处理跨年情况：如果起始月份超出了12月，需要调整年份
+    if quarter_start > 12:
+        quarter_start -= 12
+        current_year += 1
+    elif quarter_start < 1:
+        quarter_start += 12
+        current_year -= 1
+
+    # 计算季度的结束月份
+    quarter_end = quarter_start + 3 * count - 1
+
+    # 处理结束月份跨年情况：如果结束月份超过12月，需要调整年份
+    if quarter_end > 12:
+        quarter_end -= 12
+
+    return current_year, quarter_start, quarter_end
+
+
+def get_year_range(date=None, shift: int = 0, count: int = 1):
+    """
+    获取指定日期所在年的开始和结束日期。
+    支持通过 shift 参数偏移年数，和通过 count 控制返回的年度范围。
+
+    :param date: 指定的日期（默认为当前日期）。
+    :param shift: 偏移的年数，>0 表示未来的年，<0 表示过去的年，0 表示当前年。
+    :param count: 控制返回的年度范围，默认为 1，表示返回一年的开始和结束日期。
+    :return: 返回指定年的开始和结束日期，格式为 ('YYYY-MM-DD', 'YYYY-MM-DD')
+    """
+    date = format_date_type(date)
+
+    # 计算年份的开始日期
+    start_date = date.replace(month=1, day=1) + relativedelta(years=shift)
+
+    # 计算年份的结束日期
+    end_date = (start_date + relativedelta(years=count)).replace(day=1, month=1) - timedelta(days=1)
+
+    return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+
+
+def get_half_year_range(date=None, shift: int = 0, count: int = 1):
+    """
+    获取指定日期所在的半年（前半年或后半年）范围。
+    支持通过 shift 参数偏移半年数，和通过 count 控制返回的半年数范围。
+
+    :param date: 指定的日期（默认为当前日期）。
+    :param shift: 半年偏移量，0 表示当前半年，-1 表示前一半年，1 表示下一半年。
+    :param count: 返回的半年范围，默认为 1，表示返回一个半年的开始和结束日期。
+    :return: 返回指定半年的开始和结束日期，格式为 ('YYYY-MM-DD', 'YYYY-MM-DD')
+    """
+    date = format_date_type(date)
+
+    # 判断当前是前半年还是后半年
+    if date.month <= 6:
+        start_date = date.replace(month=1, day=1)
+    else:
+        start_date = date.replace(month=7, day=1)
+
+    # 调整日期到指定的半年
+    start_date += relativedelta(months=6 * shift)
+    # 计算半年结束日期
+    end_date = (start_date + relativedelta(months=6 * count)).replace(day=1) - timedelta(days=1)
+
+    return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
 
 
 class BM25:
@@ -410,10 +705,16 @@ class BM25:
             score += idf * (numerator / denominator)
         return score
 
-    def rank_documents(self, query):
+    def rank_documents(self, query, sort=True, normalize=False):
         query_terms = list(jieba.cut(query))  # 对查询进行分词
         scores = [(doc_id, self.bm25_score(query_terms, doc_id)) for doc_id in range(self.doc_count)]
-        return sorted(scores, key=lambda x: x[1], reverse=True)
+        if normalize:
+            max_score = max(scores, key=lambda x: x[1])[1]
+            min_score = min(scores, key=lambda x: x[1])[1]
+            if max_score != min_score:
+                scores = [(doc_id, (score - min_score) / (max_score - min_score)) for doc_id, score in scores]
+
+        return sorted(scores, key=lambda x: x[1], reverse=True) if sort else scores
 
 
 # class BM25:

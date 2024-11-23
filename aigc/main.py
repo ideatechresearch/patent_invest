@@ -3,14 +3,13 @@ import string, difflib, re, time, copy, os, io, sys, uuid
 import tempfile
 import logging
 import concurrent.futures
-# import spacy
 # import queue
 # import numpy as np
+from pathlib import Path
 from typing import AsyncGenerator
-from web3 import Web3
-from fastapi import FastAPI, Request, Response, Depends, Query, File, BackgroundTasks, UploadFile, Form, \
+from fastapi import FastAPI, Request, Response, Depends, Query, File, UploadFile, BackgroundTasks, Form, \
     Body, WebSocket, WebSocketDisconnect, HTTPException, status
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from starlette.middleware.sessions import SessionMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -30,26 +29,31 @@ from database import *
 async def lifespan(app: FastAPI):
     print("Starting up.")
     Base.metadata.create_all(bind=engine)
-    init_ai_clients()
+    init_ai_clients(API_KEYS)
     # if not w3.is_connected():
     #     print("Failed to connect to Ethereum node")
 
-    scheduler.add_job(tick, 'interval', seconds=60, misfire_grace_time=60)  # , max_instances=3
-    scheduler.start()
+    if not scheduler.get_job("tick_job"):
+        scheduler.add_job(tick, 'interval', id="tick_job", seconds=60, misfire_grace_time=60)  # , max_instances=3
+    if not scheduler.running:
+        scheduler.start()
+
     yield
     print("Shutting down.")
     scheduler.shutdown()
 
 
-scheduler = BackgroundScheduler(executors={'default': ThreadPoolExecutor(2)})  # 设置线程池大小, AsyncIOScheduler()
+scheduler = BackgroundScheduler(executors={'default': ThreadPoolExecutor(4)})  # 设置线程池大小, AsyncIOScheduler()
 # executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
-engine = create_engine(Config.SQLALCHEMY_DATABASE_URI)  # echo=True
+engine = create_engine(Config.SQLALCHEMY_DATABASE_URI, pool_recycle=28800, pool_size=10, max_overflow=20)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=Config.SECRET_KEY)
-# logging.basicConfig(level=logging.INFO)
+# 将文件目录映射为静态文件路径
+# app.mount("/static", StaticFiles(directory=os.path.abspath('.') + "/static"), name="static")
 qd_client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
-w3 = Web3(Web3.HTTPProvider(f'https://mainnet.infura.io/v3/{Config.INFURA_PROJECT_ID}'))  # ("http://127.0.0.1:8545")
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.WARNING)
+
 Task_queue = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
 
 dashscope.api_key = Config.DashScope_Service_Key
@@ -57,9 +61,16 @@ dashscope.api_key = Config.DashScope_Service_Key
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # OAuth2 密码令牌,设置 tokenUrl
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
+os.makedirs(Config.DATA_FOLDER, exist_ok=True)
 
 # model_config['protected_namespaces'] = ()
+try:
+    from web3 import Web3
+
+    w3 = Web3(
+        Web3.HTTPProvider(f'https://mainnet.infura.io/v3/{Config.INFURA_PROJECT_ID}'))  # ("http://127.0.0.1:8545")
+except:
+    w3 = None
 
 
 def tick():
@@ -105,6 +116,9 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    # except Exception:
+    #     db.rollback()
+    #     raise
     finally:
         db.close()
 
@@ -151,7 +165,7 @@ async def register_user(request: Registration, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="User already registered")
     # 验证签名
     if signed_message and original_message:
-        if eth_address:
+        if eth_address and w3:
             recovered_address = w3.eth.account.recover_message(text=original_message, signature=signed_message)
             if recovered_address.lower() != eth_address.lower():
                 raise HTTPException(status_code=400, detail="Signature verification failed")
@@ -189,7 +203,7 @@ async def authenticate_user(request: AuthRequest, db: Session = Depends(get_db))
     db_user = None
     # 验证签名
     if signed_message and original_message:
-        if eth_address:
+        if eth_address and w3:
             recovered_address = w3.eth.account.recover_message(text=original_message, signature=signed_message)
             if recovered_address.lower() != eth_address.lower():
                 raise HTTPException(status_code=400, detail="Authentication failed")
@@ -347,21 +361,23 @@ async def retrieval(text: str, platform: str = 'default'):
 
 @app.get("/embeddings/")
 async def embeddings(texts: List[str] = Query(...), model_name: str = 'qwen', model_id: int = 0):
-    inputs = [text.replace("\n", " ") for text in texts]
-    if model_name == 'baidu':
+    inputs = [x.replace("\n", " ") for x in texts]
+    if model_name == 'baidu_bge':
         access_token = get_baidu_access_token()
         embedding = await get_baidu_embeddings(inputs, access_token=access_token)
         return {"embedding": embedding}
+    if model_name == 'word_vec':
+        pass
     return {"embedding": await ai_embeddings(inputs, model_name=model_name, model_id=model_id)}
 
 
 @app.get("/fuzzy/")
 async def fuzzy_matches(texts: List[str] = Query(...), terms: List[str] = Query(...),
                         top_n: int = 3, cutoff: float = 0.6, method: str = 'levenshtein'):
-    querys = [text.replace("\n", " ").strip() for text in texts]
-    tokens = [text.replace("\n", " ").strip() for text in terms]
+    querys = [x.replace("\n", " ").strip() for x in texts]
+    tokens = [x.replace("\n", " ").strip() for x in terms]
     results = []
-    if method == 'levenshtein':
+    if method == 'levenshtein':  # char_unigr,计算两个词组之间的最小编辑次数,from nltk.metrics.distance import edit_distance
         for token in querys:
             matches = difflib.get_close_matches(token, tokens, n=top_n, cutoff=cutoff)
             matches = [(match, round(difflib.SequenceMatcher(None, token, match).ratio(), 3), tokens.index(match))
@@ -370,14 +386,14 @@ async def fuzzy_matches(texts: List[str] = Query(...), terms: List[str] = Query(
         # results = [{'token': token, 'matches': rapidfuzz.process.extract(token, tokens, limit=top_n, score_cutoff=cutoff)}
         #            for token in querys]
         # fuzzywuzzy.process.extractOne(token,choices,scorer=fuzzywuzzy.fuzz.token_sort_ratio)
-    elif method == 'bm25':
+    elif method == 'bm25':  # 初步检索,将词组转化为向量化表示（TF-IDF）,概率检索模型,适合在短词组或句子相似性上做简单匹配
         bm25 = BM25(tokens)  # corpus
         for token in querys:
             scores = bm25.rank_documents(token)
             matches = [(tokens[match[0]], round(match[1], 3), match[0]) for match in scores[:top_n] if
                        match[1] >= cutoff]
             results.append({'query': token, 'matches': matches})
-    elif method == 'reranker':
+    elif method == 'reranker':  # 精细排序,BERT Attention,Cross-encoder / Bi-encoder,通过 Transformer 编码，进行对比分析,可以利用上下文信息
         async def process_token(token):
             scores = await ai_reranker(token, documents=tokens, top_n=top_n,
                                        model_name="BAAI/bge-reranker-v2-m3", model_id=0)
@@ -386,12 +402,14 @@ async def fuzzy_matches(texts: List[str] = Query(...), terms: List[str] = Query(
             return {'query': token, 'matches': matches}
 
         results = await asyncio.gather(*(process_token(token) for token in querys))  # [(match,score,index)]
-    elif method == 'embeddings':
+    elif method == 'embeddings':  # SBERT,MiniLM,将词组或句子嵌入为高维向量，通过余弦相似度衡量相似性
         similars = await get_similar_embeddings(querys, tokens, ai_embeddings, topn=top_n, cutoff=cutoff,
                                                 model_name='qwen', model_id=0)
         results = [{'query': token, 'matches':
             [(match[0], round(match[1], 3), tokens.index(match[0])) for match in matches if match[1] >= cutoff]} for
                    token, matches in similars]
+    elif method == 'wordnet':  # 词典或同义词库，将词组扩展为同义词词组列表进行匹配,PageRank基于链接或交互关系构建的图中节点间的“传递性”来计算排名
+        pass
 
     # tokens = list({match for token in querys for match in difflib.get_close_matches(token, tokens)})
     # match, score = process.extractOne(token, tokens)
@@ -400,9 +418,110 @@ async def fuzzy_matches(texts: List[str] = Query(...), terms: List[str] = Query(
     # Response(content=list_to_xml('results', results), media_type='application/xml; charset=utf-8')
 
 
+@app.post("/classify")
+async def classify_text(request: ClassifyRequest):
+    intents = []
+    query = request.query.strip()
+    intent_tokens = [(it, x.replace("\n", " ").strip()) for it, keywords in request.class_terms.items() for x in
+                     keywords]
+    tokens = [token for _, token in intent_tokens]
+    last_intent = request.class_default
+
+    # 遍历 class_terms 字典，检查文本是否匹配任意关键词
+    if len(query) < 32:
+        for intent, keywords in request.class_terms.items():
+            if any(re.search(r'\b' + re.escape(keyword) + r'\b', query) for keyword in keywords):
+                intents.append({"class": intent, 'score': None, 'type': 'search'})
+
+    matches = difflib.get_close_matches(query, tokens, n=10, cutoff=0.8)
+    edit_scores = [(tokens.index(match), difflib.SequenceMatcher(None, query, match).ratio())
+                   for match in matches]
+
+    if edit_scores:
+        intent = intent_tokens[edit_scores[0][0]][0]
+        intents.append({"class": intent, 'score': edit_scores[0][1], 'type': 'edit'})
+        if (all(intent_tokens[i[0]][0] == intent for i in edit_scores[:3]) and intent == last_intent) or \
+                (max(i[1] for i in edit_scores) > 0.85 and all(i['class'] == last_intent for i in intents)):
+            return {"intent": intent, 'match': intents}
+
+    # 如果当前意图得分大于0.85并且与历史意图相同，更新历史记录并返回
+    if any(i['score'] >= 0.85 for i in intents if i['score']):
+        if last_intent and all(i['class'] == last_intent for i in intents):
+            return {"intent": last_intent, 'match': intents}
+
+    bm25_scores = BM25(tokens).rank_documents(query, sort=True, normalize=False)  # [(idx,max_score)]
+    if bm25_scores:
+        best_match = max(bm25_scores, key=lambda x: x[1])
+        intent = intent_tokens[best_match[0]][0]  # bm25_scores[0]
+        if all(intent_tokens[i[0]][0] == intent for i in bm25_scores[:3]) and all(
+                intent_tokens[i[0]][0] == intent for i in edit_scores[:3]):
+            intents.append({"class": intent, 'score': None, 'type': 'bm25'})
+
+    similar_scores = await get_similar_embeddings([query], tokens, embeddings_calls=ai_embeddings, topn=10,
+                                                  model_name=request.emb_model)  # [(q,[(match,score,index),])]
+
+    if similar_scores:
+        similar_scores = [(int(match[2]), float(match[1])) for match in similar_scores[0][1] if match[1] >= 0.8]
+    if similar_scores:
+        intent = intent_tokens[similar_scores[0][0]][0]
+        intents.append({"class": intent, 'score': similar_scores[0][1], 'type': request.emb_model})
+
+    if any(i['score'] >= 0.85 for i in intents if i['score']):
+        if all(i['class'] == intents[0]['class'] for i in intents):
+            intent = intents[0]['class']
+            return {"intent": intent, 'match': intents}
+
+    reranker_scores = await ai_reranker(query, documents=tokens, top_n=10, model_name=request.rerank_model,
+                                        model_id=0)
+
+    reranker_scores = [(match[2], match[1]) for match in reranker_scores if match[1] >= 0.8]  # [(match,score,index)]
+    if reranker_scores:
+        intent = intent_tokens[reranker_scores[0][0]][0]
+        intents.append({"class": intent, 'score': reranker_scores[0][1], 'type': request.rerank_model})
+
+    # 如果多个意图匹配得分超过0.85，并且意图相同，则返回这些意图
+    if any(i['score'] >= 0.85 for i in intents if i['score']):
+        if all(i['class'] == intents[0]['class'] for i in intents):
+            intent = intents[0]['class']
+            return {"intent": intent, 'match': intents}
+
+    system_prompt = request.prompt + f'\n{request.class_terms}'
+    model_info, payload, refer = await get_chat_payload(messages=None, user_request=query, system=system_prompt,
+                                                        temperature=0.3, top_p=0.8, max_tokens=256,
+                                                        model_name=request.llm_model, model_id=1)
+    bot_response = await ai_chat(model_info, payload)
+    result = extract_json_from_string(bot_response)
+    intent = result.get("intent") if result else None
+    if intent:
+        intents.append({"class": intent, 'type': request.llm_model})
+        result['match'] = intents
+        return result
+
+    print(bot_response, intents, payload)
+    return {"intent": last_intent, 'match': intents}
+
+
 @app.get("/nlp/")
-async def nlp():
-    return {"message": "ok"}
+async def nlp(text: str, nlp_type: str = 'ecnet'):
+    return await baidu_nlp(nlp_type=nlp_type, text=text)
+
+
+@app.post("/tools")
+async def text_tools(request: ToolRequest):
+    # 调用模型接口
+    response = ai_tool_response(messages=request.messages, tools=request.tools, model_name=request.model_name,
+                                model_id=request.model_id, top_p=request.top_p, temperature=request.temperature)
+
+    if not response:
+        raise HTTPException(status_code=500, detail="No response from AI model.")
+
+    # if request.tools:
+    #     return {"messages": response}
+
+    # 解析响应并调用工具
+    final_messages = await ai_tools_messages(response)
+    print(final_messages)
+    return {"messages": final_messages}
 
 
 @app.post("/llm")  # response_model=OpenAIResponse
@@ -473,7 +592,7 @@ async def generate_message(request: OpenAIRequest,
             '5': 'code.sql',
             '6': 'header',
         }
-        extract = agent_format.get(agent, extract)
+        extract = agent_format.get(agent, request.extract)
 
     history, user_request = chat_history.build(request.question, request.messages, request.use_hist,
                                                request.filter_limit, request.filter_time)
@@ -546,7 +665,7 @@ async def websocket_chat(websocket: WebSocket):
                 user_name, request.get('question'), robot_id, user_id, db=db,
                 user_history=request.get('messages', []), use_hist=request.get('use_hist', True),
                 filter_limit=request.get('filter_limit', -500), filter_time=request.get('filter_time', 0.0),
-                request_uuid=request.get('uuid')
+                agent=agent, request_uuid=request.get('uuid')
             )
 
             # 生成系统提示和模型请求
@@ -649,7 +768,7 @@ async def submit_messages(request: SubmitMessagesRequest, background_tasks: Back
     # history, user_request, hist_size = build_chat_history(
     #     user_name, "", request.robot_id, request.user_id, db, user_history=request.messages,
     #     use_hist=request.use_hist, filter_limit=request.filter_limit, filter_time=request.filter_time,
-    #     request_uuid=request.uuid)
+    #     agent=None,request_uuid=request.uuid)
 
     task_id = str(uuid.uuid4())
     Task_queue[task_id] = {
@@ -842,6 +961,15 @@ async def search_location(query: str, region: str = Query('', description="Regio
 @app.post("/translate")
 async def translate_text(request: TranslateRequest):
     platform = request.platform.lower()
+    if request.source == 'auto':
+        request.source = detect(request.text)
+        if request.source == 'zh-cn':
+            request.source = 'zh'
+        if request.source == 'no':
+            request.source = 'zh' if contains_chinese(request.text) else 'auto'
+    if request.target == 'auto':
+        request.target = 'en' if request.source == 'zh' else 'zh'
+
     if platform == "baidu":
         translated_text = await baidu_translate(request.text, request.source, request.target)
         return {"platform": "Baidu", "translated": translated_text}
@@ -852,34 +980,73 @@ async def translate_text(request: TranslateRequest):
         translated_text = await xunfei_translate(request.text, request.source, request.target)
         return {"platform": "XunFei", "translated": translated_text}
     else:
-        system_prompt = System_content.get('9')
-        translated_text = await ai_generate(
-            prompt=system_prompt,
-            user_request=request.text,
-            model_name=platform,
-            model_id=0,
-            stream=False,
-        )
-        if translated_text:
-            return {"platform": platform, "translated": translated_text}
+        system_prompt = System_content.get('9').format(source_language=request.source, target_language=request.target)
+        # print(system_prompt)
+        try:
+            translated_text = await ai_generate(
+                prompt=system_prompt,
+                user_request=request.text,
+                model_name=platform,
+                model_id=0,
+                stream=False,
+            )
+            if translated_text:
+                return {"platform": platform, "translated": translated_text}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Unsupported platform:{e}")
 
-    raise HTTPException(status_code=400, detail="Unsupported platform.")
+
+bucket_name = 'rime'  # 存储桶名称
+oss_endpoint = 'https://image-1381459162007822.oss-cn-shanghai.oss-accesspoint.aliyuncs.com'
+bucket = oss2.Bucket(oss2.Auth(Config.ALIYUN_AK_ID, Config.ALIYUN_Secret_Key), oss_endpoint, bucket_name)
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), to_oss=False):
+    file_path = Path(Config.DATA_FOLDER) / file.filename
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+        url = f"/files/{file.filename}"
+
+    if to_oss:
+        total_size = os.path.getsize(file_path)
+        object_name = f"upload/{file.filename}"
+        if total_size > 1024 * 1024 * 16:
+            upload_large_file_to_oss(bucket, file_path, object_name)
+        else:
+            bucket.put_object_from_file(object_name, str(file_path))  # OSS 上的存储路径, 本地图片路径
+
+        url = f"{oss_endpoint}/{object_name}"
+
+    return {"url": url}
+
+
+@app.get("/files/{filename}")
+async def get_file(filename: str):
+    file_path = Path(Config.DATA_FOLDER) / filename
+    if file_path.exists():
+        return FileResponse(file_path)
+    return {"error": "File not found"}
 
 
 @app.post("/ocr")
-async def image_to_text(file: UploadFile = File(...), image_url: str = Form(None),
-                        ocr_sign: str = 'accurate_basic'):
+async def image_to_text(file: UploadFile = File(None), image_url: str = Form(None),
+                        ocr_type: str = 'general'):
     try:
         image_data = await file.read()
     except Exception as e:
         return {"error": f"Failed to process the uploaded file:{e}"}
 
-    access_token = get_baidu_access_token(Config.BAIDU_ocr_API_Key, Config.BAIDU_ocr_Secret_Key)
-    result = baidu_ocr_recognise(image_data, image_url, access_token, ocr_sign=ocr_sign)
+    if ocr_type in ['general', 'accurate', 'accurate_basic', 'general_basic', 'webimage', 'doc_analysis_office',
+                    'table', 'numbers', 'qrcode', 'handwriting', 'idcard', 'account_opening']:
+        result = await baidu_ocr_recognise(image_data, image_url, ocr_type=ocr_type)
+    if ocr_type in ['GeneralBasicOCR', 'RecognizeTableDDSNOCR', 'GeneralAccurateOCR', 'VatInvoiceOCR',
+                    'ImageEnhancement', 'QrcodeOCR', 'SmartStructuralOCRV2']:
+        result = await tencent_ocr_recognise(image_data, image_url, ocr_type=ocr_type)
     if result is None:
         raise HTTPException(status_code=500, detail="OCR recognition failed.")
 
-    return {"result": result}
+    return result
 
 
 @app.post("/asr")
@@ -926,11 +1093,13 @@ async def speech_to_text(file: UploadFile = File(None), file_urls: List[str] = F
 
 
 @app.post("/tts")
-async def text_to_audio(sentences: str, platform: str = "baidu"):
-    audio_io, request_id = await dashscope_text_to_speech(sentences)
-    return StreamingResponse(audio_io, media_type="audio/mpeg",
-                             headers={"Content-Disposition": "attachment; filename=output.mp3",
-                                      "X-Request-ID": request_id})
+async def text_to_audio(sentences: str, platform: str = "cosyvoice-v1"):
+    if platform in ["cosyvoice-v1"]:
+        audio_io, request_id = await dashscope_text_to_speech(sentences, model=platform)
+        return StreamingResponse(audio_io, media_type="audio/mpeg",
+                                 headers={"Content-Disposition": "attachment; filename=output.mp3",
+                                          "X-Request-ID": request_id})
+    return HTTPException(status_code=400, detail="Unsupported platform.")
 
 
 # class WebSocketCallback(ResultCallback):

@@ -1156,15 +1156,27 @@ def downloads(path):
         return send_from_directory(app.config['DATA_FOLDER'], path, as_attachment=True)
     else:
         return "非管理员！<a href='/'>首页</a>"
+
+
 # import databases
-# @app.get("/query/")
-# async def execute_query(query: str, api_key: str = Depends(authenticate_api_key)):
-#     try:
-#         # 执行安全检查，确保 query 符合要求
-#         result = await database.fetch_all(text(query))
-#         return result
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
+@app.route('/query', methods=['GET'])
+def execute_query(query: str):
+    if session.get("username") != 'admin':
+        return jsonify({'error': 'The user is not admin!'}), 403
+    # query = request.args.get('query', '')
+    # ids = request.args.getlist('ids'){'ids': ids}
+    if not query.lower().startswith("select"):
+        return jsonify({'error': 'Only SELECT queries are allowed!'}), 400
+    try:
+        # 执行安全检查，确保 query 符合要求
+        result = db.session.execute(text(query))
+        rows = result.fetchall()  # 获取所有行
+        columns = result.keys()  # 获取列名
+        result_list = [dict(zip(columns, row)) for row in rows]
+        return jsonify(result_list), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/uploader', methods=['GET', 'POST'])
 def uploader():
