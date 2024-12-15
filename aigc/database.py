@@ -179,7 +179,7 @@ class BaseChatHistory(Base):
     )
 
     def __init__(self, role, content, username, robot_id=None, user_id=None, model=None, agent=None, index=0,
-                 reference=None,  transform=None, timestamp: int = 0):
+                 reference=None, transform=None, timestamp: int = 0):
         self.role = role
         self.content = content
         self.username = username
@@ -370,7 +370,7 @@ class ChatHistory(BaseChatHistory):
 
         return user_history
 
-    def build(self, user_request: str, user_history: List[dict], use_hist=False,
+    def build(self, user_request: str, user_history: List[dict] = None, use_hist=False,
               filter_limit: int = -500, filter_time: float = 0):
         history = []
         if not user_history:
@@ -557,6 +557,18 @@ class OperationMysql:
         # finally:
         #     self.cur.close()
         #     self.conn.close()
+    def insert(self, sql, params=None):
+        try:
+            if params is None:
+                params = ()
+            self.cur.execute(sql, params)
+            new_id = int(self.conn.insert_id())
+            self.conn.commit()
+            return new_id  # self.cursor.lastrowid
+        except Exception as e:
+            self.conn.rollback()
+        # finally:
+        #     self.conn.close()
 
 
 # class Task(Base):
@@ -600,6 +612,8 @@ class OperationMysql:
 #             cls.update_task_status(session, task_id, TaskStatus.COMPLETED)
 #         except Exception as e:
 #             cls.update_task_status(session, task_id, TaskStatus.FAILED)
+
+
 if __name__ == "__main__":
     with OperationMysql(host="localhost", user="root", password="password", db_name="test_db") as db111:
         print(db111.search("SELECT * FROM my_table"))

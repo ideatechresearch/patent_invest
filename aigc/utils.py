@@ -1,10 +1,12 @@
-import re, json
+import re, json, io, os
 import inspect
+from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
 from collections import OrderedDict, Counter
 import math
 import jieba
+from pypinyin import lazy_pinyin
 from langdetect import detect, detect_langs
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
@@ -89,13 +91,43 @@ def extract_json_from_string(input_str):
     return None
 
 
+def extract_method_calls(text):
+    # 匹配方法调用（方法名+括号内容）
+    pattern = r"\b[a-zA-Z_][a-zA-Z0-9_]*\b"
+    matches = re.findall(pattern, text)
+    # 检查匹配项，返回最后一个方法名
+    if matches:
+        return matches[-1]
+    return None
+
+
 def execute_code_blocks(text):
     code_blocks = extract_python_code(text)
+    results = []
+    global_namespace = globals()  # 引用全局命名空间
     for code in code_blocks:
+        local_namespace = {}  # 用于存储代码的局部变量
+        captured_output = io.StringIO()  # 用于捕获 `print` 输出
         try:
-            exec(code)
+            with redirect_stdout(captured_output):  # 重定向 `print` 输出
+                exec(code, global_namespace, local_namespace)
+                # exec(code, globals=None, locals=None)用于动态执行较复杂的代码块,不返回结果,需要通过全局或局部变量获取结果
+            output = captured_output.getvalue()  # 获取 `print` 的内容
+            results.append({
+                "output": output.strip(),
+                "namespace": local_namespace,
+                "error": None
+            })
         except Exception as e:
-            print(f"Error executing code block: {e}")
+            results.append({
+                "output": captured_output.getvalue().strip(),
+                "namespace": local_namespace,
+                "error": f"Error executing code block: {e}"
+            })
+        finally:
+            captured_output.close()
+
+    return results
 
 
 # 调整缩进,修复代码缩进，确保最小的缩进被移除，以避免缩进错误
@@ -372,14 +404,45 @@ def contains_chinese(text):
     # detect(text)=='zh-cn'
 
 
-def split_sentences(text, pattern=r'(?<=[。！？])'):  # r'(?<=。|！|？|\r\n)'
+def convert_to_pinyin(text):
+    # 检查输入是否为中国城市名称（仅中文），然后转换为拼音
+    if all('\u4e00' <= char <= '\u9fff' for char in text):
+        return ''.join(lazy_pinyin(text))
+    return text
+
+
+def split_sentences(text,
+                    pattern=r'(?<=[。！？])|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])|(?=\b\d+\、)',
+                    merged_pattern=r'\b[一二三四五六七八九十]+\、|\b[（(][一二三四五六七八九十]+[）)]|\b\d+\、'):  # r'(?<=。|！|？|\r\n)'
+    """
+    分句函数，支持按标点符号和结构化序号进行分句。
+    :param text: 输入的文本
+    :param pattern: 正则表达式匹配分隔符
+    :param merged_pattern: 正则表达式匹配结构化序号（如“一、二、三”或“（一）”、“4、”）
+    :return: 分割后的句子列表
+    """
     # 基于句号、感叹号、问号进行分句
     sentences = re.split(pattern, text)
     # 去掉空白句子并返回
+    if merged_pattern:
+        merged_sentences = []
+        temp = ""
+        for sentence in sentences:
+            if re.match(merged_pattern, sentence):
+                if temp:
+                    merged_sentences.append(temp.strip())
+                temp = sentence
+            else:
+                temp += sentence
+        if temp:
+            merged_sentences.append(temp.strip())
+
+        return [sentence for sentence in merged_sentences if sentence.strip()]
+
     return [sentence for sentence in sentences if sentence.strip()]
 
 
-def split_paragraphs(sentences, max_length=256):
+def split_paragraphs(sentences, max_length=512):
     paragraphs = []
     current_paragraph = ""
 
@@ -464,9 +527,47 @@ def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int
     return small_chunks, large_chunks
 
 
+def get_file_type(object_name: str) -> str:
+    if not object_name:
+        return ""
+
+    _, file_extension = os.path.splitext(object_name.lower())
+    # 根据文件后缀判断类型
+    if file_extension in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"]:
+        return "image"
+    elif file_extension in [".mp3", ".wav", ".ogg", ".aac", ".flac"]:
+        return "audio"
+    elif file_extension in [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"]:
+        return "video"
+    elif file_extension in [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv",
+                            '.zip', '.rar', '.html']:
+        return "*"
+    return ""
+
+
 def format_date(date_str):
     # 直接使用 strptime 来解析日期并格式化为目标格式
     return datetime.strptime(date_str, "%Y/%m/%d %H:%M:%S").date().strftime("%Y-%m-%d")
+
+
+class Url:
+    def __init__(this, host, path, schema):
+        this.host = host
+        this.path = path
+        this.schema = schema
+        pass
+
+
+def parse_url(requset_url):
+    stidx = requset_url.index("://")
+    host = requset_url[stidx + 3:]
+    schema = requset_url[:stidx + 3]
+    edidx = host.index("/")
+    if edidx <= 0:
+        raise Exception("invalid request url:" + requset_url)
+    path = host[edidx:]
+    host = host[:edidx]
+    return Url(host, path, schema)
 
 
 def format_date_type(date=None):
@@ -492,10 +593,22 @@ def format_date_type(date=None):
     return date
 
 
-def get_current_time():
+def get_times_shift(days_shift: int = 0, hours_shift: int = 0):
+    '''
+    :param days_shift: 偏移的天数，>0 表示未来，<0 表示过去，0 表示当前日期。
+    :param hours_shift: 偏移的小时数，>0 表示未来，<0 表示过去，0 表示当前时间。
+    :return: 格式化后的时间，格式为 'YYYY-MM-DD HH:MM:SS'。
+    '''
     current_datetime = datetime.now()
-    formatted_time = current_datetime.strftime('%Y-%m-%d %H:%M:%S')
-    return formatted_time
+    adjusted_time = current_datetime + timedelta(days=days_shift, hours=hours_shift)
+    return adjusted_time.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def get_day_range(date=None, shift: int = 0, count: int = 1):
+    date = format_date_type(date)
+    start_date = date - timedelta(days=shift)
+    end_date = start_date + timedelta(days=count)
+    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
 
 def get_week_range(date=None, shift: int = 0, count: int = 1):
@@ -521,20 +634,6 @@ def get_week_range(date=None, shift: int = 0, count: int = 1):
     end_date = start_of_week + timedelta(weeks=count) - timedelta(days=1)  # start_of_week + timedelta(days=6)
 
     return start_of_week.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-
-
-def get_first_day_of_month(date=None, shift: int = 0):
-    """
-     获取指定日期所在月的第一天
-     如果没有传入日期，默认为当前日期
-     """
-    date = format_date_type(date)
-
-    # 获取当前月份的第一天
-    first_day_of_month = (date + relativedelta(months=shift)).replace(day=1)
-
-    # 将日期格式化为字符串
-    return first_day_of_month.strftime("%Y-%m-%d")
 
 
 def get_month_range(date=None, shift: int = 0, count: int = 1):
@@ -661,6 +760,34 @@ def get_half_year_range(date=None, shift: int = 0, count: int = 1):
     end_date = (start_date + relativedelta(months=6 * count)).replace(day=1) - timedelta(days=1)
 
     return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+
+
+def date_range_calculator(period_type: str, date=None, shift: int = 0, count: int = 1) -> dict:
+    """
+    计算基于参考日期的时间范围。
+
+    :param period_type: 时间周期类型，'days'、'weeks'、'months' 等
+    :param date: 基准日期，格式为 'YYYY-MM-DD'
+    :param shift: 半年偏移量，0 表示当前半年，-1 表示前一半年，1 表示下一半年。
+    :param count: 时间周期数量，表示从参考日期向前或向后的时长
+    :return: 返回计算出的日期范围，包含 'start_date' 和 'end_date'
+    """
+    period_map = {'days': get_day_range,
+                  'weeks': get_week_range,
+                  'month': get_month_range,
+                  'quarters': get_quarter_range,
+                  'half_year': get_half_year_range,
+                  'year': get_year_range,
+                  }
+
+    handler = period_map.get(period_type)
+    if handler:
+        start_date, end_date = handler(date, shift, count)
+    else:
+        raise ValueError(f"不支持的时间单位: {period_type}")
+
+    # 返回结果字典，包含开始和结束日期
+    return {'start_date': start_date, 'end_date': end_date}
 
 
 class BM25:

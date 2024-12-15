@@ -2,7 +2,7 @@ import base64
 import hmac, ecdsa, hashlib
 from jose import JWTError, jwt
 import requests, json
-from urllib.parse import quote_plus, urlencode, quote
+from urllib.parse import quote_plus, urlencode, urlparse, quote, unquote
 from datetime import datetime, timedelta
 from wsgiref.handlers import format_date_time
 import time
@@ -10,7 +10,8 @@ import uuid
 
 
 class Config(object):
-    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://technet:{quote_plus("***")}@***.mysql.rds.aliyuncs.com:3306/technet?charset=utf8'
+    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://technet:{quote_plus("**")}@****.aliyuncs.com:3306/technet?charset=utf8'
+    # SQLALCHEMY_DATABASE_URI = (f'mysql+pymysql://***?charset=utf8')
     SQLALCHEMY_COMMIT_ON_TEARDOWN = False
     SQLALCHEMY_TACK_MODIFICATIONS = True
     SQLALCHEMY_ECHO = True
@@ -19,10 +20,13 @@ class Config(object):
     ACCESS_TOKEN_EXPIRE_MINUTES = 60
     HTTP_TIMEOUT_SEC = 60
     MAX_TASKS = 1024
+    MAX_CACHE = 1024
     DEVICE_ID = '***'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
-    QDRANT_HOST = 'qdrant'  # '47.***'#
+    QDRANT_HOST = 'qdrant'
+    LOCAL_URL = 'http://47.***:7000'
+    WECHAT_URL = 'http://*robot:*'
     QDRANT_URL = "http://47.***:6333"
 
     BAIDU_API_Key = '***'
@@ -58,6 +62,11 @@ class Config(object):
     ALIYUN_AK_ID = '***'
     ALIYUN_Secret_Key = '***'
     ALIYUN_nls_AppId = '***'
+
+    ALIYUN_oss_AK_ID = '***'
+    ALIYUN_oss_Secret_Key = '***'
+    ALIYUN_Bucket_Name = '***'  # 存储桶名称*
+    ALIYUN_Bucket_Domain = "***"  # 加速域名**
     # https://console.cloud.tencent.com/hunyuan/api-key
     TENCENT_SecretId = '***'
     TENCENT_Secret_Key = '***'
@@ -68,7 +77,7 @@ class Config(object):
     XF_API_Key = '***'
     XF_Secret_Key = '***'  # XF_API_Key:XF_Secret_Key
     XF_API_Password = ['**', '', '']
-    
+
     Silicon_Service_Key = '***'
     Moonshot_Service_Key = "***" 
 
@@ -76,6 +85,11 @@ class Config(object):
     GLM_Service_Key = "***"
     # https://platform.baichuan-ai.com/console/apikey
     Baichuan_Service_Key = '***'
+    HF_Service_Key = '***'
+    # https://ai.youdao.com/console/#/
+    YOUDAO_AppID = '***'
+    YOUDAO_Service_Key = '***'
+    CaiYun_Token = "***"
     HF_Service_Key = '***'
 
     VOLCE_AK_ID = '***' 
@@ -118,7 +132,7 @@ AI_Models = [
     {'name': 'qwen', 'type': 'default', 'api_key': '',
      "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
                'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max",
-               'baichuan2-7b-chat-v1', 'baichuan2-turbo', 'abab6.5s-chat', 'chatglm3-6b'],  # "qwen-vl-plus"
+               'baichuan2-7b-chat-v1', 'baichuan2-turbo', 'abab6.5s-chat'],  # "qwen-vl-plus"
      'generation': ['dolly-12b-v2', 'baichuan2-7b-chat-v1', 'belle-llama-13b-2m-v1', 'billa-7b-sft-v1'],
      'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
      'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
@@ -165,7 +179,7 @@ AI_Models = [
      'url': 'https://hunyuan.tencentcloudapi.com',  # 'hunyuan.ap-shanghai.tencentcloudapi.com'
      'base_url': "https://api.hunyuan.cloud.tencent.com/v1",
      'embedding_url': "https://api.hunyuan.cloud.tencent.com/v1/embeddings",
-     'nlp_url': "nlp.tencentcloudapi.com"},
+     'nlp_url': "nlp.tencentcloudapi.com", 'ocr_url': 'ocr.tencentcloudapi.com'},
     # https://cloud.siliconflow.cn/playground/chat
     {'name': 'silicon', 'type': 'default', 'api_key': '',
      'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat",
@@ -184,13 +198,15 @@ AI_Models = [
      'embedding_url': "https://api.siliconflow.cn/v1/embeddings",
      'reranker_url': "https://api.siliconflow.cn/v1/rerank"},
     # https://console.xfyun.cn/services/sparkapiCenter
-    {'name': 'speark', 'type': 'default', 'api_key': [],
+    {'name': 'spark', 'type': 'default', 'api_key': [],
      'model': ['pro', 'lite', 'max-32k', 'pro', 'pro-128k', '4.0Ultra', 'generalv3', 'generalv3.5'],
      'url': 'https://spark-api-open.xf-yun.com/v1/chat/completions',
      'base_url': 'https://spark-api-open.xf-yun.com/v1',
+     'file_url': 'https://spark-api-open.xf-yun.com/v1/files',
      'embedding_url': 'https://emb-cn-huabei-1.xf-yun.com/',
      'translation_url': 'https://itrans.xf-yun.com/v1/its',
-     'ws_url': 'wss://spark-api.xf-yun.com/v3.5/chat'},
+     'ws_url': 'wss://spark-api.xf-yun.com/v3.5/chat'
+     },
     {'name': 'gpt', 'type': 'default', 'api_key': '', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
      'generation': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
      'embedding': ["text-embedding-ada-002", "text-search-ada-doc-001", "text-similarity-babbage-001",
@@ -200,69 +216,18 @@ AI_Models = [
      'base_url': "https://api.openai.com/v1",
      },
 ]
-# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,speark,baichuan
+# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,spark,baichuan
 API_KEYS = {
     'moonshot': Config.Moonshot_Service_Key,
     'glm': Config.GLM_Service_Key,
     'qwen': Config.DashScope_Service_Key,
     'doubao': Config.ARK_Service_Key,
     'silicon': Config.Silicon_Service_Key,
-    'speark': Config.XF_API_Password,
+    'spark': Config.XF_API_Password,
     'baichuan': Config.Baichuan_Service_Key,
     'hunyuan': Config.TENCENT_Service_Key
 }
 
-System_content = {'0': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
-                  '1': ('你是一位领域专家，请回答以下问题。\n'
-                        '（注意：1、材料可能与问题无关，请忽略无关材料，并基于已有知识回答问题。'
-                        '2、尽量避免直接复制材料，将其作为参考来补充背景或启发分析。'
-                        '3、请直接提供分析和答案，请准确引用，并结合技术细节与实际应用案例，自然融入回答。'
-                        '4、避免使用“作者认为”等主观表达，直接陈述观点，保持分析的清晰和逻辑性。）'),
-                  '2': ('你是一位领域内的技术专家，擅长于分析和解构复杂的技术概念。'
-                        '我会向你提出一些问题，请你根据相关技术领域的最佳实践和前沿研究，对问题进行深度解析。'
-                        '请基于相关技术领域进行扩展，集思广益，并为每个技术点提供简要且精确的描述。'
-                        '请将这些技术和其描述性文本整理成JSON格式，具体结构为 `{ "技术点1": "描述1",  ...}`，请确保JSON结构清晰且易于解析。'
-                        '我将根据这些描述的语义进一步查找资料，并开展深入研究。'),
-                  '3': (
-                      '我有一个数据集，可能是JSON数据、表格文件或文本描述。你需要从中提取并处理数据，现已安装以下Python包：plotly.express、pandas、seaborn、matplotlib，以及系统自带的包如os、sys等。'
-                      '请根据我的要求生成一个Python脚本，涵盖以下内容：'
-                      '1、数据读取和处理：使用pandas读取数据，并对指定字段进行分组统计、聚合或其他处理操作。'
-                      '2、数据可视化分析：生成如折线图、条形图、散点图等，用以展示特定字段的数据趋势或关系。'
-                      '3、灵活性：脚本应具备灵活性，可以根据不同字段或分析需求快速调整。例如，当我要求生成某个字段的折线图时，可以快速修改代码实现。'
-                      '4、注释和可执行性：确保代码能够直接运行，并包含必要的注释以便理解。'
-                      '假设数据已被加载到pandas的DataFrame中，变量名为df。脚本应易于扩展，可以根据需要调整不同的可视化或数据处理逻辑。'),
-                  '4': ('你是一位信息提取专家，能够从文本中精准提取信息，并将其组织为结构化的JSON格式。你的任务是：'
-                        '1、提取文本中的关键信息，确保信息的准确性和完整性。'
-                        '2、根据用户的请求，按照指定的类别对信息进行分类（例如：“人名”、“职位”、“时间”、“事件”、“地点”、“目的”、“计划”等）。'
-                        '3、默认情况下，如果某个类别信息不完整或缺失时，不做推测或补充，返回空字符串。如果明确要求，可根据上下文进行适度的推测或补全。'
-                        '4、如果明确指定了输出类别或返回格式，请严格按照要求输出，不生成子内容或嵌套结构。'
-                        '5、将提取的信息以JSON格式输出，确保结构清晰、格式正确、易于理解。'),
-                  '5': ('你是一位SQL转换器，精通SQL语言，能够准确地理解和解析用户的日常语言描述，并将其转换为高效、可执行的SQL查询语句,Generate a SQL query。'
-                        '1、理解用户的自然语言描述，保持其意图和目标的完整性。'
-                        '2、根据描述内容，将其转换为对应的SQL查询语句。'
-                        '3、确保生成的SQL查询语句准确、有效，并符合最佳实践。'
-                        '4、输出经过优化的SQL查询语句。'),
-                  '6': ('你是一位领域专家，我正在编写一本书，请按照以下要求处理并用中文输出：'
-                        '1、内容扩展和总结: 根据提供的关键字和描述，扩展和丰富每个章节的内容，确保细节丰富、逻辑连贯，使整章文本流畅自然。'
-                        '必要时，总结已有内容和核心观点，形成有机衔接的连贯段落，避免生成分散或独立的句子。'
-                        '2、最佳实践和前沿研究: 提供相关技术领域的最佳实践和前沿研究，结合实际应用场景，深入解析关键问题，帮助读者理解复杂概念。'
-                        '3、背景知识和技术细节: 扩展背景知识，结合具体技术细节和应用场景进，提供实际案例和应用方法，增强内容的深度和实用性。保持见解鲜明，确保信息全面和确保段落的逻辑一致性。'
-                        '4、连贯段落: 组织生成的所有内容成连贯的段落，确保每段文字自然延续上一段，避免使用孤立的标题或关键词，形成完整的章节内容。'
-                        '5、适应书籍风格: 确保内容符合书籍的阅读风格，适应中文读者的阅读习惯与文化背景，语言流畅、结构清晰、易于理解并具参考价值。'),
-                  '7': ('请根据以下对话内容生成一个清晰且详细的摘要，帮我总结一下，转换成会议纪要\n：'
-                        '1、 提炼出会议的核心讨论点和关键信息。'
-                        '2、 按照主题或讨论点对内容进行分组和分类。'
-                        '3、 列出所有决定事项及后续的待办事项。'),
-                  '8': ('你是一位专业的文本润色专家，擅长处理短句和语音口述转换的内容。请根据以下要求对内容进行润色并用中文输出：'
-                        '1、语言优化: 对短句进行适当润色，确保句子流畅、自然，避免生硬表达，提升整体可读性。保持统一的语气和风格，确保文本适应场景，易于理解且专业性强。'
-                        '2、信息完整: 确保每个句子的核心信息清晰明确，对于过于简短或含糊的句子进行适当扩展，丰富细节。'
-                        '3、信息延展: 在不偏离原意的前提下，适当丰富或补充内容，使信息更加明确。'
-                        '4、段落整合: 将相关内容整合成连贯的段落，确保各句之间有逻辑关系，避免信息碎片化，避免信息孤立和跳跃。'),
-                '9': "根据输入语言（{source_language}）和目标语言（{target_language}），对输入文本进行翻译，并提供目标语言释义和例句的完整解释。请检查所有信息是否准确，并在回答时保持简洁，不需要任何其他反馈。",
-                '10': ('你是群聊中的智能助手。任务是根据给定内容，识别并分类用户的意图，并返回相应的 JSON 格式，例如：{"intent":"xx"}'
-                        '对于意图分类之外的任何内容，请归类为 "聊天",如果用户输入的内容不属于意图类别，直接返回 `{"intent": "聊天"}`，即表示这条内容不涉及明确的工作任务或查询。'
-                        '以下是常见的意图类别与对应可能的关键词或者类似的意思，请帮我判断用户意图:')
-                  }
 
 # Api_Tokens = [
 #     {"type": 'baidu', "func": get_baidu_access_token, "access_token": None, "expires_at": None, "expires_delta": 1440}]
@@ -270,7 +235,7 @@ System_content = {'0': '你是一个知识广博且乐于助人的助手，擅�
 
 # for tokens in Api_Tokens:
 def scheduled_token_refresh(token_info):
-    if token_info["expires_at"] is None or  datetime.utcnow() > token_info["expires_at"] - timedelta(minutes=5):
+    if token_info["expires_at"] is None or datetime.utcnow() > token_info["expires_at"] - timedelta(minutes=5):
         try:
             token_info["access_token"] = token_info["func"]()
             token_info["expires_at"] = datetime.utcnow() + timedelta(minutes=token_info["expires_delta"])
@@ -279,19 +244,41 @@ def scheduled_token_refresh(token_info):
             print(f"Error refreshing token for {token_info['type']}: {e}")
 
 
-def md5_sign(q: str, salt: str, appid: str, secret_key: str) -> str:
-    sign_str = appid + q + salt + secret_key
-    return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
+def md5_sign(content: str) -> str:
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 
-# sha256 HMAC 签名
 def hmac_sha256(key: bytes, content: str):
+    """生成 HMAC-SHA256 签名"""
     return hmac.new(key, content.encode("utf-8"), hashlib.sha256).digest()  # hexdigest()
 
 
 # sha256 hash
 def hash_sha256(content: str):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def generate_hash_key(*args, **kwargs):
+    """
+    根据任意输入参数生成唯一的缓存键。
+    :param args: 任意位置参数（如模型名称、模型 ID 等）
+    :param kwargs: 任意关键字参数（如其他描述性信息）
+    :return: 哈希键
+    """
+    # 将位置参数和关键字参数统一拼接成一个字符串
+    inputs = []
+    for arg in args:
+        if isinstance(arg, list):
+            inputs.extend(map(str, arg))  # 如果是列表，逐个转换为字符串
+        else:
+            inputs.append(str(arg))
+
+    for key, value in kwargs.items():
+        inputs.append(f"{key}:{value}")  # 格式化关键字参数为 key:value
+
+    joined_key = "|".join(inputs)  # [:1000]
+    # 返回 MD5 哈希
+    return hashlib.md5(joined_key.encode()).hexdigest()
 
 
 # 获取百度的访问令牌
@@ -388,7 +375,20 @@ def get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secr
         "host": host  # 请求的主机名
     }
     return headers
-    # return f"https://{host}{path}?" + urlencode(headers)  # https:// .wss://
+    # return f"https://{host}{path}?" + urlencode(headers)  #  https:// .wss:// requset_url + "?" +
+
+
+def get_xfyun_signature(appid, api_secret, timestamp):
+    # timestamp = int(time.time())
+    try:
+        # 对app_id和时间戳进行MD5加密
+        auth = md5_sign(appid + str(timestamp))
+        # 使用HMAC-SHA1算法对加密后的字符串进行加密 encrypt_key,encrypt_text
+        return base64.b64encode(
+            hmac.new(api_secret.encode('utf-8'), auth.encode('utf-8'), hashlib.sha1).digest()).decode('utf-8')
+    except Exception as e:
+        print(e)
+        return None
 
 
 # 火山引擎生成签名
@@ -516,8 +516,8 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
     headers = {
         "Authorization": authorization,  # "<认证信息>"
         "Content-Type": ct,  # "application/json"
-        "Host": host,  # "hunyuan.tencentcloudapi.com"
-        "X-TC-Action": action,  # "ChatCompletions"
+        "Host": host,  # "hunyuan.tencentcloudapi.com","tmt.tencentcloudapi.com"
+        "X-TC-Action": action,  # "ChatCompletions","TextTranslate"
         # 这里还需要添加一些认证相关的Header
         "X-TC-Timestamp": str(timestamp),
         "X-TC-Version": version,  # "<API版本号>"
@@ -537,25 +537,15 @@ def build_url(url: str, access_token: str = get_baidu_access_token(), **kwargs) 
     return f"{url}?{query_string}"
 
 
-#  API 签名
-def generate_tencent_signature(secret_key: str, method: str, params: dict):
-    """
-    生成腾讯云 API 请求签名
-
-    参数：
-    - secret_key: 用于生成签名的腾讯云 API 密钥
-    - http_method: HTTP 请求方法（如 GET、POST）
-    - params: 请求参数的字典
-    sign_str = f"{TRANSLATE_KEY}{timestamp}{nonce}
-    """
-    # string_to_sign =method+f"{service}.tencentcloudapi.com" + "/?" + "&".join("%s=%s" % (k, params[k]) for k in sorted(params))
-    string_to_sign = method + "&" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    hashed = hmac.new(secret_key.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1)  # hashlib.sha256
-    signature = base64.b64encode(hashed.digest()).decode()
-    return signature
+def is_url(url: str) -> bool:
+    """更准确地判断是否为URL"""
+    # url.startswith("http://") or url.startswith("https://")
+    parsed = urlparse(url)
+    # return all([parsed.scheme, parsed.netloc])
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
-# 生成请求签名
+# 生成API请求签名
 def generate_hmac_signature(secret_key: str, method: str, params: dict):
     """
      生成 HMAC 签名
@@ -566,7 +556,11 @@ def generate_hmac_signature(secret_key: str, method: str, params: dict):
      - params: 请求参数的字典
      """
     # 对参数进行排序并构造签名字符串
-    sorted_params = sorted(params.items())
+    # string_to_sign = method.upper() + "&" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    # hashed = hmac.new(secret_key.encode('utf-8'), string_to_sign.encode('utf-8'), hashlib.sha1)  # hashlib.sha256
+    # signature = base64.b64encode(hashed.digest()).decode()
+
+    sorted_params = sorted(params.items())  # , key=lambda x: x[0]
     canonicalized_query_string = '&'.join(f'{quote_plus(k)}={quote_plus(str(v))}' for k, v in sorted_params)
     string_to_sign = f'{method}&%2F&{quote_plus(canonicalized_query_string)}'
 
@@ -631,8 +625,8 @@ def verify_hmac_signature(shared_secret: str, data: str, signature: str):
 #     return base64.urlsafe_b64decode(padded_encoded_id.encode()).decode()
 
 if __name__ == "__main__":
-    key = 'e**'
-    secret = 'MDR'
+    key = 'e439bcf5e2b3f706b05a4962aaeac0cc'
+    secret = 'MDRjODdhNDcwYjQyNGIyMjQzOGQ2ZDE4'
     api_key = f"{key}:{secret}"
     api_key_base64 = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
     print(api_key_base64)

@@ -3,14 +3,6 @@ from typing import Optional, Dict, List, Tuple, Union, Any
 from enum import Enum as PyEnum
 
 
-class TaskStatus(PyEnum):
-    PENDING = "pending"
-    IN_PROGRESS = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    RECEIVED = "received"
-
-
 class OpenAIResponse(BaseModel):
     response: str
 
@@ -84,6 +76,23 @@ class TranslateRequest(BaseModel):
     platform: str = "baidu"
 
 
+class EmbeddingRequest(BaseModel):
+    texts: List[str]
+    model_name: str = 'qwen'
+    model_id: int = 0
+
+    class Config:
+        protected_namespaces = ()
+
+
+class FuzzyMatchRequest(BaseModel):
+    texts: List[str]
+    terms: List[str]
+    top_n: int = 3
+    cutoff: float = 0.6
+    method: str = 'levenshtein'
+
+
 class ToolRequest(BaseModel):
     messages: Optional[List[Message]] = Field(None)
     tools: Optional[List[Any]] = Field(None)
@@ -98,6 +107,10 @@ class ToolRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "messages": [
+                    {
+                        "role": "system",
+                        "content": "请根据用户的提问分析意图，请转换用户的问题，提取所需的关键参数，并自动选择最合适的工具进行处理。"
+                    },
                     {
                         "role": "user",
                         "content": "请告诉我 2023-11-22 前面三周的日期范围。"
@@ -136,7 +149,7 @@ class CompletionParams(BaseModel):
 
     model_name: str = Field("moonshot",
                             description=("Specify the name of the model to be used. It can be any available model, "
-                                         "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','speark','baichuan', or other models."))
+                                         "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan', or other models."))
     model_id: int = Field(0, description="Model ID to be used")
 
     keywords: Optional[List[Union[str, Tuple[str, Any]]]] = Field(

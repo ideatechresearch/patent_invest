@@ -2,185 +2,64 @@ AI_Tools = [
     {
         "type": "function",
         "function": {
-            "name": "get_current_time",
-            "description": "当你想知道现在的时间时非常有用。",
-            "parameters": {}  # 此处是函数参数相关描述, 因为获取当前时间无需输入参数，因此parameters为空字典
+            "name": "get_times_shift",
+            "description": "获取当前时间，并根据偏移的天数和小时数调整时间。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_shift": {
+                        "type": "integer",
+                        "description": "偏移的天数，>0 表示未来，<0 表示过去，0 表示当前日期。",
+                        "default": 0
+                    },
+                    "hours_shift": {
+                        "type": "integer",
+                        "description": "偏移的小时数，>0 表示未来，<0 表示过去，0 表示当前时间。",
+                        "default": 0
+                    }
+                },
+                "required": []
+            }
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "get_week_range",
-            "description": "获取指定日期所在周的开始和结束日期，支持偏移周数和返回多个周的范围。",
+            "name": "date_range_calculator",
+            "description": "计算基于参考日期的时间范围，支持按天、周、月、季度、年或半年计算日期范围，支持偏移周期数和返回多个周期范围。。",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "period_type": {
+                        "type": "string",
+                        "enum": ["days", "weeks", "months", "quarters", "year", "half_year"],
+                        "description": "时间周期类型，可以是 'days'、'weeks'、'months'、'quarters'、'year' 或 'half_year'。"
+                    },
                     "date": {
                         "type": "string",
                         "format": "date",
-                        "description": "指定的日期，格式为 'YYYY-MM-DD'，默认为当前日期。",
+                        "description": "基准日期，格式为 'YYYY-MM-DD'，默认为当前日期。"
                     },
                     "shift": {
                         "type": "integer",
-                        "description": "偏移的周数，>0 表示未来的周，<0 表示过去的周，0 表示当前周。",
+                        "default": 0,
+                        "description": "偏移量，表示时间周期的偏移，0 表示当前周期，负值表示过去，正值表示未来。"
                     },
                     "count": {
                         "type": "integer",
-                        "description": "控制返回的周数范围，默认为 1，表示返回一个周的范围。",
-                    },
+                        "default": 1,
+                        "description": "时间周期数量，表示返回多少个周期的日期范围,默认为 1。"
+                    }
                 },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_first_day_of_month",
-            "description": "获取指定日期所在月的第一天。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "format": "date",
-                        "description": "指定的日期，格式为 'YYYY-MM-DD'，默认为当前日期。",
-                    },
-                    "shift": {
-                        "type": "integer",
-                        "description": "偏移的月数，>0 表示未来的月，<0 表示过去的月，0 表示当前月。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_month_range",
-            "description": "获取指定日期所在月的开始和结束日期，支持偏移月数和返回多个月份范围。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "format": "date",
-                        "description": "指定的日期，格式为 'YYYY-MM-DD'，默认为当前日期。",
-                    },
-                    "shift": {
-                        "type": "integer",
-                        "description": "偏移的月数，>0 表示未来的月，<0 表示过去的月，0 表示当前月。",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "控制返回的月份范围，默认为 1，表示返回一个月的范围。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_quarter_range",
-            "description": "获取指定日期所在季度的开始和结束日期，支持偏移季度数和返回多个季度范围。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "format": "date",
-                        "description": "指定的日期，格式为 'YYYY-MM-DD'，默认为当前日期。",
-                    },
-                    "shift": {
-                        "type": "integer",
-                        "description": "偏移的季度数，>0 表示未来的季度，<0 表示过去的季度，0 表示当前季度。",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "控制返回的季度范围，默认为 1，表示返回一个季度的范围。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_year_range",
-            "description": "获取指定日期所在年的开始和结束日期，支持偏移年数和返回多个年度范围。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "format": "date",
-                        "description": "指定的日期，格式为 'YYYY-MM-DD'，默认为当前日期。",
-                    },
-                    "shift": {
-                        "type": "integer",
-                        "description": "偏移的年数，>0 表示未来的年，<0 表示过去的年，0 表示当前年。",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "控制返回的年度范围，默认为 1，表示返回一年的范围。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_half_year_range",
-            "description": "获取指定日期所在半年的开始和结束日期，支持偏移半年和返回多个半年的范围。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "format": "date",
-                        "description": "指定的日期，格式为 'YYYY-MM-DD'，默认为当前日期。",
-                    },
-                    "shift": {
-                        "type": "integer",
-                        "description": "偏移的半年数，>0 表示未来的半年，<0 表示过去的半年，0 表示当前半年。",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "控制返回的半年范围，默认为 1，表示返回一个半年的范围。",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'get_weather',
-            'description': 'Get the current weather for a given city.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'city': {
-                        'type': 'string',
-                        'description': 'The name of the city to query weather for.',
-                    },
-                },
-                'required': ['city'],
-            },
+                "required": ["period_type"]
+            }
         }
     },
     {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "通过提供的查询文本执行网络搜索。",
+            "description": "通过提供的查询文本执行网络搜索。比如查看新闻、最新消息、价格走势等实时动态，外部知识信息检索。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -224,5 +103,46 @@ AI_Tools = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "auto_translate",
+            "description": "自动翻译工具，根据输入的文本和指定的翻译模型完成语言检测与翻译。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "需要翻译的文本内容。"
+                    },
+                    "model_name": {
+                        "type": "string",
+                        "description": "指定使用的翻译模型，支持 'baidu','tencent','xunfei'。其他模型(如:'qwen','moonshot','baichuan',doubao','hunyuan','spark')将自动调用 AI 翻译,将提供目标语言释义和例句.",
+                        "default": "baidu"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "原文本的语言代码，支持具体语言代码（如 'en', 'zh','zh-TW','ja','ru','it','fr','pt','th','ko','es','vi','id'）或 'auto'（自动检测）。",
+                        "default": "auto"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "目标翻译语言代码，支持具体语言代码（如 'en', 'zh','zh-TW','ja','ru','it','fr','pt','th','ko','es','vi','id'）或 'auto'（根据源语言自动设定）。",
+                        "default": "auto"
+                    }
+                },
+                "required": ["text"]
+            }
+        }
     }
 ]
+'''
+功能型 (function): 核心逻辑的实现。
+工具型 (tool): 通过现成工具提供结果。
+API型 (api): 封装外部接口调用。
+服务型 (service): 长时间运行或后台任务。
+插件型 (plugin): 为现有系统提供扩展。
+数据型 (data): 处理和生成数据的任务。
+查询型 (query): 面向数据检索的操作。
+'''
