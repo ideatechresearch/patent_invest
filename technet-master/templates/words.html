@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>词语信息</title>
+  <!-- 引入 Bootstrap CSS -->
+  <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+  <script src="/static/js/local.storage.js"></script>
+  <style>
+    /* 将列表项横向排列 */
+    ul {
+      list-style-type: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+    }
+
+    li {
+      margin-right: 20px;
+    }
+
+    .highlight {
+      background-color: yellow;
+    }
+  </style>
+</head>
+
+<body>
+  {% include 'navbar.html' %}
+
+  <h2>停用词：</h2>
+  <form id="myForm" method="POST">
+    <ul id="wordslist">
+      {% for item in wordslist %}
+      <li>
+        <input type="checkbox" name="selected_items[]" value="{{ item }}" title="{{ item }}">
+        {{ item }}
+      </li>
+      {% endfor %}
+    </ul>
+    <button type="submit" id="submitnew" name="action" value="set_flag">Submit</button>
+    <button type="submit" id="submitback" name="action" value="call_back">Back</button>
+
+    <label for="limit">每页数量:</label>
+    <select name="limit" id="limit" class="selectBox">
+      {% for i in range(1, 21) %}
+      <option value="{{i}}" {% if i==4 %}selected{% endif %}>{{i}}</option>
+      {% endfor %}
+    </select>
+    <label for="absrtact">显示摘要:</label>
+    <select name="absrtact" id="absrtact" class="selectBox">
+      <option value="1" selected>True</option>
+      <option value="0">False</option>
+    </select>
+    <label for="randoms">随机查阅:</label>
+    <select name="randoms" id="randoms" class="selectBox">
+      <option value="1" selected>True</option>
+      <option value="0">False</option>
+    </select>
+  </form>
+  <br>
+
+  <div id="inform">
+    {% if inform %}
+    <text> {{ inform }}</text>
+    {% endif %}
+  </div>
+
+  <div class="dataframe">
+    <h2>词表详细信息：</h2>
+    <!-- 插入 Pandas 表格 -->
+    {{table |safe}}
+  </div>
+
+  <script>
+    // Call setSelectBoxValue function for each select box when page loads
+    window.onload = function () {
+      var selectBoxes = document.querySelectorAll(".selectBox");
+      selectBoxes.forEach(function (selectBox) {
+        setSelectBoxValue(selectBox);
+        // Save selected value when select box value changes
+        selectBox.addEventListener("change", function () {
+          saveSelectedValue(selectBox);
+        });
+      });
+    };
+
+    document.addEventListener('DOMContentLoaded', (event) => {
+      const clickableElements = document.querySelectorAll('.clickable');
+      clickableElements.forEach(function (element) {
+        element.addEventListener('click', handleClick);
+      });
+    });
+
+    function handleClick(event) {
+      const targetCell = event.target;
+      targetCell.style.color = 'blue';
+      const cellContent = targetCell.innerText;
+      const url = `/similar/${targetCell.getAttribute('data-info')}/${cellContent}`;
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+        .then(response => response.json())
+        .then(data => {
+          const informElement = document.getElementById('inform');
+          if (informElement) {
+            informElement.textContent = `${cellContent}: ${JSON.stringify(data.similar_next)}`;
+            // informElement.innerHTML = `<text>${JSON.stringify(data.similar_next)}</text>`;
+          }
+          console.log(cellContent, ' Received data:', data);
+        })
+        .catch(error => {
+          console.error('数据请求错误:', error);
+        });
+    };
+    <!-- var words_List = {{ wordslist | tojson }};-->
+
+  </script>
+
+</body>
+
+</html>

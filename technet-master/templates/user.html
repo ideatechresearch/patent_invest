@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用户配置</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+</head>
+
+<body>
+    {% include 'navbar.html' %}
+    <h1>用户设置</h1>
+    {% if username %}
+    <p>Welcome, {{ username }}</p>
+    {% endif %}
+    <form method="post">
+        <label for="cross">交叉读取:</label>
+        <select name="cross" id="cross">
+          <option value="true">True</option>
+          <option value="false" selected>False</option>
+        </select>
+        <br>
+        <button type="submit" id="submitButton" name="action" value="set_user">ReSet</button>
+        <br>
+        <text> 对当前用户停用词修正和补充：</text>
+        <br>
+        <label for="reset">词清零:</label>
+        <input type="text" name="reset" id="reset">
+        <br>
+        <label for="doset">词置位:</label>
+        <input type="text" name="doset" id="doset">
+        <br>
+        <button type="submit" name="action" value="set_words">Submit</button>
+    </form>
+    {% if inform %}
+    <text>{{ inform }}</text>
+    {% endif %}
+    <script>
+        document.getElementById("submitButton").addEventListener("click", function () {
+            localStorage.clear();
+        });
+    </script>
+</body>
+
+</html>

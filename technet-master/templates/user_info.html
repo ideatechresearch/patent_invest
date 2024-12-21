@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>用户信息</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <!-- <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">-->
+    <style>
+        /*     .title-container { display: inline-block; } */
+        .title-container:first-child {
+            margin-right: 60px;
+        }
+
+        .title-container:last-child {
+            margin-left: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    {% include 'navbar.html' %}
+    <h1>用户信息展示</h1>
+    <form method="post">
+        <button type="submit">重新统计</button>
+    </form>
+    <div class="custom-table-container">
+        <h2>用户表：</h2>
+        {{table |safe}}
+    </div>
+
+    <h2>已标记停用词：{{num}}</h2>
+    {% if inform %}
+    <text>{{ inform }}</text>
+    {% endif %}
+</body>
+
+</html>

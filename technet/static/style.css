@@ -1,0 +1,60 @@
+body {
+    padding: 20px;
+}
+
+a,
+h1 {
+    color: #377ba8;
+}
+
+h1 {
+    border-bottom: 2px solid #eee;
+}
+
+h2 {
+    font-size: 1.2em;
+}
+
+table.dataframe,
+.dataframe th,
+.dataframe td {
+    border: none;
+    border-bottom: 1px solid #C8C8C8;
+    border-collapse: collapse;
+    text-align: left;
+    padding: 10px;
+    margin-bottom: 40px;
+    font-size: 0.9em;
+}
+
+.custom-table-container {
+    overflow-x: auto;
+}
+
+.custom-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.custom-table th {
+    background-color: #add8e6;
+    color: white;
+}
+
+/* 奇数行背景色 */
+tr:nth-child(odd) {
+    background-color: #eee;
+}
+
+tr:nth-child(even) {
+    background-color: #fff;
+}
+
+tr:hover {
+    background-color: #ffff99;
+}
+
+.text-label {
+    font-family: sans-serif;
+    font-size: 10px;
+}

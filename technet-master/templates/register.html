@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Registration</title>
+</head>
+<body>
+<h2>User Registration</h2>
+<form method="POST">
+    <label for="username">Username:</label>
+    <input type="text" id="username" name="username" required>
+    <br>
+    <label for="password">Password :</label>
+    <input type="password" id="password" name="password" required>
+    <br>
+    <label for="validation">Validation:</label>
+    <input type="password" id="validation" name="validation" required>
+    <br>
+    <button type="submit">Register</button>
+    {% if error %}
+    <p class="error">{{ error }}</p>
+    {% endif %}
+    <div style="text-align: center; margin-top: 10px;">
+        <small>已有账户？<a href="{{ url_for('login') }}">立即登录</a></small>
+    </div>
+</form>
+</body>
+</html>

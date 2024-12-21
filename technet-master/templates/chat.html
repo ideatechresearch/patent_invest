@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>对话</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <script src="/static/js/local.storage.js"></script>
+    <style>
+        .header-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chat-container {
+            display: flex;
+            width: 100%;
+            max-width: 100%;
+            /* width: calc(100% - 20px); */
+            /* height: 100vh; */
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            background-color: #fff;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            flex-direction: column;
+        }
+
+        .chat-box {
+            flex: 1;
+            padding: 10px;
+            border-bottom: 1px solid #ccc;
+            overflow-y: auto;
+        }
+
+        @media (max-width: 768px) {
+            .chat-container {
+                position: absolute; /*fixed,relative 固定在视口 */
+                width: 99vw; /* 确保在手机上宽度为视口宽度 */
+                max-width: 100vw;
+                left: 0;/* margin-left: -20px;*/
+                border-radius: 0; /* 移动设备上取消圆角 */
+                box-shadow: none; /* 去掉阴影 */
+            }
+
+            .chat-box {
+                padding: 7px; /* 在移动端保留合适的间距 */
+                font-size: 1.2rem; /* 增大字体以便在手机上阅读 */
+            }
+        }
+
+        .message {
+            /* display: flex;
+            flex-direction: column; */
+            padding: 5px;
+            margin-bottom: 5px;
+            border-radius: 3px;
+            max-width: 100%;
+            font-size: 14px;
+            position: relative;
+            word-wrap: break-word;
+        }
+
+        .user-message {
+            /* #ffff99
+            display: inline-block;
+            text-align: right;*/
+            align-self: flex-end;
+            margin-left: auto;
+            background-color: #d0eaff;
+            font-size: 15px;
+            max-width: 80%;
+
+        }
+
+        .ai-message {
+            position: relative;
+            align-self: flex-start;
+            text-align: left;
+            white-space: pre-wrap;
+            background-color: #f1f0f0;
+            line-height: 1.25;
+            max-width: calc(100% - 15px);
+            /* padding-right: 15px; */
+        }
+
+        .input-box {
+            display: flex;
+            padding: 10px;
+            border-top: 1px solid #ccc;
+        }
+
+        .fullscreen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: white;
+            z-index: 99;
+        }
+
+        .loading-bar {
+            display: none;
+            width: 100%;
+            background-color: #f3f3f3;
+        }
+
+        .loading-bar .progress {
+            width: 0;
+            height: 3px;
+            background-color: #0366d6;
+            animation: loading 3s infinite;
+        }
+
+        @keyframes loading {
+            0% {
+                width: 0;
+            }
+
+            50% {
+                width: 100%;
+            }
+
+            100% {
+                width: 0;
+            }
+        }
+
+        #chat-input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            resize: none;
+            font-size: 15px;
+            font-family: Arial, sans-serif;
+        }
+
+        #send-button {
+            margin-left: 10px;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            background-color: #007bff;
+            color: #fff;
+            cursor: pointer;
+        }
+
+        #send-button:hover {
+            background-color: #0056b3;
+        }
+
+        #zoomBtn {
+            position: fixed;
+            top: 5px;
+            right: 5px;
+            padding: 2px 5px;
+            background-color: #fff;
+            border: 1px solid #377ba8;
+            cursor: pointer;
+            z-index: 100;
+            font-size: 12px;
+            /* user-select: none; */
+        }
+
+        code {
+            font-family: 'Courier New', Courier, monospace;
+            color: #333;
+        }
+
+        pre {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 5px;
+            /* margin-top: 10px; */
+        }
+
+        .highlight {
+            background-color: yellow;
+            border-radius: 3px;
+        }
+
+        .bold {
+            font-weight: bold;
+        }
+
+        .italic {
+            font-style: italic;
+        }
+
+        .large-text {
+            font-size: 1.2em;
+        }
+
+        .small-caps {
+            font-variant: small-caps;
+        }
+
+        .uppercase {
+            text-transform: uppercase;
+        }
+
+        .important {
+            color: #00f;
+        }
+
+        .underline {
+            text-decoration: underline;
+        }
+
+        .hover-area {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 15px;
+            height: 100%;
+            cursor: pointer;
+            background: transparent;
+            /* background-color: #ccc; */
+        }
+
+        /* .ai-message[data-title]:hover::after */
+        .hover-area::before {
+            content: attr(data-tooltip);
+            position: absolute;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 5px;
+            border-radius: 3px;
+            white-space: pre-wrap;
+            box-sizing: border-box;
+            word-wrap: break-word;
+            overflow-y: auto;
+            top: 0;
+            /* right: 0; */
+            left: -300px;
+            /* width: attr(data-mxwidth); */
+            max-width: 315px;
+            max-height: 100%;
+
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+            font-size: 12px;
+            z-index: 102;
+        }
+
+        .hover-area:hover::before {
+            pointer-events: auto;
+            opacity: 1;
+        }
+
+
+    </style>
+</head>
+
+<body>
+{% include 'navbar.html' %}
+<div id="zoomBtn">Zoom</div>
+
+<label for="topn">检索数量:</label>
+<select name="topn" id="topn" class="selectBox group6">
+    {% for i in range(1, 33) %}
+    <option value="{{i}}" {% if i==10 %}selected{% endif %}>{{i}}</option>
+    {% endfor %}
+</select>
+
+<label for="depth">检索深度:</label>
+<select name="depth" id="depth" class="selectBox group6">
+    {% for i in range(0, 4) %}
+    <option value="{{i}}" {% if i==1 %}selected{% endif %}>{{i}}</option>
+    {% endfor %}
+</select>
+
+<label for="score_threshold">得分阈值:</label>
+<input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0.6"
+       style="width: 50px;">
+
+<label for="temperature">温度系数:</label>
+<input type="number" id="temperature" name="temperature" min="0" max="0.99" step="0.01" value="0.4"
+       style="width: 50px;">
+
+<label for="stream">流式输出:</label>
+<select name="stream" id="stream" class="selectBox group6">
+    <option value="0">False</option>
+    <option value="1" selected>True</option>
+</select>
+
+<label for="agent">代理角色:</label>
+<select name="agent" id="agent" class="selectBox group6">
+    {% for agent in agents %}
+    <option value="{{ agent.value }}" {% if agent.value=='0' %}selected{% endif %}>{{ agent.name }}</option>
+    {% endfor %}
+</select>
+
+<label for="model">语言模型:</label>
+<select name="model" id="model" class="selectBox group6">
+    {% for model in models %}
+    <option value="{{ model.value }}" {% if model.value=='qwen' %}selected{% endif %}>{{ model.name }}</option>
+    {% endfor %}
+</select>
+
+<button type="button" id="clean">清空上下文</button>
+<button type="button" id="save" class="submitButton" data-group="group6">保存参数</button>
+
+<div class="header-container">
+    <h1>AIGC</h1>
+    {% if username %}
+    <p>{{ username }}</p>
+    {% elif uuid %}
+    <p>{{ uuid }}</p>
+    {% endif %}
+</div>
+
+<div class="chat-container">
+    <div class="chat-box" id="chat-box">
+        <div class="message ai-message">
+            Hello! How can I help you today?
+        </div>
+        <!-- <div class="message user-message">
+            I'm looking for information on creating a chat interface.
+        </div> -->
+        <!-- More messages can be added here -->
+        <!-- <img src="https://via.placeholder.com/150" alt="Example Image" /> -->
+    </div>
+    <div class="loading-bar" id="loading-bar">
+        <div class="progress"></div>
+    </div>
+    <div class="input-box">
+        <textarea id="chat-input" rows="3" placeholder="Your message here..."></textarea>
+        <button id="send-button">Send</button>
+    </div>
+</div>
+<!-- <script src="{{ url_for('static', filename='script.js') }}"></script> -->
+<script>
+        const username = '{{ username }}' || localStorage.getItem('username');
+        const uuid = '{{ uuid }}' || localStorage.getItem('uuid');
+
+        // Call setSelectBoxValues function for Group when page loads
+        window.onload = function () {
+            if (username) {
+                localStorage.setItem('username', '{{ username }}');
+            } else if (uuid) {
+                localStorage.setItem('uuid', '{{ uuid }}');
+            }
+            loadMessages();
+            setSelectBoxValues('group6');
+        };
+
+
+        // Save selected values for each group when corresponding submit button clicked
+        var submitButtons = document.querySelectorAll('.submitButton');
+        submitButtons.forEach(function (button) {
+            button.addEventListener("click", function () {
+                var group = this.getAttribute('data-group');
+                console.log("参数保存中...");
+                saveSelectedValues(group);
+            });
+        });
+
+        document.getElementById('zoomBtn').addEventListener('click', function () {
+            var chatElement = document.querySelector('.chat-container');
+            var zoomBtn = document.getElementById('zoomBtn');
+
+            if (chatElement.classList.contains('fullscreen')) {
+                chatElement.classList.remove('fullscreen');
+                chatElement.style.borderRadius = '10px';
+            } else {
+                chatElement.classList.add('fullscreen');
+                chatElement.style.borderRadius = '0';
+            }
+
+            zoomBtn.style.zIndex = 101;
+        });
+
+        document.getElementById('clean').addEventListener('click', function (event) {
+            const filterTimestamp = Date.now()
+            localStorage.setItem('ChatCleanTime', filterTimestamp);
+            fetch(`/cut_messages?uuid=${uuid}&username=${username}&filter_time=${filterTimestamp}`)
+                .then(response => response.json())
+                .then(data => {
+                    const chatBox = document.getElementById('chat-box');
+                    chatBox.innerHTML = '';
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                    chatBox.setAttribute('data-timestamp', filterTimestamp);
+                    console.log(data);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                });
+        });
+
+        document.getElementById('send-button').addEventListener('click', sendMessageHandler);
+
+        document.getElementById('chat-input').addEventListener('keypress', function (event) {
+            if (event.key === 'Enter' && event.shiftKey) {
+                event.preventDefault();
+                sendMessageHandler();// document.getElementById('send-button').click();
+                //'keyup',&& event.ctrlKey
+            }
+        });
+
+        const loadingBar = document.getElementById('loading-bar');
+
+        async function sendMessageHandler() {
+            if (loadingBar.style.display === 'block') {
+                alert('正在接收消息，请稍候...');
+                return;
+            }
+
+            var input = document.getElementById('chat-input');
+            var message = input.value.trim();
+            if (message === "") return;
+
+            addMessage(message, 'user-message');
+            input.value = '';
+            const chatBox = document.getElementById('chat-box');
+            const filterTimestamp = chatBox.getAttribute('data-timestamp') || localStorage.getItem('ChatCleanTime') || 0;
+            const params = {
+                username: username, uuid: uuid,
+                question: message,//encodeURIComponent()
+                agent: document.getElementById("agent").value,
+                model: document.getElementById("model").value,
+                topn: parseInt(document.getElementById("topn").value, 10),
+                depth: parseInt(document.getElementById("depth").value, 10),
+                temperature: parseFloat(document.getElementById("temperature").value),
+                score_threshold: parseFloat(document.getElementById("score_threshold").value),
+                filter_time: parseInt(filterTimestamp, 10)
+            };
+            let task_id = null;
+            if (!username && !uuid) {
+                let history = Array.from(chatBox.children).map(messageDiv => ({
+                    role: messageDiv.classList.contains('user-message') ? 'user' : 'assistant',
+                    content: messageDiv.textContent//element.innerText
+                }));
+                // const filterTimestamp = chatBox.getAttribute('data-timestamp') || localStorage.getItem('ChatCleanTime') || 0;
+                // .filter(messageDiv => {
+                //     const messageTimestamp = messageDiv.getAttribute('data-timestamp');
+                //     return (!filterTimestamp || !messageTimestamp || (parseInt(messageTimestamp, 10) > parseInt(filterTimestamp, 10)));
+                // })
+                task_id = await submitMessages(params, history);
+            }
+
+            if (document.getElementById("stream").value == '1') {
+                chunkMessage(params, task_id);
+            }
+            else {
+                sendMessage(params, task_id);
+            }
+
+            // setTimeout(function () {
+            //     addMessage("This is a simulated response.", 'ai-message');
+            //     loadingBar.style.display = 'none';
+            // }, 100000)
+        }
+
+        function formatToSpans(text, codes = false) {
+            const formatText = (t) => t.replace(/\n+/g, '\n').trim()
+                .replace(/^(#{4,7})\s+(.*?)(\n|$)/gm, '<span class="bold important small-caps">$2</span>\n') // 处理#### 标题 $2
+                .replace(/###\s(.*?)(\n|$)/g, '<span class="bold large-text uppercase">$1</span>\n') //### 标题
+                .replace(/\*\*(.*?)\*\*/g, '<span class="bold">$1</span>') //  **粗体** bold
+                .replace(/!!(.*?)!!/g, '<span class="highlight">$1</span>')  // !!高亮!!  
+                .replace(/__(.*?)__/g, '<span class="italic">$1</span>') // __斜体__
+                .replace(/~~(.*?)~~/g, '<span class="underline">$1</span>') // ~~下划线~~
+                .replace(/\^\^(.*?)\^\^/g, '<span class="important">$1</span>'); // ^^重要^^ important
+
+            //.replace(/```([^`]+)```/g, '<pre><code>$1</code></pre>')
+            //.replace(/\[([^\]]+)\]\((https?:\/\/[^\s]+)\)/g, '<a href="$2" target="_blank">$1</a>'); // [链接文字](链接地址)
+            //.replace(/\n/g, '<br>');
+
+            if (codes) {
+                text = text.replace(/```(.*?)```/gs, function (match, p1) {
+                    return '<pre><code>' + p1.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</code></pre>';
+                });
+                return formatText(text);
+            }
+
+            return formatText(text);
+        }
+
+
+        function addMessage(text, className, title = null) {
+            var chatBox = document.querySelector('.chat-box');
+            var messageElement = document.createElement('div');
+            messageElement.className = 'message ' + className;
+            messageElement.setAttribute('data-timestamp', Date.now());
+
+            if (text) {
+                if (text.includes('```')) {
+                    const codeParts = text.split(/```/);
+                    for (let i = 0; i < codeParts.length; i++) {
+                        if (i % 2 === 0) {
+                            const textNode = document.createElement('div');
+                            textNode.className = 'text-node';
+                            textNode.innerHTML = formatToSpans(codeParts[i]);
+
+                            messageElement.appendChild(textNode);
+                        } else {
+                            const codeElement = document.createElement('pre');
+                            codeElement.innerHTML = `<code>${codeParts[i].replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code>`;
+
+                            messageElement.appendChild(codeElement);
+                        }
+                    }
+                } else {
+                    messageElement.innerHTML = formatToSpans(text);
+                }
+            }
+            else { messageElement.textContent = "No response from the bot." }
+
+            if (title) {
+                if (title.length < 256) {
+                    messageElement.title = title;
+                }
+                else {
+                    //messageElement.setAttribute('data-title', title);
+                    const hoverArea = document.createElement('div');
+                    hoverArea.className = 'hover-area';
+                    hoverArea.setAttribute('data-tooltip', title);
+                    hoverArea.setAttribute('data-mxwidth', messageElement.getBoundingClientRect().width + 'px');
+                    messageElement.appendChild(hoverArea);
+                }
+            }
+            chatBox.appendChild(messageElement);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+
+        async function sendMessage(params, task_id = null) {
+            loadingBar.style.display = 'block';
+            try {
+                const response = await (task_id ? fetch(`/send_message/${task_id}`) : fetch('/send_message', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(params)
+                }));
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                const data = await response.json();
+                addMessage(data.answer, 'ai-message', data.refer);
+                console.log(data.answer);
+            } catch (error) {
+                console.error('Error:', error);
+            } finally {
+                loadingBar.style.display = 'none';
+            }
+        }
+
+        async function chunkMessage(params, task_id = null) {
+            loadingBar.style.display = 'block';
+            const url = task_id ? `/stream_response/${task_id}` : `/stream_response?${new URLSearchParams(params).toString()}`;
+            const eventSource = new EventSource(url);//task_url || url
+            var chatBox = document.querySelector('.chat-box');
+            var messageElement = document.createElement('div');
+            messageElement.className = 'message ai-message';
+            messageElement.setAttribute('data-timestamp', Date.now());
+
+            let accumulatedText = '';
+            let reference = '';
+            let lastUpdate = 0;
+            eventSource.onmessage = function (event) {
+                if (event.data === '[DONE]') {
+                    messageElement.innerHTML = formatToSpans(messageElement.textContent || accumulatedText, true);
+                    chatBox.scrollTop = chatBox.scrollHeight;// 保持滚动条在底部
+                    loadingBar.style.display = 'none';
+                    eventSource.close();
+                    console.log(accumulatedText);
+                    if (reference) {
+                        if (reference.length < 256) {
+                            messageElement.title = reference;
+                        }
+                        else {
+                            //messageElement.setAttribute('data-title', reference);
+                            const hoverArea = document.createElement('div');
+                            hoverArea.className = 'hover-area';
+                            hoverArea.setAttribute('data-tooltip', reference);
+                            hoverArea.setAttribute('data-mxwidth', messageElement.getBoundingClientRect().width + 'px');
+                            messageElement.appendChild(hoverArea);
+                        }
+                    };
+                    return;
+                }
+
+                if (!accumulatedText) {
+                    chatBox.appendChild(messageElement);
+                }
+                if (!event.data.startsWith('{') && !event.data.startsWith('[')) {
+                    accumulatedText += event.data;
+                    // messageElement.textContent = accumulatedText.replace(/\n+/g, '\n').trim();
+                    //document.querySelector('.chat-box').innerText += event.data.trim();    
+                    const currentTime = Date.now()
+                    if (currentTime - lastUpdate >= 100) {
+                        messageElement.innerHTML = formatToSpans(accumulatedText, true);
+                        lastUpdate = currentTime;
+                    }
+                }
+                else {
+                    try {
+                        const parsedData = JSON.parse(event.data);
+                        if (parsedData && parsedData.role && parsedData.content) {
+                            if (parsedData.role === 'reference') {
+                                reference = parsedData.content.trim();
+                                messageElement.textContent = reference; //.innerText
+                            }
+                            if (parsedData.role === 'assistant') {
+                                messageElement.textContent = parsedData.content.replace(/\n+/g, '\n').trim();
+                            }
+                            chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                    } catch (e) {
+                        console.error('Error parsing JSON:', e);
+                    }
+                }
+                // console.log(event);
+            };
+
+
+            eventSource.onerror = function (error) {
+                console.error('EventSource failed:', error);
+                loadingBar.style.display = 'none';
+                eventSource.close();
+            };
+
+            eventSource.onclose = function () {
+                loadingBar.style.display = 'none';
+            }
+        }
+
+        async function loadMessages(messages = null) {
+            if (!messages) {
+                try {
+                    const response = await fetch(`/get_messages?filter_time=${localStorage.getItem('ChatCleanTime') || 0}`);
+                    if (!response.ok) {
+                        throw new Error('Network response was not ok');
+                    }
+                    messages = await response.json();
+                } catch (error) {
+                    console.error('Error fetching messages:', error);
+                    return;
+                }
+            }
+
+            const chatBox = document.getElementById('chat-box');
+            if (messages && messages.length > 0) {
+                chatBox.innerHTML = '';
+            }
+
+            messages.forEach(message => {
+                //addMessage(message.content, message.role === 'user' ? 'user-message' : 'ai-message');
+                const messageElement = document.createElement('div');
+                messageElement.className = 'message ' + (message.role === 'user' ? 'user-message' : 'ai-message');
+                messageElement.innerHTML = formatToSpans(message.content, true);
+                // messageElement.textContent = message.content.replace(/\n+/g, '\n').trim();
+                if (message.timestamp) {
+                    messageElement.setAttribute('data-timestamp', message.timestamp * 1000);
+                }
+                if (message.reference) {
+                    messageElement.title = message.reference;//message.reference.join('\n');
+                }
+                chatBox.appendChild(messageElement);
+            });
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        async function submitMessages(params, history = []) {
+            try {
+                params['messages'] = history;
+                const response = await fetch('/submit_messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(params)
+                });
+                if (!response.ok) {
+                    console.error('Error:', response.statusText);
+                    return;
+                }
+                const data = await response.json();
+                console.log(data);
+                // 上传页面信息,得到任务链接
+                return data.task_id
+            } catch (error) {
+                console.error('Error:', error);
+            }
+            // .then(response => response.json())
+            //     .then(data => {
+            //         //data.forEach(message => {
+            //         //addMessage(message.content, message.role === 'user' ? 'user-message' : 'ai-message');
+            //         //});
+            //         if (username) {
+            //             loadMessages(data);
+            //         }
+            //     })
+        }
+
+        //document.addEventListener('DOMContentLoaded', loadMessages);
+
+
+</script>
+
+</body>
+
+</html>

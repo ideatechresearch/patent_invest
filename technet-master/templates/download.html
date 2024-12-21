@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>文件下载</title>
+    <style>
+            a{
+                text-decoration: none;
+                color: #2062e0;
+            }
+            a:hover{
+                text-decoration: none;
+                color: #2062e0;
+            }
+
+    </style>
+
+</head>
+<body>
+<div align="center">
+    <h1>文件下载</h1><br><br>
+<!--    输出文件名及文件详细信息(文件时间信息等)-->
+    {% for fruit in allname %}
+    <br>
+    {{ fruit }}
+    {% endfor %}
+    <br><br><br>
+<!--   将指定文件夹中的文件获取遍历显示-->
+    {% for n in name %}
+    <a href="downloads/{{ n }}">{{ n }}</a>
+    <br><br>
+    {% endfor %}
+    <!--        <button id="download-btn">下载文件</button>-->
+    <!--    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>-->
+    <!--    <script>-->
+    <!--    $(document).ready(function() {-->
+    <!--        $('#download-btn').click(function() {-->
+    <!--            window.location.href = '/download';  // 发送 GET 请求直接下载文件-->
+    <!--        });-->
+    <!--    });-->
+    <!--    </script>-->
+</div>
+</body>
+</html>

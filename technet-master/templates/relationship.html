@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>关系网络</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <script src="/static/js/d3.v7.min.js"></script>
+    <!-- "https://d3js.org/d3.v7.min.js" -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.20.0/cytoscape.min.js"></script>
+    <script src="/static/js/local.storage.js"></script>
+    <script src="/static/js/draw.graph.js"></script>
+    <style>
+        .form-container {
+            position: relative;
+        }
+
+        .right-align {
+            position: absolute;
+            right: 0;
+        }
+
+        svg {
+            width: 150%;
+            height: 150%;
+            transition: all 0.5s ease;
+        }
+
+        #zoomBtn {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            padding: 2px 5px;
+            background-color: #fff;
+            border: 1px solid #377ba8;
+            cursor: pointer;
+            z-index: 100;
+            font-size: 12px;
+            /* user-select: none; */
+        }
+
+        .fullscreen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: white;
+            z-index: 99;
+        }
+
+        .link {
+            /* stroke: #999;*/
+            stroke-opacity: 0.7;
+            stroke-width: 1.5px;
+            fill: none;
+        }
+
+        .node {
+            stroke-width: 0.5px;
+        }
+
+        .node:hover {
+            stroke: #000;
+            stroke-width: 1.0px;
+        }
+
+        .node circle {
+            fill-opacity: 0.5;
+            /* 节点半透明 */
+            stroke: #fff;
+            /* 设置节点的边框颜色为白色 */
+        }
+
+        .node text {
+            pointer-events: none;
+            /* 防止文本遮挡鼠标事件 */
+            text-anchor: middle;
+            /* 文字居中对齐 */
+            font-size: 12px;
+            /* 适当的字体大小 */
+            font-weight: 150;
+            /* 设置字体为较细 */
+            fill: #000 !important;
+        }
+
+        #input-container {
+            margin-bottom: 10px;
+        }
+
+        .input-field {
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+
+<body>
+    {% include 'navbar.html' %}
+
+    <form id="myForm" method="post" action="/relationship">
+        <label for="layers">自定义层:</label>
+        <input type=text size="15" id="layers" name="layers" value="">
+
+        <label for="width">宽度:</label>
+        <select name="width" id="width" class="selectBox group2">
+            {% for i in range(1, 10) %}
+            <option value="{{i}}" {% if i==3 %}selected{% endif %}>{{i}}</option>
+            {% endfor %}
+        </select>
+
+        <label for="depth">深度:</label>
+        <select name="depth" id="depth" class="selectBox group2">
+            {% for i in range(1, 10) %}
+            <option value="{{i}}" {% if i==3 %}selected{% endif %}>{{i}}</option>
+            {% endfor %}
+        </select>
+
+        <label for="nodewidth">新增节点数:</label>
+        <select name="nodewidth" id="nodewidth" class="selectBox group2">>
+            {% for i in range(1, 10) %}
+            <option value="{{i}}" {% if i==1 %}selected{% endif %}>{{i}}</option>
+            {% endfor %}
+        </select>
+
+        <label for="duplicate">去重方式:</label>
+        <select name="duplicate" id="duplicate" class="selectBox group2">
+            {% for i in range(0, 4) %}
+            <option value="{{i}}" {% if i==3 %}selected{% endif %}>{{i}}</option>
+            {% endfor %}
+        </select>
+
+        <label for="batch">优先搜索:</label>
+        <select name="batch" id="batch" class="selectBox group2">
+            <option value="1" selected>广度优先(层次)</option>
+            <option value="0">深度优先(递归)</option>
+        </select>
+
+        <label for="score_threshold">得分阈值:</label>
+        <input type="number" id="score_threshold" name="score_threshold" min="0" max="0.99" step="0.01" value="0"
+            style="width: 50px;">
+
+        <label for="draw">创建方式:</label>
+        <select name="draw" id="draw" class="selectBox group2">
+            <option value="0" selected>simulation</option>
+            <option value="1">cytoscape</option>
+            <option value="2">networkx</option>
+            <option value="3">neo4j</option>
+        </select>
+
+        <label for="hy">行业类型:</label>
+        <select name="hy" id="hy" class="selectBox group2">
+            <option value="all" selected>所有</option>
+            <option value="先进制造">先进制造</option>
+            <option value="医疗健康">医疗健康</option>
+            <option value="传统制造">传统制造</option>
+            <option value="金融">金融</option>
+            <option value='金融科技'>金融科技</option>
+        </select>
+
+        <button type="button" id="save" class="submitButton" data-group="group2">Save</button>
+        <button type="button" id="calc">Calc</button>
+        <!--        <br>-->
+        <!--        <br>-->
+        <!--        <label for="search_relationships">关系网络查询:</label>-->
+        <!--        <input type=text id="search_relationships" name="search_relationships">-->
+        <!--        <button type="submit" name="action" value="search_relationships">Submit</button>-->
+        <!--        <button type="submit" name="action" value="neo4j">neo4j</button>-->
+        <br>
+        <br>
+        <label for="create_relationships">词关系:</label>
+        <input type=text size="22" id="create_relationships" name="create_relationships">
+        <button type="button" id="show_relationships" name="action" value="create_relationships">Submit</button>
+
+        <label for="radius">节点大小:</label>
+        <select name="radius" id="radius" class="selectBox group2">
+            <option value="" selected>无</option>
+            <option value="df">文档频率</option>
+            <option value="tf">单词频率</option>
+        </select>
+        <label for="exclude">使用停用词:</label>
+        <select name="exclude" id="exclude" class="selectBox group2">
+            <option value="0" selected>False</option>
+            <option value="1">True</option>
+        </select>
+        <br>
+        <br>
+        <label for="create_relationships_co">公司关系:</label>
+        <input type=text id="create_relationships_co" name="create_relationships_co">
+        <button type="button" id="show_relationships_co" name="action" value="create_relationships_co">Submit</button>
+    </form>
+
+    {% if inform %}
+    <text id="inform">{{ inform }}</text>
+    {% else %}
+    <text id="inform"></text>
+    {% endif %}
+
+    <br>
+    {% for p in data %}
+    <p>{{ p }}</p>
+    {% endfor %}
+
+    <svg width="1600" height="1200"></svg>
+    <div id="cy" style="width: 1200px; height: 800px; display: none;"></div>
+    <div id="zoomBtn">Zoom</div>
+
+    <script>
+        // Call setSelectBoxValues function for Group 1 and Group 2 when page loads
+        window.onload = function () {
+            setSelectBoxValues('group2');
+        };
+
+        // Save selected values for each group when corresponding submit button clicked
+        var submitButtons = document.querySelectorAll('.submitButton');
+        submitButtons.forEach(function (button) {
+            button.addEventListener("click", function () {
+                var group = this.getAttribute('data-group');
+                console.log("参数保存中...");
+                saveSelectedValues(group);
+            });
+        });
+    </script>
+
+    <script>
+        // 初始化 SVG 画布
+        var marge = { top: 10, bottom: 0, left: 30, right: 0 };
+        var svg = d3.select("svg"), //document.querySelector("svg");
+            width = +svg.attr("width"),
+            height = +svg.attr("height");
+        var g = svg.append("g")
+            .attr("transform", "translate(" + marge.top + "," + marge.left + ")");
+        var cy = cytoscape({ container: document.getElementById('cy') });
+        // 初始化调整大小
+        updateSize();
+
+        var nodes = [];
+        var edges = [];
+        var simulation = d3.forceSimulation();
+        var colorscale = d3.scaleOrdinal().range(d3.schemeCategory10);
+        // 准备数据并绘制图形
+        var fetchingData = false; // 标志变量，用于跟踪是否正在进行数据请求
+        let last_key = "";
+
+        // 页面加载时获取并绘制数据
+        //fetchDataAndDraw("/show_relationships");
+
+        //+action 提交表单
+        function handleSubmit(actionValue) {
+            const form = document.getElementById('myForm');
+            const actionInput = document.createElement('input');
+            actionInput.type = 'hidden';
+            actionInput.name = 'action';
+            actionInput.value = actionValue;
+            form.appendChild(actionInput);
+            form.submit();
+        }
+
+        // 当按钮点击时从 Flask 获取数据并绘制图形
+        document.getElementById("show_relationships").addEventListener("click", function (event) {
+            const draw = document.getElementById("draw").value;
+            if (draw == '3') {
+                handleSubmit('create_relationships');//neo4j
+            }
+            else {
+                event.preventDefault();
+                last_key = 'Word_';
+                const url = `/show_relationships?name=${document.getElementById("create_relationships").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&score_threshold=${document.getElementById("score_threshold").value}&draw=${draw}&key_radius=${document.getElementById("radius").value}&exclude=${document.getElementById("exclude").value}`;
+                if (draw == '0') {
+                    document.getElementById('cy').style.display = 'none';
+                    document.querySelector('svg').style.display = 'block';
+                    fetchDataAndDraw(url);
+                } else if (draw == '1') {
+                    document.querySelector('svg').style.display = 'none';
+                    document.getElementById('cy').style.display = 'block';
+                    fetchCytoscape(url);
+                }
+            }
+        });
+
+        document.getElementById("show_relationships_co").addEventListener("click", function (event) {
+            const draw = document.getElementById("draw").value;
+            if (draw == '3') {
+                handleSubmit('create_relationships_co');
+            }
+            else {
+                event.preventDefault();
+                last_key = 'Co_';
+                const url = `/show_relationships?name=${document.getElementById("create_relationships_co").value}&width=${document.getElementById("width").value}&depth=${document.getElementById("depth").value}&layers=${document.getElementById("layers").value}&batch=${document.getElementById("batch").value}&duplicate=${document.getElementById("duplicate").value}&key_prefix=${last_key}&hy=${document.getElementById("hy").value}&score_threshold=${document.getElementById("score_threshold").value}&draw=${draw}`;
+                if (draw == '0') {
+                    document.getElementById('cy').style.display = 'none';
+                    document.querySelector('svg').style.display = 'block';
+                    fetchDataAndDraw(url);
+                } else if (draw == '1') {
+                    document.querySelector('svg').style.display = 'none';
+                    document.getElementById('cy').style.display = 'block';
+                    fetchCytoscape(url);
+                }
+            }
+        });
+
+        document.getElementById("calc").addEventListener("click", function (event) {
+            event.preventDefault();// 阻止默认的表单提交行为
+            const informText = document.getElementById('inform');
+            if (edges.length > 0) {
+                informText.textContent = `关系数量:${edges.length},节点数量:${nodes.length}`;
+            }
+            else {
+                const layersString = document.getElementById("layers").value.trim();
+                let layers = parseLayers(layersString);
+                if (layers.length <= 0) {
+                    const depth = parseInt(document.getElementById("depth").value);
+                    const width = parseInt(document.getElementById("width").value);
+                    layers = Array.from({ length: depth }, () => width);
+                }
+                console.log('Layers:', layers);
+                informText.textContent = `查询次数:${calcLayersTotal(layers)},节点总数:${calcNodesTotal(layers)}`;
+            }
+        });
+
+        // Function to handle node click
+        function ClickNode(event, d) {
+            const url = `/node_relations/${d.id}/${d.name}?key_prefix=${last_key}&hy=${document.getElementById("hy").value}&duplicate=${document.getElementById("duplicate").value}&exclude=${document.getElementById("exclude").value}&nodewidth=${document.getElementById("nodewidth").value}&score_threshold=${document.getElementById("score_threshold").value}`;//id
+            fetchNodeRelations(url);
+        };
+
+        // 监听窗口大小改变事件，并在触发时更新 SVG 元素的大小
+        window.addEventListener("resize", updateSize);
+
+        document.getElementById('zoomBtn').addEventListener('click', function () {
+            var svgElement = document.querySelector('svg');
+            var cyElement = document.getElementById('cy');
+            var zoomBtn = document.getElementById('zoomBtn');
+
+            if (svgElement.style.display === 'block') {
+                if (svgElement.classList.contains('fullscreen')) {
+                    svgElement.classList.remove('fullscreen');
+                } else {
+                    svgElement.classList.add('fullscreen');
+                    cyElement.classList.remove('fullscreen');
+                }
+            } else if (cyElement.style.display === 'block') {
+                if (cyElement.classList.contains('fullscreen')) {
+                    cyElement.classList.remove('fullscreen');
+                } else {
+                    cyElement.classList.add('fullscreen');
+                    svgElement.classList.remove('fullscreen');
+                }
+            } else {
+                svgElement.style.display = 'block';
+                cyElement.style.display = 'none';
+                svgElement.classList.add('fullscreen');
+            }
+
+            zoomBtn.style.zIndex = 101;
+        });
+    </script>
+
+</body>
+
+</html>

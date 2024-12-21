@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>上传</title>
+    <style>
+        a{
+            text-decoration: none;
+            color: #2062e0;
+        }
+        a:hover{
+            text-decoration: none;
+            color: #2062e0;
+        }
+
+    </style>
+</head>
+<body>
+<div align="center">
+    <h1>文件上传</h1>
+    <!--    enctype：属性用于指定将上传文件数据发送给服务器端之前对表单数据进行编码的斱式 -->
+    <!--    enctype="multipart/form-data" => 表示不对字符编码。当使用有文件上传控件的表单时，该值是必需的。-->
+    <form action="/uploader" method="post" enctype="multipart/form-data">
+        <br><br><br>
+        <!--        accept可以自定以文件上传格式-->
+        <input type="file" name="file" accept=".txt, .pdf, .doc, .docx, .md" value="{{ csrf_token }}"/>
+        <input type="submit" value="Submit"/>
+    </form>
+</div>
+</body>
+</html>

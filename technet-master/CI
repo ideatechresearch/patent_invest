@@ -1,0 +1,20 @@
+pipeline {
+    agent any
+
+    stages {
+
+        stage('run technet') {
+            steps {
+                sh '''
+                cp -rf requirements.txt docker
+                cd docker/
+                docker build -t technet/flask .
+                   docker rm -f ${JOB_BASE_NAME} || true
+                   docker run -d --name ${JOB_BASE_NAME} --network qdrant_net -p 3300:3300 -v ${JENKINS_HOME}/workspace/${JOB_NAME}:/usr/src/app  -w /usr/src/app -e TZ=Asia/Shanghai technet/flask python flask_app.py
+                        '''
+
+            }
+        }
+
+    }
+}

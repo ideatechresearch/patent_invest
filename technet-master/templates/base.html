@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="keywords" content="AIGC、AI、AI助手、AI创作、AI写作、AI教育、AI辅助、AI监管、AI聊天、AI聊天机器人、AI语料、AI金融、IPO智能辅助、IPO问询答复、Chat、大赛、大数据、大数据处理、大语言模型、仿真交易、创新、公共数据、国内大模型、数据库、等级证书、人工智能、人工智能大模型、实验室、实训、实证研究、实证论文、智能对话、智能写作、智能客服、智能研报、智能投研、智能投顾、智能应用、智能财经、智能金融、智能风控、智能舆情、智能问答、师资培训、数据处理、数据建模、数据服务、数据治理、算力、校企合作、产学合作、金融业务、金融数据库、金融大数据、金融大模型、金融大语言模型、金融建设、金融培训、金融实训、金融实验室、金融机构、金融竞赛、金融科技、金融终端、金融教育、金融比赛、金融资讯、金融讲座、金融论文、自然语言处理、职业技能、职业技能证书、仿真交易、财经大数据、财经报告、财经资讯、证券投资、行情中心、行情数据、培训、技术分享、教学研讨、数据科学、论文复刻、私募、银行风控、专利、知识产权、融资">
+    <meta name="description" content="浙江省易得融信软件有限公司。易得融信成立于2012年，是一家运用数字科技助力金融机构高效服务企业的技术公司，致力于通过创新科技手段，通过构建线上数字化平台+线下第三方服务机构的业务协同方式，解决小微企业和“三农”群体融资难、融资贵、融资慢的难题。">
+    {% if title %}
+    <title>{{ title }}</title>
+    {% else %}
+    <title>Flask App</title>
+    {% endif %}
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css')}}">
+    <style>
+        .link-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .links {
+            display: flex;
+            gap: 10px;
+            /* position: absolute; */
+            font-size: 12px;
+            text-decoration: none;
+            color: #0366d6;
+        }
+
+        .links:hover {
+            text-decoration: underline;
+        }
+
+        .auth-links {
+            display: flex;
+            gap: 10px;
+            font-size: 12px;
+            text-align: right;
+            /* margin-left: 10px;
+            margin-top: 10px; */
+        }
+    </style>
+</head>
+
+<body>
+    <!--模板引用-->
+    {% include 'navbar.html' %}
+    <div class="link-container">
+        <div class="links">
+            <a href="https://github.com/ideatechresearch/patent_invest" target="_blank">View on GitHub</a>
+            <a href="https://gitee.com/dooven/patent_invest" target="_blank">View on Gitee</a>
+        </div>
+        <div class="auth-links">
+            <a href="{{url_for('login') }}">login</a>
+            <a href="{{url_for('logout')}}">logout</a>
+        </div>
+    </div>
+    <!--{% block content %}-->
+    <!--<h1>Template</h1>-->
+    <!--{% endblock %}-->
+
+    {% for p in data %}
+    <p>{{ p }}</p>
+    {% endfor %}
+</body>
+
+</html>
