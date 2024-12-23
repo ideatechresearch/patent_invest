@@ -193,8 +193,8 @@ async def ai_auto_calls(question, **kwargs):
     return []
 
 
-def ai_files_messages(files: List[str], question: str = None, model_name: str = 'qwen-long', model_id=-1, **kwargs) -> \
-        Dict[str, Any]:
+async def ai_files_messages(files: List[str], question: str = None, model_name: str = 'qwen-long', model_id=-1,
+                            **kwargs):
     """
     处理文件并生成 AI 模型的对话结果。
 
@@ -206,41 +206,44 @@ def ai_files_messages(files: List[str], question: str = None, model_name: str = 
     model_info, name = find_ai_model(model_name, model_id)
     client = AI_Client.get(model_info['name'], None)
     messages = []
-    if client:
-        for file_path in files:
-            file_path_obj = Path(file_path)
-            if not file_path_obj.exists():  # .is_file()
-                continue
+    for file_path in files:
+        file_path_obj = Path(file_path)
+        if not file_path_obj.exists():  # .is_file()
+            continue
+
+        if client:
             file_object = client.files.create(file=file_path_obj, purpose="file-extract")
             if model_info['name'] == 'qwen':
                 messages.append({"role": "system", "content": f"fileid://{file_object.id}", })
-            if model_info['name'] == 'moonshot':
+            elif model_info['name'] == 'moonshot':
                 file_content = client.files.content(file_id=file_object.id).text
                 messages.append({"role": "system", "content": file_content, })
+        else:
+            dashscope_file_upload(messages, file_path=str(file_path_obj))
 
-        if question:
-            messages.append({"role": "user", "content": question})
-            # print(messages)
-            completion = client.chat.completions.create(model=name, messages=messages, **kwargs)
-            bot_response = completion.choices[0].message.content  # completion.model_dump_json()
-            messages.append({"role": "assistant", "content": bot_response})
-            return {"completion": bot_response, "messages": messages}
+    if question:
+        messages.append({"role": "user", "content": question})
+        # print(messages)
+        completion = client.chat.completions.create(model=name, messages=messages, **kwargs)
+        bot_response = completion.choices[0].message.content  # completion.model_dump_json()
+        messages.append({"role": "assistant", "content": bot_response})
+        return messages
 
-    # dashscope_file_upload(messages, file_path='.pdf', api_key='')
-
-    return {"messages": messages}
+    return messages
 
 
 Embedding_Cache = {}
 
 
+# https://www.openaidoc.com.cn/docs/guides/embeddings
 async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **kwargs) -> List[List[float]]:
     """
+        text = text.replace("\n", " ")
        从远程服务获取嵌入，支持批量处理和缓存和多模型处理。
        :param inputs: 输入文本或文本列表
        :param model_name: 模型名称
        :return: 嵌入列表
-       """
+    """
     if not model_name:
         return []
 
@@ -371,6 +374,10 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
 # 生成:conversation or summary
 async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, stream=False, temperature=0.7,
                       max_tokens=4096, model_name='silicon', model_id=0, **kwargs):
+    '''
+    Completions足以解决几乎任何语言处理任务，包括内容生成、摘要、语义搜索、主题标记、情感分析等等。
+    需要注意的一点限制是，对于大多数模型，单个API请求只能在提示和完成之间处理最多4096个标记。
+    '''
     model_info, name = find_ai_model(model_name, model_id, "generation")
     if not name:
         return await ai_chat(model_info=None, messages=None, user_request=user_request, system=prompt,
@@ -432,7 +439,7 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
     # refer = function_call(user_message, ...)
     tool_calls = tool_calls or []
     items_to_process = []
-    tasks = []
+    tasks = []  # asyncio.create_task
     if not keywords:
         items_to_process = [user_request]  # ','.join(keywords)
     else:
@@ -538,8 +545,8 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
         messages[-1]['content'] = (f'以下是相关参考资料:\n{formatted_refer}\n'
                                    f'请结合以上内容或根据上下文，针对下面的问题进行解答：\n{user_request}')
 
-    if images:
-        messages[-1]['content'] = [{"type": "text", "text": user_request}]  # text-prompt 请详细描述一下这几张图片。
+    if images:  # 图片内容理解
+        messages[-1]['content'] = [{"type": "text", "text": user_request}]  # text-prompt 请详细描述一下这几张图片。这是哪里？
         messages[-1]['content'] += [{"type": "image_url", "image_url": {"url": image}} for image in images]
 
     payload = {
@@ -1528,7 +1535,7 @@ def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str
 
 
 # https://www.xfyun.cn/doc/nlp/xftrans/API.html
-async def xunfei_picture(text: str, path=None):
+async def xunfei_picture(text: str, data_folder=None):
     headers = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
                                       host="spark-api.cn-huabei-1.xf-yun.com", path="/v2.1/tti", method='POST')
     url = 'http://spark-api.cn-huabei-1.xf-yun.com/v2.1/tti' + "?" + urlencode(headers)
@@ -1573,21 +1580,19 @@ async def xunfei_picture(text: str, path=None):
         text = data["payload"]["choices"]["text"]
         imageContent = text[0]
         image_base = imageContent["content"]  # base64_string_data
-        imagen_name = data['header']['sid']
+        image_name = data['header']['sid']
         # 解码 Base64 图像数据
         file_data = base64.b64decode(image_base)
-        if path:
+        if data_folder:
             # 将解码后的数据转换为图片
-            file_path = f"{path}/{imagen_name}.jpg"
+            file_path = f"{data_folder}/{image_name}.jpg"
             img = Image.open(io.BytesIO(file_data))
             img.save(file_path)
             # with open(file_path, 'wb') as file:
             #     file.write(file_data)
-            return file_path, imagen_name
-        else:
-            image_io = io.BytesIO(file_data)
-            image_io.seek(0)
-            return image_io, imagen_name
+            return file_path, image_name
+
+        return file_data, image_name
 
 
 # https://cloud.baidu.com/doc/NLP/s/al631z295
@@ -1916,10 +1921,8 @@ async def dashscope_speech_to_text_url(file_urls, model='paraformer-v1', languag
 # 非流式合成
 async def dashscope_text_to_speech(sentences, model="cosyvoice-v1", voice="longxiaochun"):
     synthesizer = dashscope.audio.tts_v2.SpeechSynthesizer(model=model, voice=voice)
-    audio = synthesizer.call(sentences)  # ,sample_rate=48000
-    audio_io = io.BytesIO(audio)
-    audio_io.seek(0)
-    return audio_io, synthesizer.get_last_request_id()
+    audio_data = synthesizer.call(sentences)  # sample_rate=48000
+    return audio_data, synthesizer.get_last_request_id()
 
     # SpeechSynthesizer.call(model='sambert-zhichu-v1',
     #                        text='今天天气怎么样',
@@ -1933,7 +1936,7 @@ def dashscope_file_upload(messages, file_path='.pdf', api_key=''):
     url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/files'
     headers = {
         'Content-Type': 'application/json',
-        "Authorization": f'Bearer {api_key}',
+        "Authorization": f'Bearer {api_key or Config.DashScope_Service_Key}',
     }
 
     try:
@@ -1956,28 +1959,37 @@ def dashscope_file_upload(messages, file_path='.pdf', api_key=''):
         files['file'][1].close()
 
 
-def upload_file_to_oss(bucket, file_path, object_name, expires: int = 604800):
-    total_size = os.path.getsize(file_path)
+def upload_file_to_oss(bucket, file_obj, object_name, expires: int = 604800):
+    """
+      上传文件到 OSS 支持 `io` 对象。
+      :param bucket: OSS bucket 实例
+      :param file_obj: 文件对象，可以是 `io.BytesIO` 或 `io.BufferedReader`
+      :param object_name: OSS 中的对象名
+      :param expires: 签名有效期，默认一周（秒）
+    """
+    file_obj.seek(0, os.SEEK_END)
+    total_size = file_obj.tell()  # os.path.getsize(file_path)
+    file_obj.seek(0)
     if total_size > 1024 * 1024 * 16:
         part_size = oss2.determine_part_size(total_size, preferred_size=128 * 1024)
         upload_id = bucket.init_multipart_upload(object_name).upload_id
         parts = []
-        with open(file_path, 'rb') as fileobj:
-            part_number = 1
-            offset = 0
-            while offset < total_size:
-                size_to_upload = min(part_size, total_size - offset)
-                result = bucket.upload_part(object_name, upload_id, part_number,
-                                            oss2.SizedFileAdapter(fileobj, size_to_upload))
-                parts.append(oss2.models.PartInfo(part_number, result.etag, size=size_to_upload, part_crc=result.crc))
-                offset += size_to_upload
-                part_number += 1
+        part_number = 1
+        offset = 0
+        while offset < total_size:
+            size_to_upload = min(part_size, total_size - offset)
+            result = bucket.upload_part(object_name, upload_id, part_number,
+                                        oss2.SizedFileAdapter(file_obj, size_to_upload))
+            parts.append(oss2.models.PartInfo(part_number, result.etag, size=size_to_upload, part_crc=result.crc))
+            offset += size_to_upload
+            part_number += 1
 
         # 完成分片上传
         bucket.complete_multipart_upload(object_name, upload_id, parts)
-        # bucket.get_object(object_name)
     else:
-        bucket.put_object_from_file(object_name, str(file_path))  # OSS 上的存储路径, 本地图片路径
+        # OSS 上的存储路径, 本地图片路径
+        bucket.put_object(object_name, file_obj)
+        # bucket.put_object_from_file(object_name, str(file_path))
 
     if 0 < expires <= 604800:  # 如果签名signed_URL
         url = bucket.sign_url("GET", object_name, expires=expires)
@@ -1985,7 +1997,7 @@ def upload_file_to_oss(bucket, file_path, object_name, expires: int = 604800):
         url = f"{Config.ALIYUN_Bucket_Domain}/{object_name}"
         # bucket.bucket_name
 
-    os.remove(file_path)
+    # bucket.get_object(object_name)
     return url
 
 
@@ -2041,9 +2053,8 @@ async def download_file(url: str, dest_folder: Path = None) -> Path:
                     file_data = b""
                     async for chunk in response.aiter_bytes(chunk_size=8192):
                         file_data += chunk
-                    file_io = io.BytesIO(file_data)
-                    file_io.seek(0)
-                    return file_io, file_name
+
+                    return file_data, file_name
             else:
                 print(f"Failed to download file: {response.status_code},{file_name}")
                 return None, file_name

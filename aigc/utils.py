@@ -528,9 +528,13 @@ def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int
 
 
 def get_file_type(object_name: str) -> str:
-    if not object_name:
+    if not object_name:  # object_name.endswith()
         return ""
-
+    '''
+    文档：DOC、DOCX、XLS、XLSX、PPT、PPTX、PDF、Numbers、CSV
+    图片：JPG、JPG2、PNG、GIF、WEBP、HEIC、HEIF、BMP、PCD、TIFF
+    文件上传大小限制：每个文件最大512MB。
+    '''
     _, file_extension = os.path.splitext(object_name.lower())
     # 根据文件后缀判断类型
     if file_extension in [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp"]:
