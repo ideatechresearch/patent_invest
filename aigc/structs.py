@@ -171,21 +171,38 @@ class CompletionParams(BaseModel):
     class Config:
         protected_namespaces = ()
         json_schema_extra = {
-            "example": {
-                'prompt': '请解释区块链的原理。',
-                "question": "",
-                "agent": "0",
-                "suffix": "",
-                "stream": False,
-                "temperature": 0.7,
-                "top_p": 0.8,
-                "model_name": "silicon",
-                "model_id": 0,
-                "extract": "code.python",
-                "max_tokens": 4096,
-                "keywords": ["区块链"],
-                "tools": [],
-            }
+            "examples": [
+                {
+                    'prompt': '请解释人工智能的原理。',
+                    "question": "",
+                    "agent": "0",
+                    "suffix": "",
+                    "stream": False,
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "model_name": "silicon",
+                    "model_id": 0,
+                    "extract": "code.python",
+                    "max_tokens": 4096,
+                    "keywords": ["AI智能"],
+                    "tools": [],  # [("tool_name", {"key": "value"})]
+                },
+                {
+                    "stream": False,
+                    "extract": "wechat",
+                    "model_name": "doubao",
+                    "model_id": -1,
+                    "prompt": "",
+                    "agent": "42",
+                    "top_p": 0.8,
+                    "question": "这是什么啊,可以描述一下吗?",
+                    "keywords": [],
+                    "suffix": "",
+                    "temperature": 0.7,
+                    "max_tokens": 4096,
+                    "tools": []
+                }
+            ]
         }
 
     def asdict(self):

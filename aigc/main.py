@@ -375,7 +375,7 @@ async def fuzzy_matches(request: FuzzyMatchRequest):
             results.append({'query': token, 'matches': matches})
         # results = [{'token': token, 'matches': rapidfuzz.process.extract(token, tokens, limit=top_n, score_cutoff=cutoff)}
         #            for token in querys]
-        # fuzzywuzzy.process.extractOne(token,choices,scorer=fuzzywuzzy.fuzz.token_sort_ratio)
+        # rapidfuzz.process.extractOne(token,choices)
     elif request.method == 'bm25':  # 初步检索,将词组转化为向量化表示（TF-IDF）,概率检索模型,适合在短词组或句子相似性上做简单匹配
         bm25 = BM25(tokens)  # corpus
         for token in querys:
@@ -548,6 +548,7 @@ async def generate_text(request: CompletionParams):
 
         return StreamingResponse(stream_response(), media_type="text/plain")
     else:
+        system_prompt = request.prompt or System_content.get(request.agent, '')
         user_request = request.question
         refer = await retrieved_reference(request.question, request.keywords, tool_calls=None)
         if refer:
@@ -555,7 +556,7 @@ async def generate_text(request: CompletionParams):
             user_request = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请回答下面的问题:{request.question}'
 
         bot_response = await ai_generate(
-            prompt=request.prompt,
+            prompt=system_prompt,
             user_request=user_request,
             suffix=request.suffix,
             temperature=request.temperature,
@@ -988,28 +989,6 @@ async def translate_text(request: TranslateRequest):
         raise HTTPException(status_code=400, detail=f"Unsupported platform:{e}")
 
 
-@app.post("/files/message")
-async def process_files(files: List[UploadFile], question: str = None, model_name: str = 'qwen-long',
-                        model_id: int = -1):
-    """
-       接收文件并调用 AI 模型处理生成消息。
-
-       :param files: 上传的文件列表
-       :param model_name: 模型名称
-       :param model_id: 模型 ID
-       :return: AI 处理结果
-    """
-    saved_file_paths = []
-    for file in files:
-        file_path = Path(Config.DATA_FOLDER) / file.filename
-        # file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("wb") as f:
-            f.write(await file.read())
-        saved_file_paths.append(str(file_path))
-
-    return ai_files_messages(saved_file_paths, question, model_name, model_id, max_tokens=4096)
-
-
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
     file_path = Path(Config.DATA_FOLDER) / file.filename
@@ -1019,7 +998,9 @@ async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
 
     if oss_expires != 0:
         object_name = f"upload/{file.filename}"
-        url = upload_file_to_oss(AliyunBucket, file_path, object_name, expires=oss_expires)
+        with open(file_path, 'rb') as file_obj:
+            url = upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=oss_expires)
+        os.remove(file_path)
 
     return {"url": url}
 
@@ -1067,10 +1048,8 @@ async def send_wechat_scheduler(request: Request, file: UploadFile = File(None))
     if file and file.filename:
         object_name = file.filename
         oss_expires = int(max(0, tigger_sec)) + 86400
-        file_path = Path(Config.DATA_FOLDER) / file.filename
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
-        url = upload_file_to_oss(AliyunBucket, file_path, f"upload/{file.filename}", expires=oss_expires)
+        file_obj = io.BytesIO(await file.read())
+        url = upload_file_to_oss(AliyunBucket, file_obj, f"upload/{file.filename}", expires=oss_expires)
 
     if tigger_sec > 0:
         is_existing = False
@@ -1172,10 +1151,10 @@ async def send_page():
 
 
 @app.post("/ocr")
-async def image_to_text(file: UploadFile = File(None), image_url: str = Form(None),
-                        ocr_type: str = 'general'):
+async def image_recognition(file: UploadFile = File(None), image_url: str = Form(None),
+                            ocr_type: str = 'general'):
     try:
-        image_data = await file.read() if file else None
+        image_data = await file.read() if file else None  # 从内存字节b"uploading.."
     except Exception as e:
         return {"error": f"Failed to process the uploaded file:{e}"}
 
@@ -1240,7 +1219,9 @@ async def speech_to_text(file: UploadFile = File(None), file_urls: List[str] = F
 @app.post("/tts")
 async def text_to_audio(sentences: str, platform: str = "cosyvoice-v1"):
     if platform in ["cosyvoice-v1"]:
-        audio_io, request_id = await dashscope_text_to_speech(sentences, model=platform)
+        audio_data, request_id = await dashscope_text_to_speech(sentences, model=platform)
+        audio_io = io.BytesIO(audio_data)
+        audio_io.seek(0)
         return StreamingResponse(audio_io, media_type="audio/mpeg",
                                  headers={"Content-Disposition": "attachment; filename=output.mp3",
                                           "X-Request-ID": request_id})
@@ -1249,16 +1230,77 @@ async def text_to_audio(sentences: str, platform: str = "cosyvoice-v1"):
 
 @app.post("/tti")
 async def text_to_image(sentences: str):
-    image_io, imagen_name = await xunfei_picture(sentences)
-    if image_io:
+    file_data, image_name = await xunfei_picture(sentences, data_folder=None)
+    if file_data:
+        image_io = io.BytesIO(file_data)
+        image_io.seek(0)
         return StreamingResponse(image_io, media_type="image/jpeg",
-                                 headers={"Content-Disposition": f"attachment; filename={imagen_name}.jpg"})
-    return imagen_name
+                                 headers={"Content-Disposition": f"attachment; filename={image_name}.jpg"})
+    return image_name
+
+
+@app.post("/iu")
+async def image_understanding(request: Optional[CompletionParams] = None, files: List[UploadFile] = File(...)):
+    if request is None:
+        example = CompletionParams.Config.json_schema_extra["examples"][1]
+        request = CompletionParams(**example)
+
+    urls = []
+    for file in files:
+        file_obj = io.BytesIO(await file.read())
+        object_name = f"webimg/{file.filename}"
+        url = upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=86400)
+        urls.append(url)
+
+    system_prompt = request.prompt or System_content.get(request.agent, '')
+    agent_funcalls = [agent_func_calls(request.agent)]
+    model_info, payload, refer = await get_chat_payload(
+        messages=[], user_request=request.question, system=system_prompt,
+        temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens,
+        model_name=request.model_name, model_id=request.model_id,
+        tool_calls=agent_funcalls, keywords=request.keywords, images=urls)
+
+    # print(payload)
+    bot_response = await ai_chat(model_info, payload)
+    transform = extract_string(bot_response, request.extract)
+    return {'answer': bot_response, 'reference': refer, 'transform': transform, "urls": urls}
+
+
+@app.post("/fp")
+async def files_process(files: List[UploadFile], question: str = None, model_name: str = 'qwen-long',
+                        model_id: int = -1):
+    """
+       接收文件并调用 AI 模型处理,基于文件内容生成消息。
+
+       :param files: 上传的文件列表
+       :param model_name: 模型名称
+       :param model_id: 模型 ID
+       :return: AI 处理结果
+    """
+    saved_file_paths = []
+    for file in files:
+        file_path = Path(Config.DATA_FOLDER) / file.filename
+        # file_path.parent.mkdir(parents=True, exist_ok=True)
+        with file_path.open("wb") as f:
+            f.write(await file.read())
+        saved_file_paths.append(str(file_path))
+
+    return JSONResponse(ai_files_messages(saved_file_paths, question, model_name, model_id, max_tokens=4096))
 
 
 @app.get("/ppt")
-async def ppt_create(text: str, templateid: str = "20240718489569D"):
-    return {'url': xunfei_ppt_create(text, templateid)}
+async def ppt_create(text: str = Query(..., description="用于生成PPT的文本内容"), templateid: str = "20240718489569D"):
+    url = xunfei_ppt_create(text, templateid)
+
+    file_data, file_name = await download_file(url, data_folder=None)
+    if file_data:
+        file_io = io.BytesIO(file_data)
+        file_io.seek(0)
+        return StreamingResponse(file_io,
+                                 media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                                 headers={"Content-Disposition": f"attachment; filename={file_name}.pptx",
+                                          "File-Url": url})
+    return {'url': url}
 
 
 # class WebSocketCallback(ResultCallback):

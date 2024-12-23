@@ -431,8 +431,8 @@ class BaseRoBot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    user_content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
-    assistant_content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=True)
+    user_content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)  # "prompt"
+    assistant_content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=True)  # "completion"
     system_content: Mapped[str] = mapped_column(TEXT, nullable=True)
     agent: Mapped[str] = mapped_column(String(50), nullable=True, default='0')
 
@@ -557,6 +557,7 @@ class OperationMysql:
         # finally:
         #     self.cur.close()
         #     self.conn.close()
+
     def insert(self, sql, params=None):
         try:
             if params is None:
