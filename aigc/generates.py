@@ -1,7 +1,8 @@
-import httpx
+import httpx, aiohttp
+from http import HTTPStatus
 import asyncio
 import oss2
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Dict, Any, Union, Tuple, Callable, Optional
 import random, time, io, os, pickle
 from PIL import Image
@@ -11,8 +12,10 @@ import dashscope
 from dashscope.audio.tts import ResultCallback, SpeechSynthesizer
 from dashscope.audio.asr import Recognition, Transcription
 from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue
-from fastapi import HTTPException
 import numpy as np
+from sqlalchemy.sql.util import expand_column_list_from_order_by
+from sqlalchemy.util import await_only
+
 from config import *
 from utils import *
 from ai_tools import *
@@ -215,6 +218,9 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
             file_object = client.files.create(file=file_path_obj, purpose="file-extract")
             if model_info['name'] == 'qwen':
                 messages.append({"role": "system", "content": f"fileid://{file_object.id}", })
+                # client.files.list()
+                # 文件信息client.files.retrieve(file_object.id)
+                # 文件内容client.files.content(file_object.id)
             elif model_info['name'] == 'moonshot':
                 file_content = client.files.content(file_id=file_object.id).text
                 messages.append({"role": "system", "content": file_content, })
@@ -238,11 +244,14 @@ Embedding_Cache = {}
 # https://www.openaidoc.com.cn/docs/guides/embeddings
 async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **kwargs) -> List[List[float]]:
     """
-        text = text.replace("\n", " ")
-       从远程服务获取嵌入，支持批量处理和缓存和多模型处理。
-       :param inputs: 输入文本或文本列表
-       :param model_name: 模型名称
-       :return: 嵌入列表
+    text = text.replace("\n", " ")
+    从远程服务获取嵌入，支持批量处理和缓存和多模型处理。
+    :param inputs: 输入文本或文本列表
+    :param model_name: 模型名称
+    :return: 嵌入列表
+    （1）文本数量不超过 16。
+    （2）每个文本长度不超过 512 个 token，超出自动截断，token 统计信息，token 数 = 汉字数+单词数*1.3 （仅为估算逻辑，以实际返回为准)。
+    （3） 批量最多 16 个，超过 16 后默认截断。
     """
     if not model_name:
         return []
@@ -310,7 +319,7 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
     payload.update(kwargs)
     embeddings = []
     try:
-        async with httpx.AsyncClient() as cx:
+        async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
             if isinstance(inputs, list) and len(inputs) > batch_size:
                 for i in range(0, len(inputs), batch_size):
                     batch = inputs[i:i + batch_size]
@@ -360,7 +369,7 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
         "return_documents": True,
     }
     payload.update(kwargs)
-    async with httpx.AsyncClient() as cx:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         response = await cx.post(url, headers=headers, json=payload)
         if response.status_code == 200:
             results = response.json().get('results')
@@ -562,6 +571,26 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
     }
     if model_type == 'baidu':
         payload['system'] = system
+    # if model_info['name']=='baichuan':
+    #     extra_body = {
+    #         "tools": [{
+    #             "type": "retrieval",
+    #             "retrieval": {
+    #                 "kb_ids": [
+    #                     "kb-123",
+    #                      "kb-xxx"
+    #                 ],
+    #           "answer_mode": "knowledge-base-only"
+    #             }
+    #         }]
+    #     }
+    #     [{
+    #         "type": "web_search",
+    #         "web_search": {
+    #             "enable": True,
+    #             "search_mode": "performance_first"#"quality_first"
+    #         }
+    #     }]
 
     # print(payload)
     return model_info, payload, refer
@@ -826,9 +855,9 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> 
 
     headers = {'Authorization': api_key}
 
-    async with httpx.AsyncClient() as cx:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         try:
-            resp = await cx.post(url, json=data, headers=headers, timeout=Config.HTTP_TIMEOUT_SEC)
+            resp = await cx.post(url, json=data, headers=headers)
             resp.raise_for_status()
 
             data = resp.json()
@@ -897,7 +926,7 @@ def baidu_search(query, baidu_api_key, baidu_secret_key):
 
 def wikipedia_search(query):
     response = requests.get(f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json",
-                            timeout=Config.HTTP_TIMEOUT_SEC)  # proxies=
+                            timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
     search_results = response.json().get('query', {}).get('search', [])
     if search_results:
         page_id = search_results[0]['pageid']
@@ -906,6 +935,98 @@ def wikipedia_search(query):
         page_data = page_response.json()['query']['pages'][str(page_id)]
         return page_data.get('extract', 'No extract found.')
     return "No information found."
+
+
+Assistant_Cache = {}
+
+
+# https://platform.baichuan-ai.com/docs/assistants
+async def ai_assistant_create(instructions: str, user_name: str, tools_type="code_interpreter", model_id=4):
+    # 如果您判断是一次连续的对话，则无需自己拼接上下文，只需将最新的 message 添加到对应的 thread id 即可得到包含了 thread id 历史上下文的回复，历史上下文超过我们会帮您自动截断。
+    global Assistant_Cache
+    cache_key = generate_hash_key(instructions, user_name, tools_type, model_id)
+    if cache_key in Assistant_Cache:
+        return Assistant_Cache[cache_key]
+
+    model_info, model_name = find_ai_model('baichuan', model_id, 'model')
+    assistants_url = f"{model_info['base_url']}assistants"
+    threads_url = f"{model_info['base_url']}threads"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {model_info['api_key']}"
+    }
+    payload = {
+        "instructions": instructions,
+        "name": user_name,
+        "tools": [{"type": tools_type}],  # web_search,code_interpreter,function
+        "model": model_name
+    }
+    try:
+        async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+            assistant_response = await cx.post(assistants_url, headers=headers, json=payload)
+            assistant_response.raise_for_status()
+            threads_response = await cx.post(threads_url, headers=headers, json={})
+            threads_response.raise_for_status()
+            results = {'headers': headers,
+                       'assistant_data': assistant_response.json(),
+                       'threads_url': threads_url,
+                       'threads_id': threads_response.json()['id']}
+            Assistant_Cache[cache_key] = results  # assistant_response.json()["id"],assistant_id
+            return results
+    except Exception as e:
+        return {"error": f"Unexpected error: {str(e)}"}
+
+
+async def ai_assistant_run(user_request: str, instructions: str, user_name: str, tools_type="code_interpreter",
+                           model_id=4, max_retries=20, interval=5, backoff_factor=1.5):
+    assistant = await ai_assistant_create(instructions, user_name, tools_type, model_id)
+    if "error" in assistant:
+        return assistant
+
+    assistant_data = assistant['assistant_data']
+    headers = assistant['headers']
+    messages_url = f'{assistant["threads_url"]}/{assistant["threads_id"]}/messages'
+    threads_url = f'{assistant["threads_url"]}/{assistant["threads_id"]}/runs'
+
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        messages_response = await cx.post(messages_url, headers=headers, json={"role": "user", "content": user_request})
+        messages_response.raise_for_status()
+        run_response = await cx.post(threads_url, headers=headers, json={"assistant_id": assistant_data['id']})
+        run_response.raise_for_status()
+        run_url = f'{threads_url}/{run_response.json()['id']}'
+        retries = 0
+        while retries < max_retries:
+            try:
+                run_status_response = await cx.get(run_url, headers=headers)  # 定期检索 run id 的运行状态
+                # print(retries,run_status_response.status_code, run_status_response.headers, run_status_response.text)
+
+                run_status_response.raise_for_status()
+                status_data = run_status_response.json()
+
+                if status_data.get('status') == 'completed':
+                    messages_status_response = await cx.get(messages_url, headers=headers)
+                    run_status_response.raise_for_status()
+                    status_data = messages_status_response.json()
+                    # print(status_data)
+                    return status_data.get('data')
+
+                await asyncio.sleep(interval)
+                retries += 1
+
+            except httpx.HTTPStatusError as http_error:
+                if run_status_response.status_code == 429:
+                    await asyncio.sleep(interval)
+                    retries += 1
+                    interval *= backoff_factor
+                    continue
+
+                return {"error": f"HTTP error: {str(http_error)}"}  # status_data['error']
+
+            except Exception as e:
+                return {"error": f"Unexpected error: {str(e)}"}
+
+        return {
+            "error": f"Timeout: The task did not complete within the expected time. status:{status_data},retries:{retries}"}
 
 
 # （1）文本数量不超过 16。 （2）每个文本长度不超过 512 个 token，超出自动截断，token 统计信息，token 数 = 汉字数+单词数*1.3 （仅为估算逻辑，以实际返回为准)。
@@ -920,7 +1041,7 @@ async def get_baidu_embeddings(texts: List[str], access_token: str, model_name='
     }
     batch_size = 16
     embeddings = []
-    async with httpx.AsyncClient() as cx:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         if len(texts) < batch_size:
             payload = json.dumps({"input": texts})  # "model":
             response = await cx.post(url, headers=headers, data=payload)
@@ -949,7 +1070,8 @@ def get_hf_embeddings(texts, model_name='BAAI/bge-large-zh-v1.5', access_token=C
     url = f"https://api-inference.huggingface.co/models/{model_name}"
     headers = {"Authorization": f'Bearer {access_token}'}
     payload = {"inputs": texts}
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload, proxies=Config.HTTP_Proxies,
+                             timeout=Config.HTTP_TIMEOUT_SEC)
     data = response.json().get('data')
     return [emb.get('embedding') for emb in data]
 
@@ -1163,7 +1285,7 @@ async def search_bmap_location(query, region='', limit=True):
         "ak": Config.BMAP_API_Key,
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.get(url, params=params)
         res = []
         if response.status_code == 200:
@@ -1205,7 +1327,7 @@ async def search_amap_location(query, region='', limit=True):
         "key": Config.AMAP_API_Key,
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.get(url, params=params)
         res = []
         if response.status_code == 200:
@@ -1246,7 +1368,7 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
         "sign": sign
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.get(url, params=params)
 
     data = response.json()
@@ -1265,7 +1387,7 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
         "from": from_lang,
         "to": to_lang
     })
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, headers=headers, json=payload)
 
     data = response.json()
@@ -1285,12 +1407,12 @@ async def tencent_translate(text: str, source: str, target: str):
         "ProjectId": 0
     }
     url = "https://tmt.tencentcloudapi.com"
-    headers = get_tencent_signature(service="tmt", host="tmt.tencentcloudapi.com", params=payload,
+    headers = get_tencent_signature(service="tmt", host="tmt.tencentcloudapi.com", body=payload,
                                     action='TextTranslate',
                                     secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
                                     timestamp=int(time.time()), version='2018-03-21')
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, headers=headers, json=payload)
 
     # 检查响应状态码和内容
@@ -1339,12 +1461,12 @@ async def xunfei_translate(text: str, source: str = 'en', target: str = 'cn'):
         }
     }
 
-    headers = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
-                                      host="itrans.xf-yun.com", path="/v1/its", method='POST')
-    url = 'https://itrans.xf-yun.com/v1/its'  # f"https://{host}{path}?"+ urlencode(headers)
+    headers, url = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
+                                           host="itrans.xf-yun.com", path="/v1/its", method='POST')
+    url = 'https://itrans.xf-yun.com/v1/its'
 
     # 异步发送请求
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, json=request_data, headers=headers)
         if response.status_code == 200:
             response_data = await response.json()
@@ -1477,13 +1599,13 @@ def xunfei_ppt_theme(industry, style="简约", color="蓝色", appid: str = Conf
 
 # https://www.xfyun.cn/doc/spark/PPTv2.html
 def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str = Config.XF_AppID,
-                      api_secret: str = Config.XF_Secret_Key):
+                      api_secret: str = Config.XF_Secret_Key, max_retries=20):
     from requests_toolbelt.multipart.encoder import MultipartEncoder
 
     url = 'https://zwapi.xfyun.cn/api/ppt/v2/create'
     timestamp = int(time.time())
     signature = get_xfyun_signature(appid, api_secret, timestamp)
-    formData = MultipartEncoder(
+    form_data = MultipartEncoder(
         fields={
             # "file": (path, open(path, 'rb'), 'text/plain'),  # 如果需要上传文件，可以将文件路径通过path 传入
             # "fileUrl":"",   #文件地址（file、fileUrl、query必填其一）
@@ -1499,47 +1621,48 @@ def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str
         }
     )
 
-    print(formData)
+    print(form_data)
     headers = {
         "appId": appid,
         "timestamp": str(timestamp),
         "signature": signature,
-        "Content-Type": formData.content_type
+        "Content-Type": form_data.content_type
     }
 
-    response = requests.request(method="POST", url=url, data=formData, headers=headers).text
+    response = requests.request(method="POST", url=url, data=form_data, headers=headers).text
     resp = json.loads(response)
-    if (0 != resp['code']):
+    if 0 != resp['code']:
         print('创建PPT任务失败,生成PPT返回结果：', response)
         return None
 
     task_id = resp['data']['sid']
-    PPTurl = ''
+    ppt_url = ''
+    retries = 0
     # 轮询任务进度
     time.sleep(5)
-    while (None != task_id):
-        url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
-        response = requests.request("GET", url=url, headers=headers).text
+    while task_id is not None and retries < max_retries:
+        task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
+        response = requests.request("GET", url=task_url, headers=headers).text
         resp = json.loads(response)
-        pptStatus = resp['data']['pptStatus']
+        task_status = resp['data']['pptStatus']
         aiImageStatus = resp['data']['aiImageStatus']
         cardNoteStatus = resp['data']['cardNoteStatus']
 
-        if ('done' == pptStatus and 'done' == aiImageStatus and 'done' == cardNoteStatus):
-            PPTurl = resp['data']['pptUrl']
+        if ('done' == task_status and 'done' == aiImageStatus and 'done' == cardNoteStatus):
+            ppt_url = resp['data']['pptUrl']
             break
         else:
             time.sleep(3)
+            retries += 1
 
-    return PPTurl
+    return ppt_url
 
 
 # https://www.xfyun.cn/doc/nlp/xftrans/API.html
 async def xunfei_picture(text: str, data_folder=None):
-    headers = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
-                                      host="spark-api.cn-huabei-1.xf-yun.com", path="/v2.1/tti", method='POST')
+    headers, url = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
+                                           host="spark-api.cn-huabei-1.xf-yun.com", path="/v2.1/tti", method='POST')
     url = 'http://spark-api.cn-huabei-1.xf-yun.com/v2.1/tti' + "?" + urlencode(headers)
-    # f"https://{host}{path}?"+ urlencode(headers)
     # 构造请求数据
     request_body = {
         "header": {
@@ -1567,7 +1690,7 @@ async def xunfei_picture(text: str, data_folder=None):
         }
     }
     # 异步发送请求
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, json=request_body, headers={'content-type': "application/json"})
         if response.status_code != 200:
             return None, {"error": f"HTTP Error: {response.status_code}"}
@@ -1578,24 +1701,312 @@ async def xunfei_picture(text: str, data_folder=None):
             return None, {"error": f'请求错误: {code}, {data}'}
 
         text = data["payload"]["choices"]["text"]
-        imageContent = text[0]
-        image_base = imageContent["content"]  # base64_string_data
-        image_name = data['header']['sid']
+        image_base = text[0]["content"]  # base64图片结果,base64_string_data
+        image_id = data['header']['sid']
         # 解码 Base64 图像数据
         file_data = base64.b64decode(image_base)
         if data_folder:
             # 将解码后的数据转换为图片
-            file_path = f"{data_folder}/{image_name}.jpg"
+            file_path = f"{data_folder}/{image_id}.jpg"  # .png
             img = Image.open(io.BytesIO(file_data))
+            # r, g, b, a = img.split()
+            # img = img.convert('RGB')
             img.save(file_path)
             # with open(file_path, 'wb') as file:
             #     file.write(file_data)
-            return file_path, image_name
+            return file_path, {"urls": '', 'id': image_id}
 
-        return file_data, image_name
+        return file_data, {"urls": '', 'id': image_id}
 
 
-# https://cloud.baidu.com/doc/NLP/s/al631z295
+# https://www.volcengine.com/docs/6791/1361423
+async def ark_visual_picture(image_data, image_urls: List[str], prompt: str = None, logo_info=None, style_name='3D风',
+                             return_url=False, data_folder=None):
+    style_mapping = {
+        "3D风": ("img2img_disney_3d_style", ""),
+        "写实风": ("img2img_real_mix_style", ""),
+        "天使风": ("img2img_pastel_boys_style", ""),
+        "动漫风": ("img2img_cartoon_style", ""),
+        "日漫风": ("img2img_makoto_style", ""),
+        "公主风": ("img2img_rev_animated_style", ""),
+        "梦幻风": ("img2img_blueline_style", ""),
+        "水墨风": ("img2img_water_ink_style", ""),
+        "新莫奈花园": ("i2i_ai_create_monet", ""),
+        "水彩风": ("img2img_water_paint_style", ""),
+        "莫奈花园": ("img2img_comic_style", "img2img_comic_style_monet"),
+        "精致美漫": ("img2img_comic_style", "img2img_comic_style_marvel"),
+        "赛博机械": ("img2img_comic_style", "img2img_comic_style_future"),
+        "精致韩漫": ("img2img_exquisite_style", ""),
+        "国风-水墨": ("img2img_pretty_style", "img2img_pretty_style_ink"),
+        "浪漫光影": ("img2img_pretty_style", "img2img_pretty_style_light"),
+        "陶瓷娃娃": ("img2img_ceramics_style", ""),
+        "中国红": ("img2img_chinese_style", ""),
+        "丑萌粘土": ("img2img_clay_style", "img2img_clay_style_3d"),
+        "可爱玩偶": ("img2img_clay_style", "img2img_clay_style_bubble"),
+        "3D-游戏_Z时代": ("img2img_3d_style", "img2img_3d_style_era"),
+        "动画电影": ("img2img_3d_style", "img2img_3d_style_movie"),
+        "玩偶": ("img2img_3d_style", "img2img_3d_style_doll"),
+        # "文生图-2.0": ("high_aes_general_v20", ''),
+        "文生图-2.0Pro": ("high_aes_general_v20_L", ''),
+        "文生图-2.1": ("high_aes_general_v21_L", ''),
+        "角色特征保持": ("high_aes_ip_v20", ''),
+        "人像融合": ('face_swap3_6', ''),  # 换脸图在前（最多三张），模板图在后（最多一张）
+    }
+    # inpainting涂抹消除,inpainting涂抹编辑,outpainting智能扩图
+    request_body = {'req_key': style_mapping.get(style_name)[0],
+                    'sub_req_key': style_mapping.get(style_name)[1],
+                    'return_url': return_url  # 链接有效期为24小时
+                    }
+    if 'general' in request_body['req_key'] or prompt:
+        request_body["prompt"] = prompt
+        request_body["use_sr"] = True  # AIGC超分
+        request_body["scale"] = 3.6  # 影响文本描述的程度
+        request_body["seed"] = -1  # -1为不随机种子
+        # request_body["use_pre_llm"] = True  #use_rephraser, prompt扩写, 对输入prompt进行扩写优化,辅助生成图片的场景下传True
+    if image_urls and all(image_urls):
+        request_body["image_urls"] = image_urls
+    if image_data:  # 目标图片需小于 5 MB,小于4096*4096,支持JPG、JPEG、PNG格式,仅支持一张图,优先生效
+        request_body["binary_data_base64"] = [base64.b64encode(image_data).decode("utf-8")]  # 输入图片base64数组
+    if logo_info:
+        request_body["logo_info"] = logo_info
+        # {
+        #     "add_logo": True,
+        #     "position": 0,
+        #     "language": 0,
+        #     "opacity": 0.3,
+        #     "logo_text_content": "这里是明水印内容"
+        # }
+    # 'CVSync2AsyncSubmitTask',JPCartoon
+    headers, url = get_ark_signature(action='CVProcess', service='cv', host='visual.volcengineapi.com',
+                                     region="cn-north-1", version="2022-08-31", http_method="POST", body=request_body,
+                                     access_key_id=Config.VOLC_AK_ID_admin,
+                                     secret_access_key=Config.VOLC_Secret_Key_admin,
+                                     timenow=None)
+
+    # print(headers,request_body)
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.post(url, json=request_body, headers=headers)
+        if response.status_code != 200:
+            return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+        response.raise_for_status()
+        response_data = response.json()
+        # print(response_data.keys())
+        # {'code': 10000, 'data': {'1905703073': 1905703073, 'algorithm_base_resp': {'status_code': 0, 'status_message': 'Success'}, 'animeoutlineV4_16_strength_clip': 0.2, 'animeoutlineV4_16_strength_model': 0.2, 'apply_id_layer': '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15', 'binary_data_base64': [], 'clip_skip': -2, 'cn_mode': 2, 'comfyui_cost': 4, 'controlnet_weight': 1, 'ddim_steps': 20, 'i2t_tag_text': '', 'id_weight': 0, 'image_urls': ['https://p26-aiop-sign.byteimg.com/tos-cn-i-vuqhorh59i/20241225114813D0211FF38607A612BD65-0~tplv-vuqhorh59i-image.image?rk3s=7f9e702d&x-expires=1735184899&x-signature=A1Jay2TWwSsmtwRjDGzK71gzXpg%3D'], 'long_resolution': 832, 'lora_map': {'animeoutlineV4_16': {'strength_clip': 0.2, 'strength_model': 0.2}, 'null': {'strength_clip': 0.7000000000000001, 'strength_model': 0.7000000000000001}}, 'null_strength_clip': 0.7000000000000001, 'null_strength_model': 0.7000000000000001, 'prompt': '(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,', 'return_url': True, 'scale': 5, 'seed': -1, 'strength': 0.58, 'sub_prompts': ['(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,'], 'sub_req_key': ''}, 'message': 'Success', 'request_id': '20241225114813D0211FF38607A612BD65', 'status': 10000, 'time_elapsed': '6.527672506s'}
+        if response_data["status"] == 10000:
+            image_base = response_data["data"].get("binary_data_base64", [])
+            image_urls = response_data["data"].get("image_urls", [''])
+            if len(image_base) == 1:
+                image_decode = base64.b64decode(image_base[0])
+                if data_folder:
+                    # 将解码后的数据转换为图片
+                    file_path = f"{data_folder}/{response_data["request_id"]}.jpg"
+                    img = Image.open(io.BytesIO(image_decode))
+                    img.save(file_path)
+                    return file_path, {"urls": image_urls, 'id': response_data["request_id"]}
+                return image_decode, {"urls": image_urls, 'id': response_data["request_id"]}
+            return None, {"urls": image_urls, 'id': response_data["request_id"]}
+        return None, response_data
+
+
+async def ark_drawing_picture(image_data, image_urls: List[str], whitening: float = 1.0, dermabrasion: float = 1.2,
+                              logo_info=None, style_name='3d人偶', return_url=False):
+    style_mapping = {
+        # 头像风格（单人、男女均支持)
+        "美漫风格": "img2img_photoverse_american_comics",
+        "商务证件照": "img2img_photoverse_executive_ID_photo",
+        "3d人偶": "img2img_photoverse_3d_weird",
+        "赛博朋克": "img2img_photoverse_cyberpunk",
+        # 胸像写真风格(单人、只支持女生)
+        "古堡": "img2img_xiezhen_gubao",
+        "芭比牛仔": "img2img_xiezhen_babi_niuzai",
+        "浴袍风格": "img2img_xiezhen_bathrobe",
+        "蝴蝶机械": "img2img_xiezhen_butterfly_machine",
+        "职场证件照": "img2img_xiezhen_zhichangzhengjianzhao",
+        "圣诞": "img2img_xiezhen_christmas",
+        "美式甜点师": "img2img_xiezhen_dessert",
+        "old_money": "img2img_xiezhen_old_money",
+        "最美校园": "img2img_xiezhen_school"
+    }
+
+    request_body = {'req_key': style_mapping.get(style_name),
+                    'return_url': return_url,  # 链接有效期为24小时
+                    "beautify_info": {"whitening": whitening,  # 自定义美白参数，float类型，数值越大，效果越明显，未做参数范围校验，建议[0, 2]
+                                      "dermabrasion": dermabrasion  # 自定义磨皮参数，float类型, 数值越大，效果越明显，未做参数范围校验，建议[0, 2]
+                                      }
+                    }
+    if image_urls and all(image_urls):
+        request_body["image_urls"] = image_urls
+    if image_data:  # 输入图片base64数组,仅支持一张图,优先生效
+        request_body["binary_data_base64"] = [base64.b64encode(image_data).decode("utf-8")]
+    if logo_info:
+        request_body["logo_info"] = logo_info
+
+    headers, url = get_ark_signature(action='HighAesSmartDrawing', service='cv', host='visual.volcengineapi.com',
+                                     region="cn-north-1", version="2022-08-31", http_method="POST", body=request_body,
+                                     access_key_id=Config.VOLC_AK_ID_admin,
+                                     secret_access_key=Config.VOLC_Secret_Key_admin,
+                                     timenow=None)
+
+    # print(headers,request_body)
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.post(url, json=request_body, headers=headers)
+        if response.status_code != 200:
+            return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+        response.raise_for_status()
+        response_data = response.json()
+        if response_data["status"] == 10000:
+            image_base = response_data["data"].get("binary_data_base64", [])
+            image_urls = response_data["data"].get("image_urls", [''])
+            if len(image_base) == 1:
+                image_decode = base64.b64decode(image_base[0])
+                return image_decode, {"urls": image_urls, 'id': response_data["request_id"]}
+            return None, {"urls": image_urls, 'id': response_data["request_id"]}
+        return None, response_data
+
+
+# https://help.aliyun.com/zh/viapi/developer-reference/api-overview?spm=a2c4g.11186623.help-menu-142958.d_4_3_1.13e65733U2m63s
+# https://help.aliyun.com/zh/viapi/developer-reference/api-version?spm=a2c4g.11186623.help-menu-142958.d_4_3_0.290f6593LRs5Lt&scm=20140722.H_464194._.OR_help-T_cn~zh-V_1
+async def ali_cartoon_picture(image_url, style_name='复古漫画'):
+    style_mapping = {
+        "复古漫画": '0',
+        "3D童话": '1',
+        "二次元": '2',
+        "小清新": '3',
+        "未来科技": '4',
+        "国画古风": '5',
+        "将军百战": '6',
+        "炫彩卡通": '7',
+        "清雅国风": '8'
+    }
+    # 图片大小不超过10MB。支持的图片类型：JPEG、PNG、JPG、BMP、WEBP。
+    request_body = {'Index': style_mapping.get(style_name, '0'),
+                    'ImageUrl': image_url, }
+    # 视觉智能开放平台各服务支持的区域为华东2（上海）
+    parameters, url = get_aliyun_access_token(service="imageenhan", region="cn-shanghai",
+                                              action='GenerateCartoonizedImage', http_method="POST",
+                                              body=request_body, version='2019-09-30')
+
+    print(request_body)
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        try:
+            response = await cx.post(url, json=request_body)  # , headers=headers
+            print(response.text)
+            if response.status_code != 200:
+                return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+
+            response.raise_for_status()
+            response_data = response.json()
+            request_body = {'JobId': response_data["RequestId"]}
+
+            parameters, url = get_aliyun_access_token(service="imageenhan", region="cn-shanghai",
+                                                      action='GetAsyncJobResult', http_method="POST",
+                                                      body=request_body, version='2019-09-30')
+            response = await cx.post(url, json=request_body)  # , headers=headers
+            # response_data["Data"].get("ResultUrl")
+            print(response.text)
+            # 图片链接非法，请检查图片链接是否可访问 ,图片链接地域不对，请参考https://help.aliyun.com/document_detail/155645.html - imageUrl is invalid region oss url
+            if response.status_code != 200:
+                return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+            response_data = response.json()
+            if response_data["Data"]["Status"] == "PROCESS_SUCCESS":
+                image_url = response_data["Data"]["Result"].get("ImageUrls")
+
+                return {"urls": image_url, 'id': response_data["RequestId"]}
+        except httpx.ConnectError as e:
+            print(f"Connection error: {e},Request URL: {url},Request body: {request_body}")
+
+
+# https://cloud.tencent.com/document/product/1668/88066
+# https://cloud.tencent.com/document/product/1668/107799
+async def tencent_drawing_picture(image_data, image_url: str = '', prompt: str = '', negative_prompt: str = '',
+                                  style_name='日系动漫', return_url=False):
+    # 单边分辨率小于5000且大于50，转成 Base64 字符串后小于 8MB，格式支持 jpg、jpeg、png、bmp、tiff、webp。
+    style_mapping = {
+        "水彩画": '104',
+        "卡通插画": '107',
+        "3D 卡通": '116',
+        "日系动漫": '201',
+        "唯美古风": '203',
+        "2.5D 动画": '210',
+        "木雕": '120',
+        "黏土": '121',
+        "清新日漫": '123',
+        "小人书插画": '124',
+        "国风工笔": '125',
+        "玉石": '126',
+        "瓷器": '127',
+        "毛毡（亚洲版）": '135',
+        "毛毡（欧美版）": '128',
+        "美式复古": '129',
+        "蒸汽朋克": '130',
+        "赛博朋克": '131',
+        "素描": '132',
+        "莫奈花园": '133',
+        "厚涂手绘": '134',
+        "复古繁花": "flower",
+        "芭比": "babi",
+        "白领精英": "commerce",
+        "婚纱日记": "wedding",
+        "醉梦红尘": "gufeng",
+        "暴富": "coin",
+        "夏日水镜": "water",
+        "复古港漫": "retro",
+        "游乐场": "amusement",
+        "宇航员": "astronaut",
+        "休闲时刻": "cartoon",
+        "回到童年": "star",
+        "多巴胺": "dopamine",
+        "心动初夏": "comic",
+        "夏日沙滩": "beach"
+    }
+
+    style_type = style_mapping.get(style_name, '201')
+    if style_type.isdigit():
+        action = 'ImageToImage'  # 图像风格化
+        payload = {'Strength': 0.6,  # 生成自由度(0, 1]
+                   'EnhanceImage': 1,  # 画质增强开关
+                   'RestoreFace': 1,  # 细节优化的面部数量上限，支持0 ~ 6，默认为0。
+                   'RspImgType': 'url' if return_url else 'base64',
+                   'Styles': [style_type],
+                   'LogoAdd': 0
+                   # 'ResultConfig': {"Resolution": "768:768"},  # origin
+                   }
+        if prompt:
+            payload["Prompt"] = prompt
+        if negative_prompt:
+            payload["NegativePrompt"] = negative_prompt
+    else:
+        action = 'GenerateAvatar'  # 百变头像
+        payload = {'RspImgType': 'url' if return_url else 'base64',
+                   'Style': style_type,
+                   'Type': 'human',  # pet,图像类型
+                   'Filter': 1,  # 人像图的质量检测开关，默认开启，仅在人像模式下生效。
+                   'LogoAdd': 0
+                   }
+    if image_data:
+        payload["InputImage"] = base64.b64encode(image_data).decode("utf-8")
+    if image_url:
+        payload["InputUrl"] = image_url
+
+    url = "https://aiart.tencentcloudapi.com"
+    headers = get_tencent_signature(service="aiart", host="aiart.tencentcloudapi.com", body=payload,
+                                    action=action, timestamp=int(time.time()), region="ap-shanghai",
+                                    version='2022-12-29')
+
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        if response.status_code != 200:
+            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
+
+        response_data = response.json()["Response"]
+        if return_url:
+            return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
+
+        image_decode = base64.b64decode(response_data["ResultImage"])
+        return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
+
+
 async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
     '''
     address:地址识别
@@ -1627,7 +2038,7 @@ async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
     }
     body = {**kwargs}
 
-    async with httpx.AsyncClient() as cx:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         response = await cx.post(url, headers=headers, json=body)
         response.raise_for_status()
         data = response.json()  # .get('items')
@@ -1708,7 +2119,6 @@ async def tencent_ocr_recognise(image_data, image_url, ocr_type='GeneralBasicOCR
     QrcodeOCR:条形码和二维码的识别
     SmartStructuralOCRV2:智能结构化识别,智能提取各类证照、票据、表单、合同等结构化场景的key:value字段信息
     '''
-    service = 'ocr'
     url = 'https://ocr.tencentcloudapi.com'
     host = url.split("//")[-1]
     payload = {
@@ -1726,7 +2136,7 @@ async def tencent_ocr_recognise(image_data, image_url, ocr_type='GeneralBasicOCR
         else:
             payload['ImageBase64'] = base64.b64encode(image_data)
 
-    headers = get_tencent_signature(service, host, params=payload, action=ocr_type,
+    headers = get_tencent_signature('ocr', host, body=payload, action=ocr_type,
                                     secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
                                     version='2018-11-19')
 
@@ -1740,24 +2150,34 @@ async def tencent_ocr_recognise(image_data, image_url, ocr_type='GeneralBasicOCR
 
 
 # https://help.aliyun.com/zh/ocr/developer-reference/api-ocr-api-2021-07-07-dir/?spm=a2c4g.11186623.help-menu-252763.d_2_2_4.3aba47bauq0U2j
-async def ali_ocr_recognise(image_data, image_url, access_token, ocr_type='accurate_basic'):
+async def ali_ocr_recognise(image_data, image_url, ocr_type='Advanced'):
+    # accurate,general_basic,webimage
+    # RecognizeAllText
+    url = 'https://ocr-api.cn-hangzhou.aliyuncs.com'
+    token, _ = get_aliyun_access_token(service="ocr-api", region="cn-hangzhou", access_key_id=Config.ALIYUN_AK_ID,
+                                       access_key_secret=Config.ALIYUN_Secret_Key, version='2021-07-07')
     headers = {
         'Content-Type': "application/x-www-form-urlencoded",
         'charset': "utf-8"
     }
-    # accurate,general_basic,webimage
-    url = 'ocr-api.cn-hangzhou.aliyuncs.com'
     try:
         # 将图像数据编码为base64
         # image_b64 = base64.b64encode(image_data).decode().replace("\r", "")
         params = {
-            "access_token": access_token,
+            "access_token": token,
             "language_type": 'CHN_ENG',
+
+            'Type': ocr_type,  # Advanced,HandWriting,General,Table,GeneralStructure
+            'PageNo': 1,
+            'OutputRow': False,
+            'OutputParagraph': False,
+            'OutputKVExcel': False,
+            'OutputTableHtml': False,
         }
         if image_data:
-            params["image"] = base64.b64encode(image_data)  # quote(image_b64.encode("utf8"))
+            params["body"] = base64.b64encode(image_data)  # quote(image_b64.encode("utf8"))
         if url:
-            params["url"] = image_url
+            params["Url"] = image_url
 
         # if template_sign:
         #     params["templateSign"] = template_sign
@@ -1768,7 +2188,7 @@ async def ali_ocr_recognise(image_data, image_url, access_token, ocr_type='accur
         # # 请求分类器的bodys
         # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
         # request_body = "&".join(f"{key}={value}" for key, value in params.items())
-        response = requests.post(url, data=params, headers=headers)
+        response = requests.post(url, data=params, headers=headers, timeout=Config.HTTP_TIMEOUT_SEC)
         response.raise_for_status()
 
         return response.json()
@@ -1813,8 +2233,9 @@ async def ali_speech_to_text(audio_data, format='pcm'):
     }
     signature = generate_hmac_signature(Config.ALIYUN_Secret_Key, "POST", params)
     params["signature"] = signature
-    token, _ = get_aliyun_access_token(service="nls-meta", region="cn-shanghai", access_key_id=Config.ALIYUN_AK_ID,
-                                       access_key_secret=Config.ALIYUN_Secret_Key)
+    token, _ = get_aliyun_access_token(service="nls-meta", region="cn-shanghai", action='CreateToken',
+                                       http_method="GET",
+                                       access_key_id=Config.ALIYUN_AK_ID, access_key_secret=Config.ALIYUN_Secret_Key)
     if not token:
         print("No permission!")
 
@@ -1830,7 +2251,7 @@ async def ali_speech_to_text(audio_data, format='pcm'):
     # http://nls-meta.cn-shanghai.aliyuncs.com/
     # "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
     url = "https://nls-gateway.cn-shanghai.aliyuncs.com/stream/v1/asr"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, headers=headers, params=params, data=audio_data.getvalue())
 
     result = response.json()
@@ -1860,7 +2281,7 @@ async def baidu_speech_to_text(audio_data, format='pcm', dev_pid=1536):  #: io.B
     url = f"{url}?dev_pid={dev_pid}&cuid={Config.DEVICE_ID}&token={access_token}"
     headers = {'Content-Type': f'audio/{format}; rate=16000'}
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, headers=headers, data=audio_data.getvalue())
 
     result = response.json()
@@ -1897,7 +2318,7 @@ async def dashscope_speech_to_text_url(file_urls, model='paraformer-v1', languag
     transcription_texts = []
     for r in transcribe_response.output["results"]:
         if r["subtask_status"] == "SUCCEEDED":
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
                 response = await client.get(r["transcription_url"])
                 if response.status_code == 200:
                     transcription_data = response.json()
@@ -1932,11 +2353,142 @@ async def dashscope_text_to_speech(sentences, model="cosyvoice-v1", voice="longx
     # if result.get_audio_data() is not None:
 
 
-def dashscope_file_upload(messages, file_path='.pdf', api_key=''):
+# https://bailian.console.aliyun.com/?spm=5176.28197581.0.0.2e2d29a4n0Mukq#/model-market/detail/wanx-v1?tabKey=sdk
+def dashscope_image_call(prompt: str, negative_prompt: str = '', image_url: str = '', style_name="默认",
+                         model_name="wanx-v1", data_folder=None):
+    style_mapping = {
+        "默认": "<auto>",
+        "摄影": "<photography>",
+        "人像写真": "<portrait>",
+        "3D卡通": "<3d cartoon>",
+        "动画": "<anime>",
+        "油画": "<oil painting>",
+        "水彩": "<watercolor>",
+        "素描": "<sketch>",
+        "中国画": "<chinese painting>",
+        "扁平插画": "<flat illustration>"
+    }
+    style = style_mapping.get(style_name, "<auto>")
+    rsp = dashscope.ImageSynthesis.call(model=model_name,  # "stable-diffusion-3.5-large"
+                                        api_key=Config.Bailian_Service_Key,
+                                        prompt=prompt, negative_prompt=negative_prompt, ref_img=image_url,
+                                        n=1, size='1024*1024', style=style)
+
+    # ref_strength：控制输出图像与参考图（垫图）的相似度。取值范围为[0.0, 1.0]。取值越大，代表生成的图像与参考图越相似。
+    # ref_mode：基于参考图（垫图）生成图像的方式。取值有：repaint代表参考内容，为默认值；refonly代表参考风格。
+    if rsp.status_code == HTTPStatus.OK:
+        print(rsp)
+        # 保存图片到当前文件夹
+        image_urls = [result.url for result in rsp.output.results]
+        if data_folder:
+            image_path = []
+            for result in rsp.output.results:
+                file_name = PurePosixPath(unquote(urlparse(result.url).path)).parts[-1]
+                file_path = f'{data_folder}/%s' % file_name
+                with open(file_path, 'wb+') as f:
+                    f.write(requests.get(result.url).content)
+                image_path.append(file_path)
+
+            return image_path, {"urls": image_urls, 'id': rsp.request_id}
+        return requests.get(image_urls[0]).content, {"urls": image_urls, 'id': rsp.request_id}
+    return None, {"error": 'Failed, status_code: %s, code: %s, message: %s' % (rsp.status_code, rsp.code, rsp.message)}
+
+
+# https://help.aliyun.com/zh/model-studio/user-guide/cosplay-anime-character-generation?spm=0.0.0.i1
+# https://help.aliyun.com/zh/model-studio/developer-reference/portrait-style-redraw-api-reference?spm=a2c4g.11186623.help-menu-2400256.d_3_3_2_1.3e2f56e5BtF0ok
+async def wanx_image_generation(image_urls, style_name="复古漫画",
+                                api_key=Config.DashScope_Service_Key, max_retries=20):
+    # JPEG，PNG，JPG，BMP，WEB,不超过10M,不小于256*256，不超过5760*3240, 长宽比不超过2:1
+    style_mapping = {
+        "参考上传图像风格": -1,
+        "复古漫画": 0,
+        "3D童话": 1,
+        "二次元": 2,
+        "小清新": 3,
+        "未来科技": 4,
+        "国画古风": 5,
+        "将军百战": 6,
+        "炫彩卡通": 7,
+        "清雅国风": 8,
+        "喜迎新年": 9
+    }
+    if style_name == 'Cosplay动漫人物':
+        model_name = "wanx-style-cosplay-v1"
+        input_params = {
+            "model_index": 1,
+            "face_image_url": image_urls[0],
+            "template_image_url": image_urls[1],
+        }
+    elif len(image_urls) > 1:
+        model_name = "wanx-style-repaint-v1"
+        input_params = {
+            "style_index": -1,
+            "image_url": image_urls[0],
+            'style_ref_url': image_urls[1]
+        }
+    else:  # '人像风格重绘'
+        model_name = "wanx-style-repaint-v1"
+        input_params = {
+            "style_index": style_mapping.get(style_name, 0),
+            "image_url": image_urls[0],
+        }
+
+    url = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/image-generation/generation'
+    headers = {
+        'Content-Type': 'application/json',
+        "Authorization": f'Bearer {api_key}',
+        'X-DashScope-Async': 'enable'  # 使用异步方式提交作业
+    }
+    task_headers = {"Authorization": f'Bearer {api_key}'}
+    body = {
+        "model": model_name,
+        "input": input_params,
+        # "parameters": {
+        #     "style": "<auto>",
+        #     "size": "1024*1024",
+        #     "n": 1
+        # }
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        data = response.json()
+        task_id = data["output"]["task_id"]
+        task_status = data["output"]["task_status"]
+        retries = 0
+        # 轮询任务进度
+        await asyncio.sleep(3)
+        while task_id is not None and retries < max_retries:
+            task_url = f'https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}'
+            task_response = await cx.get(task_url, headers=task_headers)
+            resp = task_response.json()
+            task_status = resp["output"]["task_status"]
+            # "task_status":"PENDING""RUNNING","SUCCEEDED"->"results", "FAILED"->"message"
+            if task_status == 'SUCCEEDED':
+                urls = [item['url'] for item in resp['output'].get('results', []) if 'url' in item]
+                result = {"urls": urls or [resp['output'].get('result_url')], 'id': task_id}
+                if urls:
+                    image_response = await cx.get(urls[0])
+                    return image_response.content, result
+
+                return None, result
+
+            if task_status == "FAILED":
+                print(resp['output']['message'])
+                break
+
+            await asyncio.sleep(3)
+            retries += 1
+
+        return None, {"urls": [], 'id': task_id, 'status': task_status,
+                      'error': "Task did not succeed within the maximum retry limit."}
+
+
+def dashscope_file_upload(messages, file_path='.pdf', api_key=Config.DashScope_Service_Key):
     url = 'https://dashscope.aliyuncs.com/compatible-mode/v1/files'
     headers = {
         'Content-Type': 'application/json',
-        "Authorization": f'Bearer {api_key or Config.DashScope_Service_Key}',
+        "Authorization": f'Bearer {api_key}',
     }
 
     try:
@@ -1944,7 +2496,7 @@ def dashscope_file_upload(messages, file_path='.pdf', api_key=''):
             'file': open(file_path, 'rb'),
             'purpose': (None, 'file-extract'),
         }
-        file_response = requests.post(url, headers=headers, files=files)
+        file_response = requests.post(url, headers=headers, files=files, timeout=Config.HTTP_TIMEOUT_SEC)
         file_response.raise_for_status()
         file_object = file_response.json()
         file_id = file_object.get('id', 'unknown_id')  # 从响应中获取文件ID
@@ -1996,8 +2548,9 @@ def upload_file_to_oss(bucket, file_obj, object_name, expires: int = 604800):
     else:  # 使用加速域名
         url = f"{Config.ALIYUN_Bucket_Domain}/{object_name}"
         # bucket.bucket_name
-
-    # bucket.get_object(object_name)
+    # 获取文件对象
+    # result = bucket.get_object(object_name)
+    # result.read()获取文件的二进制内容,result.headers元数据（头部信息）
     return url
 
 
@@ -2029,38 +2582,119 @@ def list_files(bucket, prefix='upload/', max_keys=100, max_pages=1):
     return file_list
 
 
-async def download_file(url: str, dest_folder: Path = None) -> Path:
-    """下载URL中的文件到目标文件夹"""
-    try:
-        async with httpx.AsyncClient() as client:
-            # requests.get(url, stream=True, timeout=10)
-            response = await client.get(url, stream=True, timeout=10)
-            # filename = url.split("/")[-1]  # 提取文件名
-            file_name = unquote(url.split("/")[-1].split("?")[0])
-            # print(file_name)
-            if response.status_code == 200:
-                if dest_folder:
-                    # 提取文件名
-                    save_path = dest_folder / file_name
+async def download_by_aiohttp(url: str, save_path, chunk_size=4096, in_decode=False):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            # response = await asyncio.wait_for(session.get(url), timeout=timeout)
+            if response.status == 200:
+                if save_path:
                     save_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(save_path, 'wb') as f:
+                        # response.content 异步迭代器（流式读取）,iter_chunked 非阻塞调用，逐块读取
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            if isinstance(chunk, (bytes, bytearray)):
+                                f.write(chunk)
+                            elif isinstance(chunk, str):
+                                f.write(chunk.encode('utf-8'))  # 将字符串转为字节
+                            else:
+                                raise TypeError(
+                                    f"Unexpected chunk type: {type(chunk)}. Expected bytes or bytearray.")
 
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):  # iter_content
-                            f.write(chunk)
+                    return save_path
 
-                    return save_path, file_name
-                else:
-                    file_data = b""
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        file_data += chunk
+                content = await response.read()  # 单次异步读取完整内容，小文件,await response.content.read(chunk_size)
+                return content.decode('utf-8') if in_decode else content  # 将字节转为字符串,解码后的字符串 await response.text()
 
-                    return file_data, file_name
-            else:
-                print(f"Failed to download file: {response.status_code},{file_name}")
-                return None, file_name
-    except Exception as e:
-        print(f"Error downloading file: {e}")
-        return None, None
+            print(f"Failed to download {url}: {response.status}")
+
+    return None
+
+
+async def download_by_httpx(url: str, save_path, chunk_size=4096, in_decode=False):
+    async with httpx.AsyncClient() as client:
+        async with client.stream("GET", url) as response:  # 长时间的流式请求
+            # response = await client.get(url, stream=True)
+            response.raise_for_status()  # 如果响应不是2xx  response.status_code == 200:
+            if save_path:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(save_path, "wb") as f:
+                    # response.aiter_bytes() 异步迭代器
+                    async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                        f.write(chunk)
+
+                return save_path
+
+            content = bytearray()  # 使用 `bytearray` 更高效地拼接二进制内容  b""  # raw bytes
+            async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                content.extend(chunk)
+                # content += chunk
+                # yield chunk
+
+            return content.decode(response.encoding or 'utf-8') if in_decode else bytes(content)
+            # return response.text if in_decode else response.content
+
+
+def download_by_requests(url: str, save_path, chunk_size=4096, in_decode=False):
+    '''
+    同步下载的流式方法
+    如果目标是保存到文件，直接使用 content（无需解码）。（如图片、音频、视频、PDF 等）
+    如果目标是处理和解析文本数据，且确定编码正确，使用 text。（如 HTML、JSON）
+    '''
+    with requests.get(url, stream=True, timeout=Config.HTTP_TIMEOUT_SEC) as response:
+        response.raise_for_status()  # 确保请求成功
+        if save_path:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(save_path, "wb") as f:
+                # requests iter_content 同步使用,阻塞调用
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:  # <class 'bytes'>
+                        f.write(chunk)
+
+            return save_path
+
+        return response.text if in_decode else response.content  # 直接获取文本,同步直接返回全部内容
+
+
+async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
+                        in_decode=False, in_session=False, retries=3, delay=3):
+    """
+    下载URL中的文件到目标文件夹
+    :param url: 下载链接
+    :param dest_folder: 保存文件的路径
+    :param chunk_size: 每次读取的字节大小（默认4096字节）
+    :param in_decode: 是否解码为字符串
+    :param in_session: 是否使用 session（长连接优化）
+    :param retries: 下载失败后的重试次数
+    :param delay: 重试之间的等待时间（秒）
+    """
+    # filename = url.split("/")[-1]  # 提取文件名
+    file_name = unquote(url.split("/")[-1].split("?")[0])
+    save_path = None
+    # print(file_name)
+    if dest_folder:
+        save_path = dest_folder / file_name  # 提取文件名
+
+    attempt = 0
+    while attempt < retries:
+        try:
+            if in_session:  # aiohttp长连接优化，适合发送多个请求或需要更好的连接复用,维护多个请求之间的连接
+                return await download_by_aiohttp(url, save_path, chunk_size, in_decode), file_name
+            else:  # httpx少量请求场景,适合简单的、单个请求场景
+                return await download_by_httpx(url, save_path, chunk_size, in_decode), file_name
+
+        except (httpx.RequestError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"Download attempt {attempt + 1} failed: {e}")
+            attempt += 1
+            await asyncio.sleep(delay)  # 等待重试
+        except httpx.HTTPStatusError as exc:
+            print(f"Failed to download {url},HTTP error occurred: {exc.response.status_code} - {exc.response.text}")
+        except TypeError:
+            return download_by_requests(url, save_path, chunk_size, in_decode), file_name
+        except Exception as e:
+            print(f"Error: {e}, downloading url: {url} file: {file_name}")
+            break
+
+    return None, None
 
 
 def find_similar_paragraphs(node, target_embedding, top_n=3):
@@ -2177,10 +2811,10 @@ def send_to_wechat(user_name: str, context: str = None, link: str = None, object
     url = f"{Config.WECHAT_URL}/sendToChat"
     headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
     body = {'user': user_name, 'context': context, 'url': link,
-            'object_name': object_name, 'file_type': get_file_type(object_name)}
+            'object_name': object_name, 'file_type': get_file_type_wx(object_name)}
 
     try:
-        with httpx.Client(timeout=(10, 60)) as client:
+        with httpx.Client(timeout=(10, Config.HTTP_TIMEOUT_SEC)) as client:
             response = client.post(url, json=body, headers=headers)
             response.raise_for_status()
         return response.json()

@@ -92,6 +92,10 @@ class FuzzyMatchRequest(BaseModel):
     cutoff: float = 0.6
     method: str = 'levenshtein'
 
+class PlatformEnum(str, PyEnum):
+    baidu = "baidu"
+    ali = "ali"
+    dashscope = "dashscope"
 
 class ToolRequest(BaseModel):
     messages: Optional[List[Message]] = Field(None)
@@ -125,11 +129,22 @@ class ToolRequest(BaseModel):
             }
         }
 
+class AssistantToolsEnum(str, PyEnum):
+    code = "code_interpreter"
+    web = "web_search"
+    function = "function_calling"
 
-class PlatformEnum(str, PyEnum):
-    baidu = "baidu"
-    ali = "ali"
-    dashscope = "dashscope"
+
+class AssistantRequest(BaseModel):
+    question: str
+    prompt: str = "You are a personal math tutor. Write and run code to answer math questions."
+    user_name: str = 'test'
+    tools_type: AssistantToolsEnum = AssistantToolsEnum.code
+    model_id: int = 4
+
+    class Config:
+        protected_namespaces = ()
+
 
 
 class CompletionParams(BaseModel):
@@ -145,7 +160,7 @@ class CompletionParams(BaseModel):
                                  description="System content identifier. This index represents different scenarios or contexts for AI responses, allowing the selection of different system content.")
     suffix: Optional[str] = Field(None, description="The suffix for the AI to respond to completion. ")
     extract: Optional[str] = Field(None,
-                                   description="The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
+                                   description="Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
 
     model_name: str = Field("moonshot",
                             description=("Specify the name of the model to be used. It can be any available model, "
@@ -318,6 +333,7 @@ class OpenAIRequest(CompletionParams):
                 # "top_n": 10,
             }
         }
+
 
 
 class ClassifyRequest(BaseModel):

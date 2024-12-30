@@ -1,5 +1,6 @@
 import re, json, io, os
 import inspect
+from pathlib import Path
 from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
@@ -324,6 +325,14 @@ def format_for_wechat(text):
     return formatted_text.strip()
 
 
+def format_for_html(text):
+    try:
+        import markdown
+        return markdown.markdown(text)
+    except:
+        return remove_markdown(text)
+
+
 def extract_string(text, extract, **kwargs):
     if not extract:
         return None
@@ -335,6 +344,7 @@ def extract_string(text, extract, **kwargs):
         "bold": extract_bold,
         "italic": extract_italic,
         "wechat": format_for_wechat,
+        "html": format_for_html
     }
     try:
         if extract in funcs:
@@ -527,7 +537,46 @@ def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int
     return small_chunks, large_chunks
 
 
+# 支持的扩展名
+def get_local_suffix(folder_path, supported_suffix=None, recursive=False):
+    supported_extensions = (ext.lower() for ext in supported_suffix or [".jpg", ".jpeg", ".png", ".bmp"])
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        raise ValueError(f"The path '{folder_path}' is not a valid directory.")
+    pattern = "**/*" if recursive else "*"
+    return [str(f_path) for f_path in folder.glob(pattern) if f_path.suffix.lower() in supported_extensions]
+
+
 def get_file_type(object_name: str) -> str:
+    """
+    根据文件名或路径判断文件类型。
+
+    :param object_name: 文件名或路径
+    :return: 文件类型（如 'image', 'audio', 'video', 'text', 'compressed', '*'）
+    """
+    if not object_name:
+        return ""
+
+    _, file_extension = os.path.splitext(object_name.lower())
+
+    # 定义文件类型分类
+    file_types = {
+        "image": [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".tiff", ".heic", ".heif"],
+        "audio": [".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"],
+        "video": [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".3gp"],
+        "text": [".txt", ".csv", ".md", ".html", ".json", ".xml"],
+        "document": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".numbers"],
+        "compressed": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2"],
+        "code": [".py", ".java", ".c", ".cpp", ".js", ".ts", ".html", ".css", ".sql"]
+    }
+
+    for file_type, extensions in file_types.items():
+        if file_extension in extensions:
+            return file_type
+
+    return "*"
+
+def get_file_type_wx(object_name: str) -> str:
     if not object_name:  # object_name.endswith()
         return ""
     '''

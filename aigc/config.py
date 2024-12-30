@@ -29,6 +29,7 @@ class Config(object):
     WECHAT_URL = 'http://*robot:*'
     QDRANT_URL = "http://47.***:6333"
 
+
     BAIDU_API_Key = '***'
     BAIDU_Secret_Key = '***'
     # https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application/v1
@@ -58,15 +59,20 @@ class Config(object):
     AMAP_API_Key = '***'
 
     DashScope_Service_Key = '***' 
+    Bailian_Service_Key = '***'
     DashVectore_Service_Key = '***'
     ALIYUN_AK_ID = '***'
     ALIYUN_Secret_Key = '***'
     ALIYUN_nls_AppId = '***'
 
+
     ALIYUN_oss_AK_ID = '***'
     ALIYUN_oss_Secret_Key = '***'
-    ALIYUN_Bucket_Name = '***'  # 存储桶名称*
-    ALIYUN_Bucket_Domain = "***"  # 加速域名**
+    ALIYUN_oss_region = "oss-cn-hangzhou"
+    ALIYUN_oss_internal = False  # 是否使用内网地址
+    ALIYUN_oss_endpoint = f'https://{ALIYUN_oss_region}.aliyuncs.com' 
+    ALIYUN_Bucket_Name = '***'  # 存储桶名称
+    ALIYUN_Bucket_Domain = f"https://{ALIYUN_Bucket_Name}.{ALIYUN_oss_region}{'-internal' if ALIYUN_oss_internal else ''}.aliyuncs.com"  # 加速域名"https://{ALIYUN_Bucket_Name}.oss-accelerate.aliyuncs.com"
     # https://console.cloud.tencent.com/hunyuan/api-key
     TENCENT_SecretId = '***'
     TENCENT_Secret_Key = '***'
@@ -85,22 +91,26 @@ class Config(object):
     GLM_Service_Key = "***"
     # https://platform.baichuan-ai.com/console/apikey
     Baichuan_Service_Key = '***'
-    HF_Service_Key = '***'
     # https://ai.youdao.com/console/#/
     YOUDAO_AppID = '***'
     YOUDAO_Service_Key = '***'
     CaiYun_Token = "***"
     HF_Service_Key = '***'
-
-    VOLCE_AK_ID = '***' 
-    VOLCE_Secret_Key = '***' 
+    # https://console.volcengine.com/iam/keymanage
+    VOLC_AK_ID = '***'
+    VOLC_Secret_Key = '***'
+    VOLC_AK_ID_admin = '***'  
+    VOLC_Secret_Key_admin = '***'
     ARK_Service_Key = '***'
+    # https://studio.d-id.com/
+    DID_Service_Key = '***'
 
     Weather_Service_Key = '***'
 
-    SOCKS_Proxies = {
-        'http': 'socks5://your_socks_proxy_address:port',
-        'https': 'socks5://u:p@proxy_address:port', }
+    HTTP_Proxies = {
+        'http': 'http://u:p@proxy_address:port', 
+        'https': 'http://u:p@proxy_address:port', 
+    }
 
 
 # 模型编码:0默认，1小，-1最大
@@ -168,8 +178,12 @@ AI_Models = [
     # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
     {'name': 'doubao', 'type': 'default', 'api_key': '',
      "model": ['ep-20240919160005-chzhb', 'ep-20240919160119-7rbsn', 'ep-20240919160005-chzhb',
-               'ep-20240919161410-7k5d8', 'ep-20241017105930-drfm8', 'ep-20241017110248-fr7z6'],
-     # ["doubao-pro-32k", "doubao-lite-4k", "doubao-lite-32k", "doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k","GLM3-130B",chatglm3-130-fin],
+               'ep-20240919161410-7k5d8', 'ep-20241017105930-drfm8', 'ep-20241017110248-fr7z6',
+               'ep-20241018103141-fwpjd', "ep-20241219174540-rdlfj"],
+     # ["doubao-pro-32k", "doubao-lite-4k", "doubao-lite-32k", "doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k",
+     # "GLM3-130B",chatglm3-130-fin,functioncall-preview,Doubao-vision-lite-32k],
+     'embedding': ['ep-20241219165520-lpqrl', 'ep-20241219165636-kttk2'],
+     # ['Doubao-embedding', 'Doubao-embedding-large']
      'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
      'base_url': "https://ark.cn-beijing.volces.com/api/v3"},  # open.volcengineapi.com
     # https://cloud.tencent.com/document/product/1729
@@ -186,8 +200,8 @@ AI_Models = [
                "Qwen/Qwen2.5-Coder-7B-Instruct",
                "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "Pro/THUDM/glm-4-9b-chat",
                "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/DeepSeek-Coder-V2-Instruct",
-               "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "Pro/OpenGVLab/InternVL2-8B",
-               "01-ai/Yi-1.5-9B-Chat-16K", 'TeleAI/TeleChat2',
+               "deepseek-ai/deepseek-vl2", "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat",
+               "Pro/OpenGVLab/InternVL2-8B", "01-ai/Yi-1.5-9B-Chat-16K", 'TeleAI/TeleChat2',
                "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
      'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1'],
      'generation': ['Qwen/Qwen2.5-Coder-7B-Instruct', "deepseek-ai/DeepSeek-V2.5",
@@ -248,14 +262,23 @@ def md5_sign(content: str) -> str:
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 
+# sha256 非对称加密
 def hmac_sha256(key: bytes, content: str):
     """生成 HMAC-SHA256 签名"""
-    return hmac.new(key, content.encode("utf-8"), hashlib.sha256).digest()  # hexdigest()
+    return hmac.new(key, content.encode("utf-8"), digestmod=hashlib.sha256).digest()
 
 
 # sha256 hash
 def hash_sha256(content: str):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# calculate sha256 and encode to base64
+def sha256base64(data):
+    sha256 = hashlib.sha256()
+    sha256.update(data)
+    digest = base64.b64encode(sha256.digest()).decode(encoding='utf-8')
+    return digest
 
 
 def generate_hash_key(*args, **kwargs):
@@ -281,6 +304,19 @@ def generate_hash_key(*args, **kwargs):
     return hashlib.md5(joined_key.encode()).hexdigest()
 
 
+def construct_sorted_query(params: dict):
+    sort_query_string = []
+    for key in sorted(params.keys()):
+        if isinstance(params[key], list):
+            for k in params[key]:
+                sort_query_string.append(quote(key, safe="-_.~") + "=" + quote(k, safe="-_.~"))
+        else:
+            sort_query_string.append(quote(key, safe="-_.~") + "=" + quote(params[key], safe="-_.~"))
+
+    query = "&".join(sort_query_string)  # query[:-1]
+    return query.replace("+", "%20").replace('*', '%2A').replace('%7E', '~')  # .encode("utf-8")
+
+
 # 获取百度的访问令牌
 def get_baidu_access_token(secret_id=Config.BAIDU_qianfan_API_Key, secret_key=Config.BAIDU_qianfan_Secret_Key):
     # payload = json.dumps("")
@@ -301,47 +337,59 @@ def get_baidu_access_token(secret_id=Config.BAIDU_qianfan_API_Key, secret_key=Co
 
 
 # 使用 HMAC 进行数据签名 https://ram.console.aliyun.com/users
-# 阿里云服务交互时的身份验证: Base64( HMAC-SHA1(stringToSign, accessKeySecret + "&") );
-def get_aliyun_access_token(service="nls-meta", region: str = "cn-shanghai",
+# 阿里云服务交互时的身份验证
+# https://help.aliyun.com/zh/ocr/developer-reference/signature-method?spm=a2c4g.11186623.help-menu-252763.d_3_2_3.42df53e75y9ZST
+# https://help.aliyun.com/zh/viapi/developer-reference/request-a-signature?spm=a2c4g.11186623.help-menu-142958.d_4_4.525e16d1nt551a
+def get_aliyun_access_token(service: str = "nls-meta", region: str = "cn-shanghai",
+                            action: str = 'CreateToken', http_method="GET", body=None, version: str = '2019-02-28',
                             access_key_id=Config.ALIYUN_AK_ID, access_key_secret=Config.ALIYUN_Secret_Key):
+    # 公共请求参数
     parameters = {
         'AccessKeyId': access_key_id,
-        'Action': 'CreateToken',
-        'Format': 'JSON',
+        'Action': action,
+        'Format': 'JSON',  # 返回消息的格式
         'RegionId': region,
         'SignatureMethod': 'HMAC-SHA1',
         'SignatureNonce': str(uuid.uuid1()),
         'SignatureVersion': '1.0',
         'Timestamp': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        'Version': '2019-02-28'  # "2020-06-29"
+        'Version': version  # '2019-02-28',"2020-06-29"
     }
+    if body:
+        parameters.update(body)
 
     def encode_text(text):
+        # 特殊URL编码,加号+替换为%20,星号*替换为%2A,波浪号~替换为%7E
         return quote_plus(text).replace('+', '%20').replace('*', '%2A').replace('%7E', '~')
 
     def encode_dict(dic):
+        # urlencode 会将字典转为查询字符串
         dic_sorted = sorted(dic.items())
         return urlencode(dic_sorted).replace('+', '%20').replace('*', '%2A').replace('%7E', '~')
 
-    query_string = encode_dict(parameters)
-    string_to_sign = f"GET&{encode_text('/')}&{encode_text(query_string)}"
-
+    # "https://%s/?%s" % (endpoint, '&'.join('%s=%s' % (k, v) for k, v in parameters.items()))
+    query_string = encode_dict(parameters)  # construct_sorted_query
+    # HTTPMethod + “&” + UrlEncode(“/”) + ”&” + UrlEncode(sortedQueryString)
+    string_to_sign = f"{http_method.upper()}&{encode_text('/')}&{encode_text(query_string)}"
+    # 签名采用HmacSHA1算法+Base64
     secreted_string = hmac.new(bytes(f"{access_key_secret}&", 'utf-8'),
                                bytes(string_to_sign, 'utf-8'),
                                hashlib.sha1).digest()
+
     signature = base64.b64encode(secreted_string).decode()
-    signature = encode_text(signature)
+    signature = encode_text(signature)  # Base64( HMAC-SHA1(stringToSign, accessKeySecret + "&"));
 
     full_url = f"http://{service}.{region}.aliyuncs.com/?Signature={signature}&{query_string}"
-    response = requests.get(full_url)
-    response.raise_for_status()
+    if action == 'CreateToken':
+        response = requests.get(full_url)
+        response.raise_for_status()
 
-    if response.ok:
-        token_info = response.json().get('Token', {})
-        return token_info.get('Id'), token_info.get('ExpireTime')
+        if response.ok:
+            token_info = response.json().get('Token', {})
+            return token_info.get('Id'), token_info.get('ExpireTime')  # token, expire_time
+        print(response.text)
 
-    print(response.text)
-    return None, None  # token, expire_time
+    return parameters, full_url
 
 
 def get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
@@ -355,8 +403,8 @@ def get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secr
     signature_origin = f"host: {host}\ndate: {date}\n{method} {path} HTTP/1.1"
 
     # Step 3: 生成签名
-    signature_sha = hmac.new(api_secret.encode('utf-8'), signature_origin.encode('utf-8'),
-                             digestmod=hashlib.sha256).digest()
+    signature_sha = hmac_sha256(api_secret.encode('utf-8'), signature_origin)
+
     signature = base64.b64encode(signature_sha).decode('utf-8')
 
     # Step 5: 生成 authorization_origin
@@ -374,8 +422,8 @@ def get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secr
         "date": date,  # 生成的date
         "host": host  # 请求的主机名
     }
-    return headers
-    # return f"https://{host}{path}?" + urlencode(headers)  #  https:// .wss:// requset_url + "?" +
+    url = f"https://{host}{path}?" + urlencode(headers)  # https:// .wss:// requset_url + "?" +
+    return headers, url
 
 
 def get_xfyun_signature(appid, api_secret, timestamp):
@@ -392,66 +440,77 @@ def get_xfyun_signature(appid, api_secret, timestamp):
 
 
 # 火山引擎生成签名
-def get_ark_signature(action: str, service: str, host: str, region: str = "cn-north-1", version: str = "2018-01-01",
-                      access_key_id: str = Config.VOLCE_AK_ID, secret_access_key: str = Config.VOLCE_Secret_Key,
+# https://www.volcengine.com/docs/6793/127781
+# https://www.volcengine.com/docs/6369/67269
+# https://www.volcengine.com/docs/6369/67270
+# https://github.com/volcengine/volc-openapi-demos/blob/main/signature/python/sign.py
+def get_ark_signature(action: str, service: str, host: str = None, region: str = "cn-north-1",
+                      version: str = "2018-01-01", http_method="GET", body=None,
+                      access_key_id: str = Config.VOLC_AK_ID, secret_access_key: str = Config.VOLC_Secret_Key,
                       timenow=None):
     if not host:
         host = f"{service}.volcengineapi.com"  # 'open.volcengineapi.com'
     if not timenow:
-        timenow = datetime.datetime.utcnow()
-    date = timenow.strftime('%Y%m%dT%H%M%SZ')
-    date_short = date[:8]
+        timenow = datetime.utcnow()
+    date = timenow.strftime('%Y%m%dT%H%M%SZ')  # YYYYMMDD'T'HHMMSS'Z'
+    date_short = date[:8]  # Date 精确到日, YYYYMMDD
 
     # 构建Canonical Request
-    http_method = "GET"
-    canonical_uri = "/"
-    canonical_querystring = f"Action={action}&Version={version}"
-    canonical_headers = f"host:{host}\nx-date:{date}\n"
-    signed_headers = "host;x-date"
-    payload_hash = hashlib.sha256("".encode('utf-8')).hexdigest()  # 空请求体的哈希
-
-    canonical_request = f"{http_method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-
+    canonical_uri = "/"  # 如果 URI 为空，那么使用"/"作为绝对路径
+    canonical_querystring = f"Action={action}&Version={version}"  # construct_sorted_query
+    # "X-Expires"
+    canonical_headers = f"host:{host}\nx-date:{date}\n"  # 将需要参与签名的header的key全部转成小写， 然后以ASCII排序后以key-value的方式组合后换行构建,注意需要在结尾增加一个回车换行\n。
+    signed_headers = "host;x-date"  # host、x-date如果存在header中则必选参与 content-type;host;x-content-sha256;x-date
+    # HexEncode(Hash(RequestPayload))
+    payload_hash = hash_sha256("" if body is None else json.dumps(body))  # GET空请求体的哈希
+    canonical_request = "\n".join([http_method.upper(), canonical_uri, canonical_querystring,
+                                   canonical_headers, signed_headers, payload_hash])
+    # print(canonical_request)
     # 构建String to Sign
     algorithm = "HMAC-SHA256"
-    credential_scope = f"{date_short}/{region}/{service}/request"
-    canonical_request_hash = hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
-    string_to_sign = f"{algorithm}\n{date}\n{credential_scope}\n{canonical_request_hash}"
+    credential_scope = "/".join([date_short, region, service, 'request'])  # ${YYYYMMDD}/${region}/${service}/request
+    canonical_request_hash = hash_sha256(canonical_request)
+    string_to_sign = "\n".join([algorithm, date, credential_scope, canonical_request_hash])
+
+    # print(string_to_sign)
 
     # 计算签名
-    def get_signing_key(secret_key, date, region, service):
-        k_date = hmac_sha256(f"VOLC{secret_key}".encode('utf-8'), date)
+    def get_signing_key(secret_key, date_short, region, service):
+        k_date = hmac_sha256(secret_key.encode('utf-8'), date_short)  # VOLC
         k_region = hmac_sha256(k_date, region)
         k_service = hmac_sha256(k_region, service)
         k_signing = hmac_sha256(k_service, "request")
         return k_signing
 
     signing_key = get_signing_key(secret_access_key, date_short, region, service)
-    signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    # HexEncode(HMAC(Signingkey, StringToSign)) hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    signature = hmac_sha256(signing_key, string_to_sign).hex()
 
-    #  构建Authorization头
+    # 构建Authorization头: HMAC-SHA256 Credential={AccessKeyId}/{CredentialScope}, SignedHeaders={SignedHeaders}, Signature={Signature}
     authorization_header = f"{algorithm} Credential={access_key_id}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
-
+    # 签名参数可以在query中，也可以在header中
     headers = {
         "Authorization": authorization_header,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json",  # application/x-www-form-urlencoded
         "Host": host,
         "X-Date": date
+        # 'X-Security-Token'
     }
+    # Action和Version必须放在query当中
     url = f"https://{host}/?{canonical_querystring}"
 
     return headers, url
 
 
-def get_tencent_signature(service, host=None, params=None, action='ChatCompletions',
-                          secret_id: str = Config.TENCENT_SecretId,
-                          secret_key: str = Config.TENCENT_Secret_Key, timestamp: int = None, version='2023-09-01'):
+def get_tencent_signature(service, host=None, body=None, action='ChatCompletions',
+                          secret_id: str = Config.TENCENT_SecretId, secret_key: str = Config.TENCENT_Secret_Key,
+                          timestamp: int = None, region: str = "ap-shanghai", version='2023-09-01'):
     if not host:
         host = f"{service}.tencentcloudapi.com"
     if not timestamp:
         timestamp = int(time.time())
         # 支持 POST 和 GET 方式
-    if not params:
+    if not body:
         http_request_method = "GET"  # GET 请求签名
         params = {
             'Action': action,  # 'DescribeInstances'
@@ -459,7 +518,7 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
             'Limit': 20,
             'Nonce': str(uuid.uuid1().int >> 64),  # 随机数,确保唯一性
             'Offset': 0,
-            'Region': 'ap-shanghai',
+            'Region': region,
             'SecretId': secret_id,
             'Timestamp': timestamp,
             'Version': version  # '2017-03-12'
@@ -472,28 +531,25 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
         # quote_plus(signature.decode('utf8')) if isinstance(signature, bytes)  base64.b64encode(signature)
         return params
 
-    algorithm = "TC3-HMAC-SHA256"
+    algorithm = "TC3-HMAC-SHA256"  # 使用签名方法 v3
     date = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
 
     # ************* 步骤 1：拼接规范请求串 *************
     http_request_method = "POST"
     canonical_uri = "/"
     canonical_querystring = ""
-    ct = "application/json; charset=utf-8"  # 使用签名方法 v3（TC3-HMAC-SHA256）
-    payload = json.dumps(params)
+    ct = "application/json; charset=utf-8"
     canonical_headers = f"content-type:{ct}\nhost:{host}\nx-tc-action:{action.lower()}\n"
     signed_headers = "content-type;host;x-tc-action"
-    hashed_request_payload = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    canonical_request = (http_request_method + "\n" +
-                         canonical_uri + "\n" +
-                         canonical_querystring + "\n" +
-                         canonical_headers + "\n" +
-                         signed_headers + "\n" +
-                         hashed_request_payload)
+
+    payload = json.dumps(body)
+    hashed_request_payload = hash_sha256(payload)
+    canonical_request = "\n".join([http_request_method, canonical_uri, canonical_querystring,
+                                   canonical_headers, signed_headers, hashed_request_payload])
 
     # ************* 步骤 2：拼接待签名字符串 *************
     credential_scope = f"{date}/{service}/tc3_request"
-    hashed_canonical_request = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+    hashed_canonical_request = hash_sha256(canonical_request)
     string_to_sign = (algorithm + "\n" +
                       str(timestamp) + "\n" +
                       credential_scope + "\n" +
@@ -521,7 +577,7 @@ def get_tencent_signature(service, host=None, params=None, action='ChatCompletio
         # 这里还需要添加一些认证相关的Header
         "X-TC-Timestamp": str(timestamp),
         "X-TC-Version": version,  # "<API版本号>"
-        "X-TC-Region": 'ap-shanghai'  # region,"<区域>",
+        "X-TC-Region": region  # region,"<区域>",
     }
     return headers
 

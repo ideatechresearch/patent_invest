@@ -104,3 +104,4 @@ oss2==2.19.1
 langdetect==1.0.9
 igraph==0.11.8
 requests-toolbelt==1.0.0
+Markdown==3.7

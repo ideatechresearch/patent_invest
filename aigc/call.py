@@ -269,13 +269,92 @@ async def authenticate_user():
     print(response.text, success_count, failure_count)
 
 
+import os
+from pathlib import Path
+
+API_URL = "http://127.0.0.1:7000/visual"
+
+
+def get_local_images(folder_path):
+    supported_extensions = [".jpg", ".jpeg", ".png", ".bmp"]  # 支持的图片扩展名
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        raise ValueError(f"The path '{folder_path}' is not a valid directory.")
+    return [str(img_path) for img_path in folder.glob("*") if img_path.suffix.lower() in supported_extensions]
+
+def get_filename_from_content_disposition(content_disposition):
+    """
+    从 Content-Disposition 提取文件名，支持中文和编码文件名
+    """
+    if content_disposition:
+        if "filename*=" in content_disposition:
+            # filename*=UTF-8''%E4%BE%8B%E5%AD%90.jpg
+            encoded_filename = content_disposition.split("filename*=")[-1].strip()
+            return unquote(encoded_filename.split("''")[-1])#decoded_filename
+        elif "filename=" in content_disposition:
+            # filename="example.jpg"
+            return content_disposition.split("filename=")[-1].strip().replace('"', "")
+    return None
+
+
+def process_and_save_images(local_images, prompt, style_name="角色特征保持", model_id=0,
+                            save_dir='data/processed_image', image_urls=[]):
+    # 确保保存目录存在
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    for idx, image_path in enumerate(local_images):
+        # if idx<4:
+        #     continue
+        try:
+            # 准备文件
+            image_name = Path(image_path).name
+            with open(image_path, "rb") as img_file:
+                image_name = Path(image_path).name
+                files = {"file": (image_name, img_file, "image/jpeg")}
+                data = {
+                    "image_urls": json.dumps(image_urls),
+                    "prompt": prompt,
+                    "style_name": style_name,
+                    "model_id": model_id,
+                    "return_url": False,
+                }
+
+                # 请求接口
+                # headers = {"Content-Type": multipart_data.content_type}
+                # response = requests.post(API_URL, files=files, data=data, stream=True)
+                with httpx.Client(timeout=60) as client:
+                    response = client.post(API_URL, files=files, data=data)
+
+                    if response.status_code == 200:
+                        content_disposition = response.headers.get("Content-Disposition", "")
+                        req_id = response.headers.get("X-Request-ID", "")
+                        file_name = get_filename_from_content_disposition(content_disposition) or image_name
+
+                        file_path = Path(save_dir) / file_name
+                        with open(file_path, "wb") as output_file:
+                            for chunk in response.iter_bytes():  # response.iter_content(chunk_size=1024):
+                                if chunk:
+                                    output_file.write(chunk)
+
+                        print(f"{idx},Saved processed image to: {file_path}, Request ID:{req_id}")
+                        if not req_id:
+                            print(f"{idx},Failed to process image {image_path}: {response.json()}")
+                    else:
+                        print(f"{idx},Failed to process image {image_path}: {response.status_code}, {response.text}")
+
+            # time.sleep(5)
+        except Exception as e:
+            print(f"Error processing {image_path}: {e}")
+
+# process_and_save_images(get_local_images(folder_path='E:\\Pictures\\员工照片'), prompt="去除水印,卡通头像",style_name="角色特征保持")
+
 # 如果你在异步环境中，例如 FastAPI 应用程序中
 # 否则你可以直接运行
 if __name__ == "__main__":
     # main()
     from config import *
 
-    #asyncio.run(send_authenticated())
+    # asyncio.run(send_authenticated())
     asyncio.run(authenticate_user())
     # loop = asyncio.get_event_loop()
     # loop.run_until_complete(connect_chat())

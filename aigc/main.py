@@ -64,8 +64,7 @@ qd_client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_gr
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.WARNING)
 
 dashscope.api_key = Config.DashScope_Service_Key
-oss_endpoint = 'https://oss-cn-hangzhou.aliyuncs.com'  # 'https://oss-cn-shanghai.aliyuncs.com'
-AliyunBucket = oss2.Bucket(oss2.Auth(Config.ALIYUN_oss_AK_ID, Config.ALIYUN_oss_Secret_Key), oss_endpoint,
+AliyunBucket = oss2.Bucket(oss2.Auth(Config.ALIYUN_oss_AK_ID, Config.ALIYUN_oss_Secret_Key), Config.ALIYUN_oss_endpoint,
                            Config.ALIYUN_Bucket_Name)
 # 加密配置,密码哈希上下文
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -340,7 +339,7 @@ async def user(request: Request, token: str = None, db: Session = Depends(get_db
 
 @app.get('/web_search/{text}')
 async def web_search(text: str, platform: str = 'default'):
-    if platform == 'wikipedia':
+    if platform == 'wiki':
         return wikipedia_search(text)
     return JSONResponse(await web_search_async(text))
 
@@ -359,7 +358,12 @@ async def embeddings(request: EmbeddingRequest):
         return {"embedding": embedding}
     if request.model_name == 'word_vec':
         pass
-    return {"embedding": await ai_embeddings(inputs, model_name=request.model_name, model_id=request.model_id)}
+
+    embedding = await ai_embeddings(inputs, model_name=request.model_name, model_id=request.model_id)
+    if embedding:
+        return {"embedding": embedding}
+
+    return {"embedding": get_hf_embeddings(inputs, model_name=request.model_name)}
 
 
 @app.post("/fuzzy")
@@ -523,6 +527,25 @@ async def text_tools(request: ToolRequest):
 
     # 解析响应并调用工具
     return JSONResponse(await ai_tools_messages(response))
+
+
+@app.post("/assistant/")
+async def assistant_run(request: AssistantRequest):
+    # Call the ai_assistant_run function with user input
+    result = await ai_assistant_run(
+        user_request=request.question,
+        instructions=request.prompt,
+        user_name=request.user_name,
+        tools_type=request.tools_type,
+        model_id=request.model_id,
+        max_retries=20,
+        interval=5
+    )
+
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    return result
 
 
 @app.post("/llm")  # response_model=OpenAIResponse
@@ -1171,6 +1194,56 @@ async def image_recognition(file: UploadFile = File(None), image_url: str = Form
     return result
 
 
+@app.post('/visual')
+async def generate_image(file: UploadFile = File(None), image_urls: List[str] = Form(None), prompt: str = Form(None),
+                         style_name: str = '角色特征保持', model_id: int = 0, return_url: bool = False):
+    try:
+        image_data = await file.read() if file else None  # 从内存字节b"uploading.."
+    except Exception as e:
+        return {"error": f"Failed to process the uploaded file:{e}"}
+
+    image_urls = [url.strip() for url in image_urls if url.strip()] if image_urls else []
+
+    if model_id == 0:
+        image_decode, result = await ark_visual_picture(image_data, image_urls, prompt=prompt,
+                                                        logo_info=None, style_name=style_name, return_url=return_url,
+                                                        data_folder=None)
+    elif model_id == 1:
+        image_decode, result = await ark_drawing_picture(image_data, image_urls, whitening=1.0,
+                                                         dermabrasion=1.2, logo_info=None, style_name=style_name,
+                                                         return_url=return_url)
+    else:
+        if not image_urls and file:
+            file_obj = io.BytesIO(image_data)
+            object_name = f"webimg/{file.filename}"
+            image_urls = [upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=3600)]
+
+        if model_id == 2:
+            image_decode, result = await wanx_image_generation(image_urls, style_name=style_name)
+        elif model_id == 3:
+            image_decode, result = await tencent_drawing_picture(image_data, image_urls[0] if image_urls else '',
+                                                                 prompt=prompt, style_name=style_name,
+                                                                 return_url=return_url)
+            # image_decode = None
+            # result = await ali_cartoon_picture(image_urls[0], style_name=style_name)
+        else:
+            image_decode, result = dashscope_image_call(prompt, image_url=image_urls[0] if image_urls else '',
+                                                        style_name=style_name, model_name="wanx-v1", data_folder=None)
+
+    if image_decode:
+        file_basename = quote(os.path.splitext(file.filename)[0].strip()) if file else None
+        content_disposition = f"attachment; filename*=UTF-8''{file_basename}.png" if file_basename else f"attachment; filename={result['id']}.png"
+        # print(content_disposition)
+        image_io = io.BytesIO(image_decode)
+        image_io.seek(0)
+        return StreamingResponse(image_io, media_type="image/png",  # data:image/jpeg;base64,xxxx
+                                 headers={"Content-Disposition": content_disposition,
+                                          "X-Request-ID": result['id'], "File-Url": result['urls'][0]})
+    if 'image_urls' not in result:
+        result['image_urls'] = image_urls
+    return result
+
+
 @app.post("/asr")
 async def speech_to_text(file: UploadFile = File(None), file_urls: List[str] = Form(None),
                          platform: PlatformEnum = PlatformEnum.baidu):  # File(...）
@@ -1223,20 +1296,26 @@ async def text_to_audio(sentences: str, platform: str = "cosyvoice-v1"):
         audio_io = io.BytesIO(audio_data)
         audio_io.seek(0)
         return StreamingResponse(audio_io, media_type="audio/mpeg",
-                                 headers={"Content-Disposition": "attachment; filename=output.mp3",
+                                 headers={"Content-Disposition": f"attachment; filename={request_id}.mp3",
                                           "X-Request-ID": request_id})
     return HTTPException(status_code=400, detail="Unsupported platform.")
 
 
 @app.post("/tti")
-async def text_to_image(sentences: str):
-    file_data, image_name = await xunfei_picture(sentences, data_folder=None)
-    if file_data:
-        image_io = io.BytesIO(file_data)
+async def text_to_image(prompt: str, style_name: str = '人像写真'):
+    if style_name:
+        image_decode, result = dashscope_image_call(prompt, negative_prompt='', image_url='',
+                                                    style_name=style_name, model_name="wanx-v1", data_folder=None)
+    else:
+        image_decode, result = await xunfei_picture(prompt, data_folder=None)
+
+    if image_decode:
+        image_io = io.BytesIO(image_decode)
         image_io.seek(0)
         return StreamingResponse(image_io, media_type="image/jpeg",
-                                 headers={"Content-Disposition": f"attachment; filename={image_name}.jpg"})
-    return image_name
+                                 headers={
+                                     "Content-Disposition": f"attachment; filename={result.get('id', 'result')}.jpg"})
+    return result
 
 
 @app.post("/iu")
