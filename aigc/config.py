@@ -177,13 +177,16 @@ AI_Models = [
     # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
     # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
     {'name': 'doubao', 'type': 'default', 'api_key': '',
-     "model": ['ep-20240919160005-chzhb', 'ep-20240919160119-7rbsn', 'ep-20240919160005-chzhb',
-               'ep-20240919161410-7k5d8', 'ep-20241017105930-drfm8', 'ep-20241017110248-fr7z6',
-               'ep-20241018103141-fwpjd', "ep-20241219174540-rdlfj"],
-     # ["doubao-pro-32k", "doubao-lite-4k", "doubao-lite-32k", "doubao-pro-4k", "doubao-pro-32k", "doubao-pro-128k",
-     # "GLM3-130B",chatglm3-130-fin,functioncall-preview,Doubao-vision-lite-32k],
-     'embedding': ['ep-20241219165520-lpqrl', 'ep-20241219165636-kttk2'],
-     # ['Doubao-embedding', 'Doubao-embedding-large']
+     "model": {"doubao-pro-32k": 'ep-20241018103141-7hqr7', "doubao-lite-4k": 'ep-20240919160119-7rbsn',
+               'Doubao-pro-4k': 'ep-20240919160119-7rbsn',
+               "doubao-lite-32k": 'ep-20241206154509-gwsp9',
+               'doubao-pro-128k': 'ep-20240919161410-7k5d8',
+               "doubao-character-pro-32k": 'ep-20241206120328-msvt7',
+               "GLM3-130B": 'ep-20241017110248-fr7z6',
+               "doubao-pro-32k-functioncall-preview": 'ep-20241018103141-fwpjd',
+               "doubao-vision-lite-32k": "ep-20241219174540-rdlfj", "doubao-vision-pro-32k": "ep-20241217182411-kdg49"},
+     # [ "GLM3-130B",chatglm3-130-fin,functioncall-preview],
+     'embedding': {'Doubao-embedding': 'ep-20241219165520-lpqrl', 'Doubao-embedding-large': 'ep-20241219165636-kttk2'},
      'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
      'base_url': "https://ark.cn-beijing.volces.com/api/v3"},  # open.volcengineapi.com
     # https://cloud.tencent.com/document/product/1729

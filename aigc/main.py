@@ -1302,10 +1302,13 @@ async def text_to_audio(sentences: str, platform: str = "cosyvoice-v1"):
 
 
 @app.post("/tti")
-async def text_to_image(prompt: str, style_name: str = '人像写真'):
-    if style_name:
-        image_decode, result = dashscope_image_call(prompt, negative_prompt='', image_url='',
+async def text_to_image(prompt: str, negative_prompt: str = '', style_name: str = '人像写真', model_id: int = 0):
+    if model_id == 0:
+        image_decode, result = dashscope_image_call(prompt, negative_prompt=negative_prompt, image_url='',
                                                     style_name=style_name, model_name="wanx-v1", data_folder=None)
+
+    elif model_id == 1:
+        image_decode, result = await tencent_generate_image(prompt, negative_prompt, style_name, return_url=False)
     else:
         image_decode, result = await xunfei_picture(prompt, data_folder=None)
 

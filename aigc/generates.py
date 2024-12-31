@@ -43,19 +43,32 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
     - name: 要查找的模型名称
     - model_id: 可选参数，指定返回的子模型索引，默认为 0
     - search_field: 要在其中查找名称的字段（默认为 'model'）
+     返回:
+    - Tuple[Dict[str, Any], Union[str, None]]: 模型及其对应的子模型名称（或 None）
+
+    异常:
+    - ValueError: 如果未找到模型
     """
     model = next(
         (item for item in AI_Models if item['name'] == name or name in item.get(search_field, [])),
         None
     )
     if model:
-        if name in model.get(search_field, []):
-            return model, name
+        model_items = model.get(search_field, [])
+        if isinstance(model_items, list):
+            if name in model_items:
+                return model, name
+            if model_items:
+                model_i = model_id if abs(model_id) < len(model_items) else 0
+                return model, model_items[model_i]
+        elif isinstance(model_items, dict):
+            if name in model_items:
+                return model, model_items[name]
+            # 如果提供了序号，返回序号对应的值
+            keys = list(model_items.keys())
+            model_i = model_id if abs(model_id) < len(keys) else 0
+            return model, model_items[keys[model_i]]
 
-        model_list = model.get(search_field, [])
-        if model_list:
-            model_i = model_id if abs(model_id) < len(model_list) else 0
-            return model, model_list[model_i]
         return model, None
 
     raise ValueError(f"Model with name {name} not found.")
@@ -993,7 +1006,8 @@ async def ai_assistant_run(user_request: str, instructions: str, user_name: str,
         messages_response.raise_for_status()
         run_response = await cx.post(threads_url, headers=headers, json={"assistant_id": assistant_data['id']})
         run_response.raise_for_status()
-        run_url = f'{threads_url}/{run_response.json()['id']}'
+        run_id = run_response.json().get('id')
+        run_url = f'{threads_url}/{run_id}'
         retries = 0
         while retries < max_retries:
             try:
@@ -1658,7 +1672,7 @@ def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str
     return ppt_url
 
 
-# https://www.xfyun.cn/doc/nlp/xftrans/API.html
+# https://www.xfyun.cn/doc/spark/ImageGeneration.html#%E9%89%B4%E6%9D%83%E8%AF%B4%E6%98%8E
 async def xunfei_picture(text: str, data_folder=None):
     headers, url = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
                                            host="spark-api.cn-huabei-1.xf-yun.com", path="/v2.1/tti", method='POST')
@@ -1667,6 +1681,7 @@ async def xunfei_picture(text: str, data_folder=None):
     request_body = {
         "header": {
             "app_id": Config.XF_AppID,  # 你在平台申请的appid
+            # 'uid'
             # "res_id": "your_res_id"  # 可选：自定义术语资源id
         },
         "parameter": {
@@ -1795,16 +1810,17 @@ async def ark_visual_picture(image_data, image_urls: List[str], prompt: str = No
         if response_data["status"] == 10000:
             image_base = response_data["data"].get("binary_data_base64", [])
             image_urls = response_data["data"].get("image_urls", [''])
+            request_id = response_data["request_id"]
             if len(image_base) == 1:
                 image_decode = base64.b64decode(image_base[0])
                 if data_folder:
                     # 将解码后的数据转换为图片
-                    file_path = f"{data_folder}/{response_data["request_id"]}.jpg"
+                    file_path = f"{data_folder}/{request_id}.jpg"
                     img = Image.open(io.BytesIO(image_decode))
                     img.save(file_path)
-                    return file_path, {"urls": image_urls, 'id': response_data["request_id"]}
-                return image_decode, {"urls": image_urls, 'id': response_data["request_id"]}
-            return None, {"urls": image_urls, 'id': response_data["request_id"]}
+                    return file_path, {"urls": image_urls, 'id': request_id}
+                return image_decode, {"urls": image_urls, 'id': request_id}
+            return None, {"urls": image_urls, 'id': request_id}
         return None, response_data
 
 
@@ -1992,6 +2008,67 @@ async def tencent_drawing_picture(image_data, image_url: str = '', prompt: str =
     headers = get_tencent_signature(service="aiart", host="aiart.tencentcloudapi.com", body=payload,
                                     action=action, timestamp=int(time.time()), region="ap-shanghai",
                                     version='2022-12-29')
+
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        if response.status_code != 200:
+            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
+
+        response_data = response.json()["Response"]
+        if return_url:
+            return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
+
+        image_decode = base64.b64decode(response_data["ResultImage"])
+        return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
+
+
+# https://cloud.tencent.com/document/product/1729/108738
+async def tencent_generate_image(prompt: str = '', negative_prompt: str = '', style_name='不限定风格',
+                                 return_url=False):
+    style_mapping = {
+        "默认": "000",
+        "不限定风格": "000",
+        "水墨画": "101",
+        "概念艺术": "102",
+        "油画1": "103",
+        "油画2（梵高）": "118",
+        "水彩画": "104",
+        "像素画": "105",
+        "厚涂风格": "106",
+        "插图": "107",
+        "剪纸风格": "108",
+        "印象派1（莫奈）": "109",
+        "印象派2": "119",
+        "2.5D": "110",
+        "古典肖像画": "111",
+        "黑白素描画": "112",
+        "赛博朋克": "113",
+        "科幻风格": "114",
+        "暗黑风格": "115",
+        "3D": "116",
+        "蒸汽波": "117",
+        "日系动漫": "201",
+        "怪兽风格": "202",
+        "唯美古风": "203",
+        "复古动漫": "204",
+        "游戏卡通手绘": "301",
+        "通用写实风格": "401"
+    }
+    payload = {'Style': style_mapping.get(style_name, '000'),
+               'Prompt': prompt,
+               'RspImgType': 'url' if return_url else 'base64',
+               'LogoAdd': 0,
+               "Resolution": "1024:1024",  # origin
+               }
+
+    if negative_prompt:
+        payload["NegativePrompt"] = negative_prompt
+
+    url = "https://hunyuan.tencentcloudapi.com"
+    headers = get_tencent_signature(service="hunyuan", host="hunyuan.tencentcloudapi.com", body=payload,
+                                    action='TextToImageLite', timestamp=int(time.time()), region="ap-guangzhou",
+                                    version='2023-09-01')
 
     async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, headers=headers, json=payload)

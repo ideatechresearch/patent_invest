@@ -548,6 +548,7 @@ def get_local_suffix(folder_path, supported_suffix=None, recursive=False):
 
 
 def get_file_type(object_name: str) -> str:
+<<<<<<< HEAD
     """
     根据文件名或路径判断文件类型。
 
@@ -555,8 +556,15 @@ def get_file_type(object_name: str) -> str:
     :return: 文件类型（如 'image', 'audio', 'video', 'text', 'compressed', '*'）
     """
     if not object_name:
+=======
+    if not object_name:  # object_name.endswith()
+>>>>>>> 55ec03d8ef9d6a8933839943a143023f5aedfea9
         return ""
-
+    '''
+    文档：DOC、DOCX、XLS、XLSX、PPT、PPTX、PDF、Numbers、CSV
+    图片：JPG、JPG2、PNG、GIF、WEBP、HEIC、HEIF、BMP、PCD、TIFF
+    文件上传大小限制：每个文件最大512MB。
+    '''
     _, file_extension = os.path.splitext(object_name.lower())
 
     # 定义文件类型分类
