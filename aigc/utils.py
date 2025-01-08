@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
 from collections import OrderedDict, Counter
+import numpy as np
 import math
 import jieba
 from pypinyin import lazy_pinyin
@@ -422,96 +423,20 @@ def convert_to_pinyin(text):
 
 
 def split_sentences(text,
-                    pattern=r'(?<=[。！？])|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])|(?=\b\d+\、)',
-                    merged_pattern=r'\b[一二三四五六七八九十]+\、|\b[（(][一二三四五六七八九十]+[）)]|\b\d+\、'):  # r'(?<=。|！|？|\r\n)'
+                    pattern=r'(?=[。！？])|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])|(?=\b\d+\、)|(?=\r\n)'):
     """
     分句函数，支持按标点符号和结构化序号进行分句。
     :param text: 输入的文本
     :param pattern: 正则表达式匹配分隔符
-    :param merged_pattern: 正则表达式匹配结构化序号（如“一、二、三”或“（一）”、“4、”）
     :return: 分割后的句子列表
     """
-    # 基于句号、感叹号、问号进行分句
+    if not pattern:
+        pattern = r'(?=[。！？])'
+
+    # 基于句号、感叹号、问号进行初步分句
     sentences = re.split(pattern, text)
-    # 去掉空白句子并返回
-    if merged_pattern:
-        merged_sentences = []
-        temp = ""
-        for sentence in sentences:
-            if re.match(merged_pattern, sentence):
-                if temp:
-                    merged_sentences.append(temp.strip())
-                temp = sentence
-            else:
-                temp += sentence
-        if temp:
-            merged_sentences.append(temp.strip())
+    return [s for s in sentences if s.strip()]
 
-        return [sentence for sentence in merged_sentences if sentence.strip()]
-
-    return [sentence for sentence in sentences if sentence.strip()]
-
-
-def split_paragraphs(sentences, max_length=512):
-    paragraphs = []
-    current_paragraph = ""
-
-    for sentence in sentences:
-        # 如果当前段落加上新句子的长度未超标，直接添加
-        if len(current_paragraph) + len(sentence) <= max_length:
-            current_paragraph += sentence
-        else:
-            # 超过 max_length，优先寻找标点符号处分割
-            if len(current_paragraph) > 0:
-                paragraphs.append(current_paragraph)
-            current_paragraph = sentence
-
-    # 添加最后一段
-    if current_paragraph:
-        paragraphs.append(current_paragraph)
-
-    return paragraphs
-
-
-#
-# def split_paragraphs(text, max_length=256):
-#     sentences = split_sentences(text)
-#     paragraphs = []
-#     current_paragraph = ""
-#
-#     for sentence in sentences:
-#         # 如果当前段落加上新句子的长度未超标，直接添加
-#         if len(current_paragraph) + len(sentence) <= max_length:
-#             current_paragraph += sentence
-#         else:
-#             # 超过 max_length，优先寻找标点符号处分割
-#             if len(current_paragraph) > 0:
-#                 paragraphs.append(current_paragraph)
-#             current_paragraph = sentence
-#
-#     # 最后一段加入
-#     if current_paragraph:
-#         paragraphs.append(current_paragraph)
-#
-#     # 处理超过长度的段落，优先按标点或换行分段
-#     final_paragraphs = []
-#     for paragraph in paragraphs:
-#         if len(paragraph) > max_length:
-#             # 查找标点或换行符位置
-#             sub_paragraphs = re.split(r'(?<=[。！？])', paragraph)
-#             buffer = ""
-#             for sub in sub_paragraphs:
-#                 if len(buffer) + len(sub) <= max_length:
-#                     buffer += sub
-#                 else:
-#                     final_paragraphs.append(buffer.strip())
-#                     buffer = sub
-#             if buffer:
-#                 final_paragraphs.append(buffer.strip())
-#         else:
-#             final_paragraphs.append(paragraph.strip())
-#
-#     return final_paragraphs
 
 # 实现小到大分块逻辑
 def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int = 512, overlap: int = 20):
@@ -548,7 +473,6 @@ def get_local_suffix(folder_path, supported_suffix=None, recursive=False):
 
 
 def get_file_type(object_name: str) -> str:
-<<<<<<< HEAD
     """
     根据文件名或路径判断文件类型。
 
@@ -556,15 +480,8 @@ def get_file_type(object_name: str) -> str:
     :return: 文件类型（如 'image', 'audio', 'video', 'text', 'compressed', '*'）
     """
     if not object_name:
-=======
-    if not object_name:  # object_name.endswith()
->>>>>>> 55ec03d8ef9d6a8933839943a143023f5aedfea9
         return ""
-    '''
-    文档：DOC、DOCX、XLS、XLSX、PPT、PPTX、PDF、Numbers、CSV
-    图片：JPG、JPG2、PNG、GIF、WEBP、HEIC、HEIF、BMP、PCD、TIFF
-    文件上传大小限制：每个文件最大512MB。
-    '''
+
     _, file_extension = os.path.splitext(object_name.lower())
 
     # 定义文件类型分类
@@ -583,6 +500,7 @@ def get_file_type(object_name: str) -> str:
             return file_type
 
     return "*"
+
 
 def get_file_type_wx(object_name: str) -> str:
     if not object_name:  # object_name.endswith()
@@ -849,6 +767,20 @@ def date_range_calculator(period_type: str, date=None, shift: int = 0, count: in
 
     # 返回结果字典，包含开始和结束日期
     return {'start_date': start_date, 'end_date': end_date}
+
+
+def cosine_sim(A, B):
+    dot_product = np.dot(A, B)
+    similarity = dot_product / (np.linalg.norm(A) * np.linalg.norm(B))
+    return similarity
+
+
+def cosine_similarity_np(ndarr1, ndarr2):
+    denominator = np.outer(np.linalg.norm(ndarr1, axis=1), np.linalg.norm(ndarr2, axis=1))
+    dot_product = np.dot(ndarr1, ndarr2.T)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarity = np.where(denominator != 0, dot_product / denominator, 0)
+    return similarity
 
 
 class BM25:

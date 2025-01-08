@@ -179,11 +179,3 @@ def import_to_graph_from_json(filename):
 
     # g.es["condition"] = ["done"]
     return g
-
-
-def get_children(g, node):
-    return [g.vs[neighbor]["name"] for neighbor in g.neighbors(node, mode="OUT")]
-
-def get_parent(g, node):
-    neighbors = g.neighbors(node, mode="IN")
-    return g.vs[neighbors[0]]["name"] if neighbors else None

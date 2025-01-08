@@ -1,4 +1,4 @@
-import httpx, aiohttp
+import httpx, aiohttp, aiofiles
 from http import HTTPStatus
 import asyncio
 import oss2
@@ -11,10 +11,7 @@ from openai import OpenAI, Completion
 import dashscope
 from dashscope.audio.tts import ResultCallback, SpeechSynthesizer
 from dashscope.audio.asr import Recognition, Transcription
-from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue
 import numpy as np
-from sqlalchemy.sql.util import expand_column_list_from_order_by
-from sqlalchemy.util import await_only
 
 from config import *
 from utils import *
@@ -268,6 +265,8 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
     """
     if not model_name:
         return []
+    if not inputs:
+        return []
 
     global Embedding_Cache
     cache_key = generate_hash_key(inputs, model_name, model_id)
@@ -434,6 +433,9 @@ async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, s
         return stream_data()
 
     return response.choices[0].text.strip()
+
+
+from knowledge import ideatech_knowledge, graph_icc_edge
 
 
 def agent_func_calls(agent):
@@ -1090,41 +1092,6 @@ def get_hf_embeddings(texts, model_name='BAAI/bge-large-zh-v1.5', access_token=C
     return [emb.get('embedding') for emb in data]
 
 
-async def most_similar_embeddings(query, collection_name, client, topn=10, score_threshold=0.0,
-                                  match: List[Any] = [], not_match: List[Any] = [], query_vector=[],
-                                  embeddings_calls: Callable[[...], Any] = lambda x: [], **kwargs):
-    try:
-        if not query_vector:
-            query_vector = await embeddings_calls(query, **kwargs)
-            if not query_vector:
-                return []
-
-        query_filter = Filter(must=match, must_not=not_match)
-        search_hit = await client.search(collection_name=collection_name,
-                                         query_vector=query_vector,  # tolist()
-                                         query_filter=query_filter,
-                                         limit=topn,
-                                         score_threshold=score_threshold, )
-        return [(p.payload, p.score) for p in search_hit]
-    except Exception as e:
-        print('Error:', e)
-        return []
-
-
-def cosine_sim(A, B):
-    dot_product = np.dot(A, B)
-    similarity = dot_product / (np.linalg.norm(A) * np.linalg.norm(B))
-    return similarity
-
-
-def cosine_similarity_np(ndarr1, ndarr2):
-    denominator = np.outer(np.linalg.norm(ndarr1, axis=1), np.linalg.norm(ndarr2, axis=1))
-    dot_product = np.dot(ndarr1, ndarr2.T)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        similarity = np.where(denominator != 0, dot_product / denominator, 0)
-    return similarity
-
-
 async def similarity_embeddings(query, tokens: List[str], filter_idx: List[int] = None, tokens_vector=None,
                                 embeddings_calls: Callable[[...], Any] = ai_embeddings, **kwargs):
     """
@@ -1725,10 +1692,14 @@ async def xunfei_picture(text: str, data_folder=None):
             file_path = f"{data_folder}/{image_id}.jpg"  # .png
             img = Image.open(io.BytesIO(file_data))
             # r, g, b, a = img.split()
-            # img = img.convert('RGB')
+            # img = img.convert('RGB') 转换为 RGB 格式
             img.save(file_path)
-            # with open(file_path, 'wb') as file:
-            #     file.write(file_data)
+
+            # buffer = io.BytesIO()
+            # img.save(buffer, format="JPEG")  # 保存为 JPEG 格式
+            # buffer.seek(0)
+            # async with aiofiles.open(file_path, 'wb') as file:
+            #     await file.write(buffer.read())
             return file_path, {"urls": '', 'id': image_id}
 
         return file_data, {"urls": '', 'id': image_id}
@@ -2130,8 +2101,6 @@ async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
 
 # https://ai.baidu.com/ai-doc/OCR/Ek3h7y961,  https://aip.baidubce.com/rest/2.0/solution/v1/iocr/recognise"
 # https://console.bce.baidu.com/ai/#/ai/ocr/overview/index
-# with open(image_path, 'rb') as f:
-#    image_data = f.read()
 async def baidu_ocr_recognise(image_data, image_url, ocr_type='accurate_basic'):
     '''
     general:通用文字识别(含位置)
@@ -2666,13 +2635,13 @@ async def download_by_aiohttp(url: str, save_path, chunk_size=4096, in_decode=Fa
             if response.status == 200:
                 if save_path:
                     save_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(save_path, 'wb') as f:
+                    async with aiofiles.open(save_path, mode='wb') as f:
                         # response.content 异步迭代器（流式读取）,iter_chunked 非阻塞调用，逐块读取
                         async for chunk in response.content.iter_chunked(chunk_size):
                             if isinstance(chunk, (bytes, bytearray)):
-                                f.write(chunk)
+                                await f.write(chunk)
                             elif isinstance(chunk, str):
-                                f.write(chunk.encode('utf-8'))  # 将字符串转为字节
+                                await f.write(chunk.encode('utf-8'))  # 将字符串转为字节
                             else:
                                 raise TypeError(
                                     f"Unexpected chunk type: {type(chunk)}. Expected bytes or bytearray.")
@@ -2694,10 +2663,10 @@ async def download_by_httpx(url: str, save_path, chunk_size=4096, in_decode=Fals
             response.raise_for_status()  # 如果响应不是2xx  response.status_code == 200:
             if save_path:
                 save_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(save_path, "wb") as f:
+                async with aiofiles.open(save_path, mode="wb") as f:
                     # response.aiter_bytes() 异步迭代器
                     async for chunk in response.aiter_bytes(chunk_size=chunk_size):
-                        f.write(chunk)
+                        await f.write(chunk)
 
                 return save_path
 
@@ -2730,6 +2699,13 @@ def download_by_requests(url: str, save_path, chunk_size=4096, in_decode=False):
             return save_path
 
         return response.text if in_decode else response.content  # 直接获取文本,同步直接返回全部内容
+
+
+def upload_by_requests(url: str, file_path, file_key='snapshot'):
+    with open(file_path, "rb") as f:
+        files = {file_key: f}
+        response = requests.post(url, files=files)
+    return response.json()
 
 
 async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
@@ -2772,95 +2748,6 @@ async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
             break
 
     return None, None
-
-
-def find_similar_paragraphs(node, target_embedding, top_n=3):
-    """
-    找到节点中与目标嵌入最相似的段落。
-    :param node: 节点对象
-    :param target_embedding: 目标嵌入
-    :param top_n: 返回前N个相似的段落
-    :return: [(段落文本, 相似度), ...] 按相似度降序排列
-    """
-    if "paragraph_embeddings" not in node.attributes() or "paragraph" not in node.attributes():
-        return []
-
-    paragraphs = node["paragraph"]
-    paragraph_embeddings = np.array(node["paragraph_embeddings"])
-    similarities = cosine_similarity_np(target_embedding, paragraph_embeddings).flatten()
-    # sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
-
-    # 按相似度降序排序
-    similarities = sorted(zip(paragraphs, similarities), key=lambda x: x[1], reverse=True)
-    return similarities[:top_n]
-
-
-def query_similar_paragraphs(graph, target_embedding, top_n=7):
-    all_paragraphs = []
-    all_embeddings = []
-
-    for v in graph.vs:
-        if "paragraph" in v.attributes() and "paragraph_embeddings" in v.attributes():
-            all_paragraphs.extend(v["paragraph"])
-            all_embeddings.extend(v["paragraph_embeddings"])
-
-    similarities = cosine_similarity_np(target_embedding, np.array(all_embeddings)).flatten()
-
-    similarities = sorted(zip(all_paragraphs, similarities), key=lambda x: x[1], reverse=True)
-    return similarities[:top_n]
-
-
-def query_similar_content(graph, target_embedding, top_n_nodes=3, top_n_paragraphs=3):
-    """
-    查询图中与目标嵌入最相似的节点和段落。
-    :param graph: 图对象
-    :param target_embedding: 查询嵌入
-    :param top_n_nodes: 返回前 N 个最相似的节点
-    :param top_n_paragraphs: 在每个节点中返回前 N 个最相似段落
-    :return: {节点: [(段落, 相似度), ...]}
-    """
-    # 计算目标嵌入与所有节点的相似度
-
-    node_embeddings = np.array(graph.vs["combined_paragraph_embedding"])
-    similarities = cosine_similarity_np(target_embedding, node_embeddings).flatten()
-
-    # 按相似度降序排序
-    similar_nodes = sorted(zip(graph.vs, similarities), key=lambda x: x[1], reverse=True)[:top_n_nodes]
-    # 在每个节点中查找最相似段落
-    results = {}
-    for node, node_similarity in similar_nodes:
-        similar_paragraphs = find_similar_paragraphs(node, target_embedding, top_n=top_n_paragraphs)
-        results[node["name"]] = {
-            "path": node["path"],
-            "node_similarity": float(node_similarity),
-            "similar_paragraphs": similar_paragraphs
-        }
-
-    return results
-
-
-Ideatech_Graph = None
-
-
-async def ideatech_knowledge(query, rerank_model="BAAI/bge-reranker-v2-m3", version=0):
-    global Ideatech_Graph
-    if not Ideatech_Graph:
-        with open(f"{Config.DATA_FOLDER}/ideatech_pdf_graph.pkl", "rb") as f:
-            Ideatech_Graph = pickle.load(f)
-        print("load graph.")
-
-    query_embedding = np.array(await ai_embeddings(query, model_name='qwen', model_id=0))
-    if version:  # nodes and paragraphs
-        similar_content = query_similar_content(Ideatech_Graph, query_embedding, top_n_nodes=3, top_n_paragraphs=3)
-        paragraphs = [j[0] for i in similar_content.values() for j in i.get("similar_paragraphs")]
-    else:
-        similar_content = query_similar_paragraphs(Ideatech_Graph, query_embedding, top_n=9)
-        paragraphs = [i[0] for i in similar_content]
-
-    if rerank_model and paragraphs:
-        similar_content = await ai_reranker(query, documents=paragraphs, top_n=4, model_name=rerank_model)
-
-    return similar_content
 
 
 def get_weather(city: str):

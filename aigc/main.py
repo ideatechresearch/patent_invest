@@ -497,9 +497,10 @@ async def classify_text(request: ClassifyRequest):
     return {"intent": last_intent, 'match': intents}
 
 
-@app.get("/knowledge/")
-async def knowledge(text: str, rerank_model="BAAI/bge-reranker-v2-m3", version: int = 0):
-    result = await ideatech_knowledge(text.strip(), rerank_model=rerank_model, version=version)
+@app.post("/knowledge/")
+async def knowledge(text: str, rerank_model: str = "BAAI/bge-reranker-v2-m3",
+                    file: UploadFile = File(None),version: int = 0):
+    result = await ideatech_knowledge(text.strip(), rerank_model=rerank_model, file=file, version=version)
     return {'similar': result}
 
 
@@ -1015,8 +1016,8 @@ async def translate_text(request: TranslateRequest):
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
     file_path = Path(Config.DATA_FOLDER) / file.filename
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(await file.read())
         url = f"{Config.LOCAL_URL}/files/{file.filename}"
 
     if oss_expires != 0:

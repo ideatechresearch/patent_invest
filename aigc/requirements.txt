@@ -97,6 +97,7 @@ uvicorn==0.30.6
 #web3==7.2.0
 websocket-client==1.8.0
 websockets==13.0.1
+aiofiles==24.1.0
 yarl==1.9.8
 jieba==0.42.1
 pypinyin==0.53.0
@@ -105,3 +106,4 @@ langdetect==1.0.9
 igraph==0.11.8
 requests-toolbelt==1.0.0
 Markdown==3.7
+PyPDF2==3.0.1
