@@ -1,22 +1,21 @@
 import httpx, aiohttp, aiofiles
 from http import HTTPStatus
-import asyncio
 import oss2
-from pathlib import Path, PurePosixPath
-from typing import List, Dict, Any, Union, Tuple, Callable, Optional
-import random, time, io, os, pickle
+from pathlib import PurePosixPath
+from typing import List, Tuple, Any, Union, Callable
+import random
 from PIL import Image
-from openai import OpenAI, Completion
+from openai import OpenAI
 # import qianfan
 import dashscope
-from dashscope.audio.tts import ResultCallback, SpeechSynthesizer
+from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription
-import numpy as np
+# from lagent import tool_api
 
 from config import *
 from utils import *
-from ai_tools import *
-from ai_agents import *
+from agents.ai_tools import *
+from agents.ai_prompt import *
 
 AI_Client = {}
 
@@ -378,14 +377,17 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
         "model": name,
         "documents": documents,
         "top_n": top_n,
-        "return_documents": True,
+        "return_documents": False,
+        # 'max_chunks_per_doc': 1024,  # 最大块数
+        # 'overlap_tokens': 80,  # 重叠数量
     }
     payload.update(kwargs)
     async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         response = await cx.post(url, headers=headers, json=payload)
         if response.status_code == 200:
             results = response.json().get('results')
-            matches = [(match.get("document")["text"], match["relevance_score"], match["index"]) for match in results]
+            matches = [(match["document"]["text"] if match.get("document") else documents[match["index"]],
+                        match["relevance_score"], match["index"]) for match in results]
             return matches
         else:
             print(response.text)
@@ -435,7 +437,7 @@ async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, s
     return response.choices[0].text.strip()
 
 
-from knowledge import ideatech_knowledge, graph_icc_edge
+from knowledge import ideatech_knowledge
 
 
 def agent_func_calls(agent):
@@ -459,7 +461,7 @@ async def wrap_sync(func, *args, **kwargs):
 async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple[str, Any]]] = None,
                               tool_calls: List[Callable[[...], Any]] = None, **kwargs):
     # Assume this is the document retrieved from RAG
-    # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
+    # function_call = Agent_Functions.get(agents, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
     tool_calls = tool_calls or []
     items_to_process = []
@@ -507,7 +509,7 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
 
 # Callable[[参数类型], 返回类型]
 async def get_chat_payload(messages, user_request: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
-                           max_tokens: int = 1024, model_name='moonshot', model_id=0,
+                           top_k: float = 50, max_tokens: int = 1024, model_name='moonshot', model_id=0,
                            tool_calls: List[Callable[[...], Any]] = None,
                            keywords: List[Union[str, Tuple[str, Any]]] = None, images: List[str] = None, **kwargs):
     model_info, name = find_ai_model(model_name, model_id, 'model')
@@ -573,17 +575,17 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
         messages[-1]['content'] = [{"type": "text", "text": user_request}]  # text-prompt 请详细描述一下这几张图片。这是哪里？
         messages[-1]['content'] += [{"type": "image_url", "image_url": {"url": image}} for image in images]
 
-    payload = {
-        "model": name,  # 默认选择第一个模型
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": top_p,
-        # "top_k": 50,
-        "max_tokens": max_tokens,
+    payload = dict(
+        model=name,  # 默认选择第一个模型
+        messages=messages,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_tokens,
         # extra_body = {"prefix": "```python\n", "suffix":"后缀内容"} 希望的前缀内容,基于用户提供的前缀信息来补全其余的内容
         # response_format={"type": "json_object"}
         # "tools":retrieval、web_search、function
-    }
+    )
     if model_type == 'baidu':
         payload['system'] = system
     # if model_info['name']=='baichuan':
@@ -692,6 +694,7 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
+        # payload=copy(payload)
         payload.update(kwargs)
 
     payload["stream"] = True
@@ -889,6 +892,7 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> 
             return [{'error': str(exc)}]
 
 
+# https://portal.azure.com/#home
 def bing_search(query, bing_api_key):
     url = f"https://api.bing.microsoft.com/v7.0/search?q={query}"
     headers = {"Ocp-Apim-Subscription-Key": bing_api_key}
@@ -1579,8 +1583,8 @@ def xunfei_ppt_theme(industry, style="简约", color="蓝色", appid: str = Conf
 
 
 # https://www.xfyun.cn/doc/spark/PPTv2.html
-def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str = Config.XF_AppID,
-                      api_secret: str = Config.XF_Secret_Key, max_retries=20):
+async def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str = Config.XF_AppID,
+                            api_secret: str = Config.XF_Secret_Key, max_retries=20):
     from requests_toolbelt.multipart.encoder import MultipartEncoder
 
     url = 'https://zwapi.xfyun.cn/api/ppt/v2/create'
@@ -1612,7 +1616,7 @@ def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str
 
     response = requests.request(method="POST", url=url, data=form_data, headers=headers).text
     resp = json.loads(response)
-    if 0 != resp['code']:
+    if resp.get('code') != 0:
         print('创建PPT任务失败,生成PPT返回结果：', response)
         return None
 
@@ -1620,20 +1624,23 @@ def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str
     ppt_url = ''
     retries = 0
     # 轮询任务进度
-    time.sleep(5)
-    while task_id is not None and retries < max_retries:
-        task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
-        response = requests.request("GET", url=task_url, headers=headers).text
-        resp = json.loads(response)
-        task_status = resp['data']['pptStatus']
-        aiImageStatus = resp['data']['aiImageStatus']
-        cardNoteStatus = resp['data']['cardNoteStatus']
+    await asyncio.sleep(5)
 
-        if ('done' == task_status and 'done' == aiImageStatus and 'done' == cardNoteStatus):
-            ppt_url = resp['data']['pptUrl']
-            break
-        else:
-            time.sleep(3)
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        while task_id is not None and retries < max_retries:
+            task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
+            response = await cx.get(url=task_url, headers=headers)
+            response.raise_for_status()
+            resp = json.loads(response)
+            task_status = resp['data']['pptStatus']
+            aiImageStatus = resp['data']['aiImageStatus']
+            cardNoteStatus = resp['data']['cardNoteStatus']
+
+            if ('done' == task_status and 'done' == aiImageStatus and 'done' == cardNoteStatus):
+                ppt_url = resp['data']['pptUrl']
+                break
+
+            await asyncio.sleep(3)
             retries += 1
 
     return ppt_url
@@ -2053,6 +2060,45 @@ async def tencent_generate_image(prompt: str = '', negative_prompt: str = '', st
 
         image_decode = base64.b64decode(response_data["ResultImage"])
         return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
+
+
+async def embed_images_as_base64(md_content, image_dir):
+    """异步将Markdown中的图片转换为Base64并嵌入到Markdown中"""
+    lines = md_content.split('\n')
+    new_lines = []
+
+    for line in lines:
+        if line.startswith("![") and "](" in line and ")" in line:
+            start_idx = line.index("](") + 2
+            end_idx = line.index(")", start_idx)
+            img_rel_path = line[start_idx:end_idx]
+
+            img_name = os.path.basename(img_rel_path)
+            img_path = os.path.join(image_dir, img_name)
+
+            if os.path.exists(img_path):
+                # 异步读取并转换图片为Base64
+                async with aiofiles.open(img_path, 'rb') as img_file:
+                    img_data = await img_file.read()
+                    img_base64 = base64.b64encode(img_data).decode('utf-8')
+
+                img_extension = os.path.splitext(img_name)[-1].lower()
+                # 根据扩展名确定 MIME 类型
+                if img_extension in ['.jpg', '.jpeg']:
+                    mime_type = 'image/jpeg'
+                elif img_extension == '.gif':
+                    mime_type = 'image/gif'
+                else:
+                    mime_type = 'image/png'
+                # 修改Markdown中的图片路径为Base64编码
+                new_line = f'{line[:start_idx]}data:{mime_type};base64,{img_base64}{line[end_idx:]}'
+                new_lines.append(new_line)
+            else:  # 图片文件不存在，保留原始Markdown格式
+                new_lines.append(line)
+        else:  # 保留非图片链接的原始行
+            new_lines.append(line)
+
+    return '\n'.join(new_lines)
 
 
 async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
@@ -2849,3 +2895,6 @@ if __name__ == "__main__":
     asyncio.run(baidu_nlp("ecnet", text="百度是一家人工只能公司"))
 
     # asyncio.run(tencent_translate('tencent translate is ok', 'en', 'cn'))
+    # from lagent import list_tools, get_tool
+    #
+    # list_tools()

@@ -3,14 +3,30 @@ from igraph import Graph
 import PyPDF2
 
 
-def parse_toc(pdf_path):
+def parse_toc(pdf_path, toc_pages=(0, 0)):
+    """
+    提取 PDF 的目录信息。
+
+    Args:
+        pdf_path (str): PDF 文件路径。
+        toc_pages (tuple): 目录页范围，例如 (0, 1) 表示提取第一页和第二页。
+
+    Returns:
+        list: 包含目录信息的列表，每个元素为字典形式。
+    """
     with open(pdf_path, 'rb') as f:
         reader = PyPDF2.PdfReader(f)
-        toc_page = reader.pages[0].extract_text()  # 假设第一页为目录
+        toc_text = ""
+        if toc_pages[0] == toc_pages[1]:
+            toc_text = reader.pages[toc_pages[0]].extract_text()
+        else:
+            # 拼接指定的目录页内容
+            for page_num in range(toc_pages[0], min(len(reader.pages), toc_pages[1] + 1)):
+                toc_text += reader.pages[page_num].extract_text()
     toc = []
     # 正则解析目录
     toc_pattern = re.compile(r'(\d+(\.\d+)*).*?(\d+)$')
-    for line in toc_page.splitlines():
+    for line in toc_text.splitlines():
         match = toc_pattern.match(line.strip())
         if match:
             title_number = match.group(1)
@@ -20,7 +36,31 @@ def parse_toc(pdf_path):
             page = int(match.group(3))
             level = title_number.count('.')
             toc.append({'title_number': title_number, 'title': title, 'page': page, 'level': level})
+
+    # 添加父节点信息
+    for idx, item in enumerate(toc):
+        parent = None
+        for j in range(idx - 1, -1, -1):
+            if toc[j]['level'] < item['level']:
+                parent = toc[j]['title_number']
+                break
+        toc[idx]['parent'] = parent
+
     return toc
+
+
+def get_full_parent_path(toc, current_key):
+    path = []
+    while current_key:
+        # 获取当前节点
+        # node = toc.get(current_key)
+        node = next((x for x in toc if x['title_number'] == current_key), None)
+        if node:
+            path.append(node['title'])
+            current_key = node['parent']  # 更新为父节点，为父节点继续向上追溯
+        else:
+            break
+    return " > ".join(reversed(path))  # 返回拼接的父级路径，倒序拼接
 
 
 def extract_content(pdf_path, toc):
@@ -34,12 +74,15 @@ def extract_content(pdf_path, toc):
             text = ""
             for page_num in range(start_page, end_page):
                 text += reader.pages[page_num].extract_text()
+
             content[item['title_number']] = {
                 "title": item['title'],
                 "text": text.strip(),
                 "level": item['level'],
-                "parent": toc[idx - 1]['title_number'] if item['level'] > 1 else None
+                "parent": item['parent'],
+                "full_path": get_full_parent_path(toc, item['title_number'])
             }
+
     return content
 
 
@@ -51,19 +94,6 @@ def refine_content_with_titles(content):
             if sub_value['title'] in text and content[sub_key]['text'] != sub_value['text']:
                 content[sub_key]['text'] = sub_value['text']
     return content
-
-
-def get_full_parent_path(content, current_key):
-    path = []
-    while current_key:
-        # 获取当前节点
-        node = content.get(current_key)
-        if node:
-            path.append(node['title'])  # current_key
-            current_key = node['parent']
-        else:
-            break
-    return " > ".join(reversed(path))  # 返回拼接的父级路径，倒序拼接
 
 
 def clean_text(raw_text):
@@ -156,18 +186,16 @@ def generate_embeddings(sentences: list):
 
 
 async def graph_icc_edge(pdf_path='data/ideatech-251124-1758-255.pdf'):
-    toc = parse_toc(pdf_path)
-    content = extract_content(pdf_path, toc)
-    structured_content = refine_content_with_titles(content)
-    for key in structured_content:
-        structured_content[key]['full_path'] = get_full_parent_path(content, key)
+    toc = parse_toc(pdf_path, (0, 0))
+    structured_content = extract_content(pdf_path, toc)
+    # structured_content = refine_content_with_titles(content)
 
     g = Graph(directed=True)
     # 添加节点和边
     for title_number, item in structured_content.items():
         tx = clean_text(item["text"])
         paragraphs = split_paragraphs(tx, max_length=1000,
-                                      pattern=r'(?=[。！？])|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])|(?=\b\d+\、)|(?=\r\n)')
+                                      pattern=r'(?=[。！？])|(?=\r\n)|(?=\b\d+\、)|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])')
         print(title_number, [len(x) for x in paragraphs], len(paragraphs), item["full_path"])
         # print(paragraphs)
         # paragraph_embeddings = generate_embeddings(paragraphs)
@@ -220,20 +248,28 @@ def find_similar_paragraphs(target_embedding, graph=None, node=None):
     """
     paragraphs = []
     paragraph_embeddings = []
-
-    if graph:
-        # 查询整个图
-        for v in graph.vs:
-            if "paragraph" in v.attributes() and "paragraph_embeddings" in v.attributes():
-                paragraphs.extend(v["paragraph"])
-                paragraph_embeddings.extend(v["paragraph_embeddings"])
-        # print(len(paragraphs), len(paragraph_embeddings))
-    elif node:
+    if node:
         # 查询单个节点
         if "paragraph" in node.attributes() and "paragraph_embeddings" in node.attributes():
             paragraphs = node["paragraph"]
             paragraph_embeddings = node["paragraph_embeddings"]
 
+        # 同时提供了图和节点，查询该节点以及邻居节点
+        if graph:
+            # 查询该节点的邻居,添加邻居节点的段落和段落嵌入
+            for neighbor_index in graph.neighbors(node, mode='OUT'):  # direct_neighbors
+                neighbor = graph.vs[neighbor_index]  # 通过索引访问邻居节点对象
+                if "paragraph" in neighbor.attributes() and "paragraph_embeddings" in neighbor.attributes():
+                    paragraphs.extend(neighbor["paragraph"])
+                    paragraph_embeddings.extend(neighbor["paragraph_embeddings"])
+    elif graph:
+        # 查询整个图
+        for v in graph.vs:
+            if "paragraph" in v.attributes() and "paragraph_embeddings" in v.attributes():
+                paragraphs.extend(v["paragraph"])
+                paragraph_embeddings.extend(v["paragraph_embeddings"])
+
+    # print(len(paragraphs), len(paragraph_embeddings))
     # 没有提供有效的 graph 或 node
     # 如果没有段落或嵌入，返回空结果
     if not paragraphs or not paragraph_embeddings:
@@ -244,7 +280,7 @@ def find_similar_paragraphs(target_embedding, graph=None, node=None):
     # similarities = cosine_similarity([target_embedding], paragraph_embeddings).flatten()
     # sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
     # 按相似度降序排序
-    return sorted(zip(paragraphs, similarities), key=lambda x: x[1], reverse=True)
+    return sorted(zip(paragraphs, similarities), key=lambda x: x[1], reverse=True)  # enumerate
 
 
 def query_similar_content(graph, target_embedding, top_n_nodes=3, top_n_paragraphs=3):
@@ -258,30 +294,35 @@ def query_similar_content(graph, target_embedding, top_n_nodes=3, top_n_paragrap
     """
     # 计算目标嵌入与所有节点的相似度
 
-    node_embeddings = np.array(graph.vs["combined_paragraph_embedding"])
-    similarities = cosine_similarity_np(target_embedding, node_embeddings).flatten()
+    nodes_embeddings = np.array(graph.vs["combined_paragraph_embedding"])
+    similarities = cosine_similarity_np(target_embedding, nodes_embeddings).flatten()
 
     # 按相似度降序排序
     similar_nodes = sorted(zip(graph.vs, similarities), key=lambda x: x[1], reverse=True)[:top_n_nodes]
     # 在每个节点中查找最相似段落
     results = {}
     for node, node_similarity in similar_nodes:
-        similar_paragraphs = find_similar_paragraphs(target_embedding, node=node)[:top_n_paragraphs]
+        # 从当前节点查找相似段落,如果当前节点的相似段落不足，则从其邻居中补充
+        similar_paragraphs = find_similar_paragraphs(target_embedding, graph=(
+            graph if len(node["paragraph"]) < top_n_paragraphs else None), node=node)
+
         results[node["name"]] = {
-            "path": node["path"],
+            "path": node["path"],  # 节点路径
             # "child": get_children(graph, node),
-            "node_similarity": float(node_similarity),
-            "similar_paragraphs": similar_paragraphs
+            "node_similarity": float(node_similarity),  # 与目标嵌入的相似度
+            "similar_paragraphs": similar_paragraphs[:top_n_paragraphs]
         }
 
     return results
 
 
 def get_children(g, node):
+    # g.successors(node.index)
     return [g.vs[neighbor]["name"] for neighbor in g.neighbors(node, mode="OUT")]
 
 
 def get_parent(g, node):
+    # g.predecessors(node.index)
     neighbors = g.neighbors(node, mode="IN")
     return g.vs[neighbors[0]]["name"] if neighbors else None
 
@@ -311,14 +352,15 @@ async def ideatech_knowledge(query, rerank_model="BAAI/bge-reranker-v2-m3", file
 
     query_embedding = np.array(await ai_embeddings(query, model_name='qwen', model_id=0))
     if version:  # nodes and paragraphs
-        similar_content = query_similar_content(IdeaTech_Graph, query_embedding, top_n_nodes=3, top_n_paragraphs=3)
-        print(similar_content)
-        paragraphs = [j[0] for i in similar_content.values() for j in i.get("similar_paragraphs")]
+        similar_content = query_similar_content(IdeaTech_Graph, query_embedding, top_n_nodes=3, top_n_paragraphs=4)
+        # print(similar_content)
+        paragraphs = [j[0] for i in similar_content.values() for j in i.get("similar_paragraphs", [])]
     else:
         similar_content = find_similar_paragraphs(query_embedding, graph=IdeaTech_Graph)[:9]
         paragraphs = [i[0] for i in similar_content]
 
     if rerank_model and paragraphs:
+        paragraphs = list(dict.fromkeys(paragraphs))
         similar_content = await ai_reranker(query, documents=paragraphs, top_n=4, model_name=rerank_model)
 
     return similar_content

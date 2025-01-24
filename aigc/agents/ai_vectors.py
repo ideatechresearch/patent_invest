@@ -154,18 +154,29 @@ async def search_by_ids(ids, collection_name, client, key_name='word', match=[],
 
 
 def rerank_similar_by_recommend(ids, recommend_hit, topn=10, duplicate=0):
+    """
+    重排序函数，支持不同类型的数据处理（推荐或搜索）。
+    :param ids: ID 或名称列表
+    :param recommend_hit: 推荐或搜索的结果
+    :param topn: 返回的前 topn 个结果
+    :param duplicate: 去重方式，0为不去重，1为去重，2为基于节点排序去重，3为全局排序去重
+    :return: 排序后的相似数据
+    """
     similar_next = {}  # 数据格式:{_id:[(next_id,score)*topn]}
+    # 处理无重复的情况
     if duplicate == 0:
         similar_next = {i: [(p.id, p.score) for p in hit[:topn]] for i, hit in zip(ids, recommend_hit)}
         # return [(_id, [(p.id, p.score) for p in hit]) for _id, hit in zip(ids, search_hit)]
 
+    # 处理去重情况
     if duplicate == 1:
         for i, hit in zip(ids, recommend_hit):
             y = [(p.id, p.score) for p in hit]
             y2 = [_[0] for x in similar_next.values() for _ in x]
             similar_next[i] = [y3 for y3 in y if y3[0] not in y2][:topn]
 
-    if duplicate == 2:  # 各自排序后,由下一节点各自选最近的上节点,最后由上节点各自匹配重复关系
+    # 处理排序并去重的情况（按节点排序后去除重复）各自排序后,由下一节点各自选最近的上节点,最后由上节点各自匹配重复关系
+    if duplicate == 2:
         similar_with = {}
         for i, hit in zip(ids, recommend_hit):
             y = [(p.id, p.score) for p in hit]
@@ -175,7 +186,7 @@ def rerank_similar_by_recommend(ids, recommend_hit, topn=10, duplicate=0):
         for y, x in similar_with.items():
             similar_next[x[0]] = sorted(similar_next.get(x[0], []) + [(y, x[1])],
                                         key=lambda z: z[1], reverse=True)[:topn]
-
+    # 处理全局排序并去重的情况
     if duplicate == 3:
         similar_sort = sorted(
             [(i, p.id, p.score) for i, hit in zip(ids, recommend_hit) for p in hit],

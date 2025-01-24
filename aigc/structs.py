@@ -1,6 +1,71 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Tuple, Union, Any
+from typing import Optional, Dict, Generator, List, Tuple, Union, Any
 from enum import Enum as PyEnum
+from enum import IntEnum
+from dataclasses import asdict, dataclass, is_dataclass
+import random
+
+SESSION_ID_MAX = 2 ** 31 - 1  # 2147483647
+
+
+@dataclass
+class FunctionCall:
+    name: str
+    parameters: Union[Dict, str]
+
+
+def dataclass2dict(data):
+    def enum_dict_factory(inputs):
+        return {key: (value.value if isinstance(value, IntEnum) else value)
+                for key, value in inputs}
+
+    return asdict(data, dict_factory=enum_dict_factory)
+
+
+def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -> Dict[str, str]:
+    """
+    Convert variables to a dictionary.
+
+    Args:
+        variables (Optional[Union[Dict[str, str], BaseModel, Any]]):
+            Variables to convert.
+
+    Returns:
+        Dict[str, str]: The converted dictionary.
+
+    Raises:
+        ValueError: If the variables type is unsupported.
+    """
+    if variables is None:
+        return {}
+    if isinstance(variables, BaseModel):
+        return variables.dict()
+    if is_dataclass(variables):
+        return asdict(variables)
+    if isinstance(variables, dict):
+        return variables
+    raise ValueError(
+        'Unsupported variables type. Must be a dict, BaseModel, or '
+        'dataclass.')
+
+
+class GeneratorWithReturn:
+    """Generator wrapper to capture the return value."""
+
+    def __init__(self, generator: Generator):
+        self.generator = generator
+        self.ret = None
+
+    def __iter__(self):
+        self.ret = yield from self.generator
+        return self.ret
+
+
+
+class GenerationParams(BaseModel):
+    inputs: Union[str, List[Dict]]
+    session_id: int = Field(default_factory=lambda: random.randint(0, SESSION_ID_MAX))
+    agent_cfg: Dict = Field(default_factory=dict)
 
 
 class OpenAIResponse(BaseModel):
@@ -92,10 +157,12 @@ class FuzzyMatchRequest(BaseModel):
     cutoff: float = 0.6
     method: str = 'levenshtein'
 
+
 class PlatformEnum(str, PyEnum):
     baidu = "baidu"
     ali = "ali"
     dashscope = "dashscope"
+
 
 class ToolRequest(BaseModel):
     messages: Optional[List[Message]] = Field(None)
@@ -129,6 +196,7 @@ class ToolRequest(BaseModel):
             }
         }
 
+
 class AssistantToolsEnum(str, PyEnum):
     code = "code_interpreter"
     web = "web_search"
@@ -144,7 +212,6 @@ class AssistantRequest(BaseModel):
 
     class Config:
         protected_namespaces = ()
-
 
 
 class CompletionParams(BaseModel):
@@ -190,7 +257,7 @@ class CompletionParams(BaseModel):
                 {
                     'prompt': '请解释人工智能的原理。',
                     "question": "",
-                    "agent": "0",
+                    "agents": "0",
                     "suffix": "",
                     "stream": False,
                     "temperature": 0.7,
@@ -208,7 +275,7 @@ class CompletionParams(BaseModel):
                     "model_name": "doubao",
                     "model_id": -1,
                     "prompt": "",
-                    "agent": "42",
+                    "agents": "42",
                     "top_p": 0.8,
                     "question": "这是什么啊,可以描述一下吗?",
                     "keywords": [],
@@ -272,7 +339,7 @@ class SubmitMessagesRequest(BaseModel):
                     "question": "",
                     "keywords": [],
                     "tools": [],
-                    "agent": "0",
+                    "agents": "0",
                     "extract": "json",
                     "model_name": "moonshot",
                     "model_id": 0,
@@ -316,7 +383,7 @@ class OpenAIRequest(CompletionParams):
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
-                "agent": "0",
+                "agents": "0",
                 "model_name": "moonshot",
                 "model_id": 0,
                 "prompt": '',
@@ -333,7 +400,6 @@ class OpenAIRequest(CompletionParams):
                 # "top_n": 10,
             }
         }
-
 
 
 class ClassifyRequest(BaseModel):

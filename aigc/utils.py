@@ -1,5 +1,5 @@
-import re, json, io, os
-import inspect
+import re, json, io, os, sys, time, pickle
+import inspect, importlib
 from pathlib import Path
 from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
@@ -9,49 +9,9 @@ import numpy as np
 import math
 import jieba
 from pypinyin import lazy_pinyin
-from langdetect import detect, detect_langs
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-
-
-class LRUCache:
-    def __init__(self, capacity: int):
-        self.stack = OrderedDict()
-        self.capacity = capacity
-
-    def get(self, key):
-        if key in self.stack:
-            self.stack.move_to_end(key)
-            return self.stack[key]
-        else:
-            return None
-
-    def put(self, key, value) -> None:
-        if key in self.stack:
-            self.stack[key] = value
-            self.stack.move_to_end(key)
-        else:
-            self.stack[key] = value
-        if len(self.stack) > self.capacity:
-            self.stack.popitem(last=False)
-
-    def change_capacity(self, capacity):
-        self.capacity = capacity
-        for i in range(len(self.stack) - capacity):
-            self.stack.popitem(last=False)
-
-    def delete(self, key):
-        if key in self.stack:
-            del self.stack[key]
-
-    def keys(self):
-        return self.stack.keys()
-
-    def __len__(self):
-        return len(self.stack)
-
-    def __contains__(self, key):
-        return key in self.stack
+from langdetect import detect, detect_langs
 
 
 def get_function_parameters(func):
@@ -83,6 +43,7 @@ def convert_keys_to_pascal_case(d):
 
 
 def extract_json_from_string(input_str):
+    # 从一个普通字符串中提取 JSON 结构
     match = re.search(r'\{.*}', input_str, re.DOTALL)
     if match:
         json_str = match.group(0)
@@ -91,6 +52,20 @@ def extract_json_from_string(input_str):
         except json.JSONDecodeError as e:
             print(f"Error decoding JSON: {e}")
     return None
+
+
+def parse_json(inputs) -> dict:
+    # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）
+    if not isinstance(inputs, dict):
+        try:
+            match = re.search(r'^\s*(```json\n)?(.*)\n```\s*$', inputs, re.S)
+            if match:
+                inputs = match.group(2).strip()
+            inputs = json.loads(inputs)
+        except json.JSONDecodeError as exc:
+            raise Exception(f'invalid json format: {inputs}') from exc
+
+    return inputs
 
 
 def extract_method_calls(text):
@@ -228,7 +203,7 @@ def extract_jsons(input_str, n=None):
     matches = re.findall(r'\{.*?\}', input_str, re.DOTALL)
     if not matches:
         return None
-    json_objects = []
+    json_objects = []  # [var.strip() for var in matches if '{' not in var]
     for match in matches:
         try:
             json_objects.append(json.loads(match))
@@ -412,7 +387,7 @@ def contains_chinese(text):
     # 检测字符串中是否包含中文字符
     chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
     return bool(chinese_pattern.search(text))
-    # detect(text)=='zh-cn'
+    # return detect(text)=='zh-cn'
 
 
 def convert_to_pinyin(text):
@@ -835,6 +810,46 @@ class BM25:
                 scores = [(doc_id, (score - min_score) / (max_score - min_score)) for doc_id, score in scores]
 
         return sorted(scores, key=lambda x: x[1], reverse=True) if sort else scores
+
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.stack = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key in self.stack:
+            self.stack.move_to_end(key)
+            return self.stack[key]
+        else:
+            return None
+
+    def put(self, key, value) -> None:
+        if key in self.stack:
+            self.stack[key] = value
+            self.stack.move_to_end(key)
+        else:
+            self.stack[key] = value
+        if len(self.stack) > self.capacity:
+            self.stack.popitem(last=False)
+
+    def change_capacity(self, capacity):
+        self.capacity = capacity
+        for i in range(len(self.stack) - capacity):
+            self.stack.popitem(last=False)
+
+    def delete(self, key):
+        if key in self.stack:
+            del self.stack[key]
+
+    def keys(self):
+        return self.stack.keys()
+
+    def __len__(self):
+        return len(self.stack)
+
+    def __contains__(self, key):
+        return key in self.stack
 
 
 # class BM25:

@@ -26,7 +26,7 @@ AI_Tools = [
         "type": "function",
         "function": {
             "name": "date_range_calculator",
-            "description": "计算基于参考日期的时间范围，支持按天、周、月、季度、年或半年计算日期范围，支持偏移周期数和返回多个周期范围。。",
+            "description": "计算基于参考日期的时间范围，支持按天、周、月、季度、年或半年计算日期范围，支持偏移周期数和返回多个周期范围。",
             "parameters": {
                 "type": "object",
                 "properties": {

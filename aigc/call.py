@@ -10,7 +10,7 @@ async def call_generate_stream_response(stream: bool = False):
     request_data = {
         "uuid": "",
         "username": "",
-        "agent": "1",
+        "agents": "1",
         "model_name": "moonshot",
         'user_id': 'test',
         "prompt": '',
@@ -282,6 +282,7 @@ def get_local_images(folder_path):
         raise ValueError(f"The path '{folder_path}' is not a valid directory.")
     return [str(img_path) for img_path in folder.glob("*") if img_path.suffix.lower() in supported_extensions]
 
+
 def get_filename_from_content_disposition(content_disposition):
     """
     从 Content-Disposition 提取文件名，支持中文和编码文件名
@@ -290,7 +291,7 @@ def get_filename_from_content_disposition(content_disposition):
         if "filename*=" in content_disposition:
             # filename*=UTF-8''%E4%BE%8B%E5%AD%90.jpg
             encoded_filename = content_disposition.split("filename*=")[-1].strip()
-            return unquote(encoded_filename.split("''")[-1])#decoded_filename
+            return unquote(encoded_filename.split("''")[-1])  # decoded_filename
         elif "filename=" in content_disposition:
             # filename="example.jpg"
             return content_disposition.split("filename=")[-1].strip().replace('"', "")
@@ -346,6 +347,22 @@ def process_and_save_images(local_images, prompt, style_name="角色特征保持
         except Exception as e:
             print(f"Error processing {image_path}: {e}")
 
+
+def get_zmq():
+    import zmq  # ZeroMQ
+
+    # 创建一个订阅者（客户端）
+    context = zmq.Context()
+    socket = context.socket(zmq.SUB)
+    socket.connect("tcp://localhost:5556")
+    socket.setsockopt_string(zmq.SUBSCRIBE, "topic1")
+
+    # 接收订阅的消息
+    while True:
+        message = socket.recv_string()
+        print(f"Received message: {message}")
+
+
 # process_and_save_images(get_local_images(folder_path='E:\\Pictures\\员工照片'), prompt="去除水印,卡通头像",style_name="角色特征保持")
 
 # 如果你在异步环境中，例如 FastAPI 应用程序中
@@ -354,8 +371,9 @@ if __name__ == "__main__":
     # main()
     from config import *
 
+    get_zmq()
     # asyncio.run(send_authenticated())
-    asyncio.run(authenticate_user())
+    # asyncio.run(authenticate_user())
     # loop = asyncio.get_event_loop()
     # loop.run_until_complete(connect_chat())
 
@@ -365,7 +383,7 @@ if __name__ == "__main__":
     # request_data = {
     #     "uuid": "",
     #     "username": "test",
-    #     "agent": "1",
+    #     "agents": "1",
     #     "model_name": "moonshot",
     #     "prompt": '',
     #     "question": "什么是区块链金融?",
@@ -384,7 +402,7 @@ if __name__ == "__main__":
     # request_data = {
     #     "uuid": "",
     #     "username": "test",
-    #     "agent": "1",
+    #     "agents": "1",
     #     "filter_time": 0,
     # }
     # response = requests.get(url, json=request_data)

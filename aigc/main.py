@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 import datetime
-import string, difflib, re, time, copy, os, io, sys, uuid, pickle
+import difflib, copy
 import tempfile
 import logging
-import concurrent.futures
 
 from typing import AsyncGenerator
-from fastapi import FastAPI, Request, Response, Depends, Query, File, UploadFile, BackgroundTasks, Form, \
-    Body, WebSocket, WebSocketDisconnect, HTTPException, status
+from fastapi import FastAPI, Request, Depends, Query, File, UploadFile, BackgroundTasks, Form, \
+    WebSocket, WebSocketDisconnect, HTTPException, status
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer
 from starlette.middleware.sessions import SessionMiddleware
@@ -25,9 +24,9 @@ from structs import *
 from generates import *
 from config import *
 from database import *
-from ai_tasks import *
+from agents.ai_tasks import *
 
-
+#  定义一个上下文管理器,初始化任务（如初始化数据库、调度器等） @app.lifespa
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up.")
@@ -43,11 +42,16 @@ async def lifespan(app: FastAPI):
     if not scheduler.running:
         scheduler.start()
 
+    # task1 = asyncio.create_task(message_zero_mq.start())
+
     yield
 
     print("Shutting down.")
     scheduler.shutdown()
     engine.dispose()
+
+    # task1.cancel()
+    # await asyncio.gather(task1, return_exceptions=True)  # 确保任务取消时不会引发异常
 
 
 # executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
@@ -56,6 +60,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)  # i
 scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(engine=engine), 'memory': MemoryJobStore()},
                                 executors={'default': ThreadPoolExecutor(4)})  # 设置线程池大小
 # scheduler = AsyncIOScheduler(executors={'default': ThreadPoolExecutor(4)})
+# message_zero_mq = MessageZeroMQ()
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=Config.SECRET_KEY)
 # 将文件目录映射为静态文件路径
@@ -132,6 +137,8 @@ fake_users_db = {
         "public_key": "user1_public_key"
     }
 }
+
+
 
 
 # 如果提供了 eth_address 或 public_key，则不强制提供密码。
@@ -498,8 +505,8 @@ async def classify_text(request: ClassifyRequest):
 
 
 @app.post("/knowledge/")
-async def knowledge(text: str, rerank_model: str = "BAAI/bge-reranker-v2-m3",
-                    file: UploadFile = File(None),version: int = 0):
+async def knowledge(text: str, rerank_model: Optional[str] = "BAAI/bge-reranker-v2-m3",
+                    file: UploadFile = File(None), version: int = 0):
     result = await ideatech_knowledge(text.strip(), rerank_model=rerank_model, file=file, version=version)
     return {'similar': result}
 
@@ -679,7 +686,7 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             model_name = request.get('model_name', "moonshot")
-            agent = request.get('agent', '0')
+            agent = request.get('agents', '0')
             extract = request.get('extract')
             user_name = request.get('username')
             robot_id = request.get('robot_id')
@@ -794,7 +801,7 @@ async def submit_messages(request: SubmitMessagesRequest, background_tasks: Back
     # history, user_request, hist_size = build_chat_history(
     #     user_name, "", request.robot_id, request.user_id, db, user_history=request.messages,
     #     use_hist=request.use_hist, filter_limit=request.filter_limit, filter_time=request.filter_time,
-    #     agent=None,request_uuid=request.uuid)
+    #     agents=None,request_uuid=request.uuid)
 
     task_id = str(uuid.uuid4())
     Task_queue[task_id] = {
@@ -1174,6 +1181,12 @@ async def send_page():
         """
 
 
+# @app.post("/send_zero_mq")
+# async def send_msg_zero_mq(message: str, topic: str = 'topic'):
+#     await message_zero_mq.send_message(message, topic)
+#     return {"status": "success", "message": f"Message '{message}' sent to ZeroMQ."}
+
+
 @app.post("/ocr")
 async def image_recognition(file: UploadFile = File(None), image_url: str = Form(None),
                             ocr_type: str = 'general'):
@@ -1373,7 +1386,7 @@ async def files_process(files: List[UploadFile], question: str = None, model_nam
 
 @app.get("/ppt")
 async def ppt_create(text: str = Query(..., description="用于生成PPT的文本内容"), templateid: str = "20240718489569D"):
-    url = xunfei_ppt_create(text, templateid)
+    url = await  xunfei_ppt_create(text, templateid)
 
     file_data, file_name = await download_file(url, data_folder=None)
     if file_data:
