@@ -216,7 +216,7 @@ class BaseChatHistory(Base):
                                      or_(cls.robot_id == robot_id, robot_id is None),
                                      or_(cls.user_id == user_id, user_id is None),
                                      cls.timestamp >= filter_time)
-        if agent:  # or_(cls.agents == agents, agents is None)
+        if agent:  # or_(cls.agent == agent, agent is None)
             query = query.filter(cls.agent == agent)
 
         if all_payload:
@@ -230,12 +230,12 @@ class BaseChatHistory(Base):
         while i < len(chat_history):
             try:
                 msg = chat_history[i]
-                if (not agent or msg['agents'] == agent) and (not username or msg['username'] == username):
+                if (not agent or msg['agent'] == agent) and (not username or msg['username'] == username):
                     record = cls(**msg)
                     db.add(record)
                     db.commit()
                     del chat_history[i]
-                    if not any((not agent or m['agents'] == agent) and (not username or m['username'] == username)
+                    if not any((not agent or m['agent'] == agent) and (not username or m['username'] == username)
                                for m in chat_history[i:]):
                         break
                 else:
@@ -252,7 +252,7 @@ def get_user_history(user_name: str, robot_id: Optional[str], user_id: Optional[
                     if msg['username'] == (user_name or request_uuid)
                     and (not robot_id or msg['robot_id'] == robot_id)
                     and (not user_id or msg['user_id'] == user_id)
-                    and (not agent or msg['agents'] == agent)
+                    and (not agent or msg['agent'] == agent)
                     and msg['timestamp'] >= filter_time]
 
     if user_name and db:  # 从数据库中补充历史记录
@@ -321,9 +321,9 @@ def save_chat_history(user_name: str, user_message: str, bot_response: str,
         return
     new_history = [
         {'role': 'user', 'content': user_message, 'username': username, 'robot_id': robot_id, 'user_id': user_id,
-         'agents': agent, 'index': hist_size + 1, 'timestamp': timestamp},
+         'agent': agent, 'index': hist_size + 1, 'timestamp': timestamp},
         {'role': 'assistant', 'content': bot_response, 'username': username, 'robot_id': robot_id, 'user_id': user_id,
-         'agents': agent, 'index': hist_size + 2, 'model': model_name,  # 'timestamp': time.time(),
+         'agent': agent, 'index': hist_size + 2, 'model': model_name,  # 'timestamp': time.time(),
          'reference': json.dumps(refer, ensure_ascii=False) if refer else None,  # '\n'.join(refer)
          'transform': json.dumps(transform, ensure_ascii=False) if transform else None}
     ]
@@ -360,7 +360,7 @@ class ChatHistory(BaseChatHistory):
                         if msg['username'] == (self.username or self.request_uuid)
                         and (not self.robot_id or msg['robot_id'] == self.robot_id)
                         and (not self.user_id or msg['user_id'] == self.user_id)
-                        and (not self.agent or msg['agents'] == self.agent)
+                        and (not self.agent or msg['agent'] == self.agent)
                         and msg['timestamp'] >= filter_time]
 
         if self.username and self.db:  # 从数据库中补充历史记录
@@ -405,11 +405,11 @@ class ChatHistory(BaseChatHistory):
         hist_size = len(self.user_history)
         new_history = [
             {'role': 'user', 'content': user_request, 'username': username,
-             'robot_id': self.robot_id, 'user_id': self.user_id, 'agents': self.agent,
+             'robot_id': self.robot_id, 'user_id': self.user_id, 'agent': self.agent,
              'index': hist_size + 1, 'model': self.model, 'timestamp': self.timestamp
              },
             {'role': 'assistant', 'content': bot_response, 'username': username,
-             'robot_id': self.robot_id, 'user_id': self.user_id, 'agents': self.agent,
+             'robot_id': self.robot_id, 'user_id': self.user_id, 'agent': self.agent,
              'index': hist_size + 2, 'model': model_name or self.model,
              'reference': json.dumps(refer, ensure_ascii=False) if refer else None,  # '\n'.join(refer)
              'transform': json.dumps(transform, ensure_ascii=False) if transform else None

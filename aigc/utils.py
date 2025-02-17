@@ -30,14 +30,20 @@ def get_function_string(func):
 
 # 递归地将字典中的所有键名转换为首字母大写的驼峰命名
 def convert_keys_to_pascal_case(d):
-    if isinstance(d, dict):
-        new_dict = {}
-        for k, v in d.items():
-            new_key = ''.join(x.title() for x in k.split('_'))
-            new_dict[new_key] = convert_keys_to_pascal_case(v)
-        return new_dict
+    if isinstance(d, dict):  # user_name->UserName
+        return {''.join(x.title() for x in k.split('_')): convert_keys_to_pascal_case(v) for k, v in d.items()}
     elif isinstance(d, list):
         return [convert_keys_to_pascal_case(item) for item in d]
+    else:
+        return d
+
+
+def convert_keys_to_lower_case(d):
+    """递归地将字典的所有键转换为小写"""
+    if isinstance(d, dict):
+        return {k.lower(): convert_keys_to_lower_case(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [convert_keys_to_lower_case(item) for item in d]
     else:
         return d
 
@@ -122,6 +128,23 @@ def extract_python_code(text):
         code_blocks = re.findall(r'((?: {4}.*\n)+)', text)
 
     return [fix_indentation(block) for block in code_blocks]  # [block.strip()]
+
+
+def extract_python_codes(markdown_string: str):
+    # Regex pattern to match Python code blocks
+    pattern = r"```[\w\s]*python\n([\s\S]*?)```|```([\s\S]*?)```"
+    # Find all matches in the markdown string
+    matches = re.findall(pattern, markdown_string, re.IGNORECASE)
+    # Extract the Python code from the matches
+    python_code = []
+    for match in matches:
+        python = match[0] if match[0] else match[1]
+        python_code.append(python.strip())
+
+    if len(python_code) == 0:
+        return markdown_string
+
+    return python_code
 
 
 def extract_sql_code(text):
@@ -499,29 +522,13 @@ def get_file_type_wx(object_name: str) -> str:
     return ""
 
 
+def get_clock(t, speed=10):
+    return "🕐🕑🕒🕓🕔🕕🕖🕗🕘🕙🕚🕛"[int(t * speed) % 12]
+
+
 def format_date(date_str):
     # 直接使用 strptime 来解析日期并格式化为目标格式
     return datetime.strptime(date_str, "%Y/%m/%d %H:%M:%S").date().strftime("%Y-%m-%d")
-
-
-class Url:
-    def __init__(this, host, path, schema):
-        this.host = host
-        this.path = path
-        this.schema = schema
-        pass
-
-
-def parse_url(requset_url):
-    stidx = requset_url.index("://")
-    host = requset_url[stidx + 3:]
-    schema = requset_url[:stidx + 3]
-    edidx = host.index("/")
-    if edidx <= 0:
-        raise Exception("invalid request url:" + requset_url)
-    path = host[edidx:]
-    host = host[:edidx]
-    return Url(host, path, schema)
 
 
 def format_date_type(date=None):
@@ -744,18 +751,86 @@ def date_range_calculator(period_type: str, date=None, shift: int = 0, count: in
     return {'start_date': start_date, 'end_date': end_date}
 
 
-def cosine_sim(A, B):
-    dot_product = np.dot(A, B)
-    similarity = dot_product / (np.linalg.norm(A) * np.linalg.norm(B))
+def is_finite(value) -> bool:
+    """判断是否为有限数字"""
+    try:
+        float_val = float(value)
+        return not (float_val == float('inf') or float_val == float('-inf') or float_val != float_val)
+    except (TypeError, ValueError):
+        return False
+
+
+def cosine_sim(vecs1, vecs2):
+    # 两个向量（1D 数组）之间的余弦相似度
+    dot_product = np.dot(vecs1, vecs2)
+    similarity = dot_product / (np.linalg.norm(vecs1) * np.linalg.norm(vecs2))
     return similarity
+
+
+def fast_dot_np(vecs1, vecs2):
+    # 用 NumPy 批量计算点积,形状相同的 2D 数组逐行点积,矩阵逐元素相乘后按行求和
+    return np.einsum('ij,ij->i', vecs1, vecs2)  # np.sum(A * B, axis=1)
+
+
+def normalize_np(vecs):
+    # 手动归一化
+    # norms = np.sqrt(np.einsum('ij,ij->i', vecs, vecs)) #模长,L2 范数 ||ndarr1|| for each row
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
 
 
 def cosine_similarity_np(ndarr1, ndarr2):
     denominator = np.outer(np.linalg.norm(ndarr1, axis=1), np.linalg.norm(ndarr2, axis=1))
-    dot_product = np.dot(ndarr1, ndarr2.T)
+    dot_product = np.dot(ndarr1, ndarr2.T)  # np.einsum('ik,jk->ij', ndarr1, ndarr2)
     with np.errstate(divide='ignore', invalid='ignore'):
         similarity = np.where(denominator != 0, dot_product / denominator, 0)
     return similarity
+
+
+def function_registry_dynamic(functions_list: list, module_names: list):
+    """
+    动态加载模块并注册函数
+    :param functions_list: 需要注册的函数名列表
+    :param module_names: 模块名称列表（字符串形式）
+    :return: 函数注册表
+    """
+    registry = {}
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)  # 动态加载模块
+            for name in functions_list:
+                if name not in registry:  # 避免重复覆盖
+                    func = getattr(module, name, None)
+                    if func is not None:
+                        registry[name] = func
+        except ModuleNotFoundError:
+            print(f"Module '{module_name}' not found.")
+    return registry
+
+
+# import psutil,signal,contextlib
+# def kill_process_tree(pid: int):
+#     """
+#     Kills all descendant processes of the given pid by sending SIGKILL.
+#
+#     Args:
+#         pid (int): Process ID of the parent process
+#     """
+#     try:
+#         parent = psutil.Process(pid)
+#     except psutil.NoSuchProcess:
+#         return
+#
+#     # Get all children recursively
+#     children = parent.children(recursive=True)
+#
+#     # Send SIGKILL to all children first
+#     for child in children:
+#         with contextlib.suppress(ProcessLookupError):
+#             os.kill(child.pid, signal.SIGKILL)
+#
+#     # Finally kill the parent
+#     with contextlib.suppress(ProcessLookupError):
+#         os.kill(pid, signal.SIGKILL)
 
 
 class BM25:

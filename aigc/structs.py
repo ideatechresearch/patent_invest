@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Generator, List, Tuple, Union, Any
+from pydantic import BaseModel, Field, field_validator, condecimal, conint
+from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from enum import Enum as PyEnum
 from enum import IntEnum
 from dataclasses import asdict, dataclass, is_dataclass
@@ -61,21 +61,97 @@ class GeneratorWithReturn:
         return self.ret
 
 
-
 class GenerationParams(BaseModel):
     inputs: Union[str, List[Dict]]
     session_id: int = Field(default_factory=lambda: random.randint(0, SESSION_ID_MAX))
     agent_cfg: Dict = Field(default_factory=dict)
 
 
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "developer"]
+    content: Union[str, List[dict]]  # str
+    name: Optional[str] = None  # 可以包含 a-z、A-Z、0-9 和下划线，最大长度为 64 个字符
+
+
+from config import ModelListExtract
+MODEL_LIST = ModelListExtract()
+
+class OpenAIRequest(BaseModel):
+    # model: Literal[*tuple(MODEL_LIST.models)]
+    model: Annotated[str, lambda v: MODEL_LIST.contains(v)]
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[conint(ge=1)] = 512
+    stream: Optional[bool] = True
+    store: Optional[bool] = False
+
+    tools: Optional[List[dict]] = None  # 工具参数,在生成过程中调用外部工具
+    stop: Optional[Union[str, List[str]]] = None  # 停止词，用于控制生成的停止条件 ["\n"],
+    presence_penalty: Optional[float] = 0.0  # 避免生成重复内容 condecimal(ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = 0.0  # 避免过于频繁的内容 condecimal(ge=-2.0, le=2.0)
+    logit_bias: Optional[Dict[int, float]] = None  # 特定 token 的偏置
+    user: Optional[str] = None  # 用户标识符,最终用户的唯一标识符
+
+    reasoning_effort: Optional[str] = None  # 探索高级推理和问题解决模型 low,medium,high
+    # max_completion_tokens
+    response_format: Optional[dict] = None  # 结构化输出,响应符合 JSON 架构
+    prediction: Optional[dict] = None  # 预测输出,减少模型响应的延迟
+    stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
+
+    # file =
+    # modalities= ["text", "audio"]
+    # audio={voice: "alloy", format: "wav"}
+    # metadata: {
+    #     role: "manager",
+    #     department: "accounting",
+    #     source: "homepage"
+    # }
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model": "qwen-turbo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "你好,有问题要问你"
+                    }
+                ],
+                "temperature": 1,
+                "top_p": 1,
+                "max_tokens": 512,
+                "stream": True
+            }
+        }
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value):
+        if value == 'gpt-4o-mini':
+            return 'qwen-turbo'
+        if not MODEL_LIST.contains(value):
+            raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
+        return value
+
+    @field_validator("messages")
+    @classmethod
+    def check_messages(cls, values):
+        if not values:
+            raise ValueError('Messages are required')
+        return values
+
+
 class OpenAIResponse(BaseModel):
-    response: str
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: List[dict]
+    usage: dict
 
-
-class Message(BaseModel):
-    role: str
-    content: str
-    # name: str = None
+    service_tier: Optional[str] = None  # 标识当前 API 请求或用户的服务层级
+    system_fingerprint: Optional[str] = None  # 标识与请求关联的特定客户端、设备或会话
 
 
 class AuthRequest(BaseModel):
@@ -165,7 +241,7 @@ class PlatformEnum(str, PyEnum):
 
 
 class ToolRequest(BaseModel):
-    messages: Optional[List[Message]] = Field(None)
+    messages: Optional[List[ChatMessage]] = Field(None)
     tools: Optional[List[Any]] = Field(None)
     prompt: Optional[str] = Field(default=None)
     model_name: str = 'moonshot'
@@ -231,7 +307,7 @@ class CompletionParams(BaseModel):
 
     model_name: str = Field("moonshot",
                             description=("Specify the name of the model to be used. It can be any available model, "
-                                         "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan', or other models."))
+                                         "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek', or other models."))
     model_id: int = Field(0, description="Model ID to be used")
 
     keywords: Optional[List[Union[str, Tuple[str, Any]]]] = Field(
@@ -257,7 +333,7 @@ class CompletionParams(BaseModel):
                 {
                     'prompt': '请解释人工智能的原理。',
                     "question": "",
-                    "agents": "0",
+                    "agent": "0",
                     "suffix": "",
                     "stream": False,
                     "temperature": 0.7,
@@ -275,7 +351,7 @@ class CompletionParams(BaseModel):
                     "model_name": "doubao",
                     "model_id": -1,
                     "prompt": "",
-                    "agents": "42",
+                    "agent": "42",
                     "top_p": 0.8,
                     "question": "这是什么啊,可以描述一下吗?",
                     "keywords": [],
@@ -287,12 +363,19 @@ class CompletionParams(BaseModel):
             ]
         }
 
+    @field_validator("model_name")
+    @classmethod
+    def validate_model(cls, value):
+        if not MODEL_LIST.contains(value):
+            raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
+        return value
+
     def asdict(self):
-        return self.dict()
+        return self.model_dump()  # .dict()
 
     def payload(self):
-        return {k: v for k, v in self.dict().items() if
-                k in ['temperature', 'top_p', 'max_tokens', 'stream']}
+        return self.model_dump(include={'temperature', 'top_p', 'max_tokens', 'stream'})
+        # {k: v for k, v in self.dict().items() if k in ['temperature', 'top_p', 'max_tokens', 'stream']}
 
 
 class SubmitMessagesRequest(BaseModel):
@@ -305,12 +388,12 @@ class SubmitMessagesRequest(BaseModel):
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
     filter_time: Optional[int] = Field(0, description="The timestamp to filter historical messages.")
 
-    messages: Optional[List[Message]] = Field(None,
-                                              description="A list of message objects representing the current conversation. "
-                                                          "If no messages are provided and `use_hist` is set to `True`, "
-                                                          "the system will filter existing chat history using the fields "
-                                                          "`username`, `user_id`, and `filter_time`. "
-                                                          "If `messages` are provided, the last user message will be used as the question.")
+    messages: Optional[List[ChatMessage]] = Field(None,
+                                                  description="A list of message objects representing the current conversation. "
+                                                              "If no messages are provided and `use_hist` is set to `True`, "
+                                                              "the system will filter existing chat history using the fields "
+                                                              "`username`, `user_id`, and `filter_time`. "
+                                                              "If `messages` are provided, the last user message will be used as the question.")
 
     params: Optional[List[CompletionParams]] = None
 
@@ -339,7 +422,7 @@ class SubmitMessagesRequest(BaseModel):
                     "question": "",
                     "keywords": [],
                     "tools": [],
-                    "agents": "0",
+                    "agent": "0",
                     "extract": "json",
                     "model_name": "moonshot",
                     "model_id": 0,
@@ -350,7 +433,7 @@ class SubmitMessagesRequest(BaseModel):
         }
 
 
-class OpenAIRequest(CompletionParams):
+class ChatCompletionRequest(CompletionParams):
     uuid: Optional[str] = None
     username: Optional[str] = None
     robot_id: Optional[str] = None
@@ -360,12 +443,12 @@ class OpenAIRequest(CompletionParams):
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
     filter_time: float = Field(default=0, description="The timestamp to filter historical messages.")
 
-    messages: Optional[List[Message]] = Field(None,
-                                              description="A list of message objects representing the current conversation. "
-                                                          "If no messages are provided and `use_hist` is set to `True`, "
-                                                          "the system will filter existing chat history using the fields "
-                                                          "`username`, `user_id`, and `filter_time`. "
-                                                          "If `messages` are provided, the last user message will be used as the question.")
+    messages: Optional[List[ChatMessage]] = Field(None,
+                                                  description="A list of message objects representing the current conversation. "
+                                                              "If no messages are provided and `use_hist` is set to `True`, "
+                                                              "the system will filter existing chat history using the fields "
+                                                              "`username`, `user_id`, and `filter_time`. "
+                                                              "If `messages` are provided, the last user message will be used as the question.")
     question: Optional[str] = Field(None,
                                     description="The primary question or prompt for the AI to respond to. "
                                                 "If `messages` are provided, this field will be automatically overridden by "
@@ -383,7 +466,7 @@ class OpenAIRequest(CompletionParams):
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
-                "agents": "0",
+                "agent": "0",
                 "model_name": "moonshot",
                 "model_id": 0,
                 "prompt": '',

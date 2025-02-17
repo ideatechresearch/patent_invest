@@ -1,5 +1,6 @@
 from generates import *
 from igraph import Graph
+import asyncio
 import PyPDF2
 
 

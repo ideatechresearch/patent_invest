@@ -1,34 +1,61 @@
-import httpx, aiohttp, aiofiles
+import httpx, aiohttp, aiofiles, asyncio
 from http import HTTPStatus
 import oss2
 from pathlib import PurePosixPath
-from typing import List, Tuple, Any, Union, Callable
+from typing import List, Dict, Tuple, Any, Union, Callable, Awaitable, Generator, Optional
 import random
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 # import qianfan
 import dashscope
 from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription
 # from lagent import tool_api
-
+from functools import partial  # cache, lru_cache, partial, wraps, wraps
 from config import *
 from utils import *
 from agents.ai_tools import *
 from agents.ai_prompt import *
 
-AI_Client = {}
+AI_Client = {}  # Dict[str, OpenAI]
 
 
-def init_ai_clients(api_keys=API_KEYS):
-    SUPPORTED_MODELS = {'moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan'}
-    for model in AI_Models:
+async def get_data_for_model(model: dict):
+    """获取每个模型的数据"""
+    model_name = model.get('name')
+    client = AI_Client.get(model_name)
+    if client:
+        try:
+            models = await client.models.list()
+            model['data'] = [m.model_dump() for m in models.data]
+        except Exception as e:
+            print(f"OpenAI {model_name} error occurred: {e}")
+
+
+async def init_ai_clients(ai_models=AI_Models, api_keys=API_KEYS, get_data=False):
+    tasks = []
+    for model in ai_models:
         model_name = model.get('name')
         api_key = api_keys.get(model_name)
         if api_key:
             model['api_key'] = api_key
-            if model_name not in AI_Client and model_name in SUPPORTED_MODELS:
-                AI_Client[model_name] = OpenAI(api_key=api_key, base_url=model['base_url'])
+            if model_name not in AI_Client and model.get('supported_openai'):  # model_name in SUPPORTED_OPENAI_MODELS
+                AI_Client[model_name]: AsyncOpenAI = AsyncOpenAI(api_key=api_key, base_url=model['base_url'])  # OpenAI
+                if get_data:
+                    tasks.append(get_data_for_model(model))
+
+    if get_data:
+        await asyncio.gather(*tasks)
+
+    ModelListExtract.set()
+    # print(len(ModelListExtract.get()))
+
+
+# client = AI_Client['deepseek']
+# print(dir(client.chat.completions))# 'create', 'with_raw_response', 'with_streaming_response'
+# print(dir(client.completions))
+# print(dir(client.embeddings))
+# print(dir(client.files)) #'content', 'create', 'delete', 'list', 'retrieve', 'retrieve_content', 'wait_for_processing'
 
 
 def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
@@ -68,9 +95,10 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
         return model, None
 
     raise ValueError(f"Model with name {name} not found.")
+    # HTTPException(status_code=400, detail=f"Model with name {name} not found.")
 
 
-async def ai_tool_response(messages, tools=None, model_name='moonshot', model_id=1,
+async def ai_tool_response(messages, tools=None, model_name=Config.DEFAULT_MODEL, model_id=1,
                            top_p=0.95, temperature=0.01, **kwargs):
     """
       调用 AI 模型接口，使用提供的工具集和对话消息，返回模型的响应。qwen
@@ -78,11 +106,10 @@ async def ai_tool_response(messages, tools=None, model_name='moonshot', model_id
     """
     model_info, name = find_ai_model(model_name, model_id)
     client = AI_Client.get(model_info['name'], None)
-
+    # tools = [{"type": "web_search",}]
     if client:
         try:
-            completion = await asyncio.to_thread(
-                client.chat.completions.create,
+            completion = await client.chat.completions.create(
                 model=name,
                 messages=messages,
                 tools=tools,
@@ -98,6 +125,14 @@ async def ai_tool_response(messages, tools=None, model_name='moonshot', model_id
             print(f"OpenAI error occurred: {e}")
 
     return None  # await ai_chat_post(model_info, payload)
+
+
+def functions_registry(functions_list: list):
+    # 创建全局函数注册表
+    return {name: globals().get(name) for name in functions_list}
+
+
+Function_Registry = {}
 
 
 async def ai_tools_messages(response_message):
@@ -121,25 +156,20 @@ async def ai_tools_messages(response_message):
             })
         return messages
 
-    function_registry = {
-        "get_times_shift": get_times_shift,
-        "get_weather": get_weather,
-        "web_search": web_search,
-        "date_range_calculator": date_range_calculator,
-        'get_day_range': get_day_range,
-        "get_week_range": get_week_range,
-        "get_month_range": get_month_range,
-        "get_quarter_range": get_quarter_range,
-        "get_year_range": get_year_range,
-        "get_half_year_range": get_half_year_range,
-        "search_bmap_location": search_bmap_location,
-        "auto_translate": auto_translate,
-        # 添加更多可调用函数
-    }
+    global Function_Registry
+    if not Function_Registry:  # 动态性延迟加载,全局注册表初始化
+        Function_Registry = functions_registry(functions_list=[
+            "get_times_shift", "get_weather", "web_search", "date_range_calculator",
+            "get_day_range", "get_week_range", "get_month_range",
+            "get_quarter_range", "get_year_range", "get_half_year_range",
+            "search_bmap_location", "auto_translate"
+            # 添加更多可调用函数
+        ])
+
     for tool in tool_calls:
         func_name = tool.function.name  # function_name
         func_args = tool.function.arguments  # function_args = json.loads(tool_call.function.arguments)
-        func_reg = function_registry.get(func_name)  # 从注册表中获取函数
+        func_reg = Function_Registry.get(func_name, None)  # 从注册表中获取函数
         # print(func_args)
         # 检查并解析 func_args 确保是字典
         if isinstance(func_args, str):
@@ -223,24 +253,24 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
         if not file_path_obj.exists():  # .is_file()
             continue
 
-        if client:
-            file_object = client.files.create(file=file_path_obj, purpose="file-extract")
+        if client:  # client.files.create
+            file_object = await client.files.create(file=file_path_obj, purpose="file-extract")
             if model_info['name'] == 'qwen':
                 messages.append({"role": "system", "content": f"fileid://{file_object.id}", })
                 # client.files.list()
                 # 文件信息client.files.retrieve(file_object.id)
                 # 文件内容client.files.content(file_object.id)
             elif model_info['name'] == 'moonshot':
-                file_content = client.files.content(file_id=file_object.id).text
-                messages.append({"role": "system", "content": file_content, })
+                file_content = await client.files.content(file_id=file_object.id)
+                messages.append({"role": "system", "content": file_content.text, })
         else:
             dashscope_file_upload(messages, file_path=str(file_path_obj))
 
     if question:
         messages.append({"role": "user", "content": question})
         # print(messages)
-        completion = client.chat.completions.create(model=name, messages=messages, **kwargs)
-        bot_response = completion.choices[0].message.content  # completion.model_dump_json()
+        completion = await client.chat.completions.create(model=name, messages=messages, **kwargs)
+        bot_response = completion.choices[0].message.content
         messages.append({"role": "assistant", "content": bot_response})
         return messages
 
@@ -283,8 +313,7 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
     client = AI_Client.get(model_info['name'], None)
     if client:  # openai.Embedding.create
         if isinstance(inputs, list) and len(inputs) > batch_size:
-            tasks = [asyncio.to_thread(
-                client.embeddings.create,
+            tasks = [client.embeddings.create(
                 model=name, input=inputs[i:i + batch_size],
                 encoding_format="float",
                 **kwargs
@@ -306,14 +335,14 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
                 Embedding_Cache[cache_key] = embeddings
 
         else:
-            completion = await asyncio.to_thread(client.embeddings.create,
-                                                 model=name, input=inputs,
-                                                 encoding_format="float")
+            # await asyncio.to_thread(client.embeddings.create
+            completion = await client.embeddings.create(
+                model=name, input=inputs, encoding_format="float")
 
             embeddings = [item.embedding for item in completion.data]
+            # data = json.loads(completion.model_dump_json()
 
         return embeddings
-        # data = json.loads(completion.model_dump_json()
 
     # dashscope.TextEmbedding.call
     url = model_info['embedding_url']
@@ -394,9 +423,9 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
     return []
 
 
-# 生成:conversation or summary
+# 生成:conversation or summary,Fill-In-the-Middle
 async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, stream=False, temperature=0.7,
-                      max_tokens=4096, model_name='silicon', model_id=0, **kwargs):
+                      max_tokens=4096, model_name='silicon', model_id=0, get_content=True, **kwargs):
     '''
     Completions足以解决几乎任何语言处理任务，包括内容生成、摘要、语义搜索、主题标记、情感分析等等。
     需要注意的一点限制是，对于大多数模型，单个API请求只能在提示和完成之间处理最多4096个标记。
@@ -405,7 +434,7 @@ async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, s
     if not name:
         return await ai_chat(model_info=None, messages=None, user_request=user_request, system=prompt,
                              temperature=temperature, max_tokens=max_tokens, top_p=0.8, model_name=model_name,
-                             model_id=model_id, **kwargs)
+                             model_id=model_id, get_content=get_content, **kwargs)
 
     if user_request:
         prompt += '\n\n' + user_request
@@ -415,7 +444,8 @@ async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, s
         return response.output.text
 
     client = AI_Client.get(model_info['name'], None)
-    response = client.completions.create(
+    # client.completions.create
+    response = await client.completions.create(
         # engine=name,
         model=name,
         prompt=prompt,
@@ -429,18 +459,277 @@ async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, s
     )
     if stream:
         async def stream_data():
-            for chunk in response:
-                yield chunk.choices[0].text
+            async for chunk in response:
+                yield chunk.choices[0].text if get_content else chunk.model_dump_json()
 
         return stream_data()
 
-    return response.choices[0].text.strip()
+    return response.choices[0].text.strip() if get_content else response.model_dump()
 
 
-from knowledge import ideatech_knowledge
+async def request_ollama(prompt, model_name="mistral", stream=False):
+    url = "http://localhost:11434/api/generate"
+    payload = {"model": model_name, "prompt": prompt, "stream": stream}
+
+    async with aiohttp.ClientSession() as session:
+        response = await session.post(url, json=payload)
+        return response  # 直接返回响应对象
+
+
+async def call_ollama(prompt, model_name="mistral", stream=True):
+    response = await request_ollama(prompt, model_name=model_name, stream=stream)
+
+    async def stream_data():
+        async for line in response.content:
+            line = line.strip()
+            if line:
+                try:
+                    data = json.loads(line.decode('utf-8'))
+                    yield data
+                    # print(data.get("response", ""), end="", flush=True)  # 实时打印 AI 生成的文本
+                except json.JSONDecodeError:
+                    pass  # 忽略 JSON 解析错误
+
+    try:
+        return stream_data() if stream else await response.json()
+    finally:
+        await response.release()
+
+
+def messages_to_prompt(messages):
+    """ 将 OpenAI-style messages 转换为 Ollama 的 prompt """
+    prompt = ""
+    for msg in messages:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        prompt += f"{role}: {msg['content']}\n"
+    prompt += "Assistant:"
+    return prompt
+
+
+async def openai_llama_chat_completions(messages, stream=True, **kwargs):
+    """
+      模拟 OpenAI 的返回结构
+      - 如果 stream=True，模拟流式返回
+      - 如果 stream=False，返回完整 JSON 响应
+    """
+    prompt = messages_to_prompt(messages)
+    response = await call_ollama(prompt, model_name="mistral", stream=stream)
+    if stream:
+        async def stream_data():
+            async for chunk in response:
+                content = chunk.get("response", "")
+                data = {"id": "chatcmpl-xyz", "object": "chat.completion.chunk", "created": int(time.time()),
+                        "model": "gpt-4o",
+                        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]},
+                yield f"data: {json.dumps(data)}\n\n"  # (f"data: {data}\n\n").encode("utf-8")
+
+        return stream_data()
+
+    completion = response.get("response", "")
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "gpt-4o",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": completion,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt),
+            "completion_tokens": len(completion),  # .split()
+            "total_tokens": len(prompt) + len(completion),
+        },
+    }
+
+
+#
+# async def create_completion(
+#         messages: List[Dict[str, str]],
+#         refresh_token: str,
+#         model: str = Config.DEFAULT_MODEL,
+#         retry_count: int = 0
+# ) -> Dict:
+#     """同步对话补全
+#
+#     Args:
+#         messages: 消息列表
+#         refresh_token: 刷新token
+#         model: 模型名称
+#         retry_count: 重试次数
+#
+#     Returns:
+#         Dict: 补全结果
+#
+#     Raises:
+#         API_REQUEST_PARAMS_INVALID: 参数无效
+#     """
+#     try:
+#         if not messages:
+#             raise  Exception("消息不能为空")
+#
+#         # 解析模型参数
+#         model_info = parse_model(model)
+#
+#         # 生成图像
+#         image_urls = generate_images(
+#             model=model_info['model'],
+#             prompt=messages[-1]['content'],
+#             width=model_info['width'],
+#             height=model_info['height'],
+#             refresh_token=refresh_token
+#         )
+#
+#         # 构造返回结果
+#         return {
+#             'id': generate_uuid(),
+#             'model': model or model_info['model'],
+#             'object': 'chat.completion',
+#             'choices': [{
+#                 'index': 0,
+#                 'message': {
+#                     'role': 'assistant',
+#                     'content': ''.join(f'![image_{i}]({url})\n' for i, url in enumerate(image_urls))
+#                 },
+#                 'finish_reason': 'stop'
+#             }],
+#             'usage': {
+#                 'prompt_tokens': 1,
+#                 'completion_tokens': 1,
+#                 'total_tokens': 2
+#             },
+#             'created':  int(time.time())
+#         }
+#     except Exception as e:
+#         if retry_count < Config.MAX_RETRY_COUNT:
+#             print(f"Response error: {str(e)}")
+#             print(f"Try again after {Config.RETRY_DELAY}s...")
+#             await asyncio.sleep(Config.RETRY_DELAY)
+#             return await create_completion(messages, refresh_token, model, retry_count + 1)
+#         raise e
+
+#
+# async def create_completion_stream(
+#         messages: List[Dict[str, str]],
+#         refresh_token: str,
+#         model: str = Config.DEFAULT_MODEL,
+#         retry_count: int = 0
+# ) -> Generator[Dict, None, None]:
+#     """流式对话补全
+#
+#     Args:
+#         messages: 消息列表
+#         refresh_token: 刷新token
+#         model: 模型名称
+#         retry_count: 重试次数
+#
+#     Yields:
+#         Dict: 补全结果片段
+#     """
+#     try:
+#         if not messages:
+#             yield {
+#                 'id': generate_uuid(),
+#                 'model': model,
+#                 'object': 'chat.completion.chunk',
+#                 'choices': [{
+#                     'index': 0,
+#                     'delta': {'role': 'assistant', 'content': '消息为空'},
+#                     'finish_reason': 'stop'
+#                 }]
+#             }
+#             return
+#
+#         # 解析模型参数
+#         model_info = parse_model(model)
+#
+#         # 发送开始生成消息
+#         yield {
+#             'id': generate_uuid(),
+#             'model': model or model_info['model'],
+#             'object': 'chat.completion.chunk',
+#             'choices': [{
+#                 'index': 0,
+#                 'delta': {'role': 'assistant', 'content': '🎨 图像生成中，请稍候...'},
+#                 'finish_reason': None
+#             }]
+#         }
+#
+#         try:
+#             # 生成图像
+#             image_urls = generate_images(
+#                 model=model_info['model'],
+#                 prompt=messages[-1]['content'],
+#                 width=model_info['width'],
+#                 height=model_info['height'],
+#                 refresh_token=refresh_token
+#             )
+#
+#             # 发送图像URL
+#             for i, url in enumerate(image_urls):
+#                 yield {
+#                     'id': generate_uuid(),
+#                     'model': model or model_info['model'],
+#                     'object': 'chat.completion.chunk',
+#                     'choices': [{
+#                         'index': i + 1,
+#                         'delta': {
+#                             'role': 'assistant',
+#                             'content': f'![image_{i}]({url})\n'
+#                         },
+#                         'finish_reason': None if i < len(image_urls) - 1 else 'stop'
+#                     }]
+#                 }
+#
+#             # 发送完成消息
+#             yield {
+#                 'id': generate_uuid(),
+#                 'model': model or model_info['model'],
+#                 'object': 'chat.completion.chunk',
+#                 'choices': [{
+#                     'index': len(image_urls) + 1,
+#                     'delta': {
+#                         'role': 'assistant',
+#                         'content': '图像生成完成！'
+#                     },
+#                     'finish_reason': 'stop'
+#                 }]
+#             }
+#
+#         except Exception as e:
+#             # 发送错误消息
+#             yield {
+#                 'id': generate_uuid(),
+#                 'model': model or model_info['model'],
+#                 'object': 'chat.completion.chunk',
+#                 'choices': [{
+#                     'index': 1,
+#                     'delta': {
+#                         'role': 'assistant',
+#                         'content': f'生成图片失败: {str(e)}'
+#                     },
+#                     'finish_reason': 'stop'
+#                 }]
+#             }
+#     except Exception as e:
+#         if retry_count < Config.MAX_RETRY_COUNT:
+#             print(f"Response error: {str(e)}")
+#             print(f"Try again after {Config.RETRY_DELAY}s...")
+#             await asyncio.sleep(Config.RETRY_DELAY)
+#             async for chunk in create_completion_stream(messages, refresh_token, model, retry_count + 1):
+#                 yield chunk
+#             return
+#         raise e
 
 
 def agent_func_calls(agent):
+    from knowledge import ideatech_knowledge
     function_agent = {
         'default': lambda *args, **kwargs: [],
         '2': web_search,  # web_search_async
@@ -458,10 +747,12 @@ async def wrap_sync(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+# retriever
 async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple[str, Any]]] = None,
                               tool_calls: List[Callable[[...], Any]] = None, **kwargs):
+    # docs = retriever(question)
     # Assume this is the document retrieved from RAG
-    # function_call = Agent_Functions.get(agents, lambda *args, **kwargs: [])
+    # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
     tool_calls = tool_calls or []
     items_to_process = []
@@ -509,7 +800,7 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
 
 # Callable[[参数类型], 返回类型]
 async def get_chat_payload(messages, user_request: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
-                           top_k: float = 50, max_tokens: int = 1024, model_name='moonshot', model_id=0,
+                           max_tokens: int = 1024, model_name=Config.DEFAULT_MODEL, model_id=0,
                            tool_calls: List[Callable[[...], Any]] = None,
                            keywords: List[Union[str, Tuple[str, Any]]] = None, images: List[str] = None, **kwargs):
     model_info, name = find_ai_model(model_name, model_id, 'model')
@@ -561,13 +852,14 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
     else:
         if messages is None:
             messages = []
-        if model_type != 'baidu' and system:
+        if model_type != 'baidu' and system:  # system_message
             messages = [{"role": "system", "content": system}]
         messages.append({'role': 'user', 'content': user_request})
 
     refer = await retrieved_reference(user_request, keywords, tool_calls, **kwargs)
     if refer:
         formatted_refer = '\n'.join(map(str, refer))
+        # """Answer the users question using only the provided information below:{docs}""".format(docs=formatted_refer)
         messages[-1]['content'] = (f'以下是相关参考资料:\n{formatted_refer}\n'
                                    f'请结合以上内容或根据上下文，针对下面的问题进行解答：\n{user_request}')
 
@@ -580,7 +872,7 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
         messages=messages,
         temperature=temperature,
         top_p=top_p,
-        top_k=top_k,
+        # top_k=50,
         max_tokens=max_tokens,
         # extra_body = {"prefix": "```python\n", "suffix":"后缀内容"} 希望的前缀内容,基于用户提供的前缀信息来补全其余的内容
         # response_format={"type": "json_object"}
@@ -613,44 +905,34 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
     return model_info, payload, refer
 
 
-async def ai_chat(model_info, payload=None, **kwargs):
-    if not payload:
-        model_info, payload, _ = await get_chat_payload(**kwargs)
-    else:
-        payload.update(kwargs)  # {**payload, **kwargs}
-
-    client = AI_Client.get(model_info['name'], None)
-    if client:
-        try:
-            completion = await asyncio.to_thread(client.chat.completions.create, **payload)
-            return completion.choices[0].message.content
-        except Exception as e:
-            return f"OpenAI error occurred: {e}"
-
-    return await ai_chat_post(model_info, payload)
-
-
-async def ai_chat_post(model_info, payload):
+def get_chat_payload_post(model_info, payload):
     # 通过 requests 库直接发起 HTTP POST 请求
-    model_type = model_info['type']
     url = model_info['url']
     api_key = model_info['api_key']
     headers = {'Content-Type': 'application/json', }
+    payload = payload.deepcopy()
     if api_key:
         if isinstance(api_key, list):
             idx = model_info['model'].index(payload["model"])
             api_key = model_info['api_key'][idx]
 
         headers = {'Content-Type': 'application/json',
-                   "Authorization": f'Bearer {api_key}'}
-    if model_type == 'baidu':
-        url = build_url(url, get_baidu_access_token(Config.BAIDU_qianfan_API_Key, Config.BAIDU_qianfan_Secret_Key))
-        payload["disable_search"] = False
+                   "Authorization": f'Bearer {api_key}'
+                   }
+    if model_info['type'] == 'baidu':  # 'ernie'
+        url = build_url(f'{url}{payload["model"]}',
+                        get_baidu_access_token(Config.BAIDU_qianfan_API_Key,
+                                               Config.BAIDU_qianfan_Secret_Key))  # ?access_token=" + get_access_token()
+        # print(url)
+        # payload.pop('model', None)
+        payload['max_output_tokens'] = payload.pop('max_tokens', 1024)
         # payload['enable_system_memory'] = False
         # payload["enable_citation"]= False
+        # payload["disable_search"] = False
         # payload["user_id"]=
+        # payload["user_ip"]=
         # payload['system'] = system
-    if model_type == 'tencent':
+    if model_info['type'] == 'tencent':
         service = 'hunyuan'
         host = url.split("//")[-1]
         payload = convert_keys_to_pascal_case(payload)
@@ -667,30 +949,53 @@ async def ai_chat_post(model_info, payload):
     #         "content-type": "application/json",
     #         "authorization": "Bearer sk-tokens"
     #     }
-    # print(headers, payload)
+    return url, headers, payload
 
+
+async def ai_chat(model_info, payload=None, get_content=True, **kwargs):
+    if not payload:
+        model_info, payload, _ = await get_chat_payload(**kwargs)
+    else:
+        payload.update(kwargs)  # {**payload, **kwargs}
+
+    client = AI_Client.get(model_info['name'], None)
+    if client:
+        try:
+            # await asyncio.to_thread(client.chat.completions.create, **payload)
+            completion = await client.chat.completions.create(**payload)
+            return completion.choices[0].message.content if get_content else completion.model_dump()  # 自动序列化为 JSON
+            # json.loads(completion.model_dump_json())
+        except Exception as e:
+            return f"OpenAI error occurred: {e}"
+
+    url, headers, payload = get_chat_payload_post(model_info, payload)
+    # print(headers, payload)
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=10)
     parse_rules = {
         'baidu': lambda d: d.get('result'),
         'tencent': lambda d: d.get('Response', {}).get('Choices', [{}])[0].get('Message', {}).get('Content'),
         # d.get('Choices')[0].get('Message').get('Content')
         'default': lambda d: d.get('choices', [{}])[0].get('message', {}).get('content')
     }
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=10)
 
     try:
         async with httpx.AsyncClient(limits=limits, timeout=Config.HTTP_TIMEOUT_SEC) as cx:
             response = await cx.post(url, headers=headers, json=payload)
             response.raise_for_status()  # 如果请求失败，则抛出异常
             data = response.json()
-            result = parse_rules.get(model_type, parse_rules['default'])(data)
-            if result:
-                return result
-            print(response.text)
+            if get_content:
+                result = parse_rules.get(model_info['type'], parse_rules['default'])(data)
+                if result:
+                    return result
+                print(response.text)
+            return data
+
     except Exception as e:
+        # print(response.text)
         return f"HTTP error occurred: {e}"
 
 
-async def ai_chat_async(model_info, payload=None, **kwargs):
+async def ai_chat_async(model_info, payload=None, get_content=True, **kwargs):
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
@@ -698,53 +1003,32 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
         payload.update(kwargs)
 
     payload["stream"] = True
-    # payload["stream"]= {"include_usage": True}        # 可选，配置以后会在流式输出的最后一行展示token使用信息
+    # payload["stream_options"]= {"include_usage": True}        # 可选，配置以后会在流式输出的最后一行展示token使用信息
     client = AI_Client.get(model_info['name'], None)
-
+    # print(payload)
     if client:
         try:
-            stream = client.chat.completions.create(**payload)
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                    yield delta.content  # completion.append(delta.content)
+            stream = await client.chat.completions.create(**payload)
+            async for chunk in stream:  # for chunk in stream
+                if get_content:
+                    delta = chunk.choices[0].delta
+                    if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
+                        yield delta.content  # completion.append(delta.content)
+                else:
+                    yield chunk.model_dump_json()  # 获取字节流数据
         except Exception as e:
             yield f"OpenAI error occurred: {e}"
         # yield '[DONE]'
-        return
+        return  # 异步生成器的结束无需返回值
 
-    model_type = model_info['type']
-    url = model_info['url']
-    api_key = model_info['api_key']
-    if api_key:
-        if isinstance(api_key, list):
-            idx = model_info['model'].index(payload["model"])
-            api_key = model_info['api_key'][idx]
-        headers = {
-            'Content-Type': 'text/event-stream',
-            "Authorization": f'Bearer {api_key}'
-        }
-
-    if model_type == 'baidu':  # 'ernie'
-        url = build_url(url, get_baidu_access_token(Config.BAIDU_qianfan_API_Key,
-                                                    Config.BAIDU_qianfan_Secret_Key))  # ?access_token=" + get_access_token()
-        headers = {'Content-Type': 'application/json', }
-    if model_type == 'tencent':
-        service = 'hunyuan'
-        host = url.split("//")[-1]
-        payload = convert_keys_to_pascal_case(payload)
-        payload.pop('MaxTokens', None)
-        headers = get_tencent_signature(service, host, payload, action='ChatCompletions',
-                                        secret_id=Config.TENCENT_SecretId,
-                                        secret_key=Config.TENCENT_Secret_Key)
-        headers['X-TC-Version'] = '2023-09-01'
-
+    url, headers, payload = get_chat_payload_post(model_info, payload)
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=10)
     try:
         async with httpx.AsyncClient(limits=limits) as cx:
             async with cx.stream("POST", url, headers=headers, json=payload) as response:
                 response.raise_for_status()
-                async for content in process_line_stream(response, model_type):
+                async for content in process_line_stream(response, model_info['type']):
+                    # print(chunk["choices"][0]["delta"].get("content", ""), end="", flush=True)
                     yield content
     except httpx.RequestError as e:
         yield str(e)
@@ -755,6 +1039,7 @@ async def ai_chat_async(model_info, payload=None, **kwargs):
 async def process_line_stream(response, model_type='default'):
     data = ""
     async for line in response.aiter_lines():
+        # print(line)
         line = line.strip()
         if len(line) == 0:  # 开头的行 not line
             if data:
@@ -772,6 +1057,7 @@ async def process_line_stream(response, model_type='default'):
                 chunk = json.loads(line_data)
                 reason = chunk.get('Choices', [{}])[0].get('FinishReason')
                 if reason == "stop":
+                    # raise StopIteration(2)
                     break
             elif model_type == 'baidu':
                 chunk = json.loads(line_data)
@@ -791,14 +1077,13 @@ async def process_line_stream(response, model_type='default'):
 def process_data_chunk(data, model_type='default'):
     try:
         chunk = json.loads(data)
+
         if model_type == 'baidu':  # line.decode("UTF-8")
-            return chunk.get("result")
-        elif model_type == 'tencent':
-            choices = chunk.get('Choices', [])
-            if choices:
-                delta = choices[0].get('Delta', {})
-                return delta.get("Content")
+            return chunk.get("result") or chunk.get("error_msg")
         else:
+            if model_type == 'tencent':
+                chunk = convert_keys_to_lower_case(chunk)
+
             choices = chunk.get('choices', [])
             if choices:
                 delta = choices[0].get('delta', {})
@@ -875,10 +1160,10 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> 
 
     async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         try:
-            resp = await cx.post(url, json=data, headers=headers)
-            resp.raise_for_status()
+            response = await cx.post(url, json=data, headers=headers)
+            response.raise_for_status()
 
-            data = resp.json()
+            data = response.json()
             results = data['choices'][0]['message']['tool_calls'][1]['search_result']
             return [{
                 'title': result.get('title'),
@@ -890,9 +1175,12 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> 
             # return resp.text  # resp.content.decode()
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             return [{'error': str(exc)}]
+        # finally:
+        #     await response.close()
+
+        # https://portal.azure.com/#home
 
 
-# https://portal.azure.com/#home
 def bing_search(query, bing_api_key):
     url = f"https://api.bing.microsoft.com/v7.0/search?q={query}"
     headers = {"Ocp-Apim-Subscription-Key": bing_api_key}
@@ -1454,7 +1742,7 @@ async def xunfei_translate(text: str, source: str = 'en', target: str = 'cn'):
     async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
         response = await client.post(url, json=request_data, headers=headers)
         if response.status_code == 200:
-            response_data = await response.json()
+            response_data = response.json()
 
             # 解码返回结果中的text字段
             if "payload" in response_data and "result" in response_data["payload"]:
@@ -2060,6 +2348,35 @@ async def tencent_generate_image(prompt: str = '', negative_prompt: str = '', st
 
         image_decode = base64.b64decode(response_data["ResultImage"])
         return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
+
+
+async def siliconflow_generate_image(prompt: str = '', negative_prompt: str = '', model_name='siliconflow', model_id=0):
+    model_info, name = find_ai_model(model_name, model_id, 'image')
+
+    url = "https://api.siliconflow.cn/v1/images/generations"
+
+    payload = {
+        "model": name,
+        "prompt": prompt,
+        "seed": random.randint(1, 9999999998),  # Required seed range:0 < x < 9999999999
+        'prompt_enhancement': True,
+    }
+    if negative_prompt:
+        payload["negative_prompt"] = negative_prompt
+
+    headers = {
+        "Authorization": f"Bearer {Config.Silicon_Service_Key}",
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        if response.status_code != 200:
+            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
+
+        response_data = response.json()
+
+        return None, {"urls": [i['url'] for i in response_data["images"]], 'id': response_data["seed"]}
 
 
 async def embed_images_as_base64(md_content, image_dir):
@@ -2796,7 +3113,8 @@ async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
     return None, None
 
 
-def get_weather(city: str):
+# https://www.weatherapi.com/api-explorer.aspx#forecast
+def get_weather(city: str, days: int = 0, date: str = None):
     # 使用 WeatherAPI 的 API 来获取天气信息
     api_key = Config.Weather_Service_Key
     base_url = "http://api.weatherapi.com/v1/current.json"
@@ -2804,10 +3122,19 @@ def get_weather(city: str):
     params = {
         'key': api_key,
         'q': city,
-        'aqi': 'no'  # 不需要空气质量数据
+        # Pass US Zipcode, UK Postcode, Canada Postalcode, IP address, Latitude/Longitude (decimal degree) or city name.
+        'aqi': 'no'  # Get air quality data 空气质量数据
     }
-    response = requests.get(base_url, params=params)
+    # Number of days of weather forecast. Value ranges from 1 to 10
+    if days > 0:
+        params['days'] = days
+        params['alerts'] = 'no'
+    elif date:
+        # Date on or after 1st Jan, 2010 in yyyy-MM-dd format
+        # Date between 14 days and 300 days from today in the future in yyyy-MM-dd format
+        params['dt'] = date
 
+    response = requests.get(base_url, params=params)
     if response.status_code == 200:
         data = response.json()
         weather = data['current']['condition']['text']

@@ -3,9 +3,10 @@ import datetime
 import difflib, copy
 import tempfile
 import logging
+from functools import wraps
 
-from typing import AsyncGenerator
-from fastapi import FastAPI, Request, Depends, Query, File, UploadFile, BackgroundTasks, Form, \
+from typing import AsyncGenerator, Generator
+from fastapi import FastAPI, Request, Header, Depends, Query, File, UploadFile, BackgroundTasks, Form, \
     WebSocket, WebSocketDisconnect, HTTPException, status
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from fastapi.security import OAuth2PasswordBearer
@@ -26,13 +27,12 @@ from config import *
 from database import *
 from agents.ai_tasks import *
 
+
 #  定义一个上下文管理器,初始化任务（如初始化数据库、调度器等） @app.lifespa
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up.")
     Base.metadata.create_all(bind=engine)
-    init_ai_clients(API_KEYS)
-
     # if not w3.is_connected():
     #     print("Failed to connect to Ethereum node")
 
@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     if not scheduler.running:
         scheduler.start()
 
+    await init_ai_clients(AI_Models, API_KEYS,get_data=True)
+
+    # print(json.dumps(AI_Models, indent=4))
     # task1 = asyncio.create_task(message_zero_mq.start())
 
     yield
@@ -126,6 +129,16 @@ def get_db():
 # async def shutdown_event():
 #     print("Shutting down...")
 
+# def api_route(path: str):
+#     """装饰器：把变量变成 API"""
+#     def decorator(func):
+#         @functools.wraps(func)
+#         @app.get(path)
+#         def wrapper():
+#             return func()
+#         return wrapper
+#     return decorator
+
 
 # 用户验证后的数据
 fake_users_db = {
@@ -139,6 +152,36 @@ fake_users_db = {
 }
 
 
+# @app.middleware("http")
+# async def verify_api_key(request: Request, call_next):
+#     api_key = request.headers.get("Authorization")
+#     if api_key:
+#         api_key = api_key.replace("Bearer ", "")  # 如果用的是 Bearer Token
+#     if api_key not in Config.VALID_API_KEYS:
+#         raise HTTPException(status_code=401, detail="Invalid API key")
+#     response = await call_next(request)
+#     return response
+# 用于依赖注入
+# async def verify_api_key(authorization: str = Header(None)):
+#     if not authorization:
+#         raise HTTPException(status_code=401, detail="Missing API key")
+#     api_key = authorization.replace("Bearer ", "")  # 如果用的是 Bearer Token 格式
+#     if api_key not in Config.VALID_API_KEYS:
+#         raise HTTPException(status_code=401, detail="Invalid API key")
+
+def require_api_key(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        request: Request = kwargs.get("request")
+        authorization = request.headers.get("Authorization")
+        if not authorization:
+            raise HTTPException(status_code=401, detail="Missing API key")
+        api_key = authorization.replace("Bearer ", "")  # 如果用的是 Bearer Token
+        if api_key not in Config.VALID_API_KEYS:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return await func(*args, **kwargs)
+
+    return wrapper
 
 
 # 如果提供了 eth_address 或 public_key，则不强制提供密码。
@@ -507,6 +550,8 @@ async def classify_text(request: ClassifyRequest):
 @app.post("/knowledge/")
 async def knowledge(text: str, rerank_model: Optional[str] = "BAAI/bge-reranker-v2-m3",
                     file: UploadFile = File(None), version: int = 0):
+    '''search_knowledge_base'''
+    from knowledge import ideatech_knowledge
     result = await ideatech_knowledge(text.strip(), rerank_model=rerank_model, file=file, version=version)
     return {'similar': result}
 
@@ -562,30 +607,29 @@ async def generate_text(request: CompletionParams):
     # prompt = "以下是最近的对话内容，请生成一个摘要：\n\n"  # 请根据对话内容将会议的讨论内容整理成纪要,从中提炼出关键信息,将会议内容按照主题或讨论点分组,列出决定事项和待办事项。
     # prompt += "\n".join(str(msg) for msg in conversation),"\n".join(conversation_history[-10:])
     # prompt += "\n\n摘要：",Summary
+    system_prompt = request.prompt or System_content.get(request.agent, '')
+    user_request = request.question
+    refer = await retrieved_reference(request.question, request.keywords, tool_calls=None)
+    if refer:
+        formatted_refer = '\n'.join(map(str, refer))
+        user_request = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请回答下面的问题:{request.question}'
 
     if request.stream:
-        async def stream_response():
+        async def stream_response() -> AsyncGenerator[str, None]:
             async for chunk in await ai_generate(
-                    prompt=request.prompt,
-                    user_request=request.question,
+                    prompt=system_prompt,
+                    user_request=user_request,
                     suffix=request.suffix,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
                     model_name=request.model_name,
                     model_id=request.model_id,
-                    stream=True,
-            ):
+                    stream=True, get_content=True):
                 yield chunk
+                await asyncio.sleep(0.01)  # 模拟 Token 逐步返回的延迟
 
         return StreamingResponse(stream_response(), media_type="text/plain")
     else:
-        system_prompt = request.prompt or System_content.get(request.agent, '')
-        user_request = request.question
-        refer = await retrieved_reference(request.question, request.keywords, tool_calls=None)
-        if refer:
-            formatted_refer = '\n'.join(map(str, refer))
-            user_request = f'参考材料:\n{formatted_refer}\n 材料仅供参考,请回答下面的问题:{request.question}'
-
         bot_response = await ai_generate(
             prompt=system_prompt,
             user_request=user_request,
@@ -594,15 +638,14 @@ async def generate_text(request: CompletionParams):
             max_tokens=request.max_tokens,
             model_name=request.model_name,
             model_id=request.model_id,
-            stream=False,
-        )
+            stream=False, get_content=True)
         return {"completion": bot_response, 'reference': refer,
                 'transform': extract_string(bot_response, request.extract)}  # OpenAIResponse(response=generated_text)
 
 
 # ,current_user: User = Depends(get_current_user)
 @app.post("/message/")
-async def generate_message(request: OpenAIRequest,
+async def generate_message(request: ChatCompletionRequest,
                            db: Session = Depends(get_db)) -> StreamingResponse or JSONResponse:
     # data = await request.json()
     # print(request.__dict__)
@@ -656,7 +699,7 @@ async def generate_message(request: OpenAIRequest,
             bot_response = ''.join(assistant_response)
             transform = extract_string(bot_response, extract)
             last_data = json.dumps({'role': 'assistant', 'content': bot_response, 'transform': transform},
-                                   ensure_ascii=False)
+                                   ensure_ascii=False)  # 转换字节流数据
             yield f'data: {last_data}\n\n'
             yield 'data: [DONE]\n\n'
 
@@ -673,6 +716,89 @@ async def generate_message(request: OpenAIRequest,
         return JSONResponse({'answer': bot_response, 'reference': refer, 'transform': transform})
 
 
+# /v1/completions
+# /v1/embeddings
+# /v1/audio/transcriptions
+# @require_api_key
+@app.post("/v1/chat/completions", response_model=OpenAIResponse)
+async def chat_completions(request: OpenAIRequest):
+    """
+    兼容 OpenAI API 的 /v1/chat/completions 路径，返回类似 OpenAI API 的格式
+    """
+    # print(request.dict())
+    if request.stream:
+        async def fake_stream_response():
+            async for chunk in ai_chat_async(model_info=None, messages=[msg.dict() for msg in request.messages],
+                                             user_request=None, system=None,
+                                             temperature=request.temperature, max_tokens=request.max_tokens,
+                                             top_p=request.top_p,
+                                             model_name=request.model, model_id=0, get_content=False):
+                # print(chunk.encode("utf-8"))
+                yield f"data: {chunk}\n\n"
+
+                await asyncio.sleep(0.01)
+
+            yield 'data: [DONE]\n\n'
+
+        return StreamingResponse(fake_stream_response(), media_type="text/event-stream")
+    else:
+        response = await ai_chat(model_info=None, messages=[msg.dict() for msg in request.messages],
+                                 user_request=None, system=None,
+                                 temperature=request.temperature, max_tokens=request.max_tokens,
+                                 top_p=request.top_p,
+                                 model_name=request.model, model_id=0, get_content=False)
+        # print(response)
+        return JSONResponse(content=response)
+
+
+@app.get("/v1/models")
+async def get_models(model: Optional[str] = Query(None,
+                                                  description=f"Retrieves a model instance, providing basic information about the model such as the owner and permissioning. e.g., 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek' or custom models.")):
+    if model:
+        model_info, model_id = find_ai_model(model, 0, 'model')
+        response_data = {
+            "id": model_id,
+            "object": "model",
+            "created": 1686935002 if model_info['supported_openai'] else 0,
+            "owned_by": model_info['name']
+        }
+    else:
+        extracted_data = extract_ai_model("model")
+        response_data = {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_id,  # 用于指定模型进行请求 fine-tuned-model
+                    "object": "model",
+                    "created": 1677645600,
+                    "owned_by": owner,
+                    "permission": [
+                        {
+                            "id": f"modelperm-{owner}:{model_id}",
+                            # "object": "model_permission",
+                            # "created": 1677645600,
+                            # "allow_create_engine": True,
+                            # "allow_sampling": True,
+                            # "allow_logprobs": True,
+                            # "allow_search_indices": False,
+                            # "allow_view": True,
+                            # "allow_fine_tuning": False,
+                            # "organization": "*",
+                            # "group": None,
+                            # "is_blocking": False
+                        }
+                    ],
+                    "root": model_id,  # 根版本，与 ID 相同
+                    "parent": None  # 如果没有父模型，则为 None
+                } for i, (owner, models) in enumerate(extracted_data)
+                for j, model_id in enumerate(models)]
+        }
+        # print(len(MODEL_LIST.models))
+        # response_data['data'].append({"id": 'gpt-4o-mini',
+        #                               "object": "model", "created": 0, "owned_by": 'openai'})
+    return JSONResponse(content=response_data)
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     db = next(get_db())  # async for db in get_db():
@@ -686,7 +812,7 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             model_name = request.get('model_name', "moonshot")
-            agent = request.get('agents', '0')
+            agent = request.get('agent', '0')
             extract = request.get('extract')
             user_name = request.get('username')
             robot_id = request.get('robot_id')
@@ -801,7 +927,7 @@ async def submit_messages(request: SubmitMessagesRequest, background_tasks: Back
     # history, user_request, hist_size = build_chat_history(
     #     user_name, "", request.robot_id, request.user_id, db, user_history=request.messages,
     #     use_hist=request.use_hist, filter_limit=request.filter_limit, filter_time=request.filter_time,
-    #     agents=None,request_uuid=request.uuid)
+    #     agent=None,request_uuid=request.uuid)
 
     task_id = str(uuid.uuid4())
     Task_queue[task_id] = {
@@ -1323,6 +1449,9 @@ async def text_to_image(prompt: str, negative_prompt: str = '', style_name: str 
 
     elif model_id == 1:
         image_decode, result = await tencent_generate_image(prompt, negative_prompt, style_name, return_url=False)
+    elif model_id == 2:
+        image_decode, result = await siliconflow_generate_image(prompt, negative_prompt, model_name=style_name,
+                                                                model_id=0)
     else:
         image_decode, result = await xunfei_picture(prompt, data_folder=None)
 

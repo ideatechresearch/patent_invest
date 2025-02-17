@@ -7,11 +7,11 @@ from datetime import datetime, timedelta
 from wsgiref.handlers import format_date_time
 import time
 import uuid
+import yaml, os
 
 
 class Config(object):
-    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://technet:{quote_plus("**")}@****.aliyuncs.com:3306/technet?charset=utf8'
-    # SQLALCHEMY_DATABASE_URI = (f'mysql+pymysql://***?charset=utf8')
+    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://***:{quote_plus("***")}@***:3306/technet?charset=utf8'
     SQLALCHEMY_COMMIT_ON_TEARDOWN = False
     SQLALCHEMY_TACK_MODIFICATIONS = True
     SQLALCHEMY_ECHO = True
@@ -21,20 +21,28 @@ class Config(object):
     HTTP_TIMEOUT_SEC = 60
     MAX_TASKS = 1024
     MAX_CACHE = 1024
+    MAX_RETRY_COUNT = 3
+    RETRY_DELAY = 5
     DEVICE_ID = '***'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
+    _config_path = 'data/.config.yaml'  # 'data/default_config.yaml'
+    _config_dynamic = {}  # 其他默认配置项
     QDRANT_HOST = 'qdrant'
-    LOCAL_URL = 'http://47.***:7000'
-    WECHAT_URL = 'http://*robot:*'
-    QDRANT_URL = "http://47.***:6333"
+    LOCAL_URL = 'http://*:7000'
+    WECHAT_URL = 'http://*'
+    QDRANT_URL = "http://*:6333"
 
+    VALID_API_KEYS = {"token-abc123", "token-def456"}
+    DEFAULT_MODEL = 'moonshot'
 
     BAIDU_API_Key = '***'
     BAIDU_Secret_Key = '***'
     # https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application/v1
+    # https://console.bce.baidu.com/iam/?_=1739264215214#/iam/apikey/list
     BAIDU_qianfan_API_Key = '***'  # 45844683
-    BAIDU_qianfan_Secret_Key = '***'
+    BAIDU_qianfan_Secret_Key = '***'  # 'bce-v3/ALTAK-NtpbkKRwgOjSHgtLn4iNl/b92d2895e3016aef5f746283fe99406f841ca10f'
+    QIANFAN_Service_Key = '***'
     # https://console.bce.baidu.com/ai/#/ai/nlp/overview/index
     BAIDU_nlp_API_Key = '***'  # 11266517
     BAIDU_nlp_Secret_Key = '***'
@@ -50,6 +58,9 @@ class Config(object):
     # https://console.bce.baidu.com/ai/#/ai/speech/overview/index
     BAIDU_speech_API_Key = '***'  # '115520761'
     BAIDU_speech_Secret_Key = '***'
+    # https://console.bce.baidu.com/ai/#/ai/machinetranslation/app/list
+    BAIDU_translate_API_Key = '***'  # '116451173'
+    BAIDU_translate_Secret_Key = '***'
     # https://fanyi-api.baidu.com/api/trans/product/desktop
     BAIDU_trans_AppId = '***'
     BAIDU_trans_Secret_Key = '***'
@@ -58,59 +69,161 @@ class Config(object):
     # https://console.amap.com/dev/key/app
     AMAP_API_Key = '***'
 
-    DashScope_Service_Key = '***' 
+    DashScope_Service_Key = '***'  # Bailian,DashScope
     Bailian_Service_Key = '***'
     DashVectore_Service_Key = '***'
     ALIYUN_AK_ID = '***'
     ALIYUN_Secret_Key = '***'
     ALIYUN_nls_AppId = '***'
 
-
     ALIYUN_oss_AK_ID = '***'
     ALIYUN_oss_Secret_Key = '***'
     ALIYUN_oss_region = "oss-cn-hangzhou"
     ALIYUN_oss_internal = False  # 是否使用内网地址
-    ALIYUN_oss_endpoint = f'https://{ALIYUN_oss_region}.aliyuncs.com' 
+    ALIYUN_oss_endpoint = f'https://{ALIYUN_oss_region}.aliyuncs.com'  # 'https://oss-cn-shanghai.aliyuncs.com'
     ALIYUN_Bucket_Name = '***'  # 存储桶名称
-    ALIYUN_Bucket_Domain = f"https://{ALIYUN_Bucket_Name}.{ALIYUN_oss_region}{'-internal' if ALIYUN_oss_internal else ''}.aliyuncs.com"  # 加速域名"https://{ALIYUN_Bucket_Name}.oss-accelerate.aliyuncs.com"
+    ALIYUN_Bucket_Domain = f"https://{ALIYUN_Bucket_Name}.{ALIYUN_oss_region}{'-internal' if ALIYUN_oss_internal else ''}.aliyuncs.com"  # 加速域名"https://rime.oss-accelerate.aliyuncs.com"
     # https://console.cloud.tencent.com/hunyuan/api-key
     TENCENT_SecretId = '***'
     TENCENT_Secret_Key = '***'
     TENCENT_Service_Key = '***'
 
     # https://console.xfyun.cn/services
-    XF_AppID = '***'
+    XF_AppID = 'e823df98'
     XF_API_Key = '***'
     XF_Secret_Key = '***'  # XF_API_Key:XF_Secret_Key
-    XF_API_Password = ['**', '', '']
+    XF_API_Password = ['***', '***', '', '']
+    # https://aistudio.google.com/apikey
+    GEMINI_Service_Key = '***'
 
+    # https://cloud.siliconflow.cn/models
     Silicon_Service_Key = '***'
-    Moonshot_Service_Key = "***" 
-
+    Moonshot_Service_Key = "***"
+    # https://build.nvidia.com/explore/discover
+    NVIDIA_Service_Key = '***'
+    # https://platform.openai.com/settings/organization/admin-keys
+    OPENAI_Admin_Service_Key = '***'
+    OPENAI_Service_Key = '***'
     # https://open.bigmodel.cn/console/overview
-    GLM_Service_Key = "***"
+    GLM_Service_Key = "***"  # f'Bearer {}'
     # https://platform.baichuan-ai.com/console/apikey
     Baichuan_Service_Key = '***'
+    # https://platform.deepseek.com/usage
+    DeepSeek_Service_Key = '***'
+    # https://platform.minimaxi.com/user-center/basic-information
+    MINIMAX_Group_ID = '***'
+    MINIMAX_Service_Key = '***'
     # https://ai.youdao.com/console/#/
     YOUDAO_AppID = '***'
     YOUDAO_Service_Key = '***'
     CaiYun_Token = "***"
     HF_Service_Key = '***'
+    # https://console.mistral.ai/api-keys/
+    MISTRAL_API_KEY = '***'
+    Codestral_API_KEY = '***'
+    # https://jina.ai/api-dashboard/key-manager
+    # https://jina.ai/reader/
+    JINA_Service_Key = '***'
+    # https://www.firecrawl.dev/app
+    # https://docs.firecrawl.dev/introduction
+    Firecrawl_Service_Key = '***'
     # https://console.volcengine.com/iam/keymanage
     VOLC_AK_ID = '***'
     VOLC_Secret_Key = '***'
-    VOLC_AK_ID_admin = '***'  
+    VOLC_AK_ID_admin = '***'  #
     VOLC_Secret_Key_admin = '***'
     ARK_Service_Key = '***'
+
+    # https://vanna.ai/account/models 基于大模型和RAG的Text2SQL
+    # https://vanna.ai/docs/app/
+    VANNA_Api_Key = '***'
+    # https://platform.stability.ai/account/keys
+    Stability_Api_Key = '***'
+    # https://www.comet.com/opik/dooven-prime/get-started
+    # https://www.comet.com/opik/dooven-prime/home
+    OPIK_Api_Key = '***'
+    OPIK_Workspace = '***'
+    # https://www.searchapi.io/
+    SearchApi = '***'
+    # https://api.search.brave.com/app/dashboard
+    # https://serper.dev/api-key
+    SERPER_Api_Key = '***'
+    # https://console.deepgram.com/project/
+    Deepgram_Api_Key = '***'
+    # https://fish.audio/zh-CN/discovery/
+    FishAudio_Api_Key = '***'
+    # https://serpapi.com/dashboard
+    SERPAPI_Api_Key = '***'
+    # https://www.alphavantage.co/support/#api-key
+    AlphaVantage_Api_Key = '***'
+    # https://app.tavily.com/home
+    TAVILY_Api_Key = '***'
+    # https://github.com/settings/personal-access-tokens
+    GITHUB_Access_Tokens = '***'
     # https://studio.d-id.com/
     DID_Service_Key = '***'
-
+    # https://www.weatherapi.com/my/
     Weather_Service_Key = '***'
+    # https://openweathermap.org/api
+    WeatherMap_APPID = '***'
+    # https://vectorizer.ai/account#Account-apiKey0
+    Vectorizer_Api_Key = '***'
+    Vectorizer_Secret_Key = '***'
+
+    # https://gitee.com/personal_access_tokens
+    GITEE_Access_Tokens = '***'
 
     HTTP_Proxies = {
-        'http': 'http://u:p@proxy_address:port', 
-        'https': 'http://u:p@proxy_address:port', 
+        'http': 'http://***:9030',  # socks5://10.10.10.3:9031
+        'https': 'http://***:9030',
     }
+
+    @classmethod
+    def save(cls, filepath=None):
+        """将配置项保存到YAML文件"""
+        config_data = {key: getattr(cls, key) for key in dir(cls)
+                       if not key.startswith('__')
+                       and not callable(getattr(cls, key))
+                       and not isinstance(getattr(cls, key), classmethod)}
+
+        path = filepath or getattr(cls, '_config_path', 'data/default_config.yaml')
+        with open(path, "w") as f:
+            yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
+
+        print(f"已保存配置文件 {path}")
+
+    @classmethod
+    def load(cls, filepath=None):
+        """从YAML文件加载配置项"""
+        path = filepath or getattr(cls, '_config_path', 'data/default_config.yaml')
+        if not os.path.exists(path):
+            print(f"配置文件 {path} 不存在，使用默认配置")
+            return
+
+        with open(path, "r") as f:
+            config_data = yaml.safe_load(f)
+
+        # print('load yaml:', config_data)
+        # 将文件中的配置覆盖类中的默认值,cls优先,无值则导入
+        for key, value in config_data.items():
+            if hasattr(cls, key):
+                current_value = getattr(cls, key)
+                if current_value is None or (isinstance(current_value, str) and all(c == '*' for c in current_value)):
+                    setattr(cls, key, value)
+                elif current_value != value:
+                    print(f"配置项 '{key}' 不一致: 当前值 = {current_value}, 加载值 = {value}")
+            else:
+                # 添加到动态配置
+                cls._config_dynamic[key] = value
+
+        print("配置已加载并更新")
+
+    @classmethod
+    def print_config(cls):
+        """打印当前的配置项"""
+        for key, value in cls.__dict__.items():
+            if not key.startswith('__') and not isinstance(value, classmethod):  # callable(value)
+                print(f"{key}: {value}")
 
 
 # 模型编码:0默认，1小，-1最大
@@ -119,7 +232,7 @@ AI_Models = [
     {'name': 'moonshot', 'type': 'default', 'api_key': '',
      "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
      'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1",
-     'file_url': "https://api.moonshot.cn/v1/files"},
+     'file_url': "https://api.moonshot.cn/v1/files", 'supported_openai': True},
     # https://open.bigmodel.cn/console/overview
     {'name': 'glm', 'type': 'default', 'api_key': '',
      "model": ["glm-4-air", "glm-4-flash", "glm-4-air", "glm-4", 'glm-4-plus', "glm-4v", "glm-4-0520"],
@@ -127,7 +240,7 @@ AI_Models = [
      'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
      'base_url': "https://open.bigmodel.cn/api/paas/v4/",
      'embedding_url': 'https://open.bigmodel.cn/api/paas/v4/embeddings',
-     'tool_url': "https://open.bigmodel.cn/api/paas/v4/tools"},
+     'tool_url': "https://open.bigmodel.cn/api/paas/v4/tools", 'supported_openai': True},
     # https://platform.baichuan-ai.com/docs/api
     {'name': 'baichuan', 'type': 'default', 'api_key': '',
      "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', "Baichuan4",
@@ -135,7 +248,13 @@ AI_Models = [
      "embedding": ["Baichuan-Text-Embedding"],
      'url': 'https://api.baichuan-ai.com/v1/chat/completions',
      'base_url': "https://api.baichuan-ai.com/v1/",  # assistants,files,threads
-     'embedding_url': 'https://api.baichuan-ai.com/v1/embeddings'},
+     'embedding_url': 'https://api.baichuan-ai.com/v1/embeddings', 'supported_openai': True},
+    # https://api-docs.deepseek.com/zh-cn/
+    {'name': 'deepseek', 'type': 'default', 'api_key': '',
+     'model': ["deepseek-chat", "deepseek-reasoner"],  # DeepSeek-V3,DeepSeek-R1
+     'url': 'https://api.deepseek.com/chat/completions',
+     'generation_url': "https://api.deepseek.com/beta",  # https://api.deepseek.com/beta/completions
+     'base_url': 'https://api.deepseek.com', 'supported_openai': True},  # /v1
     # https://dashscope.console.aliyun.com/overview
     # https://bailian.console.aliyun.com/#/home
     # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
@@ -147,33 +266,50 @@ AI_Models = [
      'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
      'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
+     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1", 'supported_openai': True,
      'generation_url': 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
-     'embedding_url': 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding'},
-    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t#%E8%AF%B7%E6%B1%82%E8%AF%B4%E6%98%8E
-    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/mlm0nonsv#%E5%AF%BC%E5%85%A5hf%E7%B3%BB%E5%88%97%E6%A8%A1%E5%9E%8B
-    {'name': 'ernie', 'type': 'baidu', 'api_key': '',
-     "model": ["ERNIE-4.0-8K", "ERNIE-3.5-8K", "ERNIE-4.0-8K", "ERNIE-4.0-8K-Preview", "ERNIE-4.0-8K-Latest",
-               "ERNIE-3.5-128K"],
-     'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions_pro",
-     'base_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
+     'embedding_url': 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding',
      },
+    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Zm2ycv77m
+    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/mlm0nonsv
+    {'name': 'ernie', 'type': 'default', 'api_key': '',
+     # "ERNIE-4.0-8K", "ERNIE-3.5-8K", "ERNIE-4.0-8K","ERNIE-4.0-8K-Preview", "ERNIE-4.0-8K-Latest","ERNIE-3.5-128K"
+     "model": ["ernie-4.0-8k-latest", 'ernie-speed-8k', "ernie-4.0-8k-preview", "ernie-4.0-turbo-8k",
+               'ernie-4.0-turbo-8k', 'ernie-4.0-turbo-128k', 'ernie-speed-pro-128k',
+               'deepseek-v3', 'deepseek-r1',
+               'deepseek-r1-distill-qwen-14b', 'deepseek-r1-distill-qwen-32b',
+               ],
+     'embedding': ['tao-8k', 'embedding-v1', 'bge-large-zh', 'bge-large-en'],
+     'reranker': ['bce-reranker-base'],
+     'url': 'https://qianfan.baidubce.com/v2/chat/completions',
+     'embedding_url': 'https://qianfan.baidubce.com/v2/embeddings',
+     'reranker_url': "https://qianfan.baidubce.com/v2/rerankers",
+     'base_url': "https://qianfan.baidubce.com/v2", 'supported_openai': True
+     },
+    # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t
     # https://console.bce.baidu.com/qianfan/ais/console/onlineService
     # https://console.bce.baidu.com/ai/#/ai/nlp/overview/index
     {'name': 'baidu', 'type': 'baidu', 'api_key': '',
-     'model': ['llama_3_8b', 'Qianfan-Chinese-Llama-2-7B', 'Qianfan-Chinese-Llama-2-7B-32K',
-               'Llama-2-7B-Chat', 'llama_3_8b', 'Llama-2-13B-Chat', 'Llama-2-70B-Chat',
-               'ChatGLM3-6B', 'ChatGLM2-6B-32K', 'ChatGLM3-6B-32K',
-               'Baichuan2-7B-Chat', 'Baichuan2-13B-Chat', 'Fuyu-8B', 'Yi-34B-Chat',
-               'BLOOMZ-7B', 'Qianfan-BLOOMZ-7B-compressed'],
+     'model': ['completions_pro', 'qianfan-agent-lite-8k', 'qianfan-agent-speed-8k', 'qianfan-agent-speed-32k',
+               'qianfan-dynamic-8k',
+               'ernie-lite-8k', 'ernie_speed', 'ernie-novel-8k', 'ernie-speed-128k',
+               'qianfan_chinese_llama_2_7b', 'qianfan_chinese_llama_2_13b', 'qianfan_chinese_llama_2_70b',
+               'llama_2_7b', 'llama_2_13b', 'llama_2_70b', 'llama_3_8b',
+               'gemma_7b_it', 'mixtral_8x7b_instruct', 'sqlcoder_7b', 'aquilachat_7b',
+               'bloomz_7b1', 'qianfan_bloomz_7b_compressed',
+               'chatglm2_6b_32k', 'chatglm3-6b', 'chatglm3-6b-32k',
+               'Baichuan2-7B-Chat', 'Baichuan2-13B-Chat', 'Fuyu-8B',
+               'yi_7b_chat', 'yi_34b_chat',
+               ],
      "generation": ['sqlcoder_7b', 'CodeLlama-7b-Instruct', 'Yi-34B'],
      'embedding': ['bge_large_zh'],
      "nlp": ["txt_mone", "address", "simnet", "word_emb_sim", "ecnet", "text_correction", "keyword", "topic"],
      'url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/",
+     # 'https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{model}'.format(model)
      'generation_url': "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/completions",
      'embedding_url': 'https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/embeddings',
      'nlp_url': "https://aip.baidubce.com/rpc/2.0/nlp/v1/",
-     'base_url': ''},
+     'base_url': '', 'supported_openai': False},
     # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
     # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
     {'name': 'doubao', 'type': 'default', 'api_key': '',
@@ -188,13 +324,13 @@ AI_Models = [
      # [ "GLM3-130B",chatglm3-130-fin,functioncall-preview],
      'embedding': {'Doubao-embedding': 'ep-20241219165520-lpqrl', 'Doubao-embedding-large': 'ep-20241219165636-kttk2'},
      'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-     'base_url': "https://ark.cn-beijing.volces.com/api/v3"},  # open.volcengineapi.com
+     'base_url': "https://ark.cn-beijing.volces.com/api/v3", 'supported_openai': True},  # open.volcengineapi.com
     # https://cloud.tencent.com/document/product/1729
     {'name': 'hunyuan', 'type': 'tencent', 'api_key': '',
      'model': ["hunyuan-pro", "hunyuan-lite", "hunyuan-turbo", "hunyuan-code", 'hunyuan-functioncall'],
      'embedding': ['hunyuan-embedding'],
      'url': 'https://hunyuan.tencentcloudapi.com',  # 'hunyuan.ap-shanghai.tencentcloudapi.com'
-     'base_url': "https://api.hunyuan.cloud.tencent.com/v1",
+     'base_url': "https://api.hunyuan.cloud.tencent.com/v1", 'supported_openai': True,
      'embedding_url': "https://api.hunyuan.cloud.tencent.com/v1/embeddings",
      'nlp_url': "nlp.tencentcloudapi.com", 'ocr_url': 'ocr.tencentcloudapi.com'},
     # https://cloud.siliconflow.cn/playground/chat
@@ -202,38 +338,70 @@ AI_Models = [
      'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat",
                "Qwen/Qwen2.5-Coder-7B-Instruct",
                "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "Pro/THUDM/glm-4-9b-chat",
-               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/DeepSeek-Coder-V2-Instruct",
-               "deepseek-ai/deepseek-vl2", "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat",
+               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/deepseek-vl2",
+               "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1",
+               "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+               "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+               "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+               "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat",
                "Pro/OpenGVLab/InternVL2-8B", "01-ai/Yi-1.5-9B-Chat-16K", 'TeleAI/TeleChat2',
                "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
-     'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1'],
+     'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1', 'Pro/BAAI/bge-m3'],
      'generation': ['Qwen/Qwen2.5-Coder-7B-Instruct', "deepseek-ai/DeepSeek-V2.5",
                     'deepseek-ai/DeepSeek-Coder-V2-Instruct'],
-     'reranker': ['BAAI/bge-reranker-v2-m3', 'netease-youdao/bce-reranker-base_v1'],
+     'reranker': ['BAAI/bge-reranker-v2-m3', 'netease-youdao/bce-reranker-base_v1', 'Pro/BAAI/bge-reranker-v2-m3'],
+     'speech': ['FunAudioLLM/SenseVoiceSmall', ],
+     'image': ['stabilityai/stable-diffusion-3-medium', 'black-forest-labs/FLUX.1-schnell',
+               'stabilityai/stable-diffusion-3-5-large', 'black-forest-labs/FLUX.1-dev', 'deepseek-ai/Janus-Pro-7B', ],
      'url': 'https://api.siliconflow.cn/v1/chat/completions',
-     'base_url': 'https://api.siliconflow.cn/v1',
+     'base_url': 'https://api.siliconflow.cn/v1', 'supported_openai': True,
      'embedding_url': "https://api.siliconflow.cn/v1/embeddings",
-     'reranker_url': "https://api.siliconflow.cn/v1/rerank"},
+     'reranker_url': "https://api.siliconflow.cn/v1/rerank",
+     'image_url': 'https://api.siliconflow.cn/v1/images/generations',
+     'speech_url': "https://api.siliconflow.cn/v1/uploads/audio/voice"},
+
     # https://console.xfyun.cn/services/sparkapiCenter
     {'name': 'spark', 'type': 'default', 'api_key': [],
      'model': ['pro', 'lite', 'max-32k', 'pro', 'pro-128k', '4.0Ultra', 'generalv3', 'generalv3.5'],
      'url': 'https://spark-api-open.xf-yun.com/v1/chat/completions',
-     'base_url': 'https://spark-api-open.xf-yun.com/v1',
+     'base_url': 'https://spark-api-open.xf-yun.com/v1', 'supported_openai': False,
      'file_url': 'https://spark-api-open.xf-yun.com/v1/files',
      'embedding_url': 'https://emb-cn-huabei-1.xf-yun.com/',
      'translation_url': 'https://itrans.xf-yun.com/v1/its',
      'ws_url': 'wss://spark-api.xf-yun.com/v3.5/chat'
      },
+    # https://platform.minimaxi.com/document/ChatCompletion%20v2?key=66701d281d57f38758d581d0
+    {'name': 'minimax', 'type': 'default', 'api_key': '',
+     'model': ["MiniMax-Text-01", 'abab6.5s-chat'],
+     'url': 'https://api.minimax.chat/v1/text/chatcompletion_v2', 'base_url': 'https://api.minimax.chat/v1',
+     'supported_openai': True},
+    # https://docs.mistral.ai/api/#tag/chat/operation/chat_completion_v1_chat_completions_post
+    {'name': 'mistral', 'type': 'default', 'api_key': '',
+     'model': ["mistral-small-latest", 'open-mistral-nemo', 'open-codestral-mamba', 'codestral-latest',
+               'pixtral-12b-2409'],
+     'embedding': ["mistral-embed"],
+     'url': 'https://api.mistral.ai/v1/chat/completions',
+     'agent_url': 'https://api.mistral.ai/v1/agents/completions',
+     'embedding_url': 'https://api.mistral.ai/v1/embeddings',
+     'base_url': 'https://api.mistral.ai/v1', 'supported_openai': True},
+    # https://ai.google.dev/gemini-api/docs/openai?hl=zh-cn#python
+    {'name': 'gemini', 'type': 'default', 'api_key': '',
+     'model': ["gemini-1.5-flash", 'gemini-1.5-flash-8b', 'gemini-1.5-pro', 'gemini-2.0-flash', 'aqa'],
+     'embedding': ['text-embedding-004', ],
+     'url': 'https://generativelanguage.googleapis.com/v1beta/models/',
+     'base_url': "https://generativelanguage.googleapis.com/v1beta/openai/", 'supported_openai': True},
+    # https://platform.openai.com/docs/overview
     {'name': 'gpt', 'type': 'default', 'api_key': '', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
      'generation': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
      'embedding': ["text-embedding-ada-002", "text-search-ada-doc-001", "text-similarity-babbage-001",
                    "code-search-ada-code-001", "search-babbage-text-001"],
      'url': 'https://api.openai.com/v1/chat/completions',
      'embedding_url': 'https://api.openai.com/v1/embeddings',
-     'base_url': "https://api.openai.com/v1",
+     'base_url': "https://api.openai.com/v1", 'supported_openai': True,
+     'ws_url': 'wss://api.openai.com/v1/realtime'
      },
 ]
-# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,spark,baichuan
+# moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,spark,baichuan,deepseek
 API_KEYS = {
     'moonshot': Config.Moonshot_Service_Key,
     'glm': Config.GLM_Service_Key,
@@ -241,9 +409,88 @@ API_KEYS = {
     'doubao': Config.ARK_Service_Key,
     'silicon': Config.Silicon_Service_Key,
     'spark': Config.XF_API_Password,
+    'ernie': Config.QIANFAN_Service_Key,
     'baichuan': Config.Baichuan_Service_Key,
-    'hunyuan': Config.TENCENT_Service_Key
+    'hunyuan': Config.TENCENT_Service_Key,
+    'deepseek': Config.DeepSeek_Service_Key,
+    'minimax': Config.MINIMAX_Service_Key,
+    'mistral': Config.MISTRAL_API_KEY,
+    'gemini': Config.GEMINI_Service_Key,
 }
+
+
+# SUPPORTED_OPENAI_MODELS = {'moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan', 'deepseek', 'minimax',
+#                            'mistral', 'gemini'}
+
+
+def extract_ai_model(search_field: str = "model"):
+    """
+    提取 AI_Models 中的 name 以及 search_field 中的所有值（列表或字典 key）。
+
+    参数：
+    - search_field: 需要提取的字段名称，默认为 'model'
+
+    返回：
+    - List[Tuple[str, List[str]]]: 每个模型的名称及其对应的模型列表
+    """
+    extracted_data = []
+
+    for model in AI_Models:
+        name = model["name"]
+        field_value = model.get(search_field, [])
+        if model.get('supported_openai', True) and not model.get('api_key'):
+            continue
+
+        if isinstance(field_value, list):
+            extracted_data.append((name, field_value))
+        elif isinstance(field_value, dict):
+            extracted_data.append((name, list(field_value.keys())))
+        else:
+            extracted_data.append((name, [field_value]))
+
+    return extracted_data
+
+
+class ModelListExtract:
+    models = []
+
+    # import asyncio
+    # model_lock = asyncio.Lock()
+
+    # def __init__(self):
+    #     self.models = self.extract()
+
+    @classmethod
+    def extract(cls):
+        """
+        提取 AI_Models 中的 name 以及 search_field 中的所有值，并存入一个大列表。
+
+        返回：
+        - List[str]: 包含所有模型名称及其子模型的列表
+        """
+        # list(itertools.chain(*[sublist[1] for sublist in extract_ai_model("model")]))
+        extracted_data = extract_ai_model("model")
+        return [i for item in extracted_data for i in [item[0]] + item[1]]  # flattened_list
+
+    @classmethod
+    def set(cls):
+        """更新 MODEL_LIST"""
+        cls.models = cls.extract()
+        # print("MODEL_LIST updated:", cls.models)
+
+    # @classmethod
+    # async def async_set(cls):
+    #     """更新模型列表"""
+    #     async with cls.model_lock:
+    #         cls.models = cls.extract()
+
+    @classmethod
+    def get(cls):
+        return cls.models
+
+    @classmethod
+    def contains(cls, value):
+        return value in cls.models
 
 
 # Api_Tokens = [
@@ -318,6 +565,34 @@ def construct_sorted_query(params: dict):
 
     query = "&".join(sort_query_string)  # query[:-1]
     return query.replace("+", "%20").replace('*', '%2A').replace('%7E', '~')  # .encode("utf-8")
+
+
+def token_split(auth: str):
+    """分割token
+
+    Args:
+        auth: Authorization头部值
+
+    Returns:
+        List[str]: token列表
+    """
+    if not auth:
+        return []
+    auth = auth.replace('Bearer', '').strip()
+    return [t.strip() for t in auth.split(',') if t.strip()]
+
+
+def generate_uuid(with_hyphen: bool = True) -> str:
+    """生成UUID
+
+    Args:
+        with_hyphen: 是否包含连字符
+
+    Returns:
+        str: UUID字符串
+    """
+    _uuid = str(uuid.uuid4())
+    return _uuid if with_hyphen else _uuid.replace('-', '')
 
 
 # 获取百度的访问令牌
@@ -509,7 +784,7 @@ def get_tencent_signature(service, host=None, body=None, action='ChatCompletions
                           secret_id: str = Config.TENCENT_SecretId, secret_key: str = Config.TENCENT_Secret_Key,
                           timestamp: int = None, region: str = "ap-shanghai", version='2023-09-01'):
     if not host:
-        host = f"{service}.tencentcloudapi.com"
+        host = f"{service}.tencentcloudapi.com"  # url.split("//")[-1]
     if not timestamp:
         timestamp = int(time.time())
         # 支持 POST 和 GET 方式
@@ -585,10 +860,12 @@ def get_tencent_signature(service, host=None, body=None, action='ChatCompletions
     return headers
 
 
-def build_url(url: str, access_token: str = get_baidu_access_token(), **kwargs) -> str:
+def build_url(url: str, access_token: str=None, **kwargs) -> str:
     url = url.strip().strip('"')
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
+    if not access_token:
+        access_token = get_baidu_access_token()
 
     params = {"access_token": access_token}
     params.update(kwargs)
@@ -602,6 +879,26 @@ def is_url(url: str) -> bool:
     parsed = urlparse(url)
     # return all([parsed.scheme, parsed.netloc])
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+class Url:
+    def __init__(this, host, path, schema):
+        this.host = host
+        this.path = path
+        this.schema = schema
+        pass
+
+
+def parse_url(requset_url):
+    stidx = requset_url.index("://")
+    host = requset_url[stidx + 3:]
+    schema = requset_url[:stidx + 3]
+    edidx = host.index("/")
+    if edidx <= 0:
+        raise Exception("invalid request url:" + requset_url)
+    path = host[edidx:]
+    host = host[:edidx]
+    return Url(host, path, schema)
 
 
 # 生成API请求签名
@@ -684,8 +981,18 @@ def verify_hmac_signature(shared_secret: str, data: str, signature: str):
 #     return base64.urlsafe_b64decode(padded_encoded_id.encode()).decode()
 
 if __name__ == "__main__":
-    key = 'e439bcf5e2b3f706b05a4962aaeac0cc'
-    secret = 'MDRjODdhNDcwYjQyNGIyMjQzOGQ2ZDE4'
-    api_key = f"{key}:{secret}"
-    api_key_base64 = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
-    print(api_key_base64)
+    # key = 'e439bcf5e2b3f706b05a4962aaeac0cc'
+    # secret = 'MDRjODdhNDcwYjQyNGIyMjQzOGQ2ZDE4'
+    # api_key = f"{key}:{secret}"
+    # api_key_base64 = base64.b64encode(api_key.encode('utf-8')).decode('utf-8')
+    # print(api_key_base64)
+
+    from openai import OpenAI
+
+    # for backward compatibility, you can still use `https://api.deepseek.com/v1` as `base_url`.
+    # client = OpenAI(api_key=Config.DeepSeek_Service_Key, base_url="https://api.deepseek.com")
+    # print(client.models.list().model_dump_json())
+
+    #Config.save('data/default_config.yaml')
+    Config.load('data/default_config.yaml')
+    Config.print_config()

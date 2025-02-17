@@ -347,7 +347,7 @@ async def consumer():
 class MessageZeroMQ:
 
     def __init__(self, pull_port="7556", push_port="7557", req_port="7555", process_callback=None):
-        self.context = zmq.asyncio.Context()  # zmq.Context()
+        self.context = zmq.asyncio.Context(io_threads=2)  # zmq.Context()
 
         # 设置接收消息的 socket
         self.pull_socket = self.context.socket(zmq.PULL)
@@ -365,6 +365,9 @@ class MessageZeroMQ:
         self.process_callback = process_callback or self.default_process_message
         # self.push_socket.send_string('topic1 Hello, world!')
 
+    def __del__(self):
+        self.context.destroy(linger=0)
+
     @staticmethod
     def default_process_message(message):
         # 处理逻辑
@@ -379,6 +382,17 @@ class MessageZeroMQ:
         await self.req_socket.send_string(f'{topic} {message}')
         print(f"Sent request: {message} under topic: {topic}")
         response = await self.req_socket.recv_string()
+        print(f"Received response: {response}")
+        return response
+
+    async def call_service(self, data):
+        """
+        使用 REQ socket 发送 JSON 数据并接收 JSON 响应 zmq.Context()
+        """
+        self.req_socket.send_json(data)
+        response  = self.req_socket.recv_json()
+        # message = await self.req_socket.recv()
+        # response = json.loads(message.decode())
         print(f"Received response: {response}")
         return response
 
@@ -422,9 +436,26 @@ class MessageZeroMQ:
 import numpy as np
 
 
-class ABONode:
+class ABO:
+    def __init__(self):
+        self._A = None
+        self._B = None
+        self._O = None
+
+    def AO(self):
+        pass
+
+    def BO(self):
+        pass
+
+    def _AB(self):
+        return self._A + self._B
+
+
+class ABONode(ABO):
 
     def __init__(self, node_id: str, neighbors={}, d_v: int = 1024):
+        super().__init__()
         """
         初始化节点对象
         :param node_id: 节点唯一标识
@@ -432,7 +463,7 @@ class ABONode:
         """
         self.node_id = node_id
         self._A = {}  # fact_history{timestamp: fact_vector}
-        self.__O = None
+        self._O = None
         self.neighbors = neighbors  # 记录与其他节点的关系
         self._B = np.zeros((len(neighbors), d_v))  # 节点对全局的观点矩阵,view_matrix
 
