@@ -4,19 +4,30 @@ from enum import Enum as PyEnum
 from collections import defaultdict
 import asyncio
 import queue
-from redis.asyncio import Redis
-from typing import Dict, List
+from redis.asyncio import Redis,StrictRedis
+# import redis.asyncio as redis
+from typing import Dict, List, Tuple, Union, Iterable
 from threading import Thread
 import uuid
 import zmq, zmq.asyncio
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
-QUEUE_NAME = "message_queue"
+QUEUE_NAME: str = "message_queue"
 
 Task_queue = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
 Task_graph = ig.Graph(directed=True)  # 创建有向图
 
+
+# import aioredis
+# 创建 Redis 连接池
+# async def get_redis():
+#     redis = await aioredis.create_redis_pool(('localhost', 6379),
+#         encoding='utf-8')
+#     return redis
+
+# await redis.set
+# await redis.get
 
 class TaskStatus(PyEnum):
     PENDING = "pending"  # 等待条件满足
@@ -306,29 +317,55 @@ class WebSearchGraph:
         return graph
 
 
-# message_queue = asyncio.Queue()
-# 异步生产者
-async def producer(messages):
-    redis = Redis(host=REDIS_HOST, port=REDIS_PORT)
+_StringLikeT = Union[bytes, str, memoryview]
+
+
+def list_or_args_keys(keys: Union[_StringLikeT, Iterable[_StringLikeT]],
+                      args: Tuple[_StringLikeT, ...] = None) -> List[_StringLikeT]:
+    # 将 keys 和 args 合并成一个新的列表
+    # returns a single new list combining keys and args
     try:
-        for message in messages:
-            await redis.rpush(QUEUE_NAME, message)  # 异步放入队列
-            await redis.hset("task_status", message, "pending")
-            # await message_queue.put(message)
-            print(f"Produced: {message}")
-            await asyncio.sleep(1)
+        iter(keys)
+        # a string or bytes instance can be iterated, but indicates
+        # keys wasn't passed as a list
+        if isinstance(keys, (bytes, str)):
+            keys = [keys]
+        else:
+            keys = list(keys)  # itertools.chain.from_iterable(keys)
+    except TypeError:
+        keys = [keys]
+    if args:
+        keys.extend(args)
+    return keys
+
+
+# pip install celery[redis]
+# celery = Celery('tasks', broker='redis://localhost:6379/0') #Celery 任务
+# message_queue = asyncio.Queue()
+# 异步生产者 await redis.set('my_key', 'value')
+async def producer(messages):
+    redis = Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+    # r=StrictRedis(host='localhost', port=6379, db=0)
+    try:
+        await redis.rpush(QUEUE_NAME, *messages)  # 异步放入队列
+        # for message in messages:
+        #     await redis.hset("task_status", message, "pending")
+        #     # await message_queue.put(message)
+        #     print(f"Produced: {message}")
+        #     await asyncio.sleep(1)
     finally:
         await redis.close()
 
 
-# 异步消费者
+# 异步消费者  await redis.get('my_key', encoding='utf-8')
 async def consumer():
-    redis = Redis(host=REDIS_HOST, port=REDIS_PORT)
+    redis = Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
     while True:
-        message = await redis.blpop(QUEUE_NAME, timeout=5)  # 异步阻塞消费
+        message = await redis.blpop(QUEUE_NAME, timeout=10)  # 异步阻塞消费 Left Pop
         if message:
-            task = message[1].decode()
-            print(f"Consumed: {task}")
+            q, item = message
+            task = item.decode('utf-8')
+            print(f"Consumed: {task}")  # message[1].decode()
             # message = await message_queue.get()
             # print(f"Consumed: {message}")
             # message_queue.task_done()  # 标记任务完成
@@ -390,7 +427,7 @@ class MessageZeroMQ:
         使用 REQ socket 发送 JSON 数据并接收 JSON 响应 zmq.Context()
         """
         self.req_socket.send_json(data)
-        response  = self.req_socket.recv_json()
+        response = self.req_socket.recv_json()
         # message = await self.req_socket.recv()
         # response = json.loads(message.decode())
         print(f"Received response: {response}")
@@ -431,6 +468,33 @@ class MessageZeroMQ:
             # 将处理后的消息发送
             await self.push_socket.send_string(processed_msg)
             print(f"Sent processed message back.")
+
+
+#
+# import pika
+# https://www.rabbitmq.com/tutorials
+#
+# # Pika is a RabbitMQ,发送消息到 RabbitMQ
+# def send_event(event_data):
+#     connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+#     channel = connection.channel()
+#     channel.queue_declare(queue='event_queue')
+#
+#     channel.basic_publish(exchange='', routing_key='event_queue',
+#                           body=event_data)
+#     connection.close()
+#
+#
+# # 监听消息并调用服务
+# def listen_for_events(callback):
+#     connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+#     channel = connection.channel()
+#     channel.queue_declare(queue='event_queue')
+#
+#     channel.basic_consume(queue='event_queue', on_message_callback=callback, auto_ack=True)
+#
+#     print('Waiting for events...')
+#     channel.start_consuming()
 
 
 import numpy as np

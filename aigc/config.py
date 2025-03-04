@@ -18,7 +18,7 @@ class Config(object):
     SECRET_KEY = '***'
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 60
-    HTTP_TIMEOUT_SEC = 60
+    HTTP_TIMEOUT_SEC = 60.0
     MAX_TASKS = 1024
     MAX_CACHE = 1024
     MAX_RETRY_COUNT = 3
@@ -28,13 +28,19 @@ class Config(object):
     DATA_FOLDER = 'data'
     _config_path = 'data/.config.yaml'  # 'data/default_config.yaml'
     _config_dynamic = {}  # 其他默认配置项
+    WEBUI_NAME = 'aigc'
+    WEBUI_URL = 'http://*:7000'
+    # https://api.qdrant.tech/api-reference
     QDRANT_HOST = 'qdrant'
-    LOCAL_URL = 'http://*:7000'
-    WECHAT_URL = 'http://*'
+    WECHAT_URL = 'http://*:28089'
     QDRANT_URL = "http://*:6333"
 
     VALID_API_KEYS = {"token-abc123", "token-def456"}
-    DEFAULT_MODEL = 'moonshot'
+    DEFAULT_LANGUAGE = 'Chinese'
+    DEFAULT_MODEL = 'moonshot'  # 'qwen'
+    DEFAULT_MODEL_ENCODING = "gpt-3.5-turbo"
+    DEFAULT_MODEL_EMBEDDING = 'BAAI/bge-large-zh-v1.5'
+    DEFAULT_MAX_TOKENS = 4000
 
     BAIDU_API_Key = '***'
     BAIDU_Secret_Key = '***'
@@ -99,6 +105,8 @@ class Config(object):
     # https://cloud.siliconflow.cn/models
     Silicon_Service_Key = '***'
     Moonshot_Service_Key = "***"
+    # https://console.x.ai/team/457298eb-40a8-4308-907d-0a36ec706042/api-keys/create
+    Grok_Service_Key = '***'
     # https://build.nvidia.com/explore/discover
     NVIDIA_Service_Key = '***'
     # https://platform.openai.com/settings/organization/admin-keys
@@ -169,13 +177,16 @@ class Config(object):
     # https://vectorizer.ai/account#Account-apiKey0
     Vectorizer_Api_Key = '***'
     Vectorizer_Secret_Key = '***'
+    # https://console.deepgram.com/project/fb261c77-9eb1-4c7a-bf47-1eef8297bafc/keys
+    Deepgram_Service_Key = '***'
 
     # https://gitee.com/personal_access_tokens
     GITEE_Access_Tokens = '***'
 
+    HTTP_Proxy = 'http://***:9030'# socks5://10.10.10.3:9793
     HTTP_Proxies = {
-        'http': 'http://***:9030',  # socks5://10.10.10.3:9031
-        'https': 'http://***:9030',
+        'http': HTTP_Proxy,  
+        'https': HTTP_Proxy,
     }
 
     @classmethod
@@ -228,6 +239,21 @@ class Config(object):
 
 # 模型编码:0默认，1小，-1最大
 AI_Models = [
+    # https://dashscope.console.aliyun.com/overview
+    # https://bailian.console.aliyun.com/#/home
+    # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
+    {'name': 'qwen', 'type': 'default', 'api_key': '',
+     "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
+               'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max",
+               'baichuan2-7b-chat-v1', 'baichuan2-turbo'],  # "qwen-vl-plus", 'abab6.5s-chat'
+     'generation': ['dolly-12b-v2', 'baichuan2-7b-chat-v1', 'belle-llama-13b-2m-v1', 'billa-7b-sft-v1'],
+     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
+     'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
+     'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1", 'supported_openai': True,
+     'generation_url': 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
+     'embedding_url': 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding',
+     },
     # https://platform.moonshot.cn/console/api-keys
     {'name': 'moonshot', 'type': 'default', 'api_key': '',
      "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
@@ -255,21 +281,6 @@ AI_Models = [
      'url': 'https://api.deepseek.com/chat/completions',
      'generation_url': "https://api.deepseek.com/beta",  # https://api.deepseek.com/beta/completions
      'base_url': 'https://api.deepseek.com', 'supported_openai': True},  # /v1
-    # https://dashscope.console.aliyun.com/overview
-    # https://bailian.console.aliyun.com/#/home
-    # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
-    {'name': 'qwen', 'type': 'default', 'api_key': '',
-     "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
-               'qwen-long', "qwen-turbo", "qwen-plus", "qwen-max",
-               'baichuan2-7b-chat-v1', 'baichuan2-turbo', 'abab6.5s-chat'],  # "qwen-vl-plus"
-     'generation': ['dolly-12b-v2', 'baichuan2-7b-chat-v1', 'belle-llama-13b-2m-v1', 'billa-7b-sft-v1'],
-     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
-     'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
-     'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-     'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1", 'supported_openai': True,
-     'generation_url': 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
-     'embedding_url': 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding',
-     },
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Zm2ycv77m
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/mlm0nonsv
     {'name': 'ernie', 'type': 'default', 'api_key': '',
@@ -350,6 +361,7 @@ AI_Models = [
      'generation': ['Qwen/Qwen2.5-Coder-7B-Instruct', "deepseek-ai/DeepSeek-V2.5",
                     'deepseek-ai/DeepSeek-Coder-V2-Instruct'],
      'reranker': ['BAAI/bge-reranker-v2-m3', 'netease-youdao/bce-reranker-base_v1', 'Pro/BAAI/bge-reranker-v2-m3'],
+     # "BAAI/bge-reranker-large","BAAI/bge-reranker-base"
      'speech': ['FunAudioLLM/SenseVoiceSmall', ],
      'image': ['stabilityai/stable-diffusion-3-medium', 'black-forest-labs/FLUX.1-schnell',
                'stabilityai/stable-diffusion-3-5-large', 'black-forest-labs/FLUX.1-dev', 'deepseek-ai/Janus-Pro-7B', ],
@@ -372,7 +384,7 @@ AI_Models = [
      },
     # https://platform.minimaxi.com/document/ChatCompletion%20v2?key=66701d281d57f38758d581d0
     {'name': 'minimax', 'type': 'default', 'api_key': '',
-     'model': ["MiniMax-Text-01", 'abab6.5s-chat'],
+     'model': ["MiniMax-Text-01", 'abab6.5s-chat', 'DeepSeek-R1'],
      'url': 'https://api.minimax.chat/v1/text/chatcompletion_v2', 'base_url': 'https://api.minimax.chat/v1',
      'supported_openai': True},
     # https://docs.mistral.ai/api/#tag/chat/operation/chat_completion_v1_chat_completions_post
@@ -383,13 +395,18 @@ AI_Models = [
      'url': 'https://api.mistral.ai/v1/chat/completions',
      'agent_url': 'https://api.mistral.ai/v1/agents/completions',
      'embedding_url': 'https://api.mistral.ai/v1/embeddings',
-     'base_url': 'https://api.mistral.ai/v1', 'supported_openai': True},
+     'base_url': 'https://api.mistral.ai/v1', 'supported_openai': True, 'proxy': True},
     # https://ai.google.dev/gemini-api/docs/openai?hl=zh-cn#python
     {'name': 'gemini', 'type': 'default', 'api_key': '',
-     'model': ["gemini-1.5-flash", 'gemini-1.5-flash-8b', 'gemini-1.5-pro', 'gemini-2.0-flash', 'aqa'],
+     'model': ["gemini-1.5-flash", 'gemini-1.5-flash-8b', 'gemini-1.5-pro', 'gemini-2.0-flash'],  # 'aqa'
      'embedding': ['text-embedding-004', ],
      'url': 'https://generativelanguage.googleapis.com/v1beta/models/',
-     'base_url': "https://generativelanguage.googleapis.com/v1beta/openai/", 'supported_openai': True},
+     'base_url': "https://generativelanguage.googleapis.com/v1beta/openai/", 'supported_openai': True, 'proxy': True},
+    # https://docs.x.ai/docs/overview
+    {'name': 'grok', 'type': 'default', 'api_key': '',
+     'model': ["grok-2-latest", "grok-2-vision-1212"],
+     'url': 'https://api.x.ai/v1/chat/completions ',
+     'base_url': "https://api.x.ai/v1", 'supported_openai': True, 'proxy': True},
     # https://platform.openai.com/docs/overview
     {'name': 'gpt', 'type': 'default', 'api_key': '', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
      'generation': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
@@ -397,7 +414,7 @@ AI_Models = [
                    "code-search-ada-code-001", "search-babbage-text-001"],
      'url': 'https://api.openai.com/v1/chat/completions',
      'embedding_url': 'https://api.openai.com/v1/embeddings',
-     'base_url': "https://api.openai.com/v1", 'supported_openai': True,
+     'base_url': "https://api.openai.com/v1", 'supported_openai': True, 'proxy': True,
      'ws_url': 'wss://api.openai.com/v1/realtime'
      },
 ]
@@ -416,6 +433,8 @@ API_KEYS = {
     'minimax': Config.MINIMAX_Service_Key,
     'mistral': Config.MISTRAL_API_KEY,
     'gemini': Config.GEMINI_Service_Key,
+    # 'grok': Config.Grok_Service_Key,
+    # 'gpt': Config.OPENAI_Service_Key
 }
 
 
@@ -442,7 +461,7 @@ def extract_ai_model(search_field: str = "model"):
             continue
 
         if isinstance(field_value, list):
-            extracted_data.append((name, field_value))
+            extracted_data.append((name, list(dict.fromkeys(field_value))))
         elif isinstance(field_value, dict):
             extracted_data.append((name, list(field_value.keys())))
         else:
@@ -490,6 +509,10 @@ class ModelListExtract:
 
     @classmethod
     def contains(cls, value):
+        if ':' in value:
+            owner, name = value.split(':')
+            return owner in cls.models or name in cls.models
+
         return value in cls.models
 
 
@@ -860,7 +883,7 @@ def get_tencent_signature(service, host=None, body=None, action='ChatCompletions
     return headers
 
 
-def build_url(url: str, access_token: str=None, **kwargs) -> str:
+def build_url(url: str, access_token: str = None, **kwargs) -> str:
     url = url.strip().strip('"')
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
@@ -990,9 +1013,9 @@ if __name__ == "__main__":
     from openai import OpenAI
 
     # for backward compatibility, you can still use `https://api.deepseek.com/v1` as `base_url`.
-    # client = OpenAI(api_key=Config.DeepSeek_Service_Key, base_url="https://api.deepseek.com")
-    # print(client.models.list().model_dump_json())
+    # cx = OpenAI(api_key=Config.DeepSeek_Service_Key, base_url="https://api.deepseek.com")
+    # print(cx.models.list().model_dump_json())
 
-    #Config.save('data/default_config.yaml')
-    Config.load('data/default_config.yaml')
+    Config.save()
+    # Config.load()
     Config.print_config()

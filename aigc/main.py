@@ -3,12 +3,13 @@ import datetime
 import difflib, copy
 import tempfile
 import logging
-from functools import wraps
 
 from typing import AsyncGenerator, Generator
 from fastapi import FastAPI, Request, Header, Depends, Query, File, UploadFile, BackgroundTasks, Form, \
     WebSocket, WebSocketDisconnect, HTTPException, status
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, HTMLResponse
+# from starlette.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer
 from starlette.middleware.sessions import SessionMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -19,7 +20,7 @@ from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from passlib.context import CryptContext
-from qdrant_client import AsyncQdrantClient
+# from qdrant_client import AsyncQdrantClient
 
 from structs import *
 from generates import *
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
     if not scheduler.running:
         scheduler.start()
 
-    await init_ai_clients(AI_Models, API_KEYS,get_data=True)
+    await init_ai_clients(AI_Models, API_KEYS, get_data=False)
 
     # print(json.dumps(AI_Models, indent=4))
     # task1 = asyncio.create_task(message_zero_mq.start())
@@ -66,9 +67,6 @@ scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(engine=
 # message_zero_mq = MessageZeroMQ()
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=Config.SECRET_KEY)
-# 将文件目录映射为静态文件路径
-# app.mount("/static", StaticFiles(directory=os.path.abspath('.') + "/static"), name="static")
-qd_client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.WARNING)
 
 dashscope.api_key = Config.DashScope_Service_Key
@@ -387,11 +385,44 @@ async def user(request: Request, token: str = None, db: Session = Depends(get_db
     return {"user": user_id}
 
 
+@app.get("/health")
+async def healthcheck():
+    return {"status": True}
+
+
+# @app.get("/opensearch.xml")
+# async def get_opensearch_xml():
+#     # OpenSearch是一个开放的搜索标准，允许用户将一个网站的搜索功能集成到浏览器或其他应用程序中。
+#     xml_content = rf"""
+#     <OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/" xmlns:moz="http://www.mozilla.org/2006/browser/search/">
+#     <ShortName>{Config.WEBUI_NAME}</ShortName>
+#     <Description>Search {Config.WEBUI_NAME}</Description>
+#     <InputEncoding>UTF-8</InputEncoding>
+#     <Image width="16" height="16" type="image/x-icon">{Config.WEBUI_URL}/static/favicon.png</Image>
+#     <Url type="text/html" method="get" template="{Config.WEBUI_URL}/?q={"{searchTerms}"}"/>
+#     <moz:SearchForm>{Config.WEBUI_URL}</moz:SearchForm>
+#     </OpenSearchDescription>
+#     """
+#     return Response(content=xml_content, media_type="application/xml")
+
+
 @app.get('/web_search/{text}')
-async def web_search(text: str, platform: str = 'default'):
+async def web_search(text: str, platform: Optional[str] = None):
     if platform == 'wiki':
         return wikipedia_search(text)
-    return JSONResponse(await web_search_async(text))
+
+    if platform == 'duckduckgo':
+        results = await duckduckgo_search(text)
+    elif platform == 'tavily':
+        results = await web_search_tavily(text)
+    elif platform in ('google', 'bing', "baidu", "yahoo"):
+        results = await search_by_api(text, engine=platform)
+    elif platform is None:
+        results = await search_by_api(text, engine=None, location='中国')
+    else:
+        results = await web_search_async(text)
+
+    return JSONResponse(results)
 
 
 @app.get('/retrieval/{text}')
@@ -474,7 +505,7 @@ async def classify_text(request: ClassifyRequest):
     last_intent = request.class_default
 
     # 遍历 class_terms 字典，检查文本是否匹配任意关键词
-    if len(query) < 32:
+    if lang_token_size(query, tokenizer=None) < 32:
         for intent, keywords in request.class_terms.items():
             if any(re.search(r'\b' + re.escape(keyword) + r'\b', query) for keyword in keywords):
                 intents.append({"class": intent, 'score': None, 'type': 'search'})
@@ -568,18 +599,18 @@ async def text_tools(request: ToolRequest):
         request.messages = [{"role": "system", "content": System_content.get('31')},
                             {"role": "user", "content": request.prompt}]
 
-    response = await ai_tool_response(messages=request.messages, tools=request.tools or AI_Tools,
-                                      model_name=request.model_name, model_id=request.model_id,
-                                      top_p=request.top_p, temperature=request.temperature)
+    tool_messages = await ai_tool_response(messages=request.messages, tools=request.tools or AI_Tools,
+                                           model_name=request.model_name, model_id=request.model_id,
+                                           top_p=request.top_p, temperature=request.temperature)
 
-    if not response:
+    if not tool_messages:
         raise HTTPException(status_code=500, detail="No response from AI model.")
 
     if request.tools:  # 自定义tools直接返回
-        return JSONResponse(response)
+        return JSONResponse(tool_messages)
 
     # 解析响应并调用工具
-    return JSONResponse(await ai_tools_messages(response))
+    return JSONResponse(await ai_tools_results(tool_messages))
 
 
 @app.post("/assistant/")
@@ -628,6 +659,7 @@ async def generate_text(request: CompletionParams):
                 yield chunk
                 await asyncio.sleep(0.01)  # 模拟 Token 逐步返回的延迟
 
+        # media_type="text/plain",纯文本数据
         return StreamingResponse(stream_response(), media_type="text/plain")
     else:
         bot_response = await ai_generate(
@@ -674,12 +706,15 @@ async def generate_message(request: ChatCompletionRequest,
                                                request.filter_limit, request.filter_time)
 
     system_prompt = request.prompt or System_content.get(agent, '')
-    agent_funcalls = [agent_func_calls(agent)]
+    agent_callable = [agent_func_calls(agent)]
+    # if request.tools:
+    #     agent_callable.extend(convert_to_callable_list(request.tools))
+
     model_info, payload, refer = await get_chat_payload(
         messages=history, user_request=user_request, system=system_prompt,
         temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens,
         model_name=model_name, model_id=request.model_id,
-        tool_calls=agent_funcalls, keywords=request.keywords)
+        tool_calls=agent_callable, keywords=request.keywords)
 
     if request.stream:
         async def generate_stream() -> AsyncGenerator[str, None]:
@@ -705,7 +740,6 @@ async def generate_message(request: ChatCompletionRequest,
 
             chat_history.save(user_request, bot_response, refer, transform, payload['model'])
 
-        # generate() , media_type="text/plain"
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
     else:
         bot_response = await ai_chat(model_info, payload)
@@ -716,8 +750,15 @@ async def generate_message(request: ChatCompletionRequest,
         return JSONResponse({'answer': bot_response, 'reference': refer, 'transform': transform})
 
 
+@app.post("/v1/embeddings")
+async def get_embeddings(request: OpenAIEmbeddingRequest):
+    # kwargs = request.model_dump(exclude_unset=True, exclude={'input', 'model'})
+    response = await ai_embeddings(request.input, model_name=request.model, model_id=0, get_embedding=False)
+    return JSONResponse(content=response)
+
+
+# /v1/files
 # /v1/completions
-# /v1/embeddings
 # /v1/audio/transcriptions
 # @require_api_key
 @app.post("/v1/chat/completions", response_model=OpenAIResponse)
@@ -726,13 +767,13 @@ async def chat_completions(request: OpenAIRequest):
     兼容 OpenAI API 的 /v1/chat/completions 路径，返回类似 OpenAI API 的格式
     """
     # print(request.dict())
+    kwargs = request.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream'})
+    # messages = kwargs.pop('messages', None)
     if request.stream:
         async def fake_stream_response():
             async for chunk in ai_chat_async(model_info=None, messages=[msg.dict() for msg in request.messages],
                                              user_request=None, system=None,
-                                             temperature=request.temperature, max_tokens=request.max_tokens,
-                                             top_p=request.top_p,
-                                             model_name=request.model, model_id=0, get_content=False):
+                                             model_name=request.model, model_id=0, get_content=False, **kwargs):
                 # print(chunk.encode("utf-8"))
                 yield f"data: {chunk}\n\n"
 
@@ -741,14 +782,13 @@ async def chat_completions(request: OpenAIRequest):
             yield 'data: [DONE]\n\n'
 
         return StreamingResponse(fake_stream_response(), media_type="text/event-stream")
-    else:
-        response = await ai_chat(model_info=None, messages=[msg.dict() for msg in request.messages],
-                                 user_request=None, system=None,
-                                 temperature=request.temperature, max_tokens=request.max_tokens,
-                                 top_p=request.top_p,
-                                 model_name=request.model, model_id=0, get_content=False)
-        # print(response)
-        return JSONResponse(content=response)
+
+    response = await ai_chat(model_info=None, messages=[msg.dict() for msg in request.messages],
+                             user_request=None, system=None,
+                             # temperature=request.temperature, max_tokens=request.max_tokens,top_p=request.top_p,
+                             model_name=request.model, model_id=0, get_content=False, **kwargs)
+    # print(response)
+    return JSONResponse(content=response)  # Response(content=json.dumps(data), media_type="application/json")
 
 
 @app.get("/v1/models")
@@ -768,16 +808,19 @@ async def get_models(model: Optional[str] = Query(None,
             "object": "list",
             "data": [
                 {
-                    "id": model_id,  # 用于指定模型进行请求 fine-tuned-model
+                    "id": f'{owner}:{model_id}',  # 用于指定模型进行请求 fine-tuned-model
                     "object": "model",
-                    "created": 1677645600,
-                    "owned_by": owner,
+                    "created": 1740386673,
+                    "owned_by": owner,  # 拥有该模型的组织
+                    "root": model_id,  # 根版本，与 ID 相同
+                    "parent": None,  # 如果没有父模型，则为 None
+                    # "max_model_len": 4096,#GPU内存限制而需要调整模型的最大序列长度
                     "permission": [
                         {
                             "id": f"modelperm-{owner}:{model_id}",
-                            # "object": "model_permission",
-                            # "created": 1677645600,
-                            # "allow_create_engine": True,
+                            "object": "model_permission",
+                            "created": 1740386673,
+                            # "allow_create_engine": False,
                             # "allow_sampling": True,
                             # "allow_logprobs": True,
                             # "allow_search_indices": False,
@@ -788,8 +831,6 @@ async def get_models(model: Optional[str] = Query(None,
                             # "is_blocking": False
                         }
                     ],
-                    "root": model_id,  # 根版本，与 ID 相同
-                    "parent": None  # 如果没有父模型，则为 None
                 } for i, (owner, models) in enumerate(extracted_data)
                 for j, model_id in enumerate(models)]
         }
@@ -1151,7 +1192,7 @@ async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
     file_path = Path(Config.DATA_FOLDER) / file.filename
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(await file.read())
-        url = f"{Config.LOCAL_URL}/files/{file.filename}"
+        url = f"{Config.WEBUI_URL}/files/{file.filename}"
 
     if oss_expires != 0:
         object_name = f"upload/{file.filename}"
@@ -1162,20 +1203,33 @@ async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
     return {"url": url}
 
 
+if not os.path.exists(Config.DATA_FOLDER):
+    # print(f"Error: The directory {Config.DATA_FOLDER} does not exist.")
+    Path(Config.DATA_FOLDER).mkdir(parents=True, exist_ok=True)  # 确保目标文件夹存在
+
+# 将文件目录映射为静态文件路径
+# directory=os.path.abspath('.') + "/static")
+app.mount("/static", StaticFiles(directory=Config.DATA_FOLDER), name="static")
+
+
 @app.get("/files/{filename}")
-async def file_handler(filename: str = None, url: str = None):
+async def file_handler(filename: str = None, url: str = None, stream: bool = False):
     data_folder = Path(Config.DATA_FOLDER)
     data_folder.mkdir(parents=True, exist_ok=True)  # 确保目标文件夹存在
 
     if url and is_url(url):
         file_path, file_name = await download_file(url, data_folder)
         if file_path:
+            if stream:
+                return StreamingResponse(file_path.open("rb"), media_type="application/octet-stream")
             return FileResponse(file_path)
     elif filename:
         file_path = data_folder / filename
         if file_path.exists():
+            if stream:
+                # media_type='application/octet-stream' 使用流式响应，二进制模式打开文件
+                return StreamingResponse(file_path.open("rb"), media_type="application/octet-stream")
             return FileResponse(file_path)
-
     return {"error": "File not found"}
 
 
@@ -1615,4 +1669,10 @@ async def ppt_create(text: str = Query(..., description="用于生成PPT的文�
 if __name__ == "__main__":
     import uvicorn
 
+    os.environ['HTTP_PROXY'] = Config.HTTP_Proxies['http']
+    os.environ['HTTPS_PROXY'] = Config.HTTP_Proxies['https']
+
     uvicorn.run(app, host="0.0.0.0", port=7000)
+
+    # pip install -r requirements.txt
+    # uvicorn main:app --host 0.0.0.0 --port 7000 --workers 4

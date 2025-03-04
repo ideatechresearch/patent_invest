@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, ForeignKey, String, Integer, BigInteger, Boolean, Float, DateTime, Index, \
+from sqlalchemy import create_engine,JSON, Column, ForeignKey, String, Integer, BigInteger, Boolean, Float, DateTime, Index, \
     TEXT
 from sqlalchemy import func, or_, and_, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
@@ -168,6 +168,7 @@ class BaseChatHistory(Base):
     agent: Mapped[str] = mapped_column(String(99), nullable=True)
 
     index: Mapped[int] = mapped_column(Integer, nullable=False)
+    # data = Column(JSON, nullable=True)
     reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
     # summary: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
     transform: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
@@ -263,22 +264,22 @@ def get_user_history(user_name: str, robot_id: Optional[str], user_id: Optional[
     return user_history
 
 
-def cut_chat_history(user_history, max_len_limit_count=33000):
+def cut_chat_history(user_history, max_size_limit_count=33000):
     last_records = []
-    total_len = 0
-    if max_len_limit_count > 0:
+    total_size = 0
+    if max_size_limit_count > 0:
         for i in range(len(user_history) - 2, -1, -2):
             pair = user_history[i:i + 2]
-            pair_len = sum(len(record['content']) for record in pair)  # 计算这一对消息的总长度
+            pair_len = sum(len(record['content']) for record in pair)  # 计算这一对消息的总长度,lang_token_size
 
-            if total_len + pair_len > max_len_limit_count:
+            if total_size + pair_len > max_size_limit_count:
                 break
 
             last_records = pair + last_records
-            total_len += pair_len
+            total_size += pair_len
 
-    elif max_len_limit_count < 0:
-        last_records = user_history[max_len_limit_count * 2:]  # -(filter_limit * 2):
+    elif max_size_limit_count < 0:
+        last_records = user_history[max_size_limit_count * 2:]  # -(filter_limit * 2):
     else:
         last_records = user_history
 
@@ -296,12 +297,12 @@ def build_chat_history(user_name: str, user_request: str, robot_id: Optional[str
             user_history = get_user_history(user_name, robot_id, user_id, filter_time, db, agent=agent,
                                             request_uuid=request_uuid)
             last_records = cut_chat_history(sorted(user_history, key=lambda x: x['timestamp']),
-                                            max_len_limit_count=filter_limit)
+                                            max_size_limit_count=filter_limit)
             history.extend([{'role': msg['role'], 'content': msg['content']} for msg in last_records])
 
         history.append({'role': 'user', 'content': user_request})
     else:
-        last_records = cut_chat_history(user_history, max_len_limit_count=filter_limit)
+        last_records = cut_chat_history(user_history, max_size_limit_count=filter_limit)
         history.extend([msg.dict() for msg in last_records])
         if not user_request:
             if history[-1]["role"] == 'user':
@@ -377,14 +378,14 @@ class ChatHistory(BaseChatHistory):
             if use_hist:  # 如果 use_hist 为真，可以根据 filter_limit 和 filter_time 筛选出历史记录，如果没有消息提供，过滤现有的聊天记录，user_message为问题
                 self.user_history = self.get(filter_time)
                 message_records = cut_chat_history(sorted(self.user_history, key=lambda x: x['timestamp']),
-                                                   max_len_limit_count=filter_limit)
+                                                   max_size_limit_count=filter_limit)
                 history.extend([{'role': msg['role'], 'content': msg['content']} for msg in message_records])
 
             if user_request:
                 history.append({'role': 'user', 'content': user_request})
         else:
             self.user_history = user_history
-            message_records = cut_chat_history(self.user_history, max_len_limit_count=filter_limit)
+            message_records = cut_chat_history(self.user_history, max_size_limit_count=filter_limit)
             history.extend([msg.dict() for msg in message_records])
 
             if not user_request:

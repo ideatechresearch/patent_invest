@@ -1,10 +1,10 @@
 import re, json, io, os, sys, time, pickle
-import inspect, importlib
+import inspect, importlib, ast
 from pathlib import Path
 from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
-from collections import OrderedDict, Counter
+from collections import OrderedDict, Counter, deque
 import numpy as np
 import math
 import jieba
@@ -113,6 +113,39 @@ def execute_code_blocks(text):
     return results
 
 
+def pip_install(*args):
+    import subprocess  # nosec
+    # import platform
+    cli_args = []
+    for arg in args:
+        cli_args.extend(str(arg).split(" "))  # export_command.split(" "),
+
+    subprocess.run([sys.executable, "-m", "pip", "install", *cli_args],
+                   # shell=(platform.system() == "Windows"),
+                   check=True)
+
+
+def git_repo_clone(repo_url: str, revision: str = None, add_to_sys_path: bool = True) -> Path:
+    # 自动化环境部署、动态加载 Git 仓库代码
+    repo_path = Path(repo_url.split("/")[-1].replace(".git", ""))
+    import subprocess
+    if not repo_path.exists():  # 本地没有该仓库
+        try:
+            subprocess.run(["git", "clone", repo_url], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as exc:
+            print(f"Failed to clone the repository: {exc.stderr}")
+            raise
+
+        if revision:  # 切换分支或提交
+            subprocess.Popen(["git", "checkout", revision], cwd=str(repo_path))
+    if add_to_sys_path and str(repo_path.resolve()) not in sys.path:
+        sys.path.insert(0, str(repo_path.resolve()))
+        # 加入 Python 的 sys.path，以便 import该仓库的模块
+
+    return repo_path
+
+
 # 调整缩进,修复代码缩进，确保最小的缩进被移除，以避免缩进错误
 def fix_indentation(code):
     lines = code.splitlines()
@@ -145,6 +178,52 @@ def extract_python_codes(markdown_string: str):
         return markdown_string
 
     return python_code
+
+
+def remove_function_decorators(func):
+    """
+    获取函数源码，去掉所有装饰器
+    """
+    source = inspect.getsource(func)  # 获取原始代码
+    tree = ast.parse(source)  # 解析 AST
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):  # 找到函数定义
+            node.decorator_list = []  # 清空装饰器列表
+
+    return ast.unparse(tree)  # 重新转换成代码
+    # import textwrap
+    # textwrap.dedent(source)  # 处理缩进
+
+
+def extract_function_metadata(code, r=None):
+    # 用于解析Python函数并提取元数据,从源代码级别提取详细的代码信息
+    # 使用AST来解析Python代码,将 Python 源代码（字符串形式）转换为抽象语法树（AST）
+    tree = ast.parse(code)
+    functions = []
+
+    # 遍历AST节点，找到函数定义
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            function_name = node.name
+            arguments = [arg.arg for arg in node.args.args]
+            docstring = ast.get_docstring(node) or ""
+            function_code = ast.unparse(node) if hasattr(ast, 'unparse') else ast.dump(node)
+            # if generate_docstring and not docstring:
+            #     docstring = generate_docstring(function_name, function_code)
+
+            metadata = {
+                'name': function_name,
+                'args': arguments,
+                'docstring': docstring,
+                'code': function_code
+            }
+            functions.append(metadata)
+            if r:
+                key = f"function:{function_name}"  # 用函数名作为Redis的键
+                r.set(key, str(metadata))  # 存储为JSON格式
+
+    return functions
 
 
 def extract_sql_code(text):
@@ -331,6 +410,9 @@ def format_for_html(text):
     except:
         return remove_markdown(text)
 
+    # from IPython.display import Markdown, display
+    # display(Markdown(f"`{export_command}`"))
+
 
 def extract_string(text, extract, **kwargs):
     if not extract:
@@ -420,6 +502,69 @@ def convert_to_pinyin(text):
     return text
 
 
+def lang_detect_to_trans(text):
+    t = detect(text)
+    if t == 'zh-cn':
+        t = 'zh'
+    if t == 'no':
+        t = 'zh' if contains_chinese(text) else 'auto'
+    return t
+
+
+def lang_token_size(text, tokenizer=None):
+    if tokenizer:
+        return len(tokenizer.encode(text))
+
+    lang = detect(text)
+    if lang in ('en', 'fr', 'es', 'de'):
+        # 对于英文、法语、西班牙语、德语等，使用空格分词
+        return len(text.split())
+
+    # 'zh-cn','zh-hk','zh-tw','ja','ar',简体中文,日语,阿拉伯语，返回字符数
+    return len(text)
+
+
+# import tiktoken #OpenAI 专用
+# from transformers import AutoTokenizer
+# def get_max_tokens_from_string(string: str, max_tokens: int, encoding_name: str = Config.DEFAULT_MODEL_ENCODING) -> str:
+#     """
+#         Extract max tokens from string using the specified encoding (based on openai compute)
+#         从一个字符串中提取出符合最大 token 数限制的部分
+#     """
+#     # tokenizer = AutoTokenizer.from_pretrained(model_id)
+#     encoding = tiktoken.encoding_for_model(encoding_name)  # tiktoken.model.MODEL_TO_ENCODING
+#     tokens = encoding.encode(string)
+#     token_bytes = [encoding.decode_single_token_bytes(token) for token in tokens[:max_tokens]]
+#     return b"".join(token_bytes).decode()
+#
+#
+def get_max_items_from_list(data: list, max_tokens: int = 4000, tokenizer=None):
+    """
+        Get max items from list of items based on defined max tokens (based on openai compute)
+        根据给定的最大 token 数，从一组字典数据中选取适合的项目，直到达到 token 限制为止
+        :param data: 包含字典的列表，每个字典表示一个项目
+        :param max_tokens: 允许的最大 token 数
+        :param tokenizer: 可选的 tokenizer（如果没有提供，则根据语言自动处理）
+        :return: 适合的项目列表
+        List[Dict[str, str]]
+    """
+    result = []
+    current_tokens = 0
+    # encoding = tiktoken.encoding_for_model(encoding_name)
+    # tiktoken.get_encoding("cl100k_base")
+    for item in data:
+        item_str = json.dumps(item)
+        item_tokens = lang_token_size(item_str, tokenizer)
+        new_total_tokens = current_tokens + item_tokens
+
+        if new_total_tokens > max_tokens:
+            break
+        else:
+            result.append(item)
+            current_tokens = new_total_tokens
+    return result
+
+
 def split_sentences(text,
                     pattern=r'(?=[。！？])|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])|(?=\b\d+\、)|(?=\r\n)'):
     """
@@ -476,6 +621,7 @@ def get_file_type(object_name: str) -> str:
 
     :param object_name: 文件名或路径
     :return: 文件类型（如 'image', 'audio', 'video', 'text', 'compressed', '*'）
+    .pdf .txt .csv .doc .docx .xls .xlsx .ppt .pptx .md .jpeg .png .bmp .gif .svg .svgz .webp .ico .xbm .dib .pjp .tif .pjpeg .avif .dot .apng .epub .tiff .jfif .html .json .mobi .log .go .h .c .cpp .cxx .cc .cs .java .js .css .jsp .php .py .py3 .asp .yaml .yml .ini .conf .ts .tsx
     """
     if not object_name:
         return ""
@@ -778,6 +924,13 @@ def normalize_np(vecs):
     return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
 
 
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
 def cosine_similarity_np(ndarr1, ndarr2):
     denominator = np.outer(np.linalg.norm(ndarr1, axis=1), np.linalg.norm(ndarr2, axis=1))
     dot_product = np.dot(ndarr1, ndarr2.T)  # np.einsum('ik,jk->ij', ndarr1, ndarr2)
@@ -990,3 +1143,9 @@ if __name__ == "__main__":
     scores = bm25.rank_documents(query)
     print(scores, bm25.corpus)
     # print(BM25(corpus).rank_documents(query))
+
+    with open("utils.py", 'r', encoding='utf-8') as file:
+        code = file.read()
+    functions = extract_function_metadata(code, r=None)
+    for func in functions:
+        print(func)

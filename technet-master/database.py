@@ -76,14 +76,14 @@ class StopWords(db.Model):
     # );
     # '''
     # insert_user_sql = '''
-    #             INSERT INTO user (username, password)
+    #             INSERT INTO user (name, password)
     #             VALUES (?, ?);
     #             ''
 
     # query_user_sql = '''
     #         SELECT COUNT(*)
     #         FROM user
-    #         WHERE username = ?
+    #         WHERE name = ?
     #         AND password = ?
     #         '''
 
@@ -94,7 +94,7 @@ class ChatHistory(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     role = db.Column(db.String(20), nullable=False)  # 'user' 或 'assistant'
     content = db.Column(MEDIUMTEXT, nullable=False)
-    username = db.Column(db.String(99), nullable=False, index=True)
+    name = db.Column(db.String(99), nullable=False, index=True)
     model = db.Column(db.String(50), nullable=True, default='moonshot')  # 模型名称
     agent = db.Column(db.String(50), nullable=False, default='0', index=True)  # 代理名称或角色
     index = db.Column(db.Integer, nullable=False)  # 消息索引
@@ -103,13 +103,13 @@ class ChatHistory(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)  # 消息创建时间
 
     __table_args__ = (
-        db.Index('idx_agent_username_time', 'agent', 'username', 'timestamp'),
+        db.Index('idx_agent_name_time', 'agent', 'name', 'timestamp'),
     )
 
-    def __init__(self, role, content, username, model='moonshot', agent='0', index=0, reference=None, timestamp=0):
+    def __init__(self, role, content, name, model='moonshot', agent='0', index=0, reference=None, timestamp=0):
         self.role = role
         self.content = content
-        self.username = username
+        self.name = name
         self.model = model
         self.agent = agent
         self.index = index
@@ -126,9 +126,9 @@ class ChatHistory(db.Model):
             session.commit()
 
     @classmethod
-    def user_history(cls, username, agent=None, filter_time=0, all_payload=True):
+    def user_history(cls, name, agent=None, filter_time=0, all_payload=True):
         query = cls.query.filter(or_(cls.agent == agent, agent is None),
-                                 cls.username == username, cls.timestamp > filter_time)
+                                 cls.name == name, cls.timestamp > filter_time)
         if all_payload:
             return [record.asdict() for record in query.all()]
         records = query.with_entities(cls.role, cls.content).all()
@@ -140,13 +140,13 @@ class ChatHistory(db.Model):
         while i < len(chat_history):
             try:
                 msg = chat_history[i]
-                if (not agent or msg['agent'] == agent) and (not user_name or msg['username'] == user_name):
+                if (not agent or msg['agent'] == agent) and (not user_name or msg['name'] == user_name):
                     record = cls(**msg)
                     session.add(record)
                     session.commit()
 
                     del chat_history[i]  # pop(0)
-                    if not any((not agent or m['agent'] == agent) and (not user_name or m['username'] == user_name)
+                    if not any((not agent or m['agent'] == agent) and (not user_name or m['name'] == user_name)
                                for m in chat_history[i:]):
                         break
                 else:

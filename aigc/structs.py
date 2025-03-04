@@ -1,11 +1,15 @@
-from pydantic import BaseModel, Field, field_validator, condecimal, conint
+from pydantic import BaseModel, Field, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from enum import Enum as PyEnum
 from enum import IntEnum
 from dataclasses import asdict, dataclass, is_dataclass
 import random
 
-SESSION_ID_MAX = 2 ** 31 - 1  # 2147483647
+KB = 1 << 10
+MB = 1 << 20
+GB = 1 << 30
+T = 1e12
+SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
 
 
 @dataclass
@@ -72,9 +76,21 @@ class ChatMessage(BaseModel):
     content: Union[str, List[dict]]  # str
     name: Optional[str] = None  # 可以包含 a-z、A-Z、0-9 和下划线，最大长度为 64 个字符
 
+    @model_validator(mode="before")
+    def set_default_name(cls, values):
+        values["name"] = values.get("name", "") or ""
+        return values
+
+    # @field_validator("name")
+    # def validate_name(cls, value):
+    #     re.fullmatch(r"^\w{1,64}$", value)
+    #     return value or ''
+
 
 from config import ModelListExtract
+
 MODEL_LIST = ModelListExtract()
+
 
 class OpenAIRequest(BaseModel):
     # model: Literal[*tuple(MODEL_LIST.models)]
@@ -115,7 +131,8 @@ class OpenAIRequest(BaseModel):
                 "messages": [
                     {
                         "role": "user",
-                        "content": "你好,有问题要问你"
+                        "content": "你好,有问题要问你",
+                        "name": 'test'
                     }
                 ],
                 "temperature": 1,
@@ -125,8 +142,8 @@ class OpenAIRequest(BaseModel):
             }
         }
 
-    @field_validator("model")
     @classmethod
+    @field_validator("model")
     def validate_model(cls, value):
         if value == 'gpt-4o-mini':
             return 'qwen-turbo'
@@ -134,8 +151,8 @@ class OpenAIRequest(BaseModel):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
         return value
 
-    @field_validator("messages")
     @classmethod
+    @field_validator("messages")
     def check_messages(cls, values):
         if not values:
             raise ValueError('Messages are required')
@@ -145,13 +162,51 @@ class OpenAIRequest(BaseModel):
 class OpenAIResponse(BaseModel):
     id: str
     object: str
-    created: int
+    created: int  # Unix 时间戳
     model: str
     choices: List[dict]
     usage: dict
+    # completion_tokens,
+    # prompt_tokens(prompt_cache_hit_tokens,prompt_cache_miss_tokens),
+    # total_tokens（prompt + completion）
+    # completion_tokens_details
 
     service_tier: Optional[str] = None  # 标识当前 API 请求或用户的服务层级
-    system_fingerprint: Optional[str] = None  # 标识与请求关联的特定客户端、设备或会话
+    system_fingerprint: Optional[str] = None  # 标识与请求关联的特定客户端、设备或会话,后端配置的指纹
+
+
+class OpenAIEmbeddingRequest(BaseModel):
+    model: str  # 模型名称
+    input: Union[str, List[str]]  # 输入的文本数组
+    encoding_format: str = "float"  # 默认设置为 "float"，表示返回浮点数嵌入
+
+    user: Optional[str] = None  # 可选，标识用户
+    metadata: Optional[Dict[str, str]] = None  # 可选，附加的元数据
+
+    @model_validator(mode="before")
+    def set_default_value(cls, values):
+        if isinstance(values.get("input"), str):
+            values["input"] = [values["input"]]
+        if "user" not in values or values["user"] is None:
+            values["user"] = ""
+        values["input"] = [x.replace("\n", " ") for x in values["input"]]
+        return values
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model": "qwen",
+                "input": [
+                    "role", "user",
+                    "content", "你好,有问题要问你"
+                ],
+                "encoding_format": "float",
+                "metadata": {
+                    "source": "chatbot",
+                    "timestamp": "2025-01-01T00:00:00Z"
+                }
+            }
+        }
 
 
 class AuthRequest(BaseModel):
@@ -309,10 +364,15 @@ class CompletionParams(BaseModel):
                             description=("Specify the name of the model to be used. It can be any available model, "
                                          "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek', or other models."))
     model_id: int = Field(0, description="Model ID to be used")
-
-    keywords: Optional[List[Union[str, Tuple[str, Any]]]] = Field(
+    keywords: Optional[List[Union[
+        str,
+        Tuple[str, Any],
+        Tuple[str, List[Any]],
+        Tuple[str, Dict[str, Any]],
+        Tuple[str, List[Any], Dict[str, Any]]
+    ]]] = Field(
         None, description=(
-            "A list of keywords or tuples of (keyword, function, *args) used to search for relevant information across various sources, "
+            "A list of keywords or tuples of (keyword, function, *args,*kwargs) used to search for relevant information across various sources, "
             "such as online searches, database queries, or vector-based search systems. "
             "These keywords help guide the retrieval of data based on the specific terms provided."))
     tools: Optional[List[Tuple[str, Any]]] = Field(
@@ -325,6 +385,14 @@ class CompletionParams(BaseModel):
 
     # score_threshold: float = Field(default=0, ge=-1, le=1, description="The score threshold setting for the model.")
     # top_n: int = Field(10,description="The number of top results to retrieve during vector search. This determines how many of the highest-scoring items will be returned.")
+    # keywords = [
+    #     "simple_keyword",  # ✅ 纯字符串（符合 `str`）
+    #     ("func_name", "arg1"),  # ✅ (函数名, 单个参数)
+    #     ("func_name", [[1, 2, 3]]),  # ✅ (函数名, 单个参数,列表)
+    #     ("another_func", [1, 2, 3]),  # ✅ (函数名, 多个参数列表)
+    #     ("some_tool", {"key": "value"}),  # ✅ (函数名, 关键字参数字典)
+    #     ("complex_tool", [1, 2], {"key": "v"})  # ✅ (函数名, 位置参数列表, 关键字参数)
+    # ]
 
     class Config:
         protected_namespaces = ()
@@ -341,7 +409,7 @@ class CompletionParams(BaseModel):
                     "model_name": "silicon",
                     "model_id": 0,
                     "extract": "code.python",
-                    "max_tokens": 4096,
+                    "max_tokens": 4000,
                     "keywords": ["AI智能"],
                     "tools": [],  # [("tool_name", {"key": "value"})]
                 },
@@ -354,7 +422,7 @@ class CompletionParams(BaseModel):
                     "agent": "42",
                     "top_p": 0.8,
                     "question": "这是什么啊,可以描述一下吗?",
-                    "keywords": [],
+                    "keywords": [('web_search', "大象")],
                     "suffix": "",
                     "temperature": 0.7,
                     "max_tokens": 4096,
@@ -363,8 +431,8 @@ class CompletionParams(BaseModel):
             ]
         }
 
-    @field_validator("model_name")
     @classmethod
+    @field_validator("model_name")
     def validate_model(cls, value):
         if not MODEL_LIST.contains(value):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")

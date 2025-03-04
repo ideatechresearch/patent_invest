@@ -1,9 +1,7 @@
 from qdrant_client import QdrantClient, AsyncQdrantClient
 import asyncio
-# from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue
-from typing import List, Dict, Any, Union, Tuple, Callable, Optional
+# from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue,PointStruct
 import qdrant_client.models as qcm
-from generates import ai_embeddings
 
 
 def empty_match(field_key):
@@ -35,6 +33,100 @@ async def names_to_ids(names, collection_name, client, match=[], key_name='word'
 
     return {i.payload[key_name]: i.id for i in scroll_result[0]}
     # [(i.payload[key_name], i.id) for i in scroll_result[0]]
+
+
+async def create_collection(collection_name, client, size, new=False, vectors_on_disk=True, hnsw_on_disk=True):
+    """
+        创建 Qdrant 集合。如果 `new` 为 True 且集合已经存在，则删除现有集合并重新创建。
+
+        :param collection_name: 集合名称
+        :param client: Qdrant 客户端实例
+        :param size: 向量的维度大小
+        :param new: 是否删除现有集合并重新创建（默认值为 False）
+        :param vectors_on_disk: 向量是否保存在磁盘上
+        :param hnsw_on_disk: HNSW 索引是否保存在磁盘上
+        :return: 集合中的点数
+        """
+    try:
+        # 如果 `new` 为 True，且集合已存在，先删除集合
+        if new and await client.collection_exists(collection_name=collection_name):
+            print(f"Collection {collection_name} exists. Deleting and recreating...")
+            await client.delete_collection(collection_name=collection_name)
+
+        # 如果集合不存在，创建新的集合
+        if not await client.collection_exists(collection_name=collection_name):
+            print(f"Creating new collection: {collection_name}")
+            await client.create_collection(
+                collection_name=collection_name,
+                # 向量配置
+                vectors_config=qcm.VectorParams(size=size, distance=qcm.Distance.COSINE, on_disk=vectors_on_disk),
+                # HNSW 配置：是否将 HNSW 索引保存在磁盘上
+                hnsw_config=qcm.HnswConfigDiff(on_disk=hnsw_on_disk),
+                # 如果需要禁用索引，可以取消注释以下配置：
+                # optimizer_config=OptimizersConfigDiff(indexing_threshold=0),
+            )
+
+        # 返回集合中的点数
+        return await client.count(collection_name=collection_name, exact=True)
+
+    except Exception as e:
+        print(f"Error while creating or managing the collection {collection_name}: {e}")
+        return None
+
+
+async def upsert_points(payloads: list, vectors: list, collection_name, client):
+    """
+    插入单个点到 Qdrant 集合。
+
+    :param payloads: 数据负载
+    :param vectors: 向量
+    :param collection_name: 集合名称
+    :param client: Qdrant 客户端实例
+    """
+    current_count = await client.count(collection_name=collection_name)
+    points = [qcm.PointStruct(id=current_count + idx, payload=payload, vector=vector)
+              for idx, (payload, vector) in enumerate(zip(payloads, vectors))]
+    try:
+        res = await client.upsert(collection_name=collection_name, points=points)
+        return res.operation_id
+    except Exception as e:
+        print(f"Error upserting points to collection {collection_name}: {e}")
+        return None
+
+
+async def upsert_points_batch(payloads: list, vectors: list, collection_name: str, client,
+                              batch_size: int = 1000):
+    """
+    批量插入数据到 Qdrant 集合。
+
+    :param payloads: 数据负载列表
+    :param vectors: 向量列表
+    :param collection_name: 集合名称
+    :param client: Qdrant 客户端实例
+    :param batch_size: 每次插入的批次大小
+    """
+    assert len(payloads) == len(vectors), "Payloads and vectors must have the same length."
+    current_count = await client.count(collection_name=collection_name)
+    index = current_count
+    for i in range(0, len(payloads), batch_size):
+        batch_payloads = payloads[i:i + batch_size]
+        batch_vectors = vectors[i:i + batch_size]
+        points_size = len(batch_payloads)
+        batch_ids = list(range(index, index + points_size))
+
+        # 创建 Batch 对象
+        points = qcm.Batch(ids=batch_ids, payloads=batch_payloads, vectors=batch_vectors)
+
+        try:
+            print(f"Processing batch {i // batch_size + 1} with size {points_size}...")
+            await client.upsert(collection_name=collection_name, points=points)
+            index += points_size
+        except StopIteration:
+            break
+        except Exception as e:
+            print(f"Error upserting batch {i // batch_size + 1}: {e}")
+            continue
+    return index
 
 
 async def get_payload(names, collection_name, client, ids=[], fields=[], match=[], key_name='word'):
@@ -280,24 +372,6 @@ async def search_batch_by_ids(ids, collection_name, client, key_name='word', mat
     return rerank_similar_by_search(names, search_hit, topn=topn, duplicate=duplicate, key_name=key_name)
 
 
-async def similar_by_embeddings(query, collection_name, client, topn=10, score_threshold=0.0, query_vector=[],
-                                match=[], not_match=[], embeddings_calls: Callable[[...], Any] = ai_embeddings,
-                                **kwargs):
-    if not query_vector:
-        query_vector = await embeddings_calls(query, **kwargs)
-        if not query_vector:
-            return []
-
-    query_filter = qcm.Filter(must=match, must_not=not_match)
-    search_hit = await client.search(collection_name=collection_name,
-                                     query_vector=query_vector,  # tolist()
-                                     query_filter=query_filter,
-                                     limit=topn,
-                                     score_threshold=score_threshold,
-                                     )
-    return [(p.payload, p.score) for p in search_hit]
-
-
 # Relation
 async def node_relations(collection_name, client, width, depth, _id, ids_depth: dict = {}, match=[], not_match=[],
                          key_name='word', exclude_all=True, score_threshold=0.0):
@@ -492,3 +566,9 @@ async def similar_node_relations(collection_name, client, node_id, node_name, ex
     ids_name = await  ids_to_names(list({**ids_depth, **new_depth}), collection_name, client, key_name)
     nodes = [{"id": i, "name": ids_name.get(i, 'None'), "depth": d} for i, d in new_depth.items()]
     return {"nodes": nodes, "edges": new_relationships}
+
+
+if __name__ == "__main__":
+    # qc = AsyncQdrantClient(host='47.110.156.41', grpc_port=6334, prefer_grpc=True)
+    qc = QdrantClient(url="http://47.110.156.41:6333")
+    print(qc.get_collections())

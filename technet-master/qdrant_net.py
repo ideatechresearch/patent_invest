@@ -77,7 +77,7 @@ def recover_snapshots_upload(host, collection_name, file_path):
 
 
 def qdrant_livez(host, https=False, api_key=''):
-    url = f"https://{host}:6333/livez" if https else f"http://{host}:6333/livez"
+    url = f"{'https' if https else 'http'}://{host}:6333/livez"
     headers = {"api-key": api_key} if api_key else {}
     try:
         response = requests.get(url, headers=headers, timeout=3)
@@ -208,12 +208,6 @@ AI_Models = [
      "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
      'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1"},
 
-    # https://open.bigmodel.cn/console/overview
-    {'name': 'glm', 'type': 'default', 'api_key': '',
-     "model": ["glm-4-air", "glm-4-flash", "glm-4-air", "glm-4", "glm-4v", "glm-4-0520"],
-     'url': 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-     'base_url': "https://open.bigmodel.cn/api/paas/v4/"},
-
     # https://dashscope.console.aliyun.com/overview
     {'name': 'qwen', 'type': 'default', 'api_key': '',
      "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct", "qwen2.5-32b-instruct",
@@ -227,7 +221,11 @@ AI_Models = [
     {'name': 'silicon', 'type': 'default', 'api_key': '',
      'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat", "01-ai/Yi-1.5-9B-Chat-16K",
                "THUDM/chatglm3-6b", "THUDM/glm-4-9b-chat", "Pro/THUDM/glm-4-9b-chat",
-               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/deepseek-llm-67b-chat",
+               "deepseek-ai/DeepSeek-V2-Chat", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/deepseek-vl2",
+               "deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1",
+               "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+               "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+               "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "deepseek-ai/deepseek-llm-67b-chat",
                "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "Pro/OpenGVLab/InternVL2-8B",
                "google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"],
      'embedding': ['BAAI/bge-large-zh-v1.5', 'BAAI/bge-m3', 'netease-youdao/bce-embedding-base_v1'],
@@ -239,14 +237,6 @@ AI_Models = [
      'embeddings_url': "https://api.siliconflow.cn/v1/embeddings",
      'rerank_url': "https://api.siliconflow.cn/v1/rerank"},
 
-    # https://platform.baichuan-ai.com/docs/api
-    {'name': 'baichuan', 'type': 'default', 'api_key': '',
-     "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', "Baichuan4",
-               "Baichuan-NPC-Turbo"],
-     "embedding": ["Baichuan-Text-Embedding"],
-     'url': 'https://api.baichuan-ai.com/v1/chat/completions',
-     'base_url': "https://api.baichuan-ai.com/v1/",  # assistants,files,threads
-     'embeddings_url': 'https://api.baichuan-ai.com/v1/embeddings'},
 ]
 
 
@@ -258,16 +248,32 @@ class ModelNameEnum(str, PyEnum):
     hunyuan = "hunyuan"
     doubao = "doubao"
     silicon = "silicon"
-
-
-AI_Client = {}
+    models = [
+        {"value": "qwen", "name": "通义千问"},
+        {"value": "moonshot", "name": "kimi"},
+        {"value": "doubao", "name": "豆包"},
+        {"value": "hunyuan", "name": "混元"},
+        {"value": "ernie", "name": "文心"},
+        {"value": "deepseek-ai/DeepSeek-V2-Chat", "name": "DeepSeek"},
+        {"value": "01-ai/Yi-1.5-9B-Chat-16K", "name": "零一万物"},
+        {"value": "THUDM/glm-4-9b-chat", "name": "智谱"},
+        {"value": "internlm/internlm2_5-7b-chat", "name": "书生"},
+        {"value": "speark", "name": "星火"},
+        {"value": "baichuan", "name": "百川"},
+        {"value": "google/gemma-2-9b-it", "name": "gemma"},
+        {"value": "meta-llama/Meta-Llama-3-8B-Instruct", "name": "llama"},
+        {"value": "deepseek-ai/DeepSeek-Coder-V2-Instruct", "name": "coder"},
+    ]
 
 
 def find_ai_model(name: str, model_i: int = 0):
-    model = next((model for model in AI_Models if model['name'] == name), None)
+    model = next((model for model in AI_Models if model['name'] == name or name in model['model']), None)
     if model:
-        model_i = model_i if abs(model_i) < len(model['model']) else 0  # 默认选择第一个模型
-        return model, model['model'][model_i]
+        model_items = model['model']
+        if name in model_items:
+            return model, name
+        model_i = model_i if abs(model_i) < len(model_items) else 0  # 默认选择第一个模型
+        return model, model_items[model_i]
     return None, None
 
 
@@ -283,8 +289,11 @@ def ai_chat(messages, model_id, temperature=0.4, top_p=0.8, max_tokens=1024, pay
         }
 
     if client:
-        completion = client.chat.completions.create(**payload)
-        return completion.choices[0].message.content
+        try:
+            completion = client.chat.completions.create(**payload)
+            return completion.choices[0].message.content
+        except Exception as e:
+            return f"OpenAI error occurred: {e}"
 
     # 通过 requests 库直接发起 HTTP POST 请求
     url = model_info['url']
@@ -317,14 +326,17 @@ def ai_chat_async(messages, model_id, temperature=0.4, top_p=0.8, max_tokens=102
         }
 
     if client:
-        stream = client.chat.completions.create(**payload)
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                yield delta.content  # completion.append(delta.content)
-            # if chunk.choices[0].finish_reason == 'stop':
-            #     break
-        # yield '[DONE]'
+        try:
+            stream = client.chat.completions.create(**payload)
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
+                    yield delta.content  # completion.append(delta.content)
+                # if chunk.choices[0].finish_reason == 'stop':
+                #     break
+            # yield '[DONE]'
+        except Exception as e:
+            yield f"OpenAI error occurred: {e}"
         return
 
     api_key = model_info['api_key']
@@ -478,26 +490,6 @@ def most_similar_by_name(name, collection_name, client, match=[], exclude=[], to
     return [(p.payload['word'], p.score) for p in search_hit]
 
 
-# SimilarByIds
-def most_similar_by_ids(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10,
-                        score_threshold=0.0, exact=True):
-    id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
-
-    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in exclude]
-    not_match_ids = [HasIdCondition(has_id=ids)]
-    query_filter = Filter(must=match, must_not=not_match_ids + not_match_name)  # 缩小查询范围
-
-    search_queries = [
-        SearchRequest(vector=p.vector, filter=query_filter, limit=topn, score_threshold=score_threshold,
-                      with_payload=[key_name], params=SearchParams(exact=exact), )
-        for p in id_record]
-
-    search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
-
-    return [(id, [(p.payload[key_name], p.score) for p in hit]) for id, hit in
-            zip(ids, search_hit)]  # [:topn]
-
-
 # 选择合适的索引类型和参数,性能优先: HNSW 索引,资源优先:IVF_FLAT
 # 流式插入和批量导入
 # 谨慎使用标量过滤，删除特性
@@ -614,50 +606,6 @@ def rerank_similar_by_recommend(ids, recommend_hit, topn=10, duplicate=0):
 
     # print(similar_next)
     return [(i, similar_next[i]) for i in ids if i in similar_next]
-
-
-def SearchByIds(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10, duplicate=0,
-                score_threshold=0, exact=True):
-    id_record = client.retrieve(collection_name=collection_name, ids=ids, with_vectors=True)
-
-    names = [p.payload[key_name] for p in id_record]
-    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in names + exclude]
-    query_filter = Filter(must=match, must_not=not_match_name)  # 缩小查询范围
-
-    search_queries = [
-        SearchRequest(vector=p.vector, filter=query_filter, limit=topn * len(names), score_threshold=score_threshold,
-                      with_payload=[key_name], params=SearchParams(exact=exact))
-        for p in id_record]
-
-    search_hit = client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
-
-    return rerank_similar_by_search(names, search_hit, topn=topn, duplicate=duplicate, key_name=key_name)
-
-
-def recommend_by_ids(ids, collection_name, client, key_name='word', match=[], exclude=[], topn=10, score_threshold=0):
-    not_match_name = [FieldCondition(key=key_name, match=MatchValue(value=w), ) for w in exclude]
-    query_filter = Filter(must=match, must_not=not_match_name)  # 缩小查询范围
-
-    recommend_queries = [
-        RecommendRequest(positive=[_id], filter=query_filter, limit=topn, score_threshold=score_threshold,
-                         with_payload=[key_name]) for _id in ids]
-
-    search_hit = client.recommend_batch(collection_name=collection_name, requests=recommend_queries)  # ScoredPoint
-
-    return [(_id, [(p.payload[key_name], p.score) for p in hit]) for _id, hit in zip(ids, search_hit)]
-
-
-def RecommendByIds(ids, collection_name, client, match=[], not_ids=[], topn=10, duplicate=0, score_threshold=0):
-    not_match_ids = [HasIdCondition(has_id=not_ids)]
-    query_filter = Filter(must=match, must_not=not_match_ids)  # 缩小查询范围
-
-    recommend_queries = [
-        RecommendRequest(positive=[_id], filter=query_filter, limit=topn * len(ids), score_threshold=score_threshold,
-                         with_payload=False) for _id in ids]
-
-    search_hit = client.recommend_batch(collection_name=collection_name, requests=recommend_queries)  # ScoredPoint
-
-    return rerank_similar_by_recommend(ids, search_hit, topn=topn, duplicate=duplicate)
 
 
 class VDBSimilar:

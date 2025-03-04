@@ -1,0 +1,14 @@
+# 包含源代码文件
+include *.py
+include deoloy.bat
+include requirements.txt
+include CI
+recursive-include agents *
+recursive-include docker *
+# 排除不需要的文件夹和文件
+exclude .venv/*
+exclude .git/*
+exclude data/*
+recursive-exclude __pycache__/*
+recursive-exclude */__pycache__/*
+exclude nlp.py

@@ -105,6 +105,10 @@ System_content = {
     # 问题理解与回复分析
     '33': ('1.认真理解从知识库中召回的内容和用户输入的问题，判断召回的内容是否是用户问题的答案,'
            '2.如果你不能理解用户的问题，例如用户的问题太简单、不包含必要信息，此时你需要追问用户，直到你确定已理解了用户的问题和需求。'),
+    '34': ('你是一个乐于助人、尊重他人以及诚实可靠的助手。在安全的情况下，始终尽可能有帮助地回答。 您的回答不应包含任何有害、不道德、种族主义、性别歧视、有毒、危险或非法的内容。请确保您的回答在社会上是公正的和积极的。'
+           '如果一个问题没有任何意义或与事实不符，请解释原因，而不是回答错误的问题。如果您不知道问题的答案，请不要分享虚假信息。另外，答案请使用中文。'),
+    # DEFAULT_RAG_PROMPT
+    '35': '基于以下已知信息，请简洁并专业地回答用户的问题。如果无法从中得到答案，请说 "根据已知信息无法回答该问题" 或 "没有提供足够的相关信息"。不允许在答案中添加编造成分。另外，答案请使用中文。',
     # 图像理解
     '40': '描述图片的内容，并生成标签，以以下格式输出：{title:"",label:""}',
     # 纯文本图像的文字抽取、日常图像的文字抽取以及表格图像的内容抽取
@@ -213,4 +217,156 @@ System_content = {
 
            '# Notes [optional]'
            '[optional：边缘情况、细节，以及需要特别注意或重复强调的重要事项]'),
+    '80': "Extract the function name, arguments, and a brief description from this Python code:\n\n({function_code})\n\nOutput format: {{'name': 'function_name', 'args': ['arg1', 'arg2'], 'docstring': 'description'}}",
+
+    '81': """
+        Extract the metadata for this Python function and output it in the following JSON format:
+        
+        {{
+            "function": {{
+                "name": "({func_name})",
+                "description": "({docstring})",
+                "parameters": {{
+                    "type": "object",
+                    "properties": ({parameters})
+                }},
+                "required": ({required_params})
+            }}
+        }}
+        """,
+    '82': """
+        你是一个 Python 开发助手，请根据以下函数代码生成合适的 docstring:
+        
+        ```python
+        ({func_code})
+        ```
+        生成 Python 格式 docstring，简要说明函数的作用、参数和返回值:
+        1. **格式**: 生成标准的 Python `docstring`，采用 **NumPy 风格**。
+        2. **内容**:
+           - **简要介绍** 函数的作用。
+           - **参数说明**（使用 `参数名 : 类型` 的格式）。
+           - **返回值说明**（使用 `返回类型`）。
+           - **异常说明**（如果有异常）。
+        3. **语言**: 生成清晰、专业的 `docstring`。
+    """,
+    '83': """
+    Extract the metadata for this Python function and output it in the following JSON format:
+
+    {{
+        "function": {{
+            "name": "<function_name>",
+            "description": "<brief_description_of_function>",
+            "parameters": {{
+                "type": "object",
+                "properties": {{
+                    "<parameter_name>": {{
+                        "type": "<data_type>",
+                        "description": "<description_of_parameter>"
+                        "default": "<default_value_if_any>"
+                    }},
+                    ...
+                }},
+                "required": ["<list_of_required_parameters>"]
+            }}
+        }}
+    }}
+
+    Here is the Python function code:
+    ({function_code})
+    """
 }
+
+
+def red_pijama_partial_text_processor(partial_text, new_text):
+    if new_text == "<":
+        return partial_text
+
+    partial_text += new_text
+    return partial_text.split("<bot>:")[-1]
+
+
+def deepseek_partial_text_processor(partial_text, new_text):
+    partial_text += new_text
+    return partial_text.split("</think>")[-1]
+
+
+def llama_partial_text_processor(partial_text, new_text):
+    new_text = new_text.replace("[INST]", "").replace("[/INST]", "")
+    partial_text += new_text
+    return partial_text
+
+
+def chatglm_partial_text_processor(partial_text, new_text):
+    new_text = new_text.strip()
+    new_text = new_text.replace("[[训练时间]]", "2023年")
+    partial_text += new_text
+    return partial_text
+
+
+def youri_partial_text_processor(partial_text, new_text):
+    new_text = new_text.replace("システム:", "")
+    partial_text += new_text
+    return partial_text
+
+
+def internlm_partial_text_processor(partial_text, new_text):
+    partial_text += new_text
+    return partial_text.split("<|im_end|>")[0]
+
+
+def phi_completion_to_prompt(completion):
+    return f"<|system|><|end|><|user|>{completion}<|end|><|assistant|>\n"
+
+
+def llama3_completion_to_prompt(completion):
+    return f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{completion}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+
+def qwen_completion_to_prompt(completion):
+    return f"<|im_start|>system\n<|im_end|>\n<|im_start|>user\n{completion}<|im_end|>\n<|im_start|>assistant\n"
+
+
+if __name__ == "__main__":
+    from openai import OpenAI
+
+    client = OpenAI(api_key="xxx",
+                    base_url="http://47.110.156.41:7000/v1/",  # "http://127.0.0.1:8033/v1/"
+                    )
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {
+                "role": "system", "content": System_content['34'],
+            },
+            {
+                "role": "user",
+                "content": "你是谁",
+            }
+        ],
+        model="moonshot:moonshot-v1-8k",  # 'facebook/opt-125m',  # "Qwen2-72B-Instruct",
+    )
+    print(chat_completion)
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {
+                "role": "system", "content": System_content['82'],
+            },
+            {
+                "role": "user",
+                "content": """
+                def web_search_async(text, api_key=Config.GLM_Service_Key):
+                    \"\"\"
+                    执行网络搜索，提供查询文本，返回相关信息。
+                    参数:
+                    - text: 查询文本，字符串类型，必须提供。
+                    - api_key: 用于访问网络搜索API的密钥，可选，默认为 Config.GLM_Service_Key。
+                    \"\"\"
+                    pass
+                """,
+            }
+        ],
+        model="moonshot:moonshot-v1-32k",  # 'facebook/opt-125m',  # "Qwen2-72B-Instruct",
+        stream=False
+    )
+    print(chat_completion.choices[0].message)

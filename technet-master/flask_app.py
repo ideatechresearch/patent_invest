@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import json
+
 from flask import session, request, redirect, url_for, render_template, render_template_string, stream_with_context
 from flask import jsonify, send_file, g, current_app, send_from_directory, Response
 # from flask_socketio import SocketIO, emit
@@ -11,7 +13,7 @@ import plotly.express as px
 import plotly.io as pio
 import pandas as pd
 import string, time, os, re, uuid
-from lda_topics import LdaTopics
+# from lda_topics import LdaTopics
 import logging
 from openai import OpenAI
 from urllib.parse import urlparse, urljoin
@@ -25,7 +27,7 @@ class IgnoreHeadRequestsFilter(logging.Filter):
 
 swg = StopWordsFlag()
 vdr = VDBRelationships()
-ldt = LdaTopics()
+# ldt = LdaTopics()
 
 DEBUG_MODE = False  # .getenv('PYCHARM_HOSTED', '0') == '1'  # -e PYCHARM_HOSTED=0
 if DEBUG_MODE:
@@ -89,41 +91,44 @@ def search():
 
         if action == 'search_patent':
             txt = request.form['search_patent'].strip()
-            empty_abstract = empty_match(field_key='摘要长度')
-            if request.form.get('abstract5', '0') == '0':
-                match = empty_abstract
-                not_match = []
-            else:
-                not_match = empty_abstract
-                match = []
+            return render_template('search.html', inform=f'{txt}')
+            # empty_abstract = empty_match(field_key='摘要长度')
+            # if request.form.get('abstract5', '0') == '0':
+            #     match = empty_abstract
+            #     not_match = []
+            # else:
+            #     not_match = empty_abstract
+            #     match = []
 
-            data = most_similar_embeddings(txt, '专利_bge_189', Q_Client,
-                                           topn=int(request.form.get('topn', 10)),
-                                           match=match, not_match=not_match,
-                                           score_threshold=float(request.form.get('score_threshold', 0.0)),
-                                           access_token=Baidu_Access_Token)
-
-            detail = patents_detail_links(data, base_url='/details')
-            if len(detail):
-                return render_template('search.html', inform=f'{txt}',
-                                       table=detail.to_html(escape=False, classes='custom-table'))
+            # data = most_similar_embeddings(txt, '专利_bge_189', Q_Client,
+            #                                topn=int(request.form.get('topn', 10)),
+            #                                match=match, not_match=not_match,
+            #                                score_threshold=float(request.form.get('score_threshold', 0.0)),
+            #                                access_token=Baidu_Access_Token)
+            #
+            # detail = patents_detail_links(data, base_url='/details')
+            # if len(detail):
+            #     return render_template('search.html', inform=f'{txt}',
+            #                            table=detail.to_html(escape=False, classes='custom-table'))
 
         if action == 'search_topic':
             txt = request.form['search_topic'].strip()
-            if ldt.notload():
-                ldt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
-            if txt:
-                vec = ldt.encode(txt)
-                search_hit = Q_Client.search(collection_name='专利_先进制造_w2v_lda_120',
-                                             query_vector=vec,
-                                             score_threshold=float(request.form.get('score_threshold', 0.0)),
-                                             limit=int(request.form.get('topn', 10)))
-
-                data = [(p.payload, p.score) for p in search_hit]
-                detail = patents_detail_links(data, base_url='/details')
-            if len(detail):
-                return render_template('search.html', inform=f'{txt}',
-                                       table=detail.to_html(escape=False, classes='custom-table'))
+            return render_template('search.html', inform=f'{txt}')
+            #                            table=detail.to_html(escape=False, classes='custom-table'))
+            # if ldt.notload():
+            #     ldt.load('xjzz', len_below=2, top_n_topics=4, minimum_probability=0.03, weight_threshold_topics=0.03)
+            # if txt:
+            #     vec = ldt.encode(txt)
+            #     search_hit = Q_Client.search(collection_name='专利_先进制造_w2v_lda_120',
+            #                                  query_vector=vec,
+            #                                  score_threshold=float(request.form.get('score_threshold', 0.0)),
+            #                                  limit=int(request.form.get('topn', 10)))
+            #
+            #     data = [(p.payload, p.score) for p in search_hit]
+            #     detail = patents_detail_links(data, base_url='/details')
+            # if len(detail):
+            #     return render_template('search.html', inform=f'{txt}',
+            #                            table=detail.to_html(escape=False, classes='custom-table'))
 
         if action == 'search_co':
             txt = request.form['search_co'].strip()
@@ -419,26 +424,26 @@ def retrieval_patent_abstract(query, topn=10, score_threshold=0):
     # Retrieval-Augmented Generation
     docs = []
 
-    result = most_similar_embeddings(query, '专利_bge_189', Q_Client,
-                                     topn=topn, match=[], not_match=empty_match(field_key='摘要长度'),
-                                     score_threshold=score_threshold, access_token=Baidu_Access_Token)
-
-    if result:
-        payloads, scores = zip(*result)
-        df = pd.DataFrame(payloads).rename(columns={'标题 (中文)': '标题'})
-        id_key = '公开（公告）号'
-        ids = tuple(df[id_key].unique()) if df.shape[0] > 1 else (df.iloc[0, id_key],)  # df['序号'].to_list()
-        query = text(f'SELECT `{id_key}`,`摘要 (中文)` FROM `融资公司专利-202406` WHERE `{id_key}` in :ids')
-        result = db.session.execute(query, {'ids': ids})
-        result_dict = {row[0]: row[1] for row in result.fetchall()}  # result.fetchone()
-        df['摘要'] = df[id_key].map(result_dict)
-        docs = [f"{index + 1}、《{row['标题'].strip()}》\t{row.get('摘要', '').strip()}\n" for
-                index, row in df.drop_duplicates(id_key).iterrows()]
-        # for item in zip(df.index, df[['标题', '摘要']].to_dict(orient='records')):
-        #     docs.append(f'{item[0]}\t' + '*'.join(
-        #         f'{k}#{v.strip() if isinstance(v, str) else v}' for k, v in item[1].items() if pd.notna(v)).strip())
-        # print(docs, scores)
-        print(np.mean(scores))
+    # result = most_similar_embeddings(query, '专利_bge_189', Q_Client,
+    #                                  topn=topn, match=[], not_match=empty_match(field_key='摘要长度'),
+    #                                  score_threshold=score_threshold, access_token=Baidu_Access_Token)
+    #
+    # if result:
+    #     payloads, scores = zip(*result)
+    #     df = pd.DataFrame(payloads).rename(columns={'标题 (中文)': '标题'})
+    #     id_key = '公开（公告）号'
+    #     ids = tuple(df[id_key].unique()) if df.shape[0] > 1 else (df.iloc[0, id_key],)  # df['序号'].to_list()
+    #     query = text(f'SELECT `{id_key}`,`摘要 (中文)` FROM `融资公司专利-202406` WHERE `{id_key}` in :ids')
+    #     result = db.session.execute(query, {'ids': ids})
+    #     result_dict = {row[0]: row[1] for row in result.fetchall()}  # result.fetchone()
+    #     df['摘要'] = df[id_key].map(result_dict)
+    #     docs = [f"{index + 1}、《{row['标题'].strip()}》\t{row.get('摘要', '').strip()}\n" for
+    #             index, row in df.drop_duplicates(id_key).iterrows()]
+    #     # for item in zip(df.index, df[['标题', '摘要']].to_dict(orient='records')):
+    #     #     docs.append(f'{item[0]}\t' + '*'.join(
+    #     #         f'{k}#{v.strip() if isinstance(v, str) else v}' for k, v in item[1].items() if pd.notna(v)).strip())
+    #     # print(docs, scores)
+    #     print(np.mean(scores))
 
     return docs
 
@@ -557,19 +562,14 @@ def chat():
     models = [
         {"value": "qwen", "name": "通义千问"},
         {"value": "moonshot", "name": "kimi"},
-        {"value": "doubao", "name": "豆包"},
-        {"value": "hunyuan", "name": "混元"},
-        {"value": "ernie", "name": "文心"},
-        {"value": "deepseek-ai/DeepSeek-V2-Chat", "name": "DeepSeek"},
-        {"value": "01-ai/Yi-1.5-9B-Chat-16K", "name": "零一万物"},
+        {"value": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "name": "DeepSeek"},
         {"value": "THUDM/glm-4-9b-chat", "name": "智谱"},
         {"value": "internlm/internlm2_5-7b-chat", "name": "书生"},
-        {"value": "speark", "name": "星火"},
-        {"value": "baichuan", "name": "百川"},
-        {"value": "google/gemma-2-9b-it", "name": "gemma"},
-        {"value": "meta-llama/Meta-Llama-3-8B-Instruct", "name": "llama"},
-        {"value": "deepseek-ai/DeepSeek-Coder-V2-Instruct", "name": "coder"},
     ]
+    model_info, model_id = find_ai_model('aigc')
+    if model_info:
+        models += [{"value": m['id'], "name": m['root']} for m in model_info['data']]
+    # print(models)
     agents = [
         {"value": "0", "name": "问题助手"},
         {"value": "1", "name": "专利技术"},
@@ -592,14 +592,14 @@ def chat():
 
 @app.route('/get_messages', methods=['GET'])
 def get_messages():
-    username = session.get('username')
-    uid, inf = swg.get_user(username)
+    user_name = session.get('username')
+    uid, inf = swg.get_user(user_name)
     filter_time = int(request.args.get('filter_time', 0)) / 1000.0
-    user_history = [msg for msg in Chat_history if msg['username'] == username and msg['timestamp'] > filter_time]
+    user_history = [msg for msg in Chat_history if msg['name'] == user_name and msg['timestamp'] > filter_time]
 
     if uid >= 0:
         filter_time = inf.get('chatcut', 0)
-        user_history.extend(ChatHistory.user_history(username, agent=None, filter_time=filter_time, all_payload=True))
+        user_history.extend(ChatHistory.user_history(user_name, agent=None, filter_time=filter_time, all_payload=True))
 
     return jsonify(sorted(user_history, key=lambda x: x['timestamp']))
 
@@ -624,7 +624,9 @@ def send_message():
     agent = data.get('agent', None)
     system = System_content.get(agent, System_content['0'])
     user_message = data['question']  # unquote()
-    user_name = data.get('username', None)
+    user_name = data.get('username', '').strip()
+    if user_name.lower() == "null":
+        user_name = ''
     user_id = user_name or data.get('uuid', None)
     filter_time = data.get('filter_time', 0) / 1000.0
     model_name = data.get('model', 'moonshot')
@@ -633,7 +635,7 @@ def send_message():
 
     history = [{"role": "system", "content": system}]
     user_history = [msg for msg in Chat_history if
-                    msg['agent'] == agent and msg['username'] == user_id and msg['timestamp'] > filter_time]
+                    msg['agent'] == agent and msg['name'] == user_id and msg['timestamp'] > filter_time]
     if user_name:
         if not filter_time:
             uid, inf = swg.get_user(user_name)
@@ -664,10 +666,10 @@ def send_message():
     reference = '\n'.join(refer)
 
     new_history = [
-        {'role': 'user', 'content': user_message, 'username': user_id, 'agent': agent,
-         'index': len(history) - 1, 'timestamp': current_timestamp},
-        {'role': 'assistant', 'content': bot_response, 'username': user_id, 'agent': agent,
-         'index': len(history), 'reference': reference, 'timestamp': time.time()}]
+        {'role': 'user', 'content': user_message, 'name': user_id, 'agent': agent,
+         'index': len(history) - 1, 'model': model_name, 'timestamp': current_timestamp},
+        {'role': 'assistant', 'content': bot_response, 'name': user_id, 'agent': agent,
+         'index': len(history), 'model': model_id or model_name, 'reference': reference, 'timestamp': time.time()}]
     try:
         if user_name:
             ChatHistory.history_insert(new_history, db.session)
@@ -684,7 +686,9 @@ def send_message():
 def stream_response():
     agent = request.args.get('agent', '1')
     system = System_content.get(agent, System_content['0'])
-    user_name = request.args.get('username', None)
+    user_name = request.args.get('username', '').strip()
+    if user_name.lower() == "null":
+        user_name = ''
     user_id = user_name or request.args.get('uuid', None)
     user_message = request.args.get('question')
     model_name = request.args.get('model', 'moonshot')
@@ -699,8 +703,9 @@ def stream_response():
         filter_time = inf.get('chatcut', 0)
 
     user_history = [msg for msg in Chat_history if
-                    msg['agent'] == agent and msg['username'] == user_id and msg['timestamp'] > filter_time]
+                    msg['agent'] == agent and msg['name'] == user_id and msg['timestamp'] > filter_time]
     if user_name:
+        # print(user_name)
         user_history.extend(ChatHistory.user_history(user_name, agent, filter_time))
 
     history = [{'role': msg['role'], 'content': msg['content']} for msg in
@@ -749,10 +754,10 @@ def stream_response():
         yield 'data: [DONE]\n\n'
 
         new_history = [
-            {'role': 'user', 'content': user_message, 'username': user_id, 'agent': agent,
-             'index': len(history) - 1, 'timestamp': current_timestamp},
-            {'role': 'assistant', 'content': bot_response, 'username': user_id, 'agent': agent,
-             'index': len(history), 'reference': reference, 'timestamp': time.time()}]
+            {'role': 'user', 'content': user_message, 'name': user_id, 'agent': agent,
+             'index': len(history) - 1, 'model': model_name, 'timestamp': current_timestamp},
+            {'role': 'assistant', 'content': bot_response, 'name': user_id, 'agent': agent,
+             'index': len(history), 'model': model_id or model_name, 'reference': reference, 'timestamp': time.time()}]
 
         try:
             if user_name:
@@ -801,7 +806,7 @@ def stream_response_task(task_id):
     def generate_forward():
         for line in request_aigc(messages=history, question=task.get('user_message'), system=task.get('system'),
                                  model_name=task['model_name'], host=Config.AIGC_HOST, stream=True,
-                                 user_id=task.get('username')).iter_lines(decode_unicode=True):
+                                 user_id=task.get('name')).iter_lines(decode_unicode=True):
             if line and line.startswith("data: "):
                 yield f"{line}\n\n"
                 time.sleep(0.01)
@@ -826,7 +831,7 @@ def send_message_task(task_id):
     else:
         response = request_aigc(messages=history, question=task.get('user_message'), system=task.get('system'),
                                 model_name=task['model_name'], host=Config.AIGC_HOST, stream=False,
-                                user_id=task.get('username'))
+                                user_id=task.get('name'))
         bot_response = json.loads(response.content)['answer']
 
     del Task_queue[task_id]
@@ -849,9 +854,12 @@ def submit_messages():
     #
     # answer = response.choices[0].text.strip()
     filter_time = data.get('filter_time', 0) / 1000.0
-    username = data.get('username') or data.get('uuid') or session.get('username')
+    user_name = data.get('username', '').strip()
+    if user_name.lower() == "null":
+        user_name = ''
+    user_id = user_name or data.get('uuid') or session.get('username')
     user_chat_history = data.get('messages', [msg for msg in Chat_history if
-                                              msg['username'] == username and msg['timestamp'] > filter_time])
+                                              msg['name'] == user_id and msg['timestamp'] > filter_time])
 
     system = System_content.get(data.get('agent', '0'), System_content['0'])
     history = [{"role": "system", "content": system}]
@@ -866,7 +874,7 @@ def submit_messages():
     task_id = str(uuid.uuid4())
     Task_queue[task_id] = {
         "status": "pending",
-        'username': username,
+        'name': user_id,
         "messages": history,
         'user_message': user_message,
         'model_name': data.get('model', 'moonshot'),
@@ -1462,18 +1470,31 @@ if __name__ == "__main__":
     vdr.append(Q_Client, collection_name='企业_w2v_lda', prefix='Co',
                match_values=['先进制造', '医疗健康', '金融科技', 'all'])
 
+    AI_Client = {}
     for model in AI_Models:
         api_keys = {
             'moonshot': Config.Moonshot_Service_Key,
-            'glm': Config.GLM_Service_Key,
             'qwen': Config.DashScope_Service_Key,
             'silicon': Config.Silicon_Service_Key,
-            'baichuan': Config.Baichuan_Service_Key
         }
         api_key = api_keys.get(model['name'], '')
         if api_key:
             model['api_key'] = api_key
             AI_Client[model['name']] = OpenAI(api_key=api_key, base_url=model['base_url'])
+
+    if Config.AIGC_Service_Key:
+        AI_Client['aigc'] = OpenAI(api_key=Config.AIGC_Service_Key, base_url=f"http://{Config.AIGC_HOST}:7000/v1")
+        try:
+            aigc_models = [m.model_dump() for m in AI_Client['aigc'].models.list().data]
+            # json.loads(requests.get(f"http://{Config.AIGC_HOST}:7000/v1/models")).get("data", [])
+            AI_Models.append(
+                {'name': 'aigc', 'type': 'default', 'api_key': '', 'data': aigc_models,
+                 "model": [model['id'] for model in aigc_models],
+                 'url': f"http://{Config.AIGC_HOST}:7000/v1/chat/completions",
+                 'base_url': f"http://{Config.AIGC_HOST}:7000/v1"}
+            )
+        except:
+            print('无法加载本地模型列表')
 
     db.init_app(app)  # Flask对象与QLAlchemy()进行绑定
     with app.app_context():  # init_db

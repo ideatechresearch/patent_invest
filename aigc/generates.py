@@ -2,22 +2,24 @@ import httpx, aiohttp, aiofiles, asyncio
 from http import HTTPStatus
 import oss2
 from pathlib import PurePosixPath
-from typing import List, Dict, Tuple, Any, Union, Callable, Awaitable, Generator, Optional
+from typing import List, Dict, Tuple, Any, Union, Callable, Literal, Sequence, Awaitable, Generator, Optional
 import random
 from PIL import Image
-from openai import OpenAI, AsyncOpenAI
+from openai import OpenAI, AsyncOpenAI, AsyncClient, DefaultHttpxClient
 # import qianfan
 import dashscope
 from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription
 # from lagent import tool_api
-from functools import partial  # cache, lru_cache, partial, wraps, wraps
+from functools import partial, wraps  # cache, lru_cache, partial, wraps
 from config import *
 from utils import *
 from agents.ai_tools import *
 from agents.ai_prompt import *
+from agents.ai_vectors import *
 
-AI_Client = {}  # Dict[str, OpenAI]
+AI_Client: Dict[str, Optional[AsyncOpenAI]] = {}  # OpenAI
+QD_Client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
 
 
 async def get_data_for_model(model: dict):
@@ -34,13 +36,18 @@ async def get_data_for_model(model: dict):
 
 async def init_ai_clients(ai_models=AI_Models, api_keys=API_KEYS, get_data=False):
     tasks = []
+    # http_client = DefaultHttpxClient(proxy="http://my.test.proxy.example.com",
+    #                                  transport=httpx.HTTPTransport(local_address="0.0.0.0"))
     for model in ai_models:
         model_name = model.get('name')
         api_key = api_keys.get(model_name)
         if api_key:
             model['api_key'] = api_key
             if model_name not in AI_Client and model.get('supported_openai'):  # model_name in SUPPORTED_OPENAI_MODELS
-                AI_Client[model_name]: AsyncOpenAI = AsyncOpenAI(api_key=api_key, base_url=model['base_url'])  # OpenAI
+                http_client = httpx.AsyncClient(proxies={"http://": Config.HTTP_Proxy, "https://": Config.HTTP_Proxy}
+                                                ) if model.get('proxy') else None
+                AI_Client[model_name]: AsyncOpenAI = AsyncOpenAI(api_key=api_key, base_url=model['base_url'],
+                                                                 http_client=http_client)  # OpenAI
                 if get_data:
                     tasks.append(get_data_for_model(model))
 
@@ -58,7 +65,7 @@ async def init_ai_clients(ai_models=AI_Models, api_keys=API_KEYS, get_data=False
 # print(dir(client.files)) #'content', 'create', 'delete', 'list', 'retrieve', 'retrieve_content', 'wait_for_processing'
 
 
-def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
+def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple[Dict[str, Any], Union[str, None]]:
     """
     在 AI_Models 中查找模型。如果找到名称匹配的模型，返回模型及其类型或具体的子模型名称。
 
@@ -72,13 +79,20 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
     异常:
     - ValueError: 如果未找到模型
     """
+    if ':' in name:
+        owner, model_name = name.split(':')
+        model = next((item for item in AI_Models if item['name'] == owner), None)
+        if model and model_name in model.get(search_field, []):
+            return model, model_name
+
     model = next(
         (item for item in AI_Models if item['name'] == name or name in item.get(search_field, [])),
         None
     )
     if model:
         model_items = model.get(search_field, [])
-        if isinstance(model_items, list):
+
+        if isinstance(model_items, (list, tuple)):
             if name in model_items:
                 return model, name
             if model_items:
@@ -92,10 +106,112 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model'):
             model_i = model_id if abs(model_id) < len(keys) else 0
             return model, model_items[keys[model_i]]
 
-        return model, None
+        return model, name if model_items == name else None
 
     raise ValueError(f"Model with name {name} not found.")
     # HTTPException(status_code=400, detail=f"Model with name {name} not found.")
+
+
+Function_MetaData_Store = {}
+
+
+# Redis_client = None  # StrictRedis(host='localhost', port=6379, db=0)
+
+
+async def generate_function_metadata(func: Callable, model_name=Config.DEFAULT_MODEL,
+                                     redis_client=None) -> Optional[Dict]:
+    # 获取函数的名称、参数以及docstring
+    func_name = func.__name__
+    function_code = remove_function_decorators(func)
+    # extract_function_metadata(function_code)
+    # 来生成缓存键
+    cache_key = generate_hash_key(func_name, function_code)  # docstring, signature
+    cached_metadata = redis_client.get(cache_key) if redis_client else Function_MetaData_Store.get(cache_key)
+    if cached_metadata:
+        print(f"Metadata already cached for function: {func_name}")
+        metadata = json.loads(cached_metadata) if isinstance(cached_metadata, str) else cached_metadata
+        return metadata
+
+    # 获取函数参数列表
+    signature = inspect.signature(func)
+    docstring = func.__doc__
+
+    parameters = {}
+    required_params = []
+
+    for param_name, param in signature.parameters.items():
+        param_info = {
+            "type": "string",
+            "description": f"Description of the {param_name} parameter."
+        }
+        if param.annotation != inspect.Parameter.empty:
+            # 如果有类型提示，推断参数类型
+            param_info["type"] = str(param.annotation).replace("<class '", "").replace("'>", "")
+
+        if param.default == inspect.Parameter.empty:
+            required_params.append(param_name)
+        else:
+            param_info["default"] = param.default
+        parameters[param_name] = param_info
+
+    metadata = {
+        "function": {
+            "name": func_name,
+            "description": docstring or "No description available.",
+            "parameters": {
+                "type": "object",
+                "properties": parameters
+            },
+            "required": required_params
+        }
+    }
+    # print(f"""
+    # Extract the metadata for this Python function:
+    # {function_code}
+    #     and output it in the following JSON format:
+    # {metadata}
+    #     """)
+    model_info, name = find_ai_model(model_name)
+    ai_client = AI_Client.get(model_info['name'])
+    if ai_client:
+        prompt = f"""
+        Extract the metadata for this Python function:
+        {function_code} 
+        Output it in the following JSON format:
+        {json.dumps(metadata, indent=4, ensure_ascii=False)}
+        """
+        response = await ai_client.completions.create(
+            model=name,
+            prompt=prompt,
+            max_tokens=1000
+        )
+
+        # 获取并存储生成的元数据
+        metadata = extract_json_from_string(response.choices[0].text.strip())
+
+    if redis_client:
+        redis_client.setex(cache_key, 86400, json.dumps(metadata))
+    Function_MetaData_Store[cache_key] = metadata
+
+    return metadata
+
+
+def metadata_decorator(func: Callable) -> Callable:
+    """ 仅在后台生成元数据，不影响函数执行 """
+    # print(func.__name__, type(func))
+    if inspect.isfunction(func):  # 普通函数
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(generate_function_metadata(func))
+        else:
+            asyncio.run(generate_function_metadata(func))
+
+    # @wraps(func)
+    # def wrapper(*args, **kwargs):
+    #
+    #     return func(*args, **kwargs)# 执行
+
+    return func  # wrapper @metadata_decorator
 
 
 async def ai_tool_response(messages, tools=None, model_name=Config.DEFAULT_MODEL, model_id=1,
@@ -127,15 +243,83 @@ async def ai_tool_response(messages, tools=None, model_name=Config.DEFAULT_MODEL
     return None  # await ai_chat_post(model_info, payload)
 
 
-def functions_registry(functions_list: list):
-    # 创建全局函数注册表
-    return {name: globals().get(name) for name in functions_list}
+def functions_registry(functions_list: list, module_name: str = None) -> Dict[str, Callable[..., Any]]:
+    # 根据函数名称列表,创建全局函数注册表,或者指定模块中动态加载
+    module = importlib.import_module(module_name) if module_name else None
+    return {name: getattr(module, name) if module else globals().get(name) for name in functions_list}
 
 
-Function_Registry = {}
+Function_Registry_Global: Optional[Dict[str, Callable[..., Any]]] = {}
 
 
-async def ai_tools_messages(response_message):
+def get_global_functions(func_name: str = None) -> Union[Callable[..., Any], None, Dict[str, Callable[..., Any]]]:
+    """
+    获取全局函数注册表中的函数或整个注册表。
+
+    :param func_name: 函数名称。如果为 None，则返回整个注册表。
+    :return: 如果 func_name 为 None，返回整个注册表；否则返回指定名称的函数。
+    """
+    global Function_Registry_Global
+    if not Function_Registry_Global:  # 动态性延迟加载,全局注册表初始化
+        Function_Registry_Global = functions_registry(functions_list=[
+            "get_times_shift", "get_weather", "web_search_async", "date_range_calculator",
+            "get_day_range", "get_week_range", "get_month_range",
+            "get_quarter_range", "get_year_range", "get_half_year_range",
+            "search_bmap_location", "auto_translate"
+            # 添加更多可调用函数
+        ])
+    return Function_Registry_Global.get(func_name, None) if func_name else Function_Registry_Global  # 从注册表中获取函数
+
+
+def agent_func_calls(agent):
+    from knowledge import ideatech_knowledge
+    callable_map_agent = {
+        'default': lambda *args, **kwargs: [],
+        '2': web_search_async,
+        '30': ideatech_knowledge,
+        '32': ai_auto_calls
+    }
+    return callable_map_agent.get(agent, lambda *args, **kwargs: [])
+
+
+def convert_to_callable_list(tool_list: List[Tuple[str, Any]],
+                             callable_map: dict[str, Callable[..., Any]] = None) -> List[Callable[[], Any]]:
+    """
+        将工具列表转换为可调用函数列表。
+
+        :param tool_list: 工具列表，每个工具是一个元组 (tool_name, config)。
+        :param callable_map: 工具名称到可调用函数的映射。如果未提供，则使用全局注册表。
+        :return: 可调用函数列表。
+    """
+    callable_list = []
+    for tool_name, config in tool_list:
+        tool_func = None
+        if callable_map:
+            if tool_name in callable_map:
+                tool_func = callable_map[tool_name]  # 将配置绑定到 Callable
+        else:
+            tool_func = get_global_functions(tool_name)
+
+        if tool_func:
+            callable_list.append(partial(tool_func, **config))  # 函数绑定特定的配置参数,无参数可调用函数
+        # else:
+        #     print(f"Tool '{tool_name}' not found in callable_map.")
+    return callable_list
+
+
+# class Partial:
+#     def __init__(self, func, *args, **kwargs):
+#         self.func = func
+#         self.args = args
+#         self.kwargs = kwargs
+#
+#     def __call__(self, *more_args, **more_kwargs):
+#         # 合并固定参数和新参数
+#         all_args = self.args + more_args
+#         all_kwargs = {**self.kwargs, **more_kwargs}
+#         return self.func(*all_args, **all_kwargs)
+
+async def ai_tools_results(response_message):
     """
     解析模型响应，动态调用工具并生成后续消息列表。
 
@@ -156,20 +340,10 @@ async def ai_tools_messages(response_message):
             })
         return messages
 
-    global Function_Registry
-    if not Function_Registry:  # 动态性延迟加载,全局注册表初始化
-        Function_Registry = functions_registry(functions_list=[
-            "get_times_shift", "get_weather", "web_search", "date_range_calculator",
-            "get_day_range", "get_week_range", "get_month_range",
-            "get_quarter_range", "get_year_range", "get_half_year_range",
-            "search_bmap_location", "auto_translate"
-            # 添加更多可调用函数
-        ])
-
     for tool in tool_calls:
         func_name = tool.function.name  # function_name
         func_args = tool.function.arguments  # function_args = json.loads(tool_call.function.arguments)
-        func_reg = Function_Registry.get(func_name, None)  # 从注册表中获取函数
+        func_reg = get_global_functions(func_name)  # 从注册表中获取函数 tools_map[function_name](**function_args)
         # print(func_args)
         # 检查并解析 func_args 确保是字典
         if isinstance(func_args, str):
@@ -207,7 +381,7 @@ async def ai_tools_messages(response_message):
 
             messages.append({
                 'role': 'tool',
-                'content': f'{func_out}',
+                'content': f'{func_out}',  # json.dumps(result)
                 'tool_call_id': tool.id,
                 'name': func_name
             })
@@ -228,10 +402,11 @@ async def ai_tools_messages(response_message):
 async def ai_auto_calls(question, **kwargs):
     messages = [{"role": "system", "content": System_content.get('31')},
                 {"role": "user", "content": question}]
-    response = await ai_tool_response(messages=messages, tools=AI_Tools, **kwargs)
-    if response:
-        final_messages = await ai_tools_messages(response)
+    tool_messages = await ai_tool_response(messages=messages, tools=AI_Tools, **kwargs)
+    if tool_messages:
+        final_messages = await ai_tools_results(tool_messages)
         return [{msg['name']: msg['content']} for msg in final_messages if msg['role'] == "tool"]
+        # [{func_name:func_out}]
     return []
 
 
@@ -281,12 +456,15 @@ Embedding_Cache = {}
 
 
 # https://www.openaidoc.com.cn/docs/guides/embeddings
-async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **kwargs) -> List[List[float]]:
+async def ai_embeddings(inputs: Union[str, List[str], Tuple[str]], model_name: str = Config.DEFAULT_MODEL_EMBEDDING,
+                        model_id: int = 0, get_embedding: bool = True, **kwargs) -> Union[List[List[float]], Dict]:
     """
     text = text.replace("\n", " ")
     从远程服务获取嵌入，支持批量处理和缓存和多模型处理。
     :param inputs: 输入文本或文本列表
     :param model_name: 模型名称
+    :param model_id: 模型序号
+    :param get_embedding: 返回响应数据类型
     :return: 嵌入列表
     （1）文本数量不超过 16。
     （2）每个文本长度不超过 512 个 token，超出自动截断，token 统计信息，token 数 = 汉字数+单词数*1.3 （仅为估算逻辑，以实际返回为准)。
@@ -312,13 +490,28 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
     has_error = False
     client = AI_Client.get(model_info['name'], None)
     if client:  # openai.Embedding.create
-        if isinstance(inputs, list) and len(inputs) > batch_size:
+        if isinstance(inputs, (list, tuple)) and len(inputs) > batch_size:
             tasks = [client.embeddings.create(
                 model=name, input=inputs[i:i + batch_size],
                 encoding_format="float",
                 **kwargs
             ) for i in range(0, len(inputs), batch_size)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            if not get_embedding:
+                results_data = results[0]
+                all_data = []
+                for i, result in enumerate(results):
+                    for idx, item in enumerate(result.data):
+                        item.index = len(all_data)
+                        all_data.append(item)
+
+                    if i > 0:
+                        results_data.usage.prompt_tokens += result.usage.prompt_tokens
+                        results_data.usage.total_tokens += result.usage.total_tokens
+
+                results_data.data = all_data
+                return results_data.model_dump()
 
             embeddings = [None] * len(inputs)
             input_idx = 0
@@ -336,11 +529,13 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
 
         else:
             # await asyncio.to_thread(client.embeddings.create
-            completion = await client.embeddings.create(
-                model=name, input=inputs, encoding_format="float")
+            results = await client.embeddings.create(
+                model=name, input=inputs, encoding_format="float", **kwargs)
 
-            embeddings = [item.embedding for item in completion.data]
-            # data = json.loads(completion.model_dump_json()
+            if not get_embedding:
+                return results.model_dump()
+
+            embeddings = [item.embedding for item in results.data]
 
         return embeddings
 
@@ -360,7 +555,7 @@ async def ai_embeddings(inputs, model_name: str = 'qwen', model_id: int = 0, **k
     embeddings = []
     try:
         async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-            if isinstance(inputs, list) and len(inputs) > batch_size:
+            if isinstance(inputs, (list, tuple)) and len(inputs) > batch_size:
                 for i in range(0, len(inputs), batch_size):
                     batch = inputs[i:i + batch_size]
                     payload["input"] = batch  # {"texts":batch}
@@ -424,8 +619,8 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
 
 
 # 生成:conversation or summary,Fill-In-the-Middle
-async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, stream=False, temperature=0.7,
-                      max_tokens=4096, model_name='silicon', model_id=0, get_content=True, **kwargs):
+async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, stream=False, temperature: float = 0.7,
+                      max_tokens: int = 4096, model_name='silicon', model_id=0, get_content=True, **kwargs):
     '''
     Completions足以解决几乎任何语言处理任务，包括内容生成、摘要、语义搜索、主题标记、情感分析等等。
     需要注意的一点限制是，对于大多数模型，单个API请求只能在提示和完成之间处理最多4096个标记。
@@ -491,6 +686,7 @@ async def call_ollama(prompt, model_name="mistral", stream=True):
                     pass  # 忽略 JSON 解析错误
 
     try:
+        # print(json.dumps(await response.json(), indent=4))  # 打印响应数据
         return stream_data() if stream else await response.json()
     finally:
         await response.release()
@@ -542,258 +738,107 @@ async def openai_llama_chat_completions(messages, stream=True, **kwargs):
             }
         ],
         "usage": {
-            "prompt_tokens": len(prompt),
-            "completion_tokens": len(completion),  # .split()
-            "total_tokens": len(prompt) + len(completion),
+            "prompt_tokens": lang_token_size(prompt),
+            "completion_tokens": lang_token_size(completion),  # .split()
+            "total_tokens": lang_token_size(prompt) + lang_token_size(completion),
         },
     }
 
 
-#
-# async def create_completion(
-#         messages: List[Dict[str, str]],
-#         refresh_token: str,
-#         model: str = Config.DEFAULT_MODEL,
-#         retry_count: int = 0
-# ) -> Dict:
-#     """同步对话补全
-#
-#     Args:
-#         messages: 消息列表
-#         refresh_token: 刷新token
-#         model: 模型名称
-#         retry_count: 重试次数
-#
-#     Returns:
-#         Dict: 补全结果
-#
-#     Raises:
-#         API_REQUEST_PARAMS_INVALID: 参数无效
-#     """
-#     try:
-#         if not messages:
-#             raise  Exception("消息不能为空")
-#
-#         # 解析模型参数
-#         model_info = parse_model(model)
-#
-#         # 生成图像
-#         image_urls = generate_images(
-#             model=model_info['model'],
-#             prompt=messages[-1]['content'],
-#             width=model_info['width'],
-#             height=model_info['height'],
-#             refresh_token=refresh_token
-#         )
-#
-#         # 构造返回结果
-#         return {
-#             'id': generate_uuid(),
-#             'model': model or model_info['model'],
-#             'object': 'chat.completion',
-#             'choices': [{
-#                 'index': 0,
-#                 'message': {
-#                     'role': 'assistant',
-#                     'content': ''.join(f'![image_{i}]({url})\n' for i, url in enumerate(image_urls))
-#                 },
-#                 'finish_reason': 'stop'
-#             }],
-#             'usage': {
-#                 'prompt_tokens': 1,
-#                 'completion_tokens': 1,
-#                 'total_tokens': 2
-#             },
-#             'created':  int(time.time())
-#         }
-#     except Exception as e:
-#         if retry_count < Config.MAX_RETRY_COUNT:
-#             print(f"Response error: {str(e)}")
-#             print(f"Try again after {Config.RETRY_DELAY}s...")
-#             await asyncio.sleep(Config.RETRY_DELAY)
-#             return await create_completion(messages, refresh_token, model, retry_count + 1)
-#         raise e
-
-#
-# async def create_completion_stream(
-#         messages: List[Dict[str, str]],
-#         refresh_token: str,
-#         model: str = Config.DEFAULT_MODEL,
-#         retry_count: int = 0
-# ) -> Generator[Dict, None, None]:
-#     """流式对话补全
-#
-#     Args:
-#         messages: 消息列表
-#         refresh_token: 刷新token
-#         model: 模型名称
-#         retry_count: 重试次数
-#
-#     Yields:
-#         Dict: 补全结果片段
-#     """
-#     try:
-#         if not messages:
-#             yield {
-#                 'id': generate_uuid(),
-#                 'model': model,
-#                 'object': 'chat.completion.chunk',
-#                 'choices': [{
-#                     'index': 0,
-#                     'delta': {'role': 'assistant', 'content': '消息为空'},
-#                     'finish_reason': 'stop'
-#                 }]
-#             }
-#             return
-#
-#         # 解析模型参数
-#         model_info = parse_model(model)
-#
-#         # 发送开始生成消息
-#         yield {
-#             'id': generate_uuid(),
-#             'model': model or model_info['model'],
-#             'object': 'chat.completion.chunk',
-#             'choices': [{
-#                 'index': 0,
-#                 'delta': {'role': 'assistant', 'content': '🎨 图像生成中，请稍候...'},
-#                 'finish_reason': None
-#             }]
-#         }
-#
-#         try:
-#             # 生成图像
-#             image_urls = generate_images(
-#                 model=model_info['model'],
-#                 prompt=messages[-1]['content'],
-#                 width=model_info['width'],
-#                 height=model_info['height'],
-#                 refresh_token=refresh_token
-#             )
-#
-#             # 发送图像URL
-#             for i, url in enumerate(image_urls):
-#                 yield {
-#                     'id': generate_uuid(),
-#                     'model': model or model_info['model'],
-#                     'object': 'chat.completion.chunk',
-#                     'choices': [{
-#                         'index': i + 1,
-#                         'delta': {
-#                             'role': 'assistant',
-#                             'content': f'![image_{i}]({url})\n'
-#                         },
-#                         'finish_reason': None if i < len(image_urls) - 1 else 'stop'
-#                     }]
-#                 }
-#
-#             # 发送完成消息
-#             yield {
-#                 'id': generate_uuid(),
-#                 'model': model or model_info['model'],
-#                 'object': 'chat.completion.chunk',
-#                 'choices': [{
-#                     'index': len(image_urls) + 1,
-#                     'delta': {
-#                         'role': 'assistant',
-#                         'content': '图像生成完成！'
-#                     },
-#                     'finish_reason': 'stop'
-#                 }]
-#             }
-#
-#         except Exception as e:
-#             # 发送错误消息
-#             yield {
-#                 'id': generate_uuid(),
-#                 'model': model or model_info['model'],
-#                 'object': 'chat.completion.chunk',
-#                 'choices': [{
-#                     'index': 1,
-#                     'delta': {
-#                         'role': 'assistant',
-#                         'content': f'生成图片失败: {str(e)}'
-#                     },
-#                     'finish_reason': 'stop'
-#                 }]
-#             }
-#     except Exception as e:
-#         if retry_count < Config.MAX_RETRY_COUNT:
-#             print(f"Response error: {str(e)}")
-#             print(f"Try again after {Config.RETRY_DELAY}s...")
-#             await asyncio.sleep(Config.RETRY_DELAY)
-#             async for chunk in create_completion_stream(messages, refresh_token, model, retry_count + 1):
-#                 yield chunk
-#             return
-#         raise e
-
-
-def agent_func_calls(agent):
-    from knowledge import ideatech_knowledge
-    function_agent = {
-        'default': lambda *args, **kwargs: [],
-        '2': web_search,  # web_search_async
-        '30': ideatech_knowledge,
-        '32': ai_auto_calls
-    }
-    return function_agent.get(agent, lambda *args, **kwargs: [])
-
-
 def async_to_sync(func, *args, **kwargs):
+    # 异步代码转换为同步代码
     return asyncio.run(func(*args, **kwargs))
 
 
 async def wrap_sync(func, *args, **kwargs):
+    # 同步代码转换为异步执行,在后台独立线程中运行,以避免阻塞主事件循环,使用 await 来执行
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
 # retriever
-async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple[str, Any]]] = None,
+async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple[str, ...]]] = None,
                               tool_calls: List[Callable[[...], Any]] = None, **kwargs):
+    """
+      根据用户请求和关键字调用多个工具函数，并返回处理结果。
+
+      :param user_request: 用户请求内容。
+      :param keywords: 关键字列表，可以是字符串或元组（函数名, 参数）。
+      :param tool_calls: 工具函数列表。
+      :param kwargs: 其他关键字参数。
+      :return: 处理结果的扁平化列表。
+    """
     # docs = retriever(question)
     # Assume this is the document retrieved from RAG
     # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
     tool_calls = tool_calls or []
     items_to_process = []
-    tasks = []  # asyncio.create_task
+    callables = {}  # []
+    tasks = []  # asyncio.create_task(),创建任务对象并将其加入任务列表
+
     if not keywords:
         items_to_process = [user_request]  # ','.join(keywords)
     else:
-        if all(not (callable(func) and func.__name__ == '<lambda>' and func()) for func in tool_calls):
-            tool_calls.append(ai_auto_calls)  # not in agent_funcalls web_search_async
+        if all(not (callable(_func) and _func.__name__ == '<lambda>' and _func()) for _func in tool_calls):
+            tool_calls.append(web_search_async)  # append auto func to run. ai_auto_calls
 
         function_registry = {'map_search': search_amap_location,
                              'web_search': web_search_async,
                              'translate': baidu_translate,
                              'auto_calls': ai_auto_calls}
-
+        # 多个keywords,用在registry list 的 user_calls,自定义func参数
         for item in keywords:
-            if isinstance(item, tuple) and len(item) > 1:
-                func = function_registry.get(item[0])  # user_calls 函数
-                if func:
-                    func_args = item[1:]  # 剩下的参数
-                    if inspect.iscoroutinefunction(func):
-                        tasks.append(func(*func_args))
-                    else:
-                        tasks.append(wrap_sync(func, *func_args))
+            if isinstance(item, tuple):  # (函数名,无参,单个参数,多个位置参数列表,关键字参数字典)
+                _func = function_registry.get(item[0])  # user_calls 函数
+                if _func:
+                    # if len(item) == 1:
+                    #     callables.append((_func, [], {}))
+                    func_args = []
+                    func_kwargs = {}
+                    for _arg in item[1:]:
+                        if isinstance(_arg, (list, tuple)):  # 处理多个位置参数
+                            func_args = _arg
+                        elif isinstance(item[1], dict):  # 处理关键字参数
+                            func_kwargs = _arg
+                        else:  # (函数名, 单个参数)
+                            func_args.append(_arg)  # 剩下的参数[_arg]
+
+                    callable_key = (id(_func), tuple(func_args), frozenset(func_kwargs.items()))
+                    bound_func = partial(_func, *func_args, **func_kwargs)
+                    callables[callable_key] = bound_func
+                    # callables.append((_func, func_args, func_kwargs)))
+
             else:  # isinstance(keyword, str)
                 items_to_process.append(item)  # keyword
 
-    for func in filter(callable, tool_calls):
-        if func.__name__ == '<lambda>' and func() == []:  # empty_lambda
+    # 多个tool_calls to process items,kwargs func参数
+    for _func in filter(callable, tool_calls):
+        if _func.__name__ == '<lambda>' and _func() == []:  # empty_lambda
             continue
         for item in items_to_process:
-            if inspect.iscoroutinefunction(func):
-                tasks.append(func(item, **kwargs))
-            else:
-                tasks.append(wrap_sync(func, item, **kwargs))
+            callable_key = (id(_func), (item,), frozenset(kwargs.items()))
+            bound_func = partial(_func, item, **kwargs)
+            callables[callable_key] = bound_func
+            # if inspect.iscoroutinefunction(func):
+            #     tasks.append(func(item, **kwargs))
+            # else:
+            #     tasks.append(wrap_sync(func, item, **kwargs))
+
+    # print(callables)
+    for _key, bound_func in callables.items():
+        if inspect.iscoroutinefunction(bound_func.func):
+            tasks.append(bound_func())  # 添加异步函数任务，同时传递kwargs
+        else:
+            tasks.append(wrap_sync(bound_func))
 
     refer = await asyncio.gather(*tasks, return_exceptions=True)  # gather 收集所有异步调用的结果
 
-    for f, r in zip(tasks, refer):
-        if not r:
-            print(f.__name__, r)
+    for t, r in zip(tasks, refer):
+        if isinstance(r, Exception):
+            print(f"Task {t.__name__} failed with error: {r}")
+        elif not r:
+            print(f"Task returned empty result: {t}")
+
     return [item for result in refer if not isinstance(result, Exception)
             for item in (result.items() if isinstance(result, dict) else result)]  # 展平嵌套结果
 
@@ -802,7 +847,7 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
 async def get_chat_payload(messages, user_request: str, system: str = '', temperature: float = 0.4, top_p: float = 0.8,
                            max_tokens: int = 1024, model_name=Config.DEFAULT_MODEL, model_id=0,
                            tool_calls: List[Callable[[...], Any]] = None,
-                           keywords: List[Union[str, Tuple[str, Any]]] = None, images: List[str] = None, **kwargs):
+                           keywords: List[Union[str, Tuple[str, ...]]] = None, images: List[str] = None, **kwargs):
     model_info, name = find_ai_model(model_name, model_id, 'model')
     model_type = model_info['type']
 
@@ -817,13 +862,15 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
                 messages.insert(0, {'role': 'user', 'content': user_request or '请问您有什么问题？'})
 
             # 确保 user 和 assistant 消息交替出现
-            for i, message in enumerate(messages[:-1]):
+            i = 0
+            while i < len(messages) - 1:
                 # if (
                 #     isinstance(message, dict) and
                 #     message.get("role") in ["user", "assistant"] and
                 #     isinstance(message.get("content"), str) and
                 #     message["content"].strip()  # 确保 content 非空
                 # ):
+                message = messages[i]
                 next_message = messages[i + 1]
                 if message['role'] == next_message['role']:  # messages.insert(0, messages.pop(i))
                     if i % 2 == 0:
@@ -833,6 +880,13 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
                             messages.insert(i + 1, {'role': 'user', 'content': '请问您有什么问题？'})
                     else:
                         del messages[i + 1]
+                        i -= 1
+                i += 1
+
+        if model_info['name'] == 'mistral':
+            for message in messages:
+                if 'name' in message:
+                    del message['name']
 
         if model_type != 'baidu' and system:
             if messages[0].get('role') != 'system':
@@ -863,10 +917,11 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
         messages[-1]['content'] = (f'以下是相关参考资料:\n{formatted_refer}\n'
                                    f'请结合以上内容或根据上下文，针对下面的问题进行解答：\n{user_request}')
 
-    if images:  # 图片内容理解
+    if images:  # 图片内容理解,(str, list[dict[str, str | Any]]))
         messages[-1]['content'] = [{"type": "text", "text": user_request}]  # text-prompt 请详细描述一下这几张图片。这是哪里？
         messages[-1]['content'] += [{"type": "image_url", "image_url": {"url": image}} for image in images]
 
+    # print(messages)
     payload = dict(
         model=name,  # 默认选择第一个模型
         messages=messages,
@@ -878,6 +933,7 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
         # response_format={"type": "json_object"}
         # "tools":retrieval、web_search、function
     )
+    # payload = {**payload, **kwargs}
     if model_type == 'baidu':
         payload['system'] = system
     # if model_info['name']=='baichuan':
@@ -901,16 +957,15 @@ async def get_chat_payload(messages, user_request: str, system: str = '', temper
     #         }
     #     }]
 
-    # print(payload)
     return model_info, payload, refer
 
 
 def get_chat_payload_post(model_info, payload):
     # 通过 requests 库直接发起 HTTP POST 请求
     url = model_info['url']
-    api_key = model_info['api_key']
+    api_key = model_info['api_key'].copy()
     headers = {'Content-Type': 'application/json', }
-    payload = payload.deepcopy()
+    payload = payload.copy()
     if api_key:
         if isinstance(api_key, list):
             idx = model_info['model'].index(payload["model"])
@@ -952,7 +1007,16 @@ def get_chat_payload_post(model_info, payload):
     return url, headers, payload
 
 
-async def ai_chat(model_info, payload=None, get_content=True, **kwargs):
+async def ai_chat(model_info: Optional[Dict[str, Any]], payload=None, get_content: bool = True,
+                  **kwargs) -> Union[str, Dict]:
+    """
+    模拟发送请求给AI模型并接收响应。
+    :param model_info: 模型信息（如名称、ID、配置等）
+    :param payload: 请求的负载，通常是对话或文本输入
+    :param get_content: 返回模型响应类型
+    :param kwargs: 其他额外参数
+    :return: 返回模型的响应
+    """
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
@@ -962,6 +1026,7 @@ async def ai_chat(model_info, payload=None, get_content=True, **kwargs):
     if client:
         try:
             # await asyncio.to_thread(client.chat.completions.create, **payload)
+            # client.with_options(max_retries=5),client.with_options(timeout=5.0).
             completion = await client.chat.completions.create(**payload)
             return completion.choices[0].message.content if get_content else completion.model_dump()  # 自动序列化为 JSON
             # json.loads(completion.model_dump_json())
@@ -971,6 +1036,7 @@ async def ai_chat(model_info, payload=None, get_content=True, **kwargs):
     url, headers, payload = get_chat_payload_post(model_info, payload)
     # print(headers, payload)
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=10)
+    # timeout = httpx.Timeout(Config.HTTP_TIMEOUT_SEC, read=5.0, write=10.0, connect=3.0)
     parse_rules = {
         'baidu': lambda d: d.get('result'),
         'tencent': lambda d: d.get('Response', {}).get('Choices', [{}])[0].get('Message', {}).get('Content'),
@@ -995,7 +1061,7 @@ async def ai_chat(model_info, payload=None, get_content=True, **kwargs):
         return f"HTTP error occurred: {e}"
 
 
-async def ai_chat_async(model_info, payload=None, get_content=True, **kwargs):
+async def ai_chat_async(model_info: Optional[Dict[str, Any]], payload=None, get_content=True, **kwargs):
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
@@ -1005,7 +1071,7 @@ async def ai_chat_async(model_info, payload=None, get_content=True, **kwargs):
     payload["stream"] = True
     # payload["stream_options"]= {"include_usage": True}        # 可选，配置以后会在流式输出的最后一行展示token使用信息
     client = AI_Client.get(model_info['name'], None)
-    # print(payload)
+    # print(payload, client)
     if client:
         try:
             stream = await client.chat.completions.create(**payload)
@@ -1018,7 +1084,12 @@ async def ai_chat_async(model_info, payload=None, get_content=True, **kwargs):
                     yield chunk.model_dump_json()  # 获取字节流数据
         except Exception as e:
             yield f"OpenAI error occurred: {e}"
-        # yield '[DONE]'
+            # yield '[DONE]'
+            # with client.chat.completions.with_streaming_response.create(**payload) as response:
+            #     print(response.headers.get("X-My-Header"))
+            #     for line in response.iter_lines():
+            #         yield line
+
         return  # 异步生成器的结束无需返回值
 
     url, headers, payload = get_chat_payload_post(model_info, payload)
@@ -1109,43 +1180,16 @@ async def forward_stream(response):
                 yield {"text": line_data}
 
 
-def web_search(text: str, api_key: str = Config.GLM_Service_Key) -> list:
-    """
-    通过提供的查询文本执行网络搜索。
-
-    :param text: 查询文本。
-    :param api_key: 用于访问网络搜索工具的API密钥（默认为配置中的密钥）。
-    :return: 搜索结果列表或错误信息。
-    """
-    msg = [{"role": "user", "content": text}]
-    url = "https://open.bigmodel.cn/api/paas/v4/tools"
-    data = {
-        "request_id": str(uuid.uuid4()),
-        "tool": "web-search-pro",
-        "stream": False,
-        "messages": msg
-    }
-
-    headers = {'Authorization': api_key}
-    try:
-        response = requests.post(url, json=data, headers=headers, timeout=Config.HTTP_TIMEOUT_SEC)
-        response.raise_for_status()
-
-        data = response.json()
-        search_result = data.get('choices', [{}])[0].get('message', {}).get('tool_calls', [{}])[1].get('search_result')
-        if search_result:
-            return [{
-                'title': result.get('title'),
-                'content': result.get('content'),
-                'link': result.get('link'),
-                'media': result.get('media')
-            } for result in search_result]
-        return [{'content': response.content.decode()}]
-    except (requests.exceptions.RequestException, KeyError, IndexError) as e:
-        return [{'error': str(e)}]
+async def call_http_service(url):
+    async with httpx.AsyncClient() as cx:
+        try:
+            response = await cx.get(url)
+            return response.json()
+        except Exception as e:
+            return str(e)
 
 
-async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> list:
+async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **kwargs) -> List[Dict]:
     msg = [{"role": "user", "content": text}]
     tool = "web-search-pro"
     url = "https://open.bigmodel.cn/api/paas/v4/tools"
@@ -1155,6 +1199,8 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> 
         "stream": False,
         "messages": msg
     }
+    if kwargs:
+        data.update(kwargs)
 
     headers = {'Authorization': api_key}
 
@@ -1179,6 +1225,141 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key) -> 
         #     await response.close()
 
         # https://portal.azure.com/#home
+
+
+async def web_search_tavily(text: str, topic: Literal["general", "news"] = "general",
+                            time_range: Literal['day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'] = 'month',
+                            search_depth: Literal["basic", "advanced"] = "basic", days: int = 7,
+                            api_key: str = Config.TAVILY_Api_Key, **kwargs):
+    # https://docs.tavily.com/api-reference/endpoint/search
+    url = "https://api.tavily.com/search"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "query": text,
+        "search_depth": search_depth,
+        "topic": topic,  # finance,news
+        "time_range": time_range,
+        "max_results": 5,  # 0 <= x <= 20
+        "include_answer": True,  # basic,true,advanced
+        # "include_raw_content": False,
+        # "include_images": False,
+        # "include_image_descriptions": False,
+        # "include_domains": [],
+        # "exclude_domains": []
+    }
+    if topic == 'news':
+        payload['days'] = days  # x >= 0,Available only if topic is .news
+    if kwargs:
+        payload.update(kwargs)
+
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        # base_url="https://api.tavily.com",client.post("/search", content=json.dumps(data))
+        response = await cx.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data['results']  # "url,title,score,published_date,content
+        else:
+            print(f"Error: {response.status_code}")
+            response.raise_for_status()
+
+
+async def web_extract_tavily(urls, api_key: str = Config.TAVILY_Api_Key):
+    # 从一个或多个指定的 URL 中提取网页内容
+    url = "https://api.tavily.com/search"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "urls": urls,
+        "include_images": False,
+        "extract_depth": "basic"  # basic, advanced
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data['results']
+        else:
+            print(f"Error: {response.status_code}")
+            response.raise_for_status()
+
+
+async def search_by_api(query: str, location: str = None, engine: Literal[
+    'google', 'bing', "baidu", 'naver', "yahoo", "youtube",
+    "google_videos", "google_news", "google_images", "amazon_search", "shein_search"] = 'google',
+                        api_key=Config.SearchApi):
+    # https://www.searchapi.io/docs/google
+    if engine is None:
+        if "视频" in query or "movie" in query:
+            engine = "google_videos"
+        elif "新闻" in query or "news" in query:
+            engine = "google_news"
+        elif "图片" in query or "image" in query:
+            engine = "google_images"
+        elif "购物" in query or "buy" in query:
+            engine = "amazon_search"
+        elif "shein" in query.lower():
+            engine = "shein_search"
+        elif location:
+            if "中国" in location:
+                engine = "baidu"
+            elif "韩国" in location:
+                engine = "naver"
+            elif "日本" in location:
+                engine = "yahoo"
+            else:
+                engine = "google"
+        else:
+            engine = "google"
+
+    url = "https://www.searchapi.io/api/v1/search"
+    params = {
+        "engine": engine,
+        "q": query,
+        "api_key": api_key,
+        # "google_domain": "google.com",
+        # "hl": "en",
+        # "gl": "us"
+        # 'country_code'
+        # 'language': 'zh-hans',
+    }
+    if location:
+        params['location'] = location
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("organic_results", data)  # "knowledge_graph,answer_box,top_searches,top_stories
+        else:
+            print(f"Error: {response.status_code}")
+            response.raise_for_status()
+
+
+async def duckduckgo_search(query):
+    url = "https://api.duckduckgo.com/"
+    params = {
+        'q': query,  # 搜索查询
+        'format': 'json',  # 返回 JSON 格式
+        'no_redirect': 1,  # 防止重定向
+        'no_html': 1,  # 去除 HTML
+        'skip_disambig': 1,  # 跳过歧义提示
+    }
+
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data
+        else:
+            print(f"Error: {response.status_code}")
+            response.raise_for_status()
 
 
 def bing_search(query, bing_api_key):
@@ -1212,11 +1393,9 @@ def baidu_search(query, baidu_api_key, baidu_secret_key):
     search_response = requests.post(search_url, headers=headers, data=search_params)
 
     if search_response.status_code == 401:  # 如果token失效
-        global baidu_access_token
-        baidu_access_token = None
-        access_token = get_baidu_access_token(baidu_api_key, baidu_secret_key)
-
-        search_params["access_token"] = access_token
+        # global baidu_access_token
+        # baidu_access_token = None
+        search_params["access_token"] = get_baidu_access_token(baidu_api_key, baidu_secret_key)
         search_response = requests.post(search_url, headers=headers, data=search_params)
 
     search_response.raise_for_status()
@@ -1238,7 +1417,8 @@ def wikipedia_search(query):
     if search_results:
         page_id = search_results[0]['pageid']
         page_response = requests.get(
-            f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&pageids={page_id}&format=json")
+            f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&pageids={page_id}&format=json",
+            timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
         page_data = page_response.json()['query']['pages'][str(page_id)]
         return page_data.get('extract', 'No extract found.')
     return "No information found."
@@ -1384,10 +1564,11 @@ def get_hf_embeddings(texts, model_name='BAAI/bge-large-zh-v1.5', access_token=C
     return [emb.get('embedding') for emb in data]
 
 
-async def similarity_embeddings(query, tokens: List[str], filter_idx: List[int] = None, tokens_vector=None,
-                                embeddings_calls: Callable[[...], Any] = ai_embeddings, **kwargs):
+async def similarity_score_embeddings(query, tokens: List[str], filter_idx: List[int] = None,
+                                      tokens_vector: List[float] = None,
+                                      embeddings_calls: Callable[[...], Any] = ai_embeddings, **kwargs):
     """
-    计算查询与一组标记之间的相似度。
+    计算查询与一组标记之间的相似度分数。
     参数:
         query (str): 查询字符串。
         tokens (List[str]): 要比较的标记列表。
@@ -1427,12 +1608,130 @@ async def similarity_embeddings(query, tokens: List[str], filter_idx: List[int] 
     return similarity
 
 
-def get_similar_vectors(querys, data, exclude: List[str] = None, topn: int = 10, cutoff: float = 0.0):
+async def search_qdrant_embeddings(query: Union[str, List[str], Tuple[str]], collection_name: str, client=QD_Client,
+                                   topn: int = 10, score_threshold: float = 0.0, exact: bool = False,
+                                   query_vector: List[float] = None, match: list = [], not_match: list = [],
+                                   embeddings_calls: Callable[[...], Any] = ai_embeddings,
+                                   **kwargs) -> List[Tuple[Any, float, int]]:
     '''
-    data={
-      "name": ["word1", "word2"],
-      "vectors": [[0.1, 0.2, ...], [0.3, 0.4, ...]]
-    }
+     使用 Qdrant 搜索引擎找到与给定查询向量相似的嵌入。
+    :param query:
+    :param collection_name:集合名称
+    :param client:客户端实例
+    :param topn:
+    :param score_threshold:
+    :param query_vector:
+    :param match:
+    :param not_match:
+    :param embeddings_calls:用于生成查询向量的可调用函数
+    :param kwargs:
+    :return: 一个包含元组的列表，每个元组包括 Qdrant 搜索结果的负载数据和分数
+    '''
+    if not query_vector:
+        query_vector = await embeddings_calls(query, **kwargs)
+        if not query_vector:
+            return []
+
+    query_filter = qcm.Filter(must=match, must_not=not_match)
+    search_hit = await client.search(collection_name=collection_name,
+                                     query_vector=query_vector[0],  # tolist()
+                                     query_filter=query_filter,
+                                     limit=topn,
+                                     score_threshold=score_threshold,
+                                     params=qcm.SearchParams(exact=exact),
+                                     with_payload=True
+                                     )
+    return [(p.payload, p.score, p.id) for p in search_hit]
+
+
+async def search_batch_qdrant_embeddings(querys: Union[str, List[str]], collection_name: str, client=QD_Client,
+                                         key_name: str = 'title', match: list = [], not_match: list = [],
+                                         topn: int = 10, score_threshold: float = 0.0, exact: bool = False,
+                                         embeddings_calls: Callable[[...], Any] = ai_embeddings,
+                                         **kwargs) -> List[Tuple[str, List[Tuple[Any, float, int]]]]:
+    """
+    使用 Qdrant 批量查询查询词的嵌入，返回与查询最相似的标记和得分。
+
+    :param querys: 查询字符串或查询字符串列表。
+    :param collection_name: Qdrant 集合的名称。
+    :param client: Qdrant 客户端实例。
+    :param key_name: 返回的 payload 中的键名，默认是 'word'。
+    :param match: 搜索时需要匹配的过滤条件。
+    :param not_match: 搜索时不匹配的过滤条件。
+    :param topn: 返回的最相似结果数量。
+    :param score_threshold: 返回的最小得分阈值。
+    :param exact: 是否进行精确搜索（True）或近似搜索（False）。
+    :param embeddings_calls: 用于生成嵌入向量的可调用函数，默认为 ai_embeddings。
+    :param kwargs: 其他参数，传递给 embeddings_calls。
+
+    :return: 返回一个包含查询和匹配结果的列表，每个查询对应一个列表，包含匹配标记的 payload、得分和 ID。
+    """
+    query_vector = await embeddings_calls(querys, **kwargs)
+    if not query_vector:
+        return []
+    assert len(querys) == len(query_vector), "Query list and embedding vector list size mismatch."
+    query_filter = qcm.Filter(must=match, must_not=not_match)
+    search_queries = [
+        qcm.SearchRequest(vector=vec, filter=query_filter, limit=topn, score_threshold=score_threshold,
+                          with_payload=[key_name] if key_name else True, params=qcm.SearchParams(exact=exact), )
+        for vec in query_vector]
+
+    search_hit = await client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
+
+    return [(item, [(p.payload[key_name] if key_name else p.payload, p.score, p.id) for p in hit])
+            for item, hit in zip(querys, search_hit)]  # [:topn]
+
+
+async def get_similar_embeddings(querys: Union[str, List[str]], tokens: List[str], topn: int = 10,
+                                 embeddings_calls: Callable[[...], Any] = ai_embeddings,
+                                 **kwargs) -> List[Tuple[str, List[Tuple[str, float, int]]]]:
+    """
+    使用嵌入计算查询与标记之间的相似度。
+    :param querys: 查询词列表
+    :param tokens: 比较词列表
+    :param embeddings_calls: 嵌入生成函数
+    :param topn: 返回相似结果的数量
+    :param kwargs: 其他参数
+    返回：
+        List[Tuple[str, List[Tuple[str, float,int]]]]: 查询词与相似标记及其分数的映射。
+    """
+    if isinstance(querys, str):
+        querys = [querys]
+
+    query_vector, tokens_vector = await asyncio.gather(
+        embeddings_calls(querys, **kwargs),
+        embeddings_calls(tokens, **kwargs))
+
+    if not query_vector or not tokens_vector:
+        return []
+
+    sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
+    results = []
+    for i, w in enumerate(querys):
+        sim_scores = sim_matrix[i]
+        top_indices = np.argsort(sim_scores)[::-1][:topn] if topn > 0 else np.arange(sim_scores.shape[0])
+        top_scores = sim_scores[top_indices]
+        top_match = [tokens[j] for j in top_indices]
+        results.append((w, list(zip(top_match, top_scores, top_indices))))
+
+    return results  # [(q,[(match,score,index),])]
+
+
+def get_similar_words(querys: List[str], data: dict, exclude: List[str] = None, topn: int = 10,
+                      cutoff: float = 0.0) -> List[Tuple[str, List[Tuple[str, float]]]]:
+    '''
+   计算查询词与数据中的词之间的相似度，并返回每个查询词的最相似词及其相似度。
+
+    :param querys: 查询词列表
+    :param data: 包含词汇和对应向量的字典，格式为：
+                 {
+                     "name": ["word1", "word2", ...],
+                     "vectors": [[0.1, 0.2, ...], [0.3, 0.4, ...], ...]
+                 }
+    :param exclude: 要排除的词列表，这些词不会出现在结果中
+    :param topn: 返回最相似的前 n 个词
+    :param cutoff: 只有相似度大于该值的词才会被返回
+    :return: 每个查询词的相似词和相似度的元组列表
     返回：
         List[Tuple[str, List[Tuple[str, float]]]]: 查询词与相似标记及其分数的映射。
     '''
@@ -1441,7 +1740,7 @@ def get_similar_vectors(querys, data, exclude: List[str] = None, topn: int = 10,
 
     # 获取索引
     query_mask = np.array([w in index_to_key for w in querys])
-    exclude_mask = np.array([w in querys + exclude for w in index_to_key])
+    exclude_mask = np.array([w in querys + (exclude or []) for w in index_to_key])
     # np.delete(vectors, exclude_indices, axis=0)
 
     # 计算余弦相似度
@@ -1466,57 +1765,34 @@ def get_similar_vectors(querys, data, exclude: List[str] = None, topn: int = 10,
     return results  # [(w, list(sim[w].sort_values(ascending=False)[:topn].items())) for w in querys]
 
 
-async def get_similar_embeddings(querys: List[str], tokens: List[str],
-                                 embeddings_calls: Callable[[...], Any] = ai_embeddings, topn=10, **kwargs):
+async def find_closest_matches_embeddings(querys: List[str], tokens: List[str],
+                                          embeddings_calls: Callable[[...], Any] = ai_embeddings,
+                                          **kwargs) -> Dict[str, Tuple[str, float]]:
     """
-    使用嵌入计算查询与标记之间的相似度。
-    :param querys: 查询词列表
-    :param tokens: 比较词列表
-    :param embeddings_calls: 嵌入生成函数
-    :param topn: 返回相似结果的数量
-    :param kwargs: 其他参数
-    返回：
-        List[Tuple[str, List[Tuple[str, float]]]]: 查询词与相似标记及其分数的映射。
-    """
-    query_vector, tokens_vector = await asyncio.gather(
-        embeddings_calls(querys, **kwargs),
-        embeddings_calls(tokens, **kwargs))
+    使用嵌入计算查询与标记之间的最近匹配，找到每个查询的最佳匹配标记。
 
-    if not query_vector or not tokens_vector:
-        return []
-
-    sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
-    results = []
-    for i, w in enumerate(querys):
-        sim_scores = sim_matrix[i]
-        top_indices = np.argsort(sim_scores)[::-1][:topn] if topn > 0 else np.arange(sim_scores.shape[0])
-        top_scores = sim_scores[top_indices]
-        top_match = [tokens[j] for j in top_indices]
-        results.append((w, list(zip(top_match, top_scores, top_indices))))
-
-    return results  # [(q,[(match,score,index),])]
-
-
-async def find_closest_matches_embeddings(querys, tokens,
-                                          embeddings_calls: Callable[[...], Any] = ai_embeddings, **kwargs):
-    """
-    使用嵌入计算查询与标记之间的最近匹配,找到每个查询的最佳匹配标记。
+    :param querys: 查询字符串列表。
+    :param tokens: 标记列表，用于匹配查询。
+    :param embeddings_calls: 嵌入生成函数，接收查询和标记返回嵌入向量（默认为 ai_embeddings）。
+    :param kwargs: 其他参数，传递给 embeddings_calls 函数。
+    :return: 返回一个字典，其中每个查询的最佳匹配标记及其相似度分数被映射到查询上。
     返回：
         Dict[str, Tuple[str, float]]: 查询与最近匹配标记的映射字典。
     """
-    matchs = {x: (x, 1.0) for x in querys if x in tokens}
-    unmatched_queries = list(set(querys) - matchs.keys())
+    matches = {x: (x, 1.0) for x in querys if x in tokens}
+    unmatched_queries = list(set(querys) - matches.keys())
+    # 所有查询都已匹配，直接返回完全匹配项
     if not unmatched_queries:
-        return matchs
+        return matches
     query_vector, tokens_vector = await asyncio.gather(
         embeddings_calls(unmatched_queries, **kwargs),
         embeddings_calls(tokens, **kwargs))
-
     sim_matrix = np.array(query_vector) @ np.array(tokens_vector).T
+
     closest_matches = tokens[sim_matrix.argmax(axis=1)]  # idxmax
     closest_scores = sim_matrix.max(axis=1)
-    matchs.update(zip(unmatched_queries, zip(closest_matches, closest_scores)))
-    return matchs
+    matches.update(zip(unmatched_queries, zip(closest_matches, closest_scores)))
+    return matches
 
 
 def is_city(city, region='全国'):
@@ -1798,11 +2074,7 @@ async def auto_translate(text: str, model_name='baidu', source: str = 'auto', ta
     4. 返回翻译结果及相关信息。
     """
     if source == 'auto':
-        source = detect(text)
-        if source == 'zh-cn':
-            source = 'zh'
-        if source == 'no':
-            source = 'zh' if contains_chinese(text) else 'auto'
+        source = lang_detect_to_trans(text)
     if target == 'auto':
         target = 'en' if source == 'zh' else 'zh'
 
@@ -3164,6 +3436,7 @@ def send_to_wechat(user_name: str, context: str = None, link: str = None, object
 
 
 if __name__ == "__main__":
+    print(Function_MetaData_Store)
     AccessToken = 'd04149e455d44ac09432f0f89c3e0a41'
     # https://nls-portal-service.aliyun.com/ptts?p=eyJleHBpcmF0aW9uIjoiMjAyNC0wOS0wNlQwOToxNjoyNy42MDRaIiwiY29uZGl0aW9ucyI6W1sic3RhcnRzLXdpdGgiLCIka2V5IiwidHRwLzEzODE0NTkxNjIwMDc4MjIiXV19&s=k4sDIZ4lCmUiQ%2BV%2FcTEnFteey54%3D&e=1725614187&d=ttp%2F1381459162007822&a=LTAIiIg37IN8xeMa&h=https%3A%2F%2Ftuatara-cn-shanghai.oss-cn-shanghai.aliyuncs.com&u=qnKV1N8muiAIFiL22JTrgdYExxHS%2BPSxccg9VPiL0Nc%3D
     fileLink = "https://gw.alipayobjects.com/os/bmw-prod/0574ee2e-f494-45a5-820f-63aee583045a.wav"

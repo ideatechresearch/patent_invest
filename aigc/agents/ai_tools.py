@@ -58,7 +58,7 @@ AI_Tools = [
     {
         "type": "function",
         "function": {
-            "name": "web_search",
+            "name": "web_search_async",
             "description": "通过提供的查询文本执行网络搜索。比如查看新闻、最新消息、价格走势等实时动态，外部知识信息检索。",
             "parameters": {
                 "type": "object",

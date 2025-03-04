@@ -98,7 +98,7 @@ VOLC_Secret_Key: '***'
 VOLC_Secret_Key_admin: '***'
 Vectorizer_Api_Key: '***'
 Vectorizer_Secret_Key: '***'
-WECHAT_URL: http://**
+WECHAT_URL: http://*
 WeatherMap_APPID: '***'
 Weather_Service_Key: '***'
 XF_API_Key: '***'

@@ -8,7 +8,7 @@ basedir = os.path.abspath(os.path.dirname(__file__))
 class Config(object):
     # "sqlite:///project.db"
     DATABASE_URL = os.environ.get('DATABASE_URL') or 'sqlite:///' + os.path.join(basedir, 'app.db')
-    SQLALCHEMY_DATABASE_URI = 'mysql+pymysql://dooven:7777@10.10.10.5:3306/kettle?charset=utf8'
+    SQLALCHEMY_DATABASE_URI = 'mysql+pymysql://user:7777@10.10.10.5:3306/kettle?charset=utf8'
     SQLALCHEMY_COMMIT_ON_TEARDOWN = False
     SQLALCHEMY_TACK_MODIFICATIONS = True
     SQLALCHEMY_ECHO = True
@@ -18,6 +18,7 @@ class Config(object):
     NEO4J_USERNAME = "***"
     NEO4J_PASSWORD = "7777"
     AIGC_HOST = 'aigc'
+    AIGC_Service_Key = 'token-'
     QDRANT_HOST = '10.10.10.5'  # 'qdrant'
     QDRANT_URL = "http://10.10.10.5:6333"
 
@@ -70,3 +71,17 @@ def decode_id(encoded_id):
 
 def decode_id(encoded_id):
     return encoded_id
+
+if __name__ == "__main__":
+    key = Config.SECRET_KEY
+    original_data = '123'
+
+    # 加密数据
+    encrypted_data = xor_encrypt_decrypt(original_data, key)
+    encoded_id = encode_id(encrypted_data)
+    print("加密后的数据:", encrypted_data, encoded_id)
+
+    # 解密数据
+    decoded_id = decode_id(encoded_id)
+    decrypted_data = xor_encrypt_decrypt(decoded_id, key)  # encrypted_data
+    print("解密后的数据:", decrypted_data, decoded_id)
