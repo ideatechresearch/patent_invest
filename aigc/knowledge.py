@@ -97,7 +97,7 @@ def refine_content_with_titles(content):
     return content
 
 
-def clean_text(raw_text):
+def clean_icc_text(raw_text):
     """
     清理原始文本，去掉多余的不可见字符、异常数字等。
     """
@@ -194,7 +194,7 @@ async def graph_icc_edge(pdf_path='data/ideatech-251124-1758-255.pdf'):
     g = Graph(directed=True)
     # 添加节点和边
     for title_number, item in structured_content.items():
-        tx = clean_text(item["text"])
+        tx = clean_icc_text(item["text"])
         paragraphs = split_paragraphs(tx, max_length=1000,
                                       pattern=r'(?=[。！？])|(?=\r\n)|(?=\b\d+\、)|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])')
         print(title_number, [len(x) for x in paragraphs], len(paragraphs), item["full_path"])
@@ -315,17 +315,6 @@ def query_similar_content(graph, target_embedding, top_n_nodes=3, top_n_paragrap
         }
 
     return results
-
-
-def get_children(g, node):
-    # g.successors(node.index)
-    return [g.vs[neighbor]["name"] for neighbor in g.neighbors(node, mode="OUT")]
-
-
-def get_parent(g, node):
-    # g.predecessors(node.index)
-    neighbors = g.neighbors(node, mode="IN")
-    return g.vs[neighbors[0]]["name"] if neighbors else None
 
 
 IdeaTech_Graph = None

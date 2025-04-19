@@ -1,18 +1,26 @@
-import re, json, io, os, sys, time, pickle
-import inspect, importlib, ast
+import re, json, io, os, sys, threading, time, pickle, struct
+import httpx, aiohttp, aiofiles, asyncio, joblib
+import inspect, importlib, ast, requests
+from itertools import groupby
+import yaml
 from pathlib import Path
 from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
+from functools import partial, wraps  # cache, lru_cache, partial, wraps
 from collections import OrderedDict, Counter, deque
 import numpy as np
+from enum import Enum
 import math
-import jieba
 from pypinyin import lazy_pinyin
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from langdetect import detect, detect_langs
+import jieba
 
+
+# import tiktoken
+# tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
 
 def get_function_parameters(func):
     signature = inspect.signature(func)
@@ -48,8 +56,23 @@ def convert_keys_to_lower_case(d):
         return d
 
 
+def serialize(obj):
+    if isinstance(obj, Enum):  # 处理 Enum 类型
+        return obj.value
+    elif hasattr(obj, "dict"):  # 处理 Pydantic 模型
+        return obj.dict()
+    elif hasattr(obj, "__dict__"):  # 递归转换对象
+        return {key: serialize(value) for key, value in obj.__dict__.items()}
+    elif isinstance(obj, list):  # 处理列表
+        return [serialize(item) for item in obj]
+    elif isinstance(obj, dict):  # 处理字典
+        return {key: serialize(value) for key, value in obj.items()}
+    else:
+        return obj  # asdict
+
+
 def extract_json_from_string(input_str):
-    # 从一个普通字符串中提取 JSON 结构
+    # 从一个普通字符串中提取 JSON 结构，但可能不处理嵌套的 JSON
     match = re.search(r'\{.*}', input_str, re.DOTALL)
     if match:
         json_str = match.group(0)
@@ -61,7 +84,7 @@ def extract_json_from_string(input_str):
 
 
 def parse_json(inputs) -> dict:
-    # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）
+    # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
     if not isinstance(inputs, dict):
         try:
             match = re.search(r'^\s*(```json\n)?(.*)\n```\s*$', inputs, re.S)
@@ -75,19 +98,26 @@ def parse_json(inputs) -> dict:
 
 
 def extract_method_calls(text):
+    """
+    提取 Python 代码中的方法调用（方法名+括号）。
+    支持：
+    - 普通函数调用 func()
+    - 对象/类方法调用 obj.method()
+    Args:
+        text (str): 代码文本
+    Returns:
+        list: 代码中的方法调用列表
+    """
     # 匹配方法调用（方法名+括号内容）
-    pattern = r"\b[a-zA-Z_][a-zA-Z0-9_]*\b"
-    matches = re.findall(pattern, text)
-    # 检查匹配项，返回最后一个方法名
-    if matches:
-        return matches[-1]
-    return None
+    pattern = r"\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)"  # r"\b[a-zA-Z_][a-zA-Z0-9_]*\b"
+    # 检查匹配项
+    return re.findall(pattern, text)
 
 
-def execute_code_blocks(text):
+def execute_code_results(text):
     code_blocks = extract_python_code(text)
     results = []
-    global_namespace = globals()  # 引用全局命名空间
+    global_namespace = globals()  # 引用全局命名空间 {"__builtins__": dict(__builtins__)}
     for code in code_blocks:
         local_namespace = {}  # 用于存储代码的局部变量
         captured_output = io.StringIO()  # 用于捕获 `print` 输出
@@ -146,6 +176,151 @@ def git_repo_clone(repo_url: str, revision: str = None, add_to_sys_path: bool = 
     return repo_path
 
 
+async def download_by_aiohttp(url: str, save_path, chunk_size=4096, in_decode=False):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            # response = await asyncio.wait_for(session.get(url), timeout=timeout)
+            if response.status == 200:
+                if save_path:
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    async with aiofiles.open(save_path, mode='wb') as f:
+                        # response.content 异步迭代器（流式读取）,iter_chunked 非阻塞调用，逐块读取
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            if isinstance(chunk, (bytes, bytearray)):
+                                await f.write(chunk)
+                            elif isinstance(chunk, str):
+                                await f.write(chunk.encode('utf-8'))  # 将字符串转为字节
+                            else:
+                                raise TypeError(
+                                    f"Unexpected chunk type: {type(chunk)}. Expected bytes or bytearray.")
+
+                    return save_path
+
+                content = await response.read()  # 单次异步读取完整内容，小文件,await response.content.read(chunk_size)
+                return content.decode('utf-8') if in_decode else content  # 将字节转为字符串,解码后的字符串 await response.text()
+
+            print(f"Failed to download {url}: {response.status}")
+
+    return None
+
+
+async def download_by_httpx(url: str, save_path, chunk_size=4096, in_decode=False):
+    async with httpx.AsyncClient() as client:
+        async with client.stream("GET", url) as response:  # 长时间的流式请求
+            # response = await client.get(url, stream=True)
+            response.raise_for_status()  # 如果响应不是2xx  response.status_code == 200:
+            if save_path:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(save_path, mode="wb") as f:
+                    # response.aiter_bytes() 异步迭代器
+                    async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                        await f.write(chunk)
+
+                return save_path
+
+            content = bytearray()  # 使用 `bytearray` 更高效地拼接二进制内容  b""  # raw bytes
+            async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                content.extend(chunk)
+                # content += chunk
+                # yield chunk
+
+            return content.decode(response.encoding or 'utf-8') if in_decode else bytes(content)
+            # return response.text if in_decode else response.content
+
+
+def download_by_requests(url: str, save_path, chunk_size=4096, in_decode=False):
+    """
+    同步下载的流式方法
+    如果目标是保存到文件，直接使用 content（无需解码）。（如图片、音频、视频、PDF 等）
+    如果目标是处理和解析文本数据，且确定编码正确，使用 text。（如 HTML、JSON）
+    """
+    with requests.get(url, stream=True, timeout=30) as response:
+        response.raise_for_status()  # 确保请求成功
+        if save_path:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(save_path, "wb") as f:
+                # requests iter_content 同步使用,阻塞调用
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:  # <class 'bytes'>
+                        f.write(chunk)
+
+            return save_path
+
+        return response.text if in_decode else response.content  # 直接获取文本,同步直接返回全部内容
+
+
+async def upload_by_httpx(url: str, files_path=('example.txt', b'Hello World')):
+    files = {'file': files_path}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, files=files)
+        return resp.json()
+
+
+def upload_by_requests(url: str, file_path, file_key='snapshot'):
+    with open(file_path, "rb") as f:
+        files = {file_key: f}
+        response = requests.post(url, files=files)
+    return response.json()
+
+
+# 保存所有模型到文件
+def save_models(models: dict, model_dir='data/models/'):
+    """
+    保存训练好的模型到指定路径
+    :param models: 一个字典，包含所有需要保存的模型
+    :param model_dir: 保存模型的路径
+    """
+    os.makedirs(model_dir, exist_ok=True)
+    for model_name, model in models.items():
+        if model is not None:
+            joblib.dump(model, f'{model_dir}/{model_name}.pkl')
+    print(f"模型已保存至 {model_dir}")
+
+
+# 加载模型
+def load_models(model_names: list, model_dir='data/models/'):
+    """
+    加载保存的模型
+    :param model_names: 模型名称列表
+    :param model_dir: 保存模型的路径
+    :return: 加载的模型字典
+    """
+    models = {}
+    for model_name in model_names:
+        model_path = f'{model_dir}/{model_name}.pkl'
+        if os.path.exists(model_path):
+            models[model_name] = joblib.load(model_path)
+    print(f"模型已从 {model_dir} 加载")
+    return models
+
+
+async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
+    async with httpx.AsyncClient() as cx:
+        try:
+            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(e)
+            return None
+
+
+async def post_http_json(url, js=None, headers: dict = None, time_out=100, **kwargs):
+    connector = aiohttp.TCPConnector(limit=100, limit_per_host=50)
+    timeout = aiohttp.ClientTimeout(total=time_out, sock_read=60.0, sock_connect=5.0)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers or {}) as session:
+        async with session.post(url, json=js, **kwargs) as resp:
+            return await resp.json()  # await resp.text()
+
+
+# @asynccontextmanager
+async def get_httpx_client(time_out=100.0):
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+    timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as cx:
+        yield cx
+
+
 # 调整缩进,修复代码缩进，确保最小的缩进被移除，以避免缩进错误
 def fix_indentation(code):
     lines = code.splitlines()
@@ -156,28 +331,29 @@ def fix_indentation(code):
 
 
 def extract_python_code(text):
+    """
+    提取 Markdown 代码块中的 Python 代码，同时支持缩进代码块
+    """
     code_blocks = re.findall(r'```(?:python)?(.*?)```', text, re.DOTALL)
     if not code_blocks:
+        # 查找缩进代码块，即每行前 4 个空格的代码， 无 ``` 包围的代码块
         code_blocks = re.findall(r'((?: {4}.*\n)+)', text)
 
     return [fix_indentation(block) for block in code_blocks]  # [block.strip()]
 
 
-def extract_python_codes(markdown_string: str):
-    # Regex pattern to match Python code blocks
+def extract_any_code(markdown_string: str):
+    # Regex pattern to match Python code blocks,匹配 Python与其他代码块
     pattern = r"```[\w\s]*python\n([\s\S]*?)```|```([\s\S]*?)```"
     # Find all matches in the markdown string
     matches = re.findall(pattern, markdown_string, re.IGNORECASE)
     # Extract the Python code from the matches
-    python_code = []
+    code_blocks = []
     for match in matches:
-        python = match[0] if match[0] else match[1]
-        python_code.append(python.strip())
+        code = match[0] or match[1]  # 如果是 Python 代码块，取 ```python 之后的代码,如果是其他代码块，取代码内容
+        code_blocks.append(code.strip())
 
-    if len(python_code) == 0:
-        return markdown_string
-
-    return python_code
+    return code_blocks
 
 
 def remove_function_decorators(func):
@@ -255,11 +431,45 @@ def extract_bash_code(text):
     return [block.strip() for block in bash_blocks]
 
 
-def extract_table_data(text):
+def extract_table_code(text):
+    # 提取整个表格块
     table_blocks = re.findall(r'```(?:table)?(.*?)```', text, re.DOTALL)
     if not table_blocks:
         table_blocks = re.findall(r'((?:\|.*?\|)+)', text)  # 简单匹配 Markdown 表格，如 | A | B |
     return [block.strip() for block in table_blocks]
+
+
+def extract_table_data(text):
+    """提取 Markdown 格式的表格数据,返回按表格行分组的表格列表"""
+    table_pattern = re.findall(r'(\|.*\|)', text)
+    tables = []
+    current_table = []
+
+    for line in text.split("\n"):
+        if line.strip() in table_pattern:
+            current_table.append(line.strip())
+        elif current_table:
+            tables.append("\n".join(current_table))
+            current_table = []
+
+    if current_table:
+        tables.append("\n".join(current_table))
+
+    return tables
+
+
+def extract_yaml_data(text):
+    """提取 Markdown 中的 YAML 数据"""
+    yaml_blocks = re.findall(r'```yaml\n(.*?)\n```', text, re.DOTALL)
+    parsed_data = []
+
+    for block in yaml_blocks:
+        try:
+            parsed_data.append(yaml.safe_load(block))  # 解析 YAML
+        except yaml.YAMLError:
+            parsed_data.append(None)  # 解析失败则返回 None
+
+    return parsed_data
 
 
 def extract_list_data(text):
@@ -275,7 +485,22 @@ def extract_json_data(text):
     return [block.strip() for block in json_blocks]
 
 
-def extract_code_blocks(text, lag=''):
+def extract_json_str(json_code):
+    start = json_code.find("```json")
+    # 从start开始找到下一个```结束
+    end = json_code.find("```", start + 1)
+    if start == -1 or end == -1:
+        try:
+            json.loads(json_code)
+            return json_code
+        except Exception as e:
+            print("Error:", e)
+        return ""
+    return json_code[start + 7:end]
+
+
+def extract_code_blocks(text, lag='python', **kwargs):
+    # 从文本中提取特定格式的代码块，支持不同的编程语言（如 Python、SQL、HTML 等）以及表格、JSON、列表等数据类型
     funcs = {
         "sql": extract_sql_code,
         "html": extract_html_code,
@@ -283,8 +508,11 @@ def extract_code_blocks(text, lag=''):
         "cpp": extract_cpp_code,
         "java": extract_java_code,
         "bash": extract_bash_code,
+        "code": extract_any_code,
+        "method": extract_method_calls,
 
-        "table": extract_table_data,
+        "table": extract_table_code,
+        "yaml": extract_yaml_data,
         "list": extract_list_data,
         "json": extract_json_data,
     }
@@ -292,10 +520,16 @@ def extract_code_blocks(text, lag=''):
         return funcs[lag](text)
 
     # 提取 ``` 包裹的代码块
-    code_blocks = re.findall(r'```(.*?)```', text, re.DOTALL)
+    code_blocks = re.findall(r'```(\w+)?\n(.*?)```', text, re.DOTALL)  # r'```(.*?)```'
     if lag:
-        code_blocks = [block for block in code_blocks if block.startswith(lag)]
+        code_blocks = [block for block in code_blocks if block.lstrip().startswith(lag)]
         return code_blocks  # 过滤出指定语言的代码块
+
+    # try:
+    #     for k, f in funcs.items():
+    #         print(k,f(text))
+    # except Exception as e:
+    #     print(k,e)
 
     return {k: f(text) for k, f in funcs.items()}
 
@@ -342,6 +576,87 @@ def extract_italic(text):
     return [italic[0] or italic[1] for italic in italic_texts]  # 处理两个捕获组
 
 
+def extract_date_strings(text):
+    """
+    从文本中提取符合格式的日期时间字符串。
+
+    Args:
+        text (str): 输入文本
+
+    Returns:
+        list: 提取出的日期时间字符串列表
+    """
+    date_regex = r'\b\d{4}[-/]\d{2}[-/]\d{2}(?:\s\d{2}:\d{2}:\d{2})?\b'
+    return re.findall(date_regex, text)
+
+
+def extract_tagged_content(text, tag="answer"):
+    """
+    提取指定标签最后一个匹配
+    Extracts the value from the last occurrence of a specified tag in the text.
+
+    Args:
+        text (str): The input text containing the tagged content.
+        tag (str): The tag to extract content from (default is 'answer').
+
+    Returns:
+        str or None: The extracted content, or None if no valid content is found.
+    """
+    pattern = rf"<{tag}>(.*?)</{tag}>"  # 正则匹配 <tag>...</tag>
+    matches = re.findall(pattern, text, re.DOTALL)  # 获取所有匹配项"<answer> </answer>""
+
+    if matches:
+        last_match = matches[-1].strip()  # 获取最后一个匹配的内容并去除首尾空格
+        return None if last_match == "..." else last_match
+    return None
+
+
+# reasoning
+def extract_tagged_split(text, tag="think"):
+    """
+    Splits the text into two parts: the content inside the specified tag
+    and the remaining text outside the tag.
+
+    Args:
+        text (str): The input text containing the tagged content.
+        tag (str): The tag to extract content from (default is 'think',reasoning).
+
+    Returns:
+        list: A list containing [tag_content, remaining_text].
+    """
+    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>\s*(.*)", re.DOTALL)
+    match = pattern.search(text)
+
+    if match:
+        think_content = match.group(1).strip()  # 提取 <think> 内的内容,
+        output_content = match.group(2).strip()  # 提取最终输出内容
+        return [think_content, output_content]
+
+    return [None, text]
+
+
+def process_assistant_think(content):
+    if '<think>' in content and '</think>' in content:
+        content = re.sub(r'(<think>)(.*?)(</think>)',
+                         r'<details style="font-style: italic; background: rgba(222, 222, 222, 0.5); padding: 10px; border-radius: 10px;"><summary style="font-weight:bold;">推理内容（展开）</summary>\2</details>',
+                         content,
+                         flags=re.DOTALL)
+
+    if '<think>' in content and '</think>' not in content:
+        content = re.sub(r'<think>(.*?)$',
+                         r'<details open style="font-style: italic; background: rgba(222, 222, 222, 0.5); padding: 10px; border-radius: 10px;"><summary style="font-weight:bold;">推理中...</summary>\1</details>',
+                         content,
+                         flags=re.DOTALL)
+
+    if '<think>' not in content and '</think>' in content:
+        content = re.sub(r'(.*?)</think>',
+                         r'<details style="font-style: italic; background: rgba(222, 222, 222, 0.5); padding: 10px; border-radius: 10px;"><summary style="font-weight:bold;">推理内容（展开）</summary>\1</details>',
+                         content,
+                         flags=re.DOTALL)
+
+    return content
+
+
 def ordinal_generator():
     ordinals = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
     for ordinal in ordinals:
@@ -379,7 +694,7 @@ def remove_markdown(text):
 
 
 def format_for_wechat(text):
-    formatted_text = text
+    formatted_text = extract_tagged_split(text, tag="think")[1]  # text
     formatted_text = re.sub(r'\*\*(.*?)\*\*', r'✦\1✦', formatted_text)  # **粗体** 转换为 ✦粗体✦样式
     formatted_text = re.sub(r'!!(.*?)!!', r'❗\1❗', formatted_text)  # !!高亮!! 转换为 ❗符号包围
     # formatted_text = re.sub(r'__(.*?)__', r'※\1※', formatted_text)  # __斜体__ 转换为星号包围的样式
@@ -403,13 +718,21 @@ def format_for_wechat(text):
     return formatted_text.strip()
 
 
-def format_for_html(text):
-    try:
-        import markdown
-        return markdown.markdown(text)
-    except:
-        return remove_markdown(text)
+def df_to_markdown(df, index=False):
+    # df.fillna('N/A').to_markdown()
+    headers = df.columns.tolist()
+    md = "| " + " | ".join(headers) + " |\n"
+    md += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+    for _, row in df.iterrows():
+        md += "| " + " | ".join(row.astype(str)) + " |\n"
 
+    return md if index else md.replace("| Index |", "|")  # 可选移除索引列
+
+
+def format_for_html(text):
+    # Markdown 格式的文本转换为 HTML 的字符串,渲染 Markdown 文章
+    import markdown
+    return markdown.markdown(text)
     # from IPython.display import Markdown, display
     # display(Markdown(f"`{export_command}`"))
 
@@ -424,8 +747,15 @@ def extract_string(text, extract, **kwargs):
         "links": extract_links,
         "bold": extract_bold,
         "italic": extract_italic,
+        "tables": extract_table_data,
+        "date": extract_date_strings,
+        "answer": extract_tagged_content,
+        "think": partial(extract_tagged_split, tag="think"),
+        "reasoning": partial(extract_tagged_split, tag="reasoning"),
+        'sentence': split_sentences,
         "wechat": format_for_wechat,
-        "html": format_for_html
+        'remark': remove_markdown,
+        "html": format_for_html,
     }
     try:
         if extract in funcs:
@@ -433,7 +763,7 @@ def extract_string(text, extract, **kwargs):
 
         extract_type = extract.split('.')
         if extract_type[0] == 'code':
-            transform = extract_code_blocks(text, lag=extract_type[1], **kwargs)
+            transform = extract_code_blocks(text, lag=extract_type[1] if len(extract_type) > 1 else '', **kwargs)
             return transform
 
         return {k: f(text, **kwargs) for k, f in funcs.items()}  # "type": "all"
@@ -442,6 +772,18 @@ def extract_string(text, extract, **kwargs):
 
     return None
 
+
+# class Partial:
+#     def __init__(self, func, *args, **kwargs):
+#         self.func = func
+#         self.args = args
+#         self.kwargs = kwargs
+#
+#     def __call__(self, *more_args, **more_kwargs):
+#         # 合并固定参数和新参数
+#         all_args = self.args + more_args
+#         all_kwargs = {**self.kwargs, **more_kwargs}
+#         return self.func(*all_args, **all_kwargs)
 
 def dict_to_xml(tag, d):
     """将字典转换为 XML 字符串"""
@@ -464,6 +806,92 @@ def list_to_xml(tag, lst):
         item_elem = ET.SubElement(elem, "item")
         item_elem.text = str(item)
     return ET.tostring(elem, encoding='unicode')
+
+
+def df2doc(data, use_index=True):
+    """
+    将 DataFrame 中每一行转换为一段文本
+    :param data: 输入 DataFrame
+    :param use_index: 是否在文本前增加行索引
+    :return: 文本记录列表
+    """
+    docs = []
+    try:
+        import pandas as pd
+        if use_index:
+            for item in zip(data.index, data.to_dict(orient='records')):
+                docs.append(f'{item[0]}\t' + '|'.join(
+                    f'{k}#{v.strip() if isinstance(v, str) else v}' for k, v in item[1].items() if pd.notna(v)).strip())
+        else:
+            for item in data.to_dict(orient='records'):
+                docs.append('|'.join(
+                    f'{k}#{v.strip() if isinstance(v, str) else v}' for k, v in item.items() if pd.notna(v)).strip())
+    except ImportError:
+        if not isinstance(data, list) or not all(isinstance(d, dict) for d in data):
+            raise ValueError("输入数据应为列表的字典格式，例如 [{'key1': 'value1', 'key2': 'value2'}, ...]")
+
+        for idx, record in enumerate(data):  # data.iterrows()
+            # 拼接每个字段，跳过 None 值，并对字符串做 strip 处理
+            doc_line = '|'.join(
+                f"{k}#{v.strip() if isinstance(v, str) else v}"
+                for k, v in record.items() if v is not None
+            )
+            # 如果 use_index=True，则在前面加上索引
+            if use_index:
+                doc_line = f"{idx}\t" + doc_line
+
+            docs.append(doc_line)
+    except Exception as e:
+        print(e)
+
+    return docs
+
+
+def get_last_entries_records(records: list[dict], fields, use_index=False, max_tokens: int = 8000, tokenizer=None):
+    texts = []
+    total_chars = 0
+    # 从最新记录开始拼接，直到总字符数超过 max_tokens 时停止添加（返回最后不足 max_chars 字符的部分）
+    for idx, record in enumerate(records):
+        use_fields = fields or list(record.keys())
+        prefix = f"{idx}\t" if use_index else ""
+        item_str = prefix + '|'.join(
+            f"{k}#{(str(record[k]).strip() if isinstance(record[k], str) else record[k])}"
+            for k in use_fields if record.get(k) is not None
+        )
+        entry_length = lang_token_size(item_str, tokenizer)  # len(item_str)
+        if total_chars + entry_length > max_tokens:
+            break
+        texts.append(item_str)
+        total_chars += entry_length
+
+    # 如果有多个记录，倒序拼接（保证最早的记录在最前面）
+    return list(reversed(texts))  # "\n\n".join(reversed(texts))
+
+
+def get_max_items_from_list(data: list, max_tokens: int = 4000, tokenizer=None):
+    """
+        Get max items from list of items based on defined max tokens (based on openai compute)
+        根据给定的最大 token 数，从一组字典数据中选取适合的项目，直到达到 token 限制为止
+        :param data: 包含字典的列表，每个字典表示一个项目
+        :param max_tokens: 允许的最大 token 数
+        :param tokenizer: 可选的 tokenizer（如果没有提供，则根据语言自动处理）
+        :return: 适合的项目列表
+        List[Dict[str, str]]
+    """
+    result = []
+    current_tokens = 0
+    # encoding = tiktoken.encoding_for_model(encoding_name)
+    # tiktoken.get_encoding("cl100k_base")
+    for item in data:
+        item_str = json.dumps(item)
+        item_tokens = lang_token_size(item_str, tokenizer)
+        if current_tokens + item_tokens > max_tokens:
+            break
+
+        result.append(item)
+        current_tokens += item_tokens
+
+    return result
 
 
 def find_similar_word(target_keyword, tokens):
@@ -495,6 +923,15 @@ def contains_chinese(text):
     # return detect(text)=='zh-cn'
 
 
+def contains_hebrew_arabic(text):
+    return bool(re.search(r'[\u0590-\u05FF\u0600-\u06FF]', text))
+
+
+def contains_cjk(text):
+    """检测是否包含 CJK（中文、日文、韩文）字符"""
+    return bool(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
+
+
 def convert_to_pinyin(text):
     # 检查输入是否为中国城市名称（仅中文），然后转换为拼音
     if all('\u4e00' <= char <= '\u9fff' for char in text):
@@ -514,71 +951,212 @@ def lang_detect_to_trans(text):
 def lang_token_size(text, tokenizer=None):
     if tokenizer:
         return len(tokenizer.encode(text))
-
+    # 中文平均1字≈1 token，英文≈4字=1 token，粗略估算
     lang = detect(text)
     if lang in ('en', 'fr', 'es', 'de'):
         # 对于英文、法语、西班牙语、德语等，使用空格分词
         return len(text.split())
+        # len(text) // 3
 
     # 'zh-cn','zh-hk','zh-tw','ja','ar',简体中文,日语,阿拉伯语，返回字符数
     return len(text)
 
 
-# import tiktoken #OpenAI 专用
-# from transformers import AutoTokenizer
-# def get_max_tokens_from_string(string: str, max_tokens: int, encoding_name: str = Config.DEFAULT_MODEL_ENCODING) -> str:
-#     """
-#         Extract max tokens from string using the specified encoding (based on openai compute)
-#         从一个字符串中提取出符合最大 token 数限制的部分
-#     """
-#     # tokenizer = AutoTokenizer.from_pretrained(model_id)
-#     encoding = tiktoken.encoding_for_model(encoding_name)  # tiktoken.model.MODEL_TO_ENCODING
-#     tokens = encoding.encode(string)
-#     token_bytes = [encoding.decode_single_token_bytes(token) for token in tokens[:max_tokens]]
-#     return b"".join(token_bytes).decode()
-#
-#
-def get_max_items_from_list(data: list, max_tokens: int = 4000, tokenizer=None):
-    """
-        Get max items from list of items based on defined max tokens (based on openai compute)
-        根据给定的最大 token 数，从一组字典数据中选取适合的项目，直到达到 token 限制为止
-        :param data: 包含字典的列表，每个字典表示一个项目
-        :param max_tokens: 允许的最大 token 数
-        :param tokenizer: 可选的 tokenizer（如果没有提供，则根据语言自动处理）
-        :return: 适合的项目列表
-        List[Dict[str, str]]
-    """
-    result = []
-    current_tokens = 0
-    # encoding = tiktoken.encoding_for_model(encoding_name)
-    # tiktoken.get_encoding("cl100k_base")
-    for item in data:
-        item_str = json.dumps(item)
-        item_tokens = lang_token_size(item_str, tokenizer)
-        new_total_tokens = current_tokens + item_tokens
+def cut_text(text, tokenizer=None):
+    # 去除标点/数字/空格
+    text = re.sub(r'[^\u4e00-\u9fa5]', '', str(text))
+    if tokenizer:
+        token_ids = tokenizer.encode(text)
+        tokens = [tokenizer.decode([tid]) for tid in token_ids]
+    else:
+        tokens = jieba.lcut(text, cut_all=False)
+    return tokens  # ' '.join(tokens)
 
-        if new_total_tokens > max_tokens:
+
+def get_max_tokens_from_string(text: str, max_tokens: int, tokenizer) -> str:
+    """
+        Extract max tokens from string using the specified encoding (based on openai compute)
+        从一个字符串中提取出符合最大 token 数限制的部分
+    """
+    # from transformers import AutoTokenizer
+    # encoding = AutoTokenizer.from_pretrained(model_id)
+    # encoding = tiktoken.encoding_for_model(encoding_name)  # tiktoken.model.MODEL_TO_ENCODING
+    tokens = tokenizer.encode(text)
+    token_bytes = [tokenizer.decode_single_token_bytes(token) for token in tokens[:max_tokens]]
+    return b"".join(token_bytes).decode()
+
+
+def build_prompt(messages: list, use_role=False) -> str:
+    """
+    Build a single prompt string from a list of messages.
+    Each message is expected to be a dictionary with 'role' and 'content' keys.
+    This function concatenates all message contents, preserving the training format.
+    """
+    if use_role:
+        # OpenAI-style messages are transformed to a structured conversation format for Ollama.
+        return "\n".join(
+            f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content'].strip()}"
+            for msg in messages)
+    return "\n".join([msg["content"].strip() for msg in messages])
+
+
+def alternate_chat_history(messages: list):
+    # 确保 user 和 assistant 消息交替出现，插入默认消息或删除多余消息
+    i = 0
+    while i < len(messages) - 1:
+        # if (
+        #     isinstance(message, dict) and
+        #     message.get("role") in ["user", "assistant"] and
+        #     isinstance(message.get("content"), str) and
+        #     message["content"].strip()  # 确保 content 非空
+        # ):
+        message = messages[i]
+        next_message = messages[i + 1]
+        # 处理连续相同角色的情况
+        if message['role'] == next_message['role']:  # messages.insert(0, messages.pop(i))
+            if i % 2 == 0:
+                if message['role'] == 'user':
+                    messages.insert(i + 1, {'role': 'assistant', 'content': '这是一个默认的回答。'})
+                else:
+                    messages.insert(i + 1, {'role': 'user', 'content': '请问您有什么问题？'})
+            else:
+                del messages[i + 1]
+                i -= 1
+        i += 1
+    return messages
+
+
+def split_whitespace_nonwhitespace(s, max_len=5):
+    # 按照 空白/非空白 交替拆分字符串，控制每段的最大长度，预切割
+    for k, g in groupby(s, key=str.isspace):
+        chunk = list(g)
+        for i in range(0, len(chunk), max_len):
+            yield ''.join(chunk[i:i + max_len])
+
+
+LINE_STOP_FLAG = (
+    '.', '!', '?', '。', '！', '？', ')', '）', '"', '”', ':', '：', ';', '；', ']', '】', '}', '}', '>', '》', '、', ',', '，',
+    '-',
+    '—', '–',)
+LINE_START_FLAG = ('(', '（', '"', '“', '【', '{', '《', '<', '「', '『', '【', '[',)
+
+
+def find_last_punctuation(text, punctuations=("。", "？", "！", "；", "：")):
+    """找到文本中最后一个有效的标点符号位置"""
+    return max(text.rfind(p) for p in punctuations)
+
+
+def is_punctuation_or_emoji(char):
+    """检查字符是否为空格、指定标点或表情符号"""
+    # 定义需要去除的中英文标点（包括全角/半角）
+    punctuation_set = {
+        '，', ',',  # 中文逗号 + 英文逗号
+        '。', '.',  # 中文句号 + 英文句号
+        '！', '!',  # 中文感叹号 + 英文感叹号
+        '-', '－',  # 英文连字符 + 中文全角横线
+        '、'  # 中文顿号
+    }
+    if char.isspace() or char in punctuation_set:
+        return True
+    # 检查表情符号（保留原有逻辑）
+    code_point = ord(char)
+    emoji_ranges = [
+        (0x1F600, 0x1F64F), (0x1F300, 0x1F5FF),
+        (0x1F680, 0x1F6FF), (0x1F900, 0x1F9FF),
+        (0x1FA70, 0x1FAFF), (0x2600, 0x26FF),
+        (0x2700, 0x27BF)
+    ]
+    return any(start <= code_point <= end for start, end in emoji_ranges)
+
+
+def get_string_no_punctuation_or_emoji(s):
+    """去除字符串首尾的空格、标点符号和表情符号,只清理首尾，不影响中间的内容"""
+    chars = list(s)
+    # 处理开头的字符
+    start = 0
+    while start < len(chars) and is_punctuation_or_emoji(chars[start]):
+        start += 1
+    # 处理结尾的字符
+    end = len(chars) - 1
+    while end >= start and is_punctuation_or_emoji(chars[end]):
+        end -= 1
+    return ''.join(chars[start:end + 1])
+
+
+LLM_Abort_Event = asyncio.Event()  # threading.Event() 线程安全
+
+
+async def llm_abort_stop():
+    LLM_Abort_Event.set()  # 触发终止,是否提前终止
+
+
+async def process_llm_stream(llm_responses_stream, token_size=20):
+    """
+    处理大模型返回的文本流，并按标点符号分割交给 TTS 朗读。
+    :param llm_responses_stream: 大模型返回的文本流
+    :param token_size: 标点不足时，允许的最小缓冲区长度
+    """
+    response_message = []
+    text_index = 0
+    processed_chars = 0
+    async for content in llm_responses_stream:
+        response_message.append(content)
+        if LLM_Abort_Event.is_set():  # 实时检查是否终止
             break
-        else:
-            result.append(item)
-            current_tokens = new_total_tokens
-    return result
+
+        # 获取当前未处理的文本
+        full_text = "".join(response_message)
+        current_text = full_text[processed_chars:]
+
+        # 查找最后一个有效标点
+        last_punct_pos = find_last_punctuation(current_text)
+        if last_punct_pos != -1 or lang_token_size(current_text) > token_size:
+            split_pos = last_punct_pos if last_punct_pos != -1 else token_size  # 选取最合适的切割点
+            segment_text_raw = current_text[:split_pos + 1]
+            segment_text = get_string_no_punctuation_or_emoji(segment_text_raw)  # 处理无效字符
+            if segment_text:
+                text_index += 1
+                yield segment_text, text_index
+                processed_chars += len(segment_text_raw)  # 更新已处理字符位置
+
+    # 处理剩余未分割的文本
+    remaining_text = "".join(response_message)[processed_chars:]
+    if remaining_text:
+        segment_text = get_string_no_punctuation_or_emoji(remaining_text)
+        if segment_text:
+            text_index += 1
+            yield segment_text, text_index
+
+    yield response_message, -1  # finish_task
+
+
+async def start_llm_stream(new_llm_stream):
+    """复位终止信号，并重新启动大模型流"""
+    LLM_Abort_Event.clear()  # 重新启动前复位
+    async for text, idx in process_llm_stream(new_llm_stream):
+        if idx > 0:
+            print(f"🔊 朗读: {text}")
 
 
 def split_sentences(text,
-                    pattern=r'(?=[。！？])|(?=\b[一二三四五六七八九十]+\、)|(?=\b[（(][一二三四五六七八九十]+[）)])|(?=\b\d+\、)|(?=\r\n)'):
+                    pattern=(r'[^一二三四五六七八九十\d\r\n]*\b[一二三四五六七八九十]+\、'  # 中文序号 "一、二、"
+                             r'|[^（(）)]*\b[（(][一二三四五六七八九十]+[）)]'  # 括号内的中文序号 "(一)(二)"
+                             r'|[^\d\r\n]*\b\d+\、'  # 数字序号 "1、2、"
+                             r'|[^。！？]*[。！？]'  # 句号、感叹号、问号
+                             r'|[^\r\n]*\r?\n'  # 换行符（支持 Windows 的 \r\n 和 Unix 的 \n）
+                             )
+                    ):
     """
-    分句函数，支持按标点符号和结构化序号进行分句。
+    分句函数，支持按标点符号和结构化序号进行分句，分隔符会保留在前一句结尾。
     :param text: 输入的文本
     :param pattern: 正则表达式匹配分隔符
     :return: 分割后的句子列表
     """
     if not pattern:
         pattern = r'(?=[。！？])'
-
-    # 基于句号、感叹号、问号进行初步分句
-    sentences = re.split(pattern, text)
-    return [s for s in sentences if s.strip()]
+    sentences = re.findall(pattern, text)
+    # re.findall re.split(pattern, text)
+    return [s.strip() for s in sentences if s.strip()]
 
 
 # 实现小到大分块逻辑
@@ -668,8 +1246,40 @@ def get_file_type_wx(object_name: str) -> str:
     return ""
 
 
+def parse_tool_text(text):
+    # 定义正则表达式模式来匹配 <tags>, <tool_call>, <content> 及其内容
+    tags_pattern = r'<tags>(.*?)</tags>'
+    tool_call_pattern = r'<tool_call>(.*?)</tool_call>'
+    content_pattern = r'<content>(.*?)</content>'
+    # 使用正则表达式查找匹配的内容
+    tags_match = re.search(tags_pattern, text, re.DOTALL)
+    tool_call_match = re.search(tool_call_pattern, text, re.DOTALL)
+    content_match = re.search(content_pattern, text, re.DOTALL)
+    # 提取匹配的内容，如果没有匹配到则返回空字符串
+    tags = tags_match.group(1).strip() if tags_match else ""
+    tool_call = tool_call_match.group(1).strip() if tool_call_match else ""
+    content = content_match.group(1).strip() if content_match else ""
+    # 将提取的内容存储在字典中
+    result = {
+        "tags": tags,
+        "tool_call": tool_call,
+        "content": content
+    }
+    return result
+
+
 def get_clock(t, speed=10):
     return "🕐🕑🕒🕓🕔🕕🕖🕗🕘🕙🕚🕛"[int(t * speed) % 12]
+
+
+def parse_time(val):
+    # 解析时间字符串，并转换为 datetime 对象。如果解析失败，返回一个默认值 datetime.min（0001-01-01 00:00:00）。
+    if isinstance(val, datetime):
+        return val
+    try:
+        return datetime.strptime(val, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime.min
 
 
 def format_date(date_str):
@@ -688,9 +1298,9 @@ def format_date_type(date=None):
             "%Y-%m-%d %H:%M:%S",
             "%Y/%m/%d %H:%M:%S",
         ]
-        for date_format in supported_formats:
+        for fmt in supported_formats:
             try:
-                date = datetime.strptime(date, date_format)
+                date = datetime.strptime(date, fmt)
                 break
             except ValueError:
                 continue
@@ -701,11 +1311,11 @@ def format_date_type(date=None):
 
 
 def get_times_shift(days_shift: int = 0, hours_shift: int = 0):
-    '''
+    """
     :param days_shift: 偏移的天数，>0 表示未来，<0 表示过去，0 表示当前日期。
     :param hours_shift: 偏移的小时数，>0 表示未来，<0 表示过去，0 表示当前时间。
     :return: 格式化后的时间，格式为 'YYYY-MM-DD HH:MM:SS'。
-    '''
+    """
     current_datetime = datetime.now()
     adjusted_time = current_datetime + timedelta(days=days_shift, hours=hours_shift)
     return adjusted_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -918,10 +1528,15 @@ def fast_dot_np(vecs1, vecs2):
     return np.einsum('ij,ij->i', vecs1, vecs2)  # np.sum(A * B, axis=1)
 
 
-def normalize_np(vecs):
+def normalize_np(vecs) -> list[float]:
     # 手动归一化
     # norms = np.sqrt(np.einsum('ij,ij->i', vecs, vecs)) #模长,L2 范数 ||ndarr1|| for each row
     return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
+
+def normalize_embeddings(vectors: list[list[float]], to_list=False):
+    normalized = [vec / np.linalg.norm(vec) if np.linalg.norm(vec) != 0 else vec for vec in np.array(vectors)]
+    return [vec.tolist() if isinstance(vec, np.ndarray) else vec for vec in normalized] if to_list else normalized
 
 
 def calc_diff(x, y):
@@ -937,6 +1552,81 @@ def cosine_similarity_np(ndarr1, ndarr2):
     with np.errstate(divide='ignore', invalid='ignore'):
         similarity = np.where(denominator != 0, dot_product / denominator, 0)
     return similarity
+
+
+def get_similar_nodes(embeddings, base_nodes, top_k=3):
+    """
+    计算 base_nodes（初步召回的记录）与所有记录之间的余弦相似度，找到最相似的 top_k 记录
+    :param embeddings: 所有节点的嵌入矩阵 (Tensor)
+    :param base_nodes: 需要查询相似记录的节点索引列表
+    :param top_k: 每个节点要找的相似记录数
+    :return: 召回的相似记录索引列表
+    """
+    # 提取 base_nodes 对应的向量
+    base_embeddings = embeddings[base_nodes]
+    # all_embeddings = embeddings.cpu().detach().numpy()
+
+    # 计算余弦相似度 (sklearn)
+    similarity_matrix = cosine_similarity_np(base_embeddings, embeddings)
+    # 对每个 base_node 取最相似的 top_k 记录（排除自身）
+    similar_nodes = set()
+    for i, node in enumerate(base_nodes):
+        sorted_indices = np.argsort(-similarity_matrix[i])  # 获取该记录的相似度排序,降序排序
+        for idx in sorted_indices:
+            if idx != node:  # 排除自身
+                similar_nodes.add(idx)
+            if len(similar_nodes) >= top_k:
+                break
+
+    return list(similar_nodes)
+
+
+def float16_to_bin(num):
+    # 将float16数打包为2字节16位，使用struct.pack 处理二进制数据的模块
+    packed_num = struct.pack('e', num)  # e 半精度浮点数（float16,16-bit) b'\x00<'
+    # 解包打包后的字节以获取整数表示
+    int_value = struct.unpack('H', packed_num)[0]
+    # 将整数表示转换为二进制
+    binary_representation = bin(int_value)[2:].zfill(16)
+    return binary_representation
+
+
+def functions_registry(functions_list: list, safe_path=True, module_name: str = None) -> dict:
+    """
+    根据函数名称列表,创建全局函数注册表,或者指定模块中动态加载
+    1. 从当前全局作用域查找函数名；
+    2. 指定 module_name，批量从该模块加载；
+    3. 使用 'module.path:func' 格式，单个动态加载。
+
+    :param functions_list: 需要注册的函数名列表
+    :param safe_path: 取消不检查是否可调用，适合从一个模块中加载多个函数。
+    :param module_name: 模块名称（字符串形式），适合从一个模块中加载多个函数。
+    :return: Dict[str, Callable[..., Any]]
+    """
+    module = importlib.import_module(module_name) if module_name else None
+    if not safe_path:
+        return {name: getattr(module, name) if module else globals().get(name) for name in functions_list}
+
+    registry = {}
+    for name in functions_list:
+        try:
+            if ":" in name:
+                module_path, func_name = name.rsplit(":", 1)
+                module = importlib.import_module(module_path)
+                func_obj = getattr(module, func_name, None)
+            else:
+                func_obj = globals().get(name)
+
+            if callable(func_obj):
+                registry[name] = func_obj
+            else:
+                raise ValueError(f"函数 {name} 不存在或不是可调用对象,未在当前作用域中找到,可能未导入或模块未指定。")
+        except Exception as e:
+            registry[name] = None
+            print(f"[⚠️] 加载函数失败: {name} → {e}")
+
+    return registry
+    # get_function_parameters
 
 
 def function_registry_dynamic(functions_list: list, module_names: list):
@@ -990,7 +1680,7 @@ class BM25:
     def __init__(self, corpus, k1=1.5, b=0.75):
         self.k1 = k1
         self.b = b
-        self.corpus = [jieba.lcut(doc) for doc in corpus]  # 使用 jieba 对文档进行分词
+        self.corpus = [jieba.lcut(doc) for doc in corpus]  # 使用 jieba 对文档进行分词, cut_all=False
         self.doc_lengths = [len(doc) for doc in self.corpus]
         self.avg_doc_length = sum(self.doc_lengths) / len(self.doc_lengths)
         self.doc_count = len(self.corpus)

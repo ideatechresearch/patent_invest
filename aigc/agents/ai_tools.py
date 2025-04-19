@@ -3,7 +3,7 @@ AI_Tools = [
         "type": "function",
         "function": {
             "name": "get_times_shift",
-            "description": "获取当前时间，并根据偏移的天数和小时数调整时间。",
+            "description": "当你想知道时间时非常有用。获取当前时间，并根据偏移的天数和小时数调整时间。",
             "parameters": {
                 "type": "object",
                 "properties": {

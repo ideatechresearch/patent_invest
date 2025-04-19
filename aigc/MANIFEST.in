@@ -4,6 +4,7 @@ include deoloy.bat
 include requirements.txt
 include CI
 recursive-include agents *
+recursive-include rime *
 recursive-include docker *
 # 排除不需要的文件夹和文件
 exclude .venv/*

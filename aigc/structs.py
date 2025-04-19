@@ -1,9 +1,10 @@
 from pydantic import BaseModel, Field, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
+from abc import ABC, abstractmethod
 from enum import Enum as PyEnum
 from enum import IntEnum
 from dataclasses import asdict, dataclass, is_dataclass
-import random
+import random, time
 
 KB = 1 << 10
 MB = 1 << 20
@@ -12,10 +13,32 @@ T = 1e12
 SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
 
 
-@dataclass
-class FunctionCall:
+class BaseTool(ABC, BaseModel):
     name: str
-    parameters: Union[Dict, str]
+    description: str
+    parameters: Optional[Union[Dict, str]] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    async def __call__(self, **kwargs) -> Any:
+        """Execute the tool with given parameters."""
+        return await self.execute(**kwargs)
+
+    @abstractmethod
+    async def execute(self, **kwargs) -> Any:
+        """Execute the tool with given parameters."""
+
+    def to_param(self) -> Dict:
+        """Convert tool to function call format."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
 
 
 def dataclass2dict(data):
@@ -72,7 +95,7 @@ class GenerationParams(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "developer"]
+    role: Literal["system", "user", "assistant", "developer", "tool"]
     content: Union[str, List[dict]]  # str
     name: Optional[str] = None  # 可以包含 a-z、A-Z、0-9 和下划线，最大长度为 64 个字符
 
@@ -85,6 +108,67 @@ class ChatMessage(BaseModel):
     # def validate_name(cls, value):
     #     re.fullmatch(r"^\w{1,64}$", value)
     #     return value or ''
+
+
+class IMessage(ChatMessage):
+    """Represents a chat message in the conversation"""
+    tool_calls: Optional[List] = Field(default=None)
+    tool_call_id: Optional[str] = Field(default=None)
+
+    def __add__(self, other) -> List["IMessage"]:
+        """支持 Message + list 或 Message + Message 的操作"""
+        if isinstance(other, list):
+            return [self] + other
+        elif isinstance(other, IMessage):
+            return [self, other]
+        else:
+            raise TypeError(
+                f"unsupported operand type(s) for +: '{type(self).__name__}' and '{type(other).__name__}'"
+            )
+
+    def __radd__(self, other) -> List["IMessage"]:
+        """支持 list + Message 的操作"""
+        if isinstance(other, list):
+            return other + [self]
+        raise TypeError(
+            f"unsupported operand type(s) for +: '{type(other).__name__}' and '{type(self).__name__}'")
+
+    def to_dict(self) -> dict:
+        """Convert message to dictionary format"""
+        message = {"role": self.role}
+        if self.content is not None:
+            message["content"] = self.content
+        if self.tool_calls is not None:
+            message["tool_calls"] = [tool_call.dict() for tool_call in self.tool_calls]
+        if self.name is not None:
+            message["name"] = self.name
+        if self.tool_call_id is not None:
+            message["tool_call_id"] = self.tool_call_id
+        return message
+
+    @classmethod
+    def create_message(cls, role: Literal["system", "user", "assistant", "developer", "tool"] = "user",
+                       content: Optional[Union[str, List[dict]]] = None, **kwargs) -> "IMessage":
+        return cls(role=role, content=content, **kwargs)
+
+    @classmethod
+    def tool_message(cls, content: str, name: str, tool_call_id: str) -> "IMessage":
+        """Create a tool message"""
+        return cls(role="tool", content=content, name=name, tool_call_id=tool_call_id)
+
+    @classmethod
+    def from_tool_calls(cls, tool_calls: List[Any], content: Optional[Union[str, List[str]]] = "", **kwargs):
+        """Create ToolCallsMessage from raw tool calls.
+
+        Args:
+            tool_calls: Raw tool calls from LLM
+            content: Optional message content
+        """
+        formatted_calls = [
+            {"id": call.id, "function": call.function.model_dump(), "type": "function"}
+            for call in tool_calls
+        ]
+        return cls(role="assistant", content=content, tool_calls=formatted_calls, **kwargs)
 
 
 from config import ModelListExtract
@@ -265,6 +349,12 @@ class IError(Exception):
         super().__init__(self.message)
 
 
+class PromptRequest(BaseModel):
+    query: Optional[str] = None
+    model: Optional[str] = "deepseek:deepseek-reasoner"
+    depth: List[str] = Field(default_factory=lambda: ["73", "71", "72", "74"])
+
+
 class TranslateRequest(BaseModel):
     text: str = "你好我的朋友。"
     source: str = "auto"
@@ -274,11 +364,22 @@ class TranslateRequest(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     texts: List[str]
-    model_name: str = 'qwen'
+    model_name: str = 'qwen:text-embedding-v2'
     model_id: int = 0
+    normalize: bool = False
 
     class Config:
         protected_namespaces = ()
+        json_schema_extra = {
+            "example": {
+                "model_name": "qwen:text-embedding-v2",
+                "texts": [
+                    "role", "user",
+                    "content", "你好,有问题要问你"
+                ],
+                "normalize": False
+            }
+        }
 
 
 class FuzzyMatchRequest(BaseModel):
@@ -345,6 +446,69 @@ class AssistantRequest(BaseModel):
         protected_namespaces = ()
 
 
+class TaskStatus(PyEnum):
+    PENDING = "pending"  # 等待条件满足
+    READY = "ready"  # 条件满足，可以执行
+    IN_PROGRESS = "running"  # processing
+
+    COMPLETED = "done"
+    FAILED = "failed"
+    RECEIVED = "received"
+
+
+class TaskNode:
+    def __init__(self, name, description, action: str = None, event=None, data=None, messages=None, params=None,
+                 status=TaskStatus.PENDING, start_time=0, priority=10):
+        self.name = name  # task_id
+        self.description = description
+        self.action = action  # 任务的执行逻辑（可调用对象函数、脚本或引用的操作类型)
+        self.event = event  # 事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据
+        self.priority: int = priority
+        self.status: TaskStatus = status  # 默认状态
+
+        self.data = data
+        self.messages: list = messages
+        self.params = params
+        self.start_time: float = start_time if start_time else time.time()
+        self.end_time: float = 0
+        self.result = None
+
+
+# class TaskManager:
+#     Task_queue: dict[str, TaskNode] = {}
+#     Task_lock = asyncio.Lock()
+#
+#     @classmethod
+#     async def get_task(cls, task_id: str):
+#         async with cls.Task_lock:
+#             task = cls.Task_queue.get(task_id)
+#             if task:
+#                 task.status = TaskStatus.IN_PROGRESS
+#             else:
+#                 print(f"[start_task] Task {task_id} not found.")
+#                 return  None
+#         return task
+#
+#     @classmethod
+#     async def set_task_status(cls, task_id: str, status: TaskStatus):
+#         async with cls.Task_lock:
+#             task = cls.Task_queue.get(task_id)
+#             if task:
+#                 task.status = status
+#             else:
+#                 print(f"[TaskManager.set_task_status] Task {task_id} not found.")
+#
+#     @classmethod
+#     async def add_task(cls, task_id: str, task: TaskNode):
+#         async with cls.Task_lock:
+#             cls.Task_queue[task_id] = task
+
+class KeywordItem(BaseModel):
+    function: str
+    args: Optional[List[Any]] = None
+    kwargs: Optional[Dict[str, Any]] = None
+
+
 class CompletionParams(BaseModel):
     stream: bool = Field(False, description="Whether to stream the response")
     temperature: float = Field(0.8, description="Temperature for response generation")
@@ -373,11 +537,12 @@ class CompletionParams(BaseModel):
     ]]] = Field(
         None, description=(
             "A list of keywords or tuples of (keyword, function, *args,*kwargs) used to search for relevant information across various sources, "
+            "A list of tools represented as tuples, where each tuple consists of a callable and its corresponding arguments. "
             "such as online searches, database queries, or vector-based search systems. "
             "These keywords help guide the retrieval of data based on the specific terms provided."))
-    tools: Optional[List[Tuple[str, Any]]] = Field(
+    # keywords: Optional[List[KeywordItem]] = None
+    tools: Optional[List[Dict]] = Field(
         None, description=(
-            "A list of tools represented as tuples, where each tuple consists of a callable and its corresponding arguments. "
             "This allows the AI to call specific functions with the provided arguments to perform tasks such as data processing, "
             "API calls, or other utility operations. Each tool can be invoked to enhance the AI's capabilities and provide more "
             "dynamic responses based on the context."
@@ -386,12 +551,12 @@ class CompletionParams(BaseModel):
     # score_threshold: float = Field(default=0, ge=-1, le=1, description="The score threshold setting for the model.")
     # top_n: int = Field(10,description="The number of top results to retrieve during vector search. This determines how many of the highest-scoring items will be returned.")
     # keywords = [
-    #     "simple_keyword",  # ✅ 纯字符串（符合 `str`）
-    #     ("func_name", "arg1"),  # ✅ (函数名, 单个参数)
-    #     ("func_name", [[1, 2, 3]]),  # ✅ (函数名, 单个参数,列表)
-    #     ("another_func", [1, 2, 3]),  # ✅ (函数名, 多个参数列表)
-    #     ("some_tool", {"key": "value"}),  # ✅ (函数名, 关键字参数字典)
-    #     ("complex_tool", [1, 2], {"key": "v"})  # ✅ (函数名, 位置参数列表, 关键字参数)
+    #     "simple_keyword",  #  纯字符串（符合 `str`）
+    #     ("func_name", "arg1"),  #  (函数名, 单个参数)
+    #     ("func_name", [[1, 2, 3]]),  #  (函数名, 单个参数,列表)
+    #     ("another_func", [1, 2, 3]),  # (函数名, 多个参数列表)
+    #     ("some_tool", {"key": "value"}),  #  (函数名, 关键字参数字典)
+    #     ("complex_tool", [1, 2], {"key": "v"})  #  (函数名, 位置参数列表, 关键字参数)
     # ]
 
     class Config:
@@ -448,9 +613,9 @@ class CompletionParams(BaseModel):
 
 class SubmitMessagesRequest(BaseModel):
     uuid: Optional[str] = None
-    username: Optional[str] = None
-    robot_id: Optional[str] = None
+    name: Optional[str] = None
     user_id: Optional[str] = None
+    robot_id: Optional[str] = None
     use_hist: bool = Field(default=False, description="Use historical messages.")
     filter_limit: Optional[int] = Field(-500,
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
@@ -469,19 +634,21 @@ class SubmitMessagesRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "uuid": None,
-                "username": "test",
+                "name": None,
                 "robot_id": None,
-                "user_id": None,
+                "user_id": "test",
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
                 "messages": [
                     {
                         "role": "user",
-                        "content": "你好，我的朋友"
+                        "content": "你好，我的朋友",
+                        "name": '',
                     }
                 ],
                 "params": [{
+                    "name": None,
                     "stream": False,
                     "temperature": 0.8,
                     "top_p": 0.8,
@@ -503,9 +670,9 @@ class SubmitMessagesRequest(BaseModel):
 
 class ChatCompletionRequest(CompletionParams):
     uuid: Optional[str] = None
-    username: Optional[str] = None
-    robot_id: Optional[str] = None
+    name: Optional[str] = None
     user_id: Optional[str] = None
+    robot_id: Optional[str] = None
     use_hist: bool = Field(default=False, description="use historical messages.")
     filter_limit: Optional[int] = Field(-500,
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
@@ -527,9 +694,9 @@ class ChatCompletionRequest(CompletionParams):
         json_schema_extra = {
             "example": {
                 "uuid": None,
-                "username": "test",
+                "name": None,
+                "user_id": "test",
                 "robot_id": None,
-                "user_id": None,
 
                 "use_hist": False,
                 "filter_limit": -500,
@@ -562,8 +729,7 @@ class ClassifyRequest(BaseModel):
     # user_id: str = None
     emb_model: Optional[str] = "text-embedding-v2"
     rerank_model: Optional[str] = "BAAI/bge-reranker-v2-m3"
-    llm_model: Optional[str] = 'moonshot'
-    prompt: Optional[str] = None
+    cutoff: float = 0.85
 
     class Config:
         json_schema_extra = {
@@ -591,9 +757,6 @@ class ClassifyRequest(BaseModel):
                 "class_default": '聊天',
                 'emb_model': 'text-embedding-v2',
                 "rerank_model": "BAAI/bge-reranker-v2-m3",
-                "llm_model": 'moonshot',
-                'prompt': ('你是群聊中的智能助手。任务是根据给定内容，识别并分类用户的意图，并返回相应的 JSON 格式，例如：{"intent":"xx"}'
-                           '对于意图分类之外的任何内容，请归类为 "聊天",如果用户输入的内容不属于意图类别，直接返回 `{"intent": "聊天"}`，即表示这条内容不涉及明确的工作任务或查询。'
-                           '以下是常见的意图类别与对应可能的关键词或者类似的意思，请帮我判断用户意图:')
+                "cutoff": 0.85
             }
         }

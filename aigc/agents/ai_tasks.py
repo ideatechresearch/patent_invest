@@ -4,58 +4,31 @@ from enum import Enum as PyEnum
 from collections import defaultdict
 import asyncio
 import queue
-from redis.asyncio import Redis,StrictRedis
-# import redis.asyncio as redis
+from redis.asyncio import Redis, StrictRedis
 from typing import Dict, List, Tuple, Union, Iterable
 from threading import Thread
 import uuid
 import zmq, zmq.asyncio
+from config import Config
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
 QUEUE_NAME: str = "message_queue"
 
-Task_queue = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
+redis_client: Redis = None  # StrictRedis(host='localhost', port=6379, db=0)
 Task_graph = ig.Graph(directed=True)  # 创建有向图
 
 
-# import aioredis
-# 创建 Redis 连接池
-# async def get_redis():
-#     redis = await aioredis.create_redis_pool(('localhost', 6379),
-#         encoding='utf-8')
-#     return redis
-
-# await redis.set
-# await redis.get
-
-class TaskStatus(PyEnum):
-    PENDING = "pending"  # 等待条件满足
-    READY = "ready"  # 条件满足，可以执行
-    IN_PROGRESS = "running"  # processing
-
-    COMPLETED = "done"
-    FAILED = "failed"
-    RECEIVED = "received"
+def get_redis() -> Redis:
+    global redis_client
+    if redis_client is None:
+        redis_client = Redis(host=Config.REDIS_HOST, port=Config.REDIS_PORT, db=0,
+                             decode_responses=True  # 自动解码为字符串
+                             )
+    return redis_client
 
 
-class TaskNode:
-    name: str  # task_id
-    description: str
-    status: str = TaskStatus.PENDING  # 默认状态
-    action = None  # 任务的执行逻辑（可调用对象函数、脚本或引用的操作类型)
-    event = None  # 事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据
-    priority: int = 10
-    start_time: float = 0
-
-    def __init__(self, name, description, action=None, event=None, status="PENDING", start_time=0, priority=10):
-        self.name = name
-        self.description = description
-        self.action = action
-        self.event = event
-        self.priority = priority
-        self.status = status
-        self.start_time = start_time
+async def shutdown_redis():
+    if redis_client:
+        await redis_client.close()
 
 
 class TaskEdge:
@@ -82,9 +55,10 @@ def set_task_node(task_id, attributes):
     nodes = Task_graph.vs["name"] if "name" in Task_graph.vs.attributes() else []
     if task_id in nodes:  # Task_graph
         # 更新已有节点属性
-        # attributes= {**Task_graph.nodes[task_id], **Task_queue[task_id]}
         node_idx = Task_graph.vs.find(name=task_id).index
         Task_graph.vs[node_idx].update_attributes(attributes)
+
+        # attributes= {**Task_graph.nodes[task_id], **Task_queue[task_id]}
         # Task_graph.nodes[task_id].update(attributes)
     else:
         Task_graph.add_vertex(name=task_id, **attributes)
@@ -155,21 +129,15 @@ def task_execution_loop(graph):
         time.sleep(1)
 
 
-def cleanup_tasks(timeout_received=600, timeout=86400):
-    current_time = time.time()
-    task_ids_to_delete = []
-    for task_id, task in Task_queue.items():
-        t_sec = current_time - task['timestamp']
-        if t_sec > timeout_received:
-            if task['status'] == TaskStatus.RECEIVED:
-                task_ids_to_delete.append(task_id)
-                print(f"Task {task_id} has been marked for cleanup. Status: RECEIVED")
-        elif t_sec > timeout:
-            task_ids_to_delete.append(task_id)
-            print(f"Task {task_id} has been marked for cleanup. Timeout exceeded")
+def get_children(g, node):
+    # g.successors(node.index)
+    return [g.vs[neighbor]["name"] for neighbor in g.neighbors(node, mode="OUT")]
 
-    for task_id in task_ids_to_delete:
-        del Task_queue[task_id]
+
+def get_parent(g, node):
+    # g.predecessors(node.index)
+    neighbors = g.neighbors(node, mode="IN")
+    return g.vs[neighbors[0]]["name"] if neighbors else None
 
 
 def export_to_json_from_graph(graph, filename):
@@ -339,33 +307,39 @@ def list_or_args_keys(keys: Union[_StringLikeT, Iterable[_StringLikeT]],
     return keys
 
 
+# async def setr(key, value, ex=None):
+#     redis = get_redis()
+#     await redis.set(name=key, value=value, ex=ex)
+#     # await redis.delete(key) redis.get(key, encoding='utf-8')
+
 # pip install celery[redis]
 # celery = Celery('tasks', broker='redis://localhost:6379/0') #Celery 任务
 # message_queue = asyncio.Queue()
-# 异步生产者 await redis.set('my_key', 'value')
+# 异步生产者
 async def producer(messages):
-    redis = Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
-    # r=StrictRedis(host='localhost', port=6379, db=0)
-    try:
-        await redis.rpush(QUEUE_NAME, *messages)  # 异步放入队列
-        # for message in messages:
-        #     await redis.hset("task_status", message, "pending")
-        #     # await message_queue.put(message)
-        #     print(f"Produced: {message}")
-        #     await asyncio.sleep(1)
-    finally:
-        await redis.close()
+    # rpush, hset, 等写操作
+    redis = get_redis()
+    await redis.rpush(QUEUE_NAME, *messages)  # 异步放入队列
+    # for message in messages:
+    #     await redis.hset("task_status", message, "pending")
+    #     # await message_queue.put(message)
+    #     print(f"Produced: {message}")
+    #     await asyncio.sleep(1)
+    # finally:
+    #     await redis.close()
 
 
-# 异步消费者  await redis.get('my_key', encoding='utf-8')
+# 异步消费者
 async def consumer():
-    redis = Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+    # blpop, get, 等读操作
+    redis = get_redis()
     while True:
         message = await redis.blpop(QUEUE_NAME, timeout=10)  # 异步阻塞消费 Left Pop
         if message:
             q, item = message
             task = item.decode('utf-8')
             print(f"Consumed: {task}")  # message[1].decode()
+            # data = json.loads(task)
             # message = await message_queue.get()
             # print(f"Consumed: {message}")
             # message_queue.task_done()  # 标记任务完成
@@ -374,12 +348,12 @@ async def consumer():
             await redis.hset("task_status", task, "completed")
         else:
             break
-    await redis.close()
+    # await redis.close()
 
 
 # async for task in consumer():
 #     await asyncio.sleep(1)
-
+# asyncio.create_task(
 
 class MessageZeroMQ:
 
@@ -497,74 +471,14 @@ class MessageZeroMQ:
 #     channel.start_consuming()
 
 
-import numpy as np
-
-
-class ABO:
-    def __init__(self):
-        self._A = None
-        self._B = None
-        self._O = None
-
-    def AO(self):
-        pass
-
-    def BO(self):
-        pass
-
-    def _AB(self):
-        return self._A + self._B
-
-
-class ABONode(ABO):
-
-    def __init__(self, node_id: str, neighbors={}, d_v: int = 1024):
-        super().__init__()
-        """
-        初始化节点对象
-        :param node_id: 节点唯一标识
-        :param d_v: 观点向量维度
-        """
-        self.node_id = node_id
-        self._A = {}  # fact_history{timestamp: fact_vector}
-        self._O = None
-        self.neighbors = neighbors  # 记录与其他节点的关系
-        self._B = np.zeros((len(neighbors), d_v))  # 节点对全局的观点矩阵,view_matrix
-
-    def update_fact(self, timestamp: int, fact_vector: np.ndarray):
-        """
-        更新节点的事实向量
-        :param timestamp: 时间戳
-        :param fact_vector: 新的事实向量
-        """
-        self._A[timestamp] = fact_vector
-
-    def update_neighbors(self, node_id: str, relation_data: np.ndarray):
-        """
-        更新节点与其他节点的关系数据
-        :param node_id: 关系节点的 ID
-        :param relation_data: 节点之间的关系数据（例如：观点向量、影响力等）
-        """
-        self.neighbors[node_id] = relation_data
-
-    def update_view_matrix(self, alpha: float = 0.7):
-        """
-        根据邻居关系和节点的事实数据生成观点矩阵
-        :param alpha: 权重因子，用于控制事实和关系的影响
-        """
-        for i, (neighbor_id, relation_data) in enumerate(self.neighbors.items()):
-            fact_vector = self._A.get(1, None)  # 使用某个时间戳的事实向量
-            self._B[i] = alpha * fact_vector + (1 - alpha) * relation_data
-
-
 if __name__ == "__main__":
     import sys
 
-    if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    message_zero_mq = MessageZeroMQ()  # 创建消息处理器实例
-    asyncio.run(message_zero_mq.stream_start())
+    # if sys.platform.startswith('win'):
+    #     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    #
+    # message_zero_mq = MessageZeroMQ()  # 创建消息处理器实例
+    # asyncio.run(message_zero_mq.stream_start())
     # asyncio.run(message_zero_mq.start())
 
     # 运行异步任务
