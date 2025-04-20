@@ -330,13 +330,13 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
             "get_times_shift", "date_range_calculator",
             "get_day_range", "get_week_range", "get_month_range",
             "get_quarter_range", "get_year_range", "get_half_year_range",
-            "generates:get_weather",
-            "generates:duckduckgo_search", "generates:web_search_tavily",
-            "generates:web_search_async", "generates:search_by_api",
-            "generates:search_bmap_location", "generates:auto_translate",
-            'generates:ideatech_visitor_records', 'knowledge:ideatech_knowledge'
+            'knowledge:ideatech_knowledge'
             # 添加更多可调用函数
         ])
+        Function_Registry_Global.update(functions_registry(
+            functions_list=["get_weather", "duckduckgo_search", "web_search_tavily", "web_search_async",
+                            "search_by_api", "search_bmap_location", "auto_translate", 'ideatech_visitor_records', ],
+            module_name='generates'))
         Function_Registry_Global.update(keywords_registry)  # 合并 keywords 映射
         print(Function_Registry_Global)
 
@@ -346,16 +346,19 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
     return Function_Registry_Global.get(func_name, None) if func_name else Function_Registry_Global  # 从注册表中获取函数
 
 
-def agent_func_calls(agent: str) -> Callable[..., Any]:
+def agent_func_calls(agent: str) -> List[Callable[..., Any]]:  #
     from knowledge import ideatech_knowledge
     callable_map_agent = {
-        'default': lambda *args, **kwargs: [],
-        '2': lambda x: search_by_api(x, engine='baidu'),
-        '29': ideatech_knowledge,
-        '31': ai_auto_calls,
-        '32': ai_auto_calls
+        'default': [lambda *args, **kwargs: [], ],  # 默认返回一个空函数列表
+        '2': [named_partial('search_by_baidu', search_by_api, engine='baidu'), web_search_async],
+        '9': [named_partial('auto_translate_baidu', auto_translate, model_name='baidu')],
+        '29': [ideatech_knowledge],
+        '31': [ai_auto_calls],
+        '32': [ai_auto_calls],
+        '37': [web_search_async]
+        # 扩展更多的 agent 类型，映射到多个函数
     }
-    return callable_map_agent.get(agent, lambda *args, **kwargs: [])
+    return callable_map_agent.get(agent, callable_map_agent['default'])
 
 
 async def ideatech_visitor_records(prompt: str, customer_name: str | list | tuple, **kwargs):
@@ -895,7 +898,7 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
     if not keywords:
         items_to_process = [user_request]  # ','.join(keywords)
     else:
-        if all(not (callable(_func) and _func.__name__ == '<lambda>' and _func()) for _func in tool_calls):
+        if all(not is_empty_lambda(_func) for _func in tool_calls):  # and _func()
             tool_calls.append(web_search_async)  # append auto func to run. ai_auto_calls
         # 多个keywords,用在registry list 的 user_calls,自定义func参数
         for item in keywords:
@@ -959,14 +962,19 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
 
     refer = await asyncio.gather(*tasks, return_exceptions=True)  # gather 收集所有异步调用的结果
 
+    err_count = 0
     for t, r in zip(tasks, refer):
         if isinstance(r, Exception):
             print(f"Task {t.__name__} failed with error: {r}")
+            err_count += 1
         elif not r:
             print(f"Task returned empty result: {t}")
 
+    if err_count:
+        print(callables, refer)
+    # 展平嵌套结果,(result.items() if isinstance(result, dict) else result)
     return [item for result in refer if not isinstance(result, Exception)
-            for item in (result.items() if isinstance(result, dict) else result)]  # 展平嵌套结果
+            for item in (result if isinstance(result, list) else [result])]
 
 
 # Callable[[参数类型], 返回类型]
@@ -1018,7 +1026,7 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
             messages = [{"role": "system", "content": system}]
         messages.append({'role': 'user', 'content': user_request})
 
-    tool_callable: List[Callable[[...], Any]] = [agent_func_calls(agent)]
+    tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent)  # .extend
 
     refer = await retrieved_reference(user_request, keywords, tool_callable, **kwargs)
     if refer:
@@ -2117,8 +2125,8 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
         "sign": sign
     }
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.get(url, params=params)
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.get(url, params=params)
 
     data = response.json()
     if "trans_result" in data:
@@ -2136,8 +2144,8 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
         "from": from_lang,
         "to": to_lang
     })
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        response = await cx.post(url, headers=headers, json=payload)
 
     data = response.json()
     if "trans_result" in data:
@@ -2294,9 +2302,9 @@ async def auto_translate(text: str, model_name='baidu', source: str = 'auto', ta
 
     system_prompt = System_content.get('9').format(source_language=source, target_language=target)
 
-    model_map = {"baidu": 'ernie', "tencent": "hunyuan", "xunfei": 'spark'}
-    if model_name in model_map.keys():
-        model_name = model_map[model_name]
+    # model_map = {"baidu": 'ernie', "tencent": "hunyuan", "xunfei": 'spark'}
+    # if model_name in model_map.keys():
+    #     model_name = model_map[model_name]
     if not model_name:
         model_name = 'qwen'
 

@@ -1591,6 +1591,21 @@ def float16_to_bin(num):
     return binary_representation
 
 
+def named_partial(name, func, *args, **kwargs):
+    p = partial(func, *args, **kwargs)
+    p.__name__ = name
+    return p
+
+
+def is_empty_lambda(func):
+    try:
+        if callable(func) and func.__name__ == '<lambda>' and len(inspect.signature(func).parameters) == 0:
+            return func() == []
+    except:
+        return False
+    return False
+
+
 def functions_registry(functions_list: list, safe_path=True, module_name: str = None) -> dict:
     """
     根据函数名称列表,创建全局函数注册表,或者指定模块中动态加载
@@ -1599,7 +1614,7 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
     3. 使用 'module.path:func' 格式，单个动态加载。
 
     :param functions_list: 需要注册的函数名列表
-    :param safe_path: 取消不检查是否可调用，适合从一个模块中加载多个函数。
+    :param safe_path: 取消不检查是否可调用。
     :param module_name: 模块名称（字符串形式），适合从一个模块中加载多个函数。
     :return: Dict[str, Callable[..., Any]]
     """
@@ -1612,18 +1627,18 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
         try:
             if ":" in name:
                 module_path, func_name = name.rsplit(":", 1)
-                module = importlib.import_module(module_path)
-                func_obj = getattr(module, func_name, None)
+                _module = importlib.import_module(module_path)
+                func_obj = getattr(_module, func_name, None)
             else:
-                func_obj = globals().get(name)
+                func_obj = getattr(module, name) if module else globals().get(name)
 
-            if callable(func_obj):
-                registry[name] = func_obj
-            else:
+            if not callable(func_obj):
                 raise ValueError(f"函数 {name} 不存在或不是可调用对象,未在当前作用域中找到,可能未导入或模块未指定。")
+
+            registry[name] = func_obj
         except Exception as e:
             registry[name] = None
-            print(f"[⚠️] 加载函数失败: {name} → {e}")
+            print(f"[⚠️] 加载函数失败: {name} → {type(e).__name__}: {e}")
 
     return registry
     # get_function_parameters
