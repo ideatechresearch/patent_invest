@@ -1,5 +1,6 @@
 import re, json, io, os, sys, threading, time, pickle, struct
 import httpx, aiohttp, aiofiles, asyncio, joblib
+from urllib.parse import urlencode
 import inspect, importlib, ast, requests
 from itertools import groupby
 import yaml
@@ -12,6 +13,7 @@ from collections import OrderedDict, Counter, deque
 import numpy as np
 from enum import Enum
 import math
+import base64
 from pypinyin import lazy_pinyin
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
@@ -71,19 +73,7 @@ def serialize(obj):
         return obj  # asdict
 
 
-def extract_json_from_string(input_str):
-    # 从一个普通字符串中提取 JSON 结构，但可能不处理嵌套的 JSON
-    match = re.search(r'\{.*}', input_str, re.DOTALL)
-    if match:
-        json_str = match.group(0)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            print(f"Error decoding JSON: {e}")
-    return None
-
-
-def parse_json(inputs) -> dict:
+def parse_json(inputs: dict | str) -> dict:
     # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
     if not isinstance(inputs, dict):
         try:
@@ -95,6 +85,26 @@ def parse_json(inputs) -> dict:
             raise Exception(f'invalid json format: {inputs}') from exc
 
     return inputs
+
+
+def extract_json_str(json_code: str):
+    """
+    模型返回的内容，其中 JSON 数据通常被包裹在 Markdown 的代码块标记中（即以 json 开始，以 结束）
+    如果未找到起始或结束标记，尝试直接解析整个字符串为 JSON
+    :param json_code:
+    :return:
+    """
+    start = json_code.find("```json")
+    # 从start开始找到下一个```结束
+    end = json_code.find("```", start + 1)
+    if start == -1 or end == -1:
+        try:
+            json.loads(json_code)
+            return json_code
+        except Exception as e:
+            print("Error:", e)
+        return ""
+    return json_code[start + 7:end]
 
 
 def extract_method_calls(text):
@@ -294,23 +304,13 @@ def load_models(model_names: list, model_dir='data/models/'):
     return models
 
 
-async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
-    async with httpx.AsyncClient() as cx:
-        try:
-            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(e)
-            return None
-
-
-async def post_http_json(url, js=None, headers: dict = None, time_out=100, **kwargs):
-    connector = aiohttp.TCPConnector(limit=100, limit_per_host=50)
-    timeout = aiohttp.ClientTimeout(total=time_out, sock_read=60.0, sock_connect=5.0)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers or {}) as session:
-        async with session.post(url, json=js, **kwargs) as resp:
-            return await resp.json()  # await resp.text()
+def load_datasets(path):
+    samples = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            data = json.loads(line.strip())
+            samples.append(data)
+    return samples
 
 
 # @asynccontextmanager
@@ -321,6 +321,127 @@ async def get_httpx_client(time_out=100.0):
         yield cx
 
 
+async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
+    async with httpx.AsyncClient() as cx:
+        try:
+            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except json.JSONDecodeError as e:
+            return {'text': response.text}
+        except Exception as e:
+            print(e)
+            return None
+
+
+async def follow_http_html(url, time_out=100.0, **kwargs):
+    async with httpx.AsyncClient(timeout=time_out, follow_redirects=True) as cx:
+        try:
+            response = await cx.get(url, **kwargs)
+            response.raise_for_status()
+            return response.text
+        except httpx.HTTPError as e:
+            print(f"[HTTP error] {e}")
+            return None
+        except Exception as e:
+            print(e)
+            return None
+
+
+async def post_http_json(url, json=None, headers: dict = None, time_out=30, **kwargs):
+    connector = aiohttp.TCPConnector(limit=100, limit_per_host=50)
+    timeout = aiohttp.ClientTimeout(total=time_out, sock_read=60.0, sock_connect=5.0)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers or {}) as session:
+        try:
+            async with session.post(url, json=json, **kwargs) as resp:
+                resp.raise_for_status()  # 抛出 4xx/5xx 错误
+                try:
+                    return await resp.json()
+                except aiohttp.ContentTypeError:
+                    return {"status": resp.status, "error": "Non-JSON response", "body": await resp.text()}
+        except aiohttp.ClientResponseError as e:
+            print(f"[HTTP Error] Status: {e.status}, URL: {url}, Message: {e.message},body:{json}")
+            return {"status": e.status, "error": e.message, "url": url}
+        except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            print(f"[Connection Error] URL: {url}, Message: {e}")
+            return {"status": 503, "error": f"Connection failed: {str(e)}", "url": url}
+        except Exception as e:
+            print(f"[Unknown Error] URL: {url}, Exception: {e}")
+            return {"status": 500, "error": str(e), "url": url}
+
+
+async def post_http_form(url, data, headers=None, time_out=30, **kwargs):
+    headers = headers or {}
+    headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, data=data, headers=headers, timeout=time_out, **kwargs) as resp:
+                try:
+                    resp.raise_for_status()
+                    return await resp.json()
+                except aiohttp.ContentTypeError:
+                    return {"status": resp.status, "error": "Non-JSON response", "body": await resp.text()}
+
+        except Exception as e:
+            print(f"[Form POST Error] URL: {url}, Exception: {e}, Data: {data}")
+            return {"status": 500, "error": str(e), "url": url}
+
+
+async def get_http_query(url, params, headers=None, time_out=30, **kwargs):
+    query_string = urlencode(params)
+    url_with_params = f"{url}?{query_string}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url_with_params, headers=headers or {}, timeout=time_out, **kwargs) as resp:
+                try:
+                    resp.raise_for_status()
+                    return await resp.json()
+                except aiohttp.ContentTypeError:
+                    return {"status": resp.status, "error": "Non-JSON response", "body": await resp.text()}
+        except Exception as e:
+            print(f"[GET Query Error] URL: {url_with_params}, Exception: {e}")
+            return {"status": 500, "error": str(e), "url": url_with_params}
+
+
+async def embed_images_as_base64(md_content, image_dir):
+    """异步将Markdown中的图片转换为Base64并嵌入到Markdown中"""
+    lines = md_content.split('\n')
+    new_lines = []
+
+    for line in lines:
+        if line.startswith("![") and "](" in line and ")" in line:
+            start_idx = line.index("](") + 2
+            end_idx = line.index(")", start_idx)
+            img_rel_path = line[start_idx:end_idx]
+
+            img_name = os.path.basename(img_rel_path)
+            img_path = os.path.join(image_dir, img_name)
+
+            if os.path.exists(img_path):
+                # 异步读取并转换图片为Base64
+                async with aiofiles.open(img_path, 'rb') as img_file:
+                    img_data = await img_file.read()
+                    img_base64 = base64.b64encode(img_data).decode('utf-8')
+
+                img_extension = os.path.splitext(img_name)[-1].lower()
+                # 根据扩展名确定 MIME 类型
+                if img_extension in ['.jpg', '.jpeg']:
+                    mime_type = 'image/jpeg'
+                elif img_extension == '.gif':
+                    mime_type = 'image/gif'
+                else:
+                    mime_type = 'image/png'
+                # 修改Markdown中的图片路径为Base64编码
+                new_line = f'{line[:start_idx]}data:{mime_type};base64,{img_base64}{line[end_idx:]}'
+                new_lines.append(new_line)
+            else:  # 图片文件不存在，保留原始Markdown格式
+                new_lines.append(line)
+        else:  # 保留非图片链接的原始行
+            new_lines.append(line)
+
+    return '\n'.join(new_lines)
+
+
 # 调整缩进,修复代码缩进，确保最小的缩进被移除，以避免缩进错误
 def fix_indentation(code):
     lines = code.splitlines()
@@ -328,6 +449,14 @@ def fix_indentation(code):
     min_indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
     fixed_lines = [line[min_indent:] if len(line) >= min_indent else line for line in lines]
     return "\n".join(fixed_lines)
+
+
+def fix_invalid_backslashes(match):
+    char = match.group(1)
+    if char in '"\\/bfnrtu':  # JSON 里合法的转义字符只有这些： " \ bfnrtu
+        return '\\' + char  # 合法保留
+    else:
+        return '\\\\' + char  # 非法的补成 \\ + 字符
 
 
 def extract_python_code(text):
@@ -439,7 +568,7 @@ def extract_table_code(text):
     return [block.strip() for block in table_blocks]
 
 
-def extract_table_data(text):
+def extract_table_data(text) -> list[str]:
     """提取 Markdown 格式的表格数据,返回按表格行分组的表格列表"""
     table_pattern = re.findall(r'(\|.*\|)', text)
     tables = []
@@ -456,6 +585,88 @@ def extract_table_data(text):
         tables.append("\n".join(current_table))
 
     return tables
+
+
+def extract_table_blocks(text) -> tuple[list[str], str]:
+    """
+    从长文本中提取所有连续的“|...|”表格块，作为一个整体段落返回，
+    并返回去除了这些表格块后的纯正文。
+    :param text: 原始多行合同文本
+    :return: (table_blocks, remaining_text)
+      - table_blocks: List[str]，每个元素都是一段完整的表格（含多行）
+      - remaining_text: str，没有表格块的正文
+    """
+    # 匹配模式：连续多行、每行以 '|' 开头并至少一个 '|' 结尾
+    pattern = re.compile(r'(?:^\|[^\n]*\|\s*$\n?)+', re.MULTILINE)
+
+    # 提取所有表格块
+    table_blocks = pattern.findall(text)
+    remaining_text = pattern.sub('', text)
+
+    return table_blocks, remaining_text
+
+
+def extract_table_segments(raw_text) -> list[tuple[str, str]]:
+    # ordered
+    # 1. 正则匹配连续多行“|…|”表格块
+    table_pattern = re.compile(r'(?:^\|[^\n]*\|\s*$\n?)+', re.MULTILINE)
+
+    segments = []
+    last_end = 0
+    # 2. 遍历所有表格块
+    for m in table_pattern.finditer(raw_text):
+        start, end = m.span()
+        # 2a. 先把表格块前面的正文片段收集下来
+        if start > last_end:
+            text_segment = raw_text[last_end:start]
+            segments.append(('text', text_segment))
+        # 2b. 再把这个表格块本身收集下来
+        table_block = m.group()
+        segments.append(('table', table_block))
+        last_end = end
+
+    # 2c. 最后收集表格块后剩余的正文
+    if last_end < len(raw_text):
+        segments.append(('text', raw_text[last_end:]))
+
+    return segments
+
+
+def parse_table_block(block: str) -> list[list[str]]:
+    """
+    将一个连续的表格块（多行以 | 开头和结尾）拆成行和字段列表。
+    :param block: str, 形如:
+      "| 列A | 列B |\n| --- | --- |\n| 1  | x   |\n| 2  | y   |\n"
+    :return: List[List[str]]，如 [["列A","列B"], ["1","x"], ["2","y"]]
+    """
+    rows = []
+    for line in block.strip().split('\n'):
+        line = line.strip()
+        if not line or not line.startswith('|') or line.count('|') < 2:
+            continue
+        # 按 | 分，丢掉第一个和最后一个空字符串
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]
+        rows.append(cells)
+    return rows
+
+
+def extract_web_content(html):
+    # 提取<title>内容
+    title_match = re.search(r"<title.*?>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).strip() if title_match else ""
+
+    # 提取<body>内容，去除脚本、样式等标签
+    body_match = re.search(r"<body.*?>(.*?)</body>", html, re.IGNORECASE | re.DOTALL)
+    body_content = body_match.group(1).strip() if body_match else ""
+
+    # 移除<script>和<style>标签及其内容
+    body_content = re.sub(r"<(script|style).*?>.*?</\1>", "", body_content, flags=re.IGNORECASE | re.DOTALL)
+
+    # 移除所有HTML标签，只保留文本
+    text_content = re.sub(r"<[^>]+>", "", body_content)
+    text_content = re.sub(r"\s+", " ", text_content).strip()
+
+    return {"title": title, "content": text_content}
 
 
 def extract_yaml_data(text):
@@ -483,20 +694,6 @@ def extract_json_data(text):
     # 提取 JSON 格式的代码块
     json_blocks = re.findall(r'```(?:json)?(.*?)```', text, re.DOTALL)
     return [block.strip() for block in json_blocks]
-
-
-def extract_json_str(json_code):
-    start = json_code.find("```json")
-    # 从start开始找到下一个```结束
-    end = json_code.find("```", start + 1)
-    if start == -1 or end == -1:
-        try:
-            json.loads(json_code)
-            return json_code
-        except Exception as e:
-            print("Error:", e)
-        return ""
-    return json_code[start + 7:end]
 
 
 def extract_code_blocks(text, lag='python', **kwargs):
@@ -534,9 +731,31 @@ def extract_code_blocks(text, lag='python', **kwargs):
     return {k: f(text) for k, f in funcs.items()}
 
 
-def extract_jsons(input_str, n=None):
+def extract_json_from_string(input_str):
+    # 从一个普通字符串中提取 JSON 结构，但可能不处理嵌套的 JSON
+    match = re.search(r'\{.*}', input_str, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e1:
+            try:
+                json_str = re.sub(r'//.*', '', json_str)  # 去掉 // 注释
+                json_str = re.sub(r'\\(.)', fix_invalid_backslashes, json_str)
+                return json.loads(json_str)
+            except json.JSONDecodeError as e2:
+                print(f"Error decoding JSON: {e2},{input_str}")
+    return None
+
+
+def extract_jsons(input_str):
+    """
+    处理包含多个 JSON 对象的文本数据,成功解析了 JSON 对象，返回一个包含所有解析结果的列表
+    :param input_str:
+    :return: list[dict]
+    """
     # 1,None,-1
-    matches = re.findall(r'\{.*?\}', input_str, re.DOTALL)
+    matches = re.findall(r'\{.*?\}', input_str, re.DOTALL)  # regex.findall(r'\{(?:[^{}]|(?R))*\}', input_str)
     if not matches:
         return None
     json_objects = []  # [var.strip() for var in matches if '{' not in var]
@@ -546,10 +765,7 @@ def extract_jsons(input_str, n=None):
         except json.JSONDecodeError as e:
             print(f"Error decoding JSON: {e} - Skipping this fragment: {match}")
 
-    if not json_objects:
-        return None
-
-    return json_objects if n is None else json_objects[:n]
+    return json_objects
 
 
 def extract_headers(text):
@@ -748,14 +964,17 @@ def extract_string(text, extract, **kwargs):
         "bold": extract_bold,
         "italic": extract_italic,
         "tables": extract_table_data,
+        "table_segments": extract_table_segments,
         "date": extract_date_strings,
         "answer": extract_tagged_content,
         "think": partial(extract_tagged_split, tag="think"),
         "reasoning": partial(extract_tagged_split, tag="reasoning"),
         'sentence': split_sentences,
+        'sentences_clean': split_sentences_clean,
         "wechat": format_for_wechat,
         'remark': remove_markdown,
         "html": format_for_html,
+        "web": extract_web_content,
     }
     try:
         if extract in funcs:
@@ -845,6 +1064,29 @@ def df2doc(data, use_index=True):
         print(e)
 
     return docs
+
+
+def df2doc_batch(data, batch_size=5):
+    """
+    将 DataFrame 或列表数据按 batch_size 分批，yield 每个批次的记录（列表 of dicts）。
+    """
+    try:
+        import pandas as pd
+        if isinstance(data, pd.DataFrame):
+            data = data.to_dict(orient='records')
+    except ImportError:
+        if not isinstance(data, list) or not all(isinstance(d, dict) for d in data):
+            raise ValueError("输入数据应为列表的字典格式，例如 [{'key1': 'value1', 'key2': 'value2'}, ...]")
+    except Exception as e:
+        print(e)
+
+    batch = []
+    for i, item in enumerate(data):
+        batch.append(item)
+        # 每 batch_size 组一个 batch
+        if (i + 1) % batch_size == 0 or i == len(data) - 1:
+            yield batch
+            batch = []
 
 
 def get_last_entries_records(records: list[dict], fields, use_index=False, max_tokens: int = 8000, tokenizer=None):
@@ -949,6 +1191,7 @@ def lang_detect_to_trans(text):
 
 
 def lang_token_size(text, tokenizer=None):
+    """计算每段文本的token长度，如果没有提供tokenizer则返回字符长度"""
     if tokenizer:
         return len(tokenizer.encode(text))
     # 中文平均1字≈1 token，英文≈4字=1 token，粗略估算
@@ -967,7 +1210,7 @@ def cut_text(text, tokenizer=None):
     text = re.sub(r'[^\u4e00-\u9fa5]', '', str(text))
     if tokenizer:
         token_ids = tokenizer.encode(text)
-        tokens = [tokenizer.decode([tid]) for tid in token_ids]
+        tokens = [tokenizer.decode([tid]) for tid in token_ids]  # tokenizer.tokenize
     else:
         tokens = jieba.lcut(text, cut_all=False)
     return tokens  # ' '.join(tokens)
@@ -1137,6 +1380,23 @@ async def start_llm_stream(new_llm_stream):
         if idx > 0:
             print(f"🔊 朗读: {text}")
 
+def split_text_into_sentences(raw_text):
+    # 使用常见的标点符号分割文本，生成句子列表
+    sentence_endings = ['。', '！', '？', '；', '.', '!', '?', ';']  # 常见中文/英文标点
+    sentences = []
+    current_sentence = ""
+
+    for char in raw_text:
+        current_sentence += char
+        if current_sentence[-1] in sentence_endings:
+            sentences.append(current_sentence.strip())
+            current_sentence = ""
+
+    # 如果有残留的文本，加入句子列表
+    if current_sentence.strip():
+        sentences.append(current_sentence.strip())
+
+    return sentences
 
 def split_sentences(text,
                     pattern=(r'[^一二三四五六七八九十\d\r\n]*\b[一二三四五六七八九十]+\、'  # 中文序号 "一、二、"
@@ -1147,7 +1407,7 @@ def split_sentences(text,
                              )
                     ):
     """
-    分句函数，支持按标点符号和结构化序号进行分句，分隔符会保留在前一句结尾。
+    分句函数，支持按标点符号和结构化序号进行分句，分隔符会保留在前一句结尾。结构化比较清晰的合同、制度文件。粗粒度分句（以自然语言的标点/序号为主）
     :param text: 输入的文本
     :param pattern: 正则表达式匹配分隔符
     :return: 分割后的句子列表
@@ -1157,6 +1417,128 @@ def split_sentences(text,
     sentences = re.findall(pattern, text)
     # re.findall re.split(pattern, text)
     return [s.strip() for s in sentences if s.strip()]
+
+
+def split_sentences_clean(text, h_symbols=True, h_tables=True):
+    """
+    合同、规章、带大量编号、条款、表格的文本,分句建模、摘要、切块处理
+    篇章分句，额外支持：
+      - 第X条（中国式条款）
+      - (一)、(1)、(a) 等括号编号
+      - 1.1、2.3.4 等多级小数编号
+    :param text: str, 整段原始文本
+    :param h_symbols: bool, 是否处理连续符号和换行符标准化
+    :param h_tables: bool, 是否处理表格符号“|”
+    :return: list of sentences
+    """
+    # 1. 统一换行符
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    if h_symbols:
+        # 2. 在各种序号后面加空格，避免与正文粘连
+        # （1）中国式条款：第X条
+        text = re.sub(r'(第[一二三四五六七八九十]+条)', r'\1 ', text)
+        # （2）括号编号：(一)、(1)、(a)……
+        text = re.sub(r'(\([一二三四五六七八九十\dA-Za-z]+\))', r'\1 ', text)
+        # （3）多级小数编号：1.1、2.3.4……
+        text = re.sub(r'(\d+(?:\.\d+)+)', r'\1 ', text)
+
+        # 3. 特殊处理表格“|序号.”、“|序号、”
+        text = re.sub(r'(\|\s*\d+[\.、])', r'\1 ', text)
+        text = re.sub(r'(^|\n)\s*(\d+[\.、])', r'\1\2 ', text)
+
+    if h_tables:
+        # 4. 把表格分隔符 ‘|’ 看作句号
+        text = text.replace('|', '。')
+
+    # 5. 合并连续中文标点
+    text = re.sub(r'[。！？；]{2,}', '。', text)
+
+    # 6. 按中文句号、问号、叹号、分号切句
+    sentences = re.split(r'(?<=[。！？；])', text)
+
+    # 7. 去空白，过滤太短的
+    return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
+
+
+def cross_sentence_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max_length=512, tokenizer=None):
+    """
+    滑动窗口分块 + 最大长度截断（只测长度，不用 tokenizer.decode）
+    :param sentences: 分句后的句子列表
+    :param chunk_size: 每块包含几个句子
+    :param overlap_size: 相邻块重叠几个句子
+    :param max_length: 最大长度（token数或字符数）
+    :param tokenizer: 用于计算 token 长度的分词器（可选）
+    :return: List[str] 每块一个字符串
+    """
+    chunks = []
+    step = max(chunk_size - overlap_size, 1)
+
+    for i in range(0, len(sentences), step):
+        window = sentences[i: i + chunk_size]
+        text = " ".join(window)
+
+        # 用 tokenizer 只测长度，不 decode
+        if tokenizer:
+            token_count = len(tokenizer.encode(text))
+            if token_count > max_length:
+                # 直接按字符截断
+                text = text[: max_length]
+        else:
+            # 用字符长度作为 fallback
+            if len(text) > max_length:
+                text = text[: max_length]
+
+        chunks.append(text)
+
+    return chunks
+
+
+def organize_segments_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max_length=512, tokenizer=None) -> list[
+    list[str]]:
+    """
+    交叉分块函数，将句子列表按块划分，并在块之间保持一定重叠，并根据max_length控制每个段落的最大长度。
+    :param sentences: 分句后的句子列表
+    :param chunk_size: 每个块的句子数量
+    :param overlap_size: 块之间的重叠句子数
+    :param max_length: 每个块的最大长度（token数）
+    :param tokenizer: 用于计算token长度的分词器（Tokenizer）
+    :return: 交叉分块后的句子块列表
+    """
+    chunks = []
+    total_sentences = len(sentences)
+    current_chunk = []
+
+    # 根据 max_length 和句子数量分块
+    for i in range(total_sentences):
+        sentence = sentences[i]
+        current_chunk.append(sentence)
+        current_chunk_text = ' '.join(current_chunk)
+
+        # 如果当前块长度超过 max_length，则分割块并重置
+        if lang_token_size(current_chunk_text, tokenizer=tokenizer) > max_length:
+            current_chunk.pop()  # 删除最后一个句子
+            chunks.append(current_chunk)  # 添加当前块
+            current_chunk = [sentence]  # 从当前句子开始新的块
+
+        # 如果是最后一个句子，将当前块添加到结果中
+        if i == total_sentences - 1:
+            chunks.append(current_chunk)
+
+    # 处理滑动窗口重叠
+    overlapped_chunks = []
+    for i in range(0, len(chunks), chunk_size - overlap_size):
+        chunk = []
+        for j in range(i, min(i + chunk_size, len(chunks))):
+            chunk.extend(chunks[j])
+
+        while lang_token_size(' '.join(chunk), tokenizer=tokenizer) > max_length:
+            overlapped_chunks.append(chunk[:chunk_size])  # 分割保留前面的块
+            chunk = chunk[chunk_size:]  # 剩下的部分继续处理
+
+        overlapped_chunks.append(chunk[:max_length])  # 确保块的长度在 max_length 之内,添加不超长的部分
+
+    return overlapped_chunks
 
 
 # 实现小到大分块逻辑
@@ -1170,7 +1552,7 @@ def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int
     # 小块分割
     small_chunks = []
     for i in range(0, len(tokens), small_chunk_size - overlap):
-        small_chunks.append(tokens[i:i + small_chunk_size])
+        small_chunks.append(tokens[i:i + small_chunk_size])  # ''.join()
 
     # 组织大片段
     large_chunks = []
@@ -1282,12 +1664,23 @@ def parse_time(val):
         return datetime.min
 
 
-def format_date(date_str):
-    # 直接使用 strptime 来解析日期并格式化为目标格式
+def parse_time_format(val):
+    # 将 datetime 对象转换为 ISO 8601 格式的字符串
+    if isinstance(val, datetime):
+        return val.isoformat()  # 转换为ISO 8601格式
+    return val
+
+
+def format_date(date_str: str):
+    # 直接使用 strptime 来解析日期并格式化为目标格式：YYYY-MM-DD
     return datetime.strptime(date_str, "%Y/%m/%d %H:%M:%S").date().strftime("%Y-%m-%d")
 
 
 def format_date_type(date=None):
+    """
+    :param date:可以是一个日期字符串或 None（如果传入 None，则使用当前日期）。
+    :return:返回一个 datetime 对象，如果 date 是有效的字符串，或者当前时间或datetime
+    """
     # 如果没有传入日期，使用当前日期
     if not date:
         date = datetime.now()
@@ -1307,7 +1700,7 @@ def format_date_type(date=None):
         else:
             raise ValueError(f"Invalid date format: {date}. Supported formats are {supported_formats}.")
 
-    return date
+    return date  # isinstance(date, datetime)
 
 
 def get_times_shift(days_shift: int = 0, hours_shift: int = 0):
@@ -1528,6 +1921,7 @@ def fast_dot_np(vecs1, vecs2):
     return np.einsum('ij,ij->i', vecs1, vecs2)  # np.sum(A * B, axis=1)
 
 
+# from sklearn.preprocessing import normalize
 def normalize_np(vecs) -> list[float]:
     # 手动归一化
     # norms = np.sqrt(np.einsum('ij,ij->i', vecs, vecs)) #模长,L2 范数 ||ndarr1|| for each row
@@ -1546,12 +1940,38 @@ def calc_diff(x, y):
     return 1 - sim
 
 
+# from sklearn.metrics.pairwise import cosine_similarity
 def cosine_similarity_np(ndarr1, ndarr2):
     denominator = np.outer(np.linalg.norm(ndarr1, axis=1), np.linalg.norm(ndarr2, axis=1))
     dot_product = np.dot(ndarr1, ndarr2.T)  # np.einsum('ik,jk->ij', ndarr1, ndarr2)
     with np.errstate(divide='ignore', invalid='ignore'):
         similarity = np.where(denominator != 0, dot_product / denominator, 0)
     return similarity
+
+
+# from scipy.special import softmax
+def softmax_np(x):
+    e_x = np.exp(x - np.max(x))  # Subtract max for numerical stability
+    return e_x / e_x.sum()
+
+
+def generate_loss_mask(input_ids, bos_id, eos_id, max_length):
+    loss_mask = [0] * len(input_ids)
+    i = 0
+    while i < len(input_ids):
+        if input_ids[i:i + len(bos_id)] == bos_id:
+            start = i + len(bos_id)
+            end = start
+            while end < len(input_ids):
+                if input_ids[end:end + len(eos_id)] == eos_id:
+                    break
+                end += 1
+            for j in range(start + 1, min(end + len(eos_id) + 1, max_length)):
+                loss_mask[j] = 1
+            i = end + len(eos_id) if end < len(input_ids) else len(input_ids)
+        else:
+            i += 1
+    return loss_mask
 
 
 def get_similar_nodes(embeddings, base_nodes, top_k=3):
@@ -1591,6 +2011,56 @@ def float16_to_bin(num):
     return binary_representation
 
 
+def get_memory_info():
+    """从 /proc/self/status 获取内存使用（Linux Only）"""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    mem_kb = int(line.split()[1])
+                    return mem_kb / 1024  # 转为 MB
+    except Exception:
+        return -1
+
+
+def get_cpu_time():
+    """从 /proc/self/stat 获取 CPU 时间（单位：秒）"""
+    try:
+        with open("/proc/self/stat") as f:
+            values = f.read().split()
+            utime = int(values[13])
+            stime = int(values[14])
+            ticks_per_sec = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+            return (utime + stime) / ticks_per_sec
+    except Exception:
+        return -1
+
+
+def get_open_fds_count() -> int:
+    try:
+        base = f"/proc/{os.getpid()}/fd"
+        return len(os.listdir(base))
+    except Exception:
+        return -1
+
+
+def count_http_connections(port=8000):
+    import platform
+    if platform.system() != "Linux":
+        print("Warning: count_http_connections is only supported on Linux.")
+        return -1
+    count = 0
+    with open("/proc/net/tcp", "r") as f:
+        lines = f.readlines()[1:]
+        for line in lines:
+            parts = line.strip().split()
+            local_address = parts[1]
+            local_port_hex = local_address.split(":")[1]
+            if int(local_port_hex, 16) == port:
+                count += 1
+    return count
+
+
 def named_partial(name, func, *args, **kwargs):
     p = partial(func, *args, **kwargs)
     p.__name__ = name
@@ -1604,6 +2074,13 @@ def is_empty_lambda(func):
     except:
         return False
     return False
+
+
+def print_functions(module_name: str = None):
+    module = importlib.import_module(module_name) if module_name else inspect.getmodule(inspect.currentframe())
+    funcs = inspect.getmembers(module, inspect.isfunction)
+    for name, _func in funcs:
+        print(f"Function: {name}")
 
 
 def functions_registry(functions_list: list, safe_path=True, module_name: str = None) -> dict:
@@ -1663,6 +2140,43 @@ def function_registry_dynamic(functions_list: list, module_names: list):
         except ModuleNotFoundError:
             print(f"Module '{module_name}' not found.")
     return registry
+
+
+def openai_tools_to_mcp(tools):
+    def decorator(mcp_server):
+        for tool in tools:
+            if tool["type"] == "function":
+                func_info = tool["function"]
+
+                def make_handler(func_name, func_desc):
+                    async def handler(params):
+                        # 这里可以添加通用处理逻辑
+                        print(f"Handling {func_name} with params: {params}")
+                        # 实际处理函数应该在别处定义
+                        return await globals()[f"handle_{func_name}"](params)
+
+                    handler.__name__ = func_name
+                    handler.__doc__ = func_desc
+                    return handler
+
+                mcp_server.add_handler(
+                    action=func_info["name"],
+                    handler=make_handler(func_info["name"], func_info["description"])
+                )
+        return mcp_server
+
+    return decorator
+
+
+def deduplicate_tools_by_name(tools: list[dict]) -> list[dict]:
+    seen = set()
+    tools_metadata = []
+    for tool in tools:
+        name = tool.get("function", {}).get("name") or tool.get("name")
+        if name and name not in seen:
+            seen.add(name)
+            tools_metadata.append(tool)
+    return tools_metadata
 
 
 # import psutil,signal,contextlib

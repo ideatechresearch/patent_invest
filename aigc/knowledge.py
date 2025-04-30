@@ -1,7 +1,10 @@
+from utils import cosine_similarity_np,split_sentences
 from generates import *
 from igraph import Graph
 import asyncio
 import PyPDF2
+import re
+
 
 
 def parse_toc(pdf_path, toc_pages=(0, 0)):
@@ -174,16 +177,6 @@ def split_paragraphs(text: str, max_length=512,
             final_paragraphs.append(paragraph.strip())
 
     return final_paragraphs or paragraphs
-
-
-def generate_embeddings(sentences: list):
-    url = 'http://47.110.156.41:7000/embeddings/'
-    payload = {'texts': sentences, 'model_name': 'qwen', 'model_id': 0}
-    response = requests.post(url, json=payload)
-    if response.status_code == 200:
-        return response.json()['embedding']
-
-    return []
 
 
 async def graph_icc_edge(pdf_path='data/ideatech-251124-1758-255.pdf'):

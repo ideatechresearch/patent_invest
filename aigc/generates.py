@@ -1,29 +1,22 @@
 import httpx, aiohttp, aiofiles, asyncio
-from http import HTTPStatus
 import oss2
-from pathlib import PurePosixPath
-from typing import List, Dict, Tuple, Any, Union, Callable, Literal, Iterator, Sequence, Awaitable, Generator, Optional
-import random
-from PIL import Image
+from typing import List, Dict, Tuple, Any, Union, Callable, Literal, Iterator, Sequence, Awaitable, Generator, Optional, \
+    get_origin, get_args
+
 from openai import OpenAI, AsyncOpenAI, AsyncClient, DefaultHttpxClient, BadRequestError
-# import qianfan
-import dashscope
-from dashscope.audio.tts import ResultCallback
-from dashscope.audio.asr import Recognition, Transcription
-# from lagent import tool_api
 # from mcp.server.fastmcp import FastMCP
-from config import *
+# from mcp.server.sse import SseServerTransport
 from utils import *
 from agents.ai_tools import *
 from agents.ai_prompt import *
 from agents.ai_vectors import *
 from agents.ai_tasks import *
+from agents.ai_search import *
+from agents.ai_multi import *
 
 AI_Client: Dict[str, Optional[AsyncOpenAI]] = {}  # OpenAI
-QD_Client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=6334, prefer_grpc=True)
-
-
-# QD_Client = AsyncQdrantClient(Config.QDRANT_URL)
+QD_Client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=Config.QDRANT_GRPC_PORT,
+                              prefer_grpc=True) if Config.QDRANT_GRPC_PORT else AsyncQdrantClient(url=Config.QDRANT_URL)
 
 
 async def get_data_for_model(model: dict):
@@ -45,19 +38,23 @@ async def get_data_for_model(model: dict):
 
 async def init_ai_clients(ai_models=AI_Models, api_keys=API_KEYS, get_data=False):
     tasks = []
-    # http_client = DefaultHttpxClient(proxy="http://my.test.proxy.example.com",
-    #                                  transport=httpx.HTTPTransport(local_address="0.0.0.0"))
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+    transport = httpx.AsyncHTTPTransport(proxy=Config.HTTP_Proxy)
+    # proxies = {"http://": Config.HTTP_Proxy, "https://": Config.HTTP_Proxy}
+    # http_client = DefaultHttpxClient(proxy="http://my.test.proxy.example.com", transport=httpx.HTTPTransport(local_address="0.0.0.0"))
+
     for model in ai_models:
         model_name = model.get('name')
         api_key = api_keys.get(model_name)
         if api_key:
             model['api_key'] = api_key
             if model_name not in AI_Client and model.get('supported_openai'):  # model_name in SUPPORTED_OPENAI_MODELS
+                http_client = None
                 time_out = model.get('timeout', Config.HTTP_TIMEOUT_SEC * 2)
-                timeout = httpx.Timeout(time_out, read=time_out, write=60.0, connect=10.0)
-                http_client = httpx.AsyncClient(proxies={"http://": Config.HTTP_Proxy, "https://": Config.HTTP_Proxy},
-                                                limits=limits, timeout=timeout) if model.get('proxy') else None
+                if model.get('proxy'):  # proxies=proxies
+                    timeout = httpx.Timeout(time_out, read=time_out, write=60.0, connect=10.0)
+                    http_client = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
+
                 AI_Client[model_name]: AsyncOpenAI = AsyncOpenAI(api_key=api_key, base_url=model['base_url'],
                                                                  http_client=http_client)  # OpenAI
                 if http_client is None:
@@ -80,7 +77,7 @@ async def init_ai_clients(ai_models=AI_Models, api_keys=API_KEYS, get_data=False
 # print(dir(client.files)) #'content', 'create', 'delete', 'list', 'retrieve', 'retrieve_content', 'wait_for_processing'
 
 
-def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple[Dict[str, Any], Union[str, None]]:
+def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple[Dict[str, Any], str]:
     """
     在 AI_Models 中查找模型。如果找到名称匹配的模型，返回模型及其类型或具体的子模型名称。
 
@@ -121,29 +118,64 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple
             model_id = model_id if abs(model_id) < len(keys) else 0
             return model, model_items[keys[model_id]]
 
-        return model, name if model_items == name else None
+        return model, name if model_items == name else ''
 
     raise ValueError(f"Model with name {name} not found.")
     # HTTPException(status_code=400, detail=f"Model with name {name} not found.")
 
 
-async def ai_generate_metadata(function_code: str, model_name=Config.DEFAULT_MODEL) -> dict:
-    model_info, name = find_ai_model(model_name)
-    client = AI_Client.get(model_info['name'])
+async def ai_generate_metadata(function_code: str, metadata: dict = None, model_name=Config.DEFAULT_MODEL_METADATA,
+                               **kwargs) -> dict:
+    if not model_name:
+        model_name = Config.DEFAULT_MODEL_METADATA
+
+    chat = True
+    try:
+        model_info, name = find_ai_model(model_name)
+    except:
+        chat = False
+        model_info, name = find_ai_model(model_name, search_field="generation")
+
+    client = AI_Client.get(model_info['name'], None)
     if client:
         prompt = System_content.get('84').format(function_code=function_code)
-        response = await client.completions.create(
-            model=name,
-            prompt=prompt,
-            max_tokens=1000,
-            temperature=0.3,
-        )
-        metadata = extract_json_from_string(response.choices[0].text.strip())
-        return metadata
-    return {}
+        if chat:
+            messages = [{"role": "system", "content": prompt},
+                        {"role": "user",
+                         "content": f"帮我根据函数代码生成提取函数元数据,初始结构为{json.dumps(metadata, ensure_ascii=False)}"}]
+            payload = dict(model=name,
+                           messages=messages,
+                           max_tokens=1000,
+                           temperature=0.3,
+                           stream=False)
+            full_payload = {**payload, **kwargs}
+            response = await client.chat.completions.create(**full_payload)
+            content = response.choices[0].message.content.strip()
+        else:
+            response = await client.completions.create(
+                model=name,
+                prompt=prompt,
+                max_tokens=1000,
+                temperature=0.3,
+                stream=False,
+                **kwargs,
+            )
+            content = response.choices[0].text.strip()
+
+        match = re.search(r'\{.*}', content, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            try:
+                metadata = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                print(f"Error decoding JSON: {e},{content}")
+        else:
+            print(response)
+
+    return metadata or {}
 
 
-Function_MetaData_Store = {}
+Function_MetaData_Store = {}  # cache_func_key:cached_metadata
 
 
 async def get_metadata_from_cache(func: Callable, redis=None):
@@ -153,23 +185,53 @@ async def get_metadata_from_cache(func: Callable, redis=None):
     # extract_function_metadata(function_code)
     cache_key = generate_hash_key(func_name, function_code)  # 来生成缓存键
 
-    cached_metadata = await redis.get(f"funcmeta:{cache_key}") if redis else Function_MetaData_Store.get(cache_key)
+    try:
+        if redis:
+            cached_metadata = await redis.get(f"funcmeta:{cache_key}")
+            await redis.expire(f"funcmeta:{cache_key}", Config.REDIS_CACHE_SEC)
+        else:
+            raise Exception
+    except:
+        cached_metadata = Function_MetaData_Store.get(cache_key, {})
+
     if cached_metadata:
-        print(f"Metadata already cached for function: {func_name}")
+        # print(f"Metadata already cached for function: {func_name}")
         metadata = json.loads(cached_metadata) if isinstance(cached_metadata, str) else cached_metadata
         return cache_key, metadata
     return cache_key, {}
 
 
-async def generate_function_metadata(func: Callable, model_name=Config.DEFAULT_MODEL) -> Optional[Dict]:
-    redis = get_redis()
-    cache_key, metadata = get_metadata_from_cache(func, redis)
+def python_type_to_json_schema_type(python_type):
+    origin = get_origin(python_type) or python_type
+
+    # 处理 Union/Optional
+    if origin is Union:
+        args = [a for a in get_args(python_type) if a is not type(None)]
+        if len(args) == 1:
+            return python_type_to_json_schema_type(args[0])
+        else:
+            return "string"  # fallback for complex Unions
+
+    mapping = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+    }
+    return mapping.get(origin, "string")
+
+
+async def generate_function_metadata(func: Callable, model_name=None, redis=None, **kwargs) -> Optional[Dict]:
+    cache_key, metadata = await get_metadata_from_cache(func, redis)
     if metadata:
         return metadata
+
     # 获取函数的名称、参数以及docstring
     func_name = func.__name__
     function_code = remove_function_decorators(func)
-
+    # print(f"[tools] 未找到缓存: {func_name},生成 metadata")
     # 获取函数参数列表
     signature = inspect.signature(func)
     docstring = func.__doc__
@@ -178,13 +240,13 @@ async def generate_function_metadata(func: Callable, model_name=Config.DEFAULT_M
     required_params = []
 
     for param_name, param in signature.parameters.items():
+        param_type = param.annotation if param.annotation != inspect.Parameter.empty else str
+        json_type = python_type_to_json_schema_type(param_type)
+        # 如果有类型提示，推断参数类型str(param.annotation).replace("<class '", "").replace("'>", "")
         param_info = {
-            "type": "string",
+            "type": json_type,
             "description": f"Description of the {param_name} parameter."
         }
-        if param.annotation != inspect.Parameter.empty:
-            # 如果有类型提示，推断参数类型
-            param_info["type"] = str(param.annotation).replace("<class '", "").replace("'>", "")
 
         if param.default == inspect.Parameter.empty:
             required_params.append(param_name)
@@ -211,34 +273,34 @@ async def generate_function_metadata(func: Callable, model_name=Config.DEFAULT_M
     # and output it in the following JSON format:
     # {json.dumps(metadata, indent=4, ensure_ascii=False)}
     #     """)
-    metadata = await ai_generate_metadata(function_code, model_name=model_name) or metadata
+    metadata = await ai_generate_metadata(function_code, metadata, model_name=model_name, **kwargs)
     # 获取并存储生成的元数据
+
     if redis:
-        await redis.setex(f"funcmeta:{cache_key}", 86400, json.dumps(metadata, ensure_ascii=False))
+        try:
+            await redis.setex(f"funcmeta:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(metadata, ensure_ascii=False))
+        except Exception as e:
+            print(e)
     Function_MetaData_Store[cache_key] = metadata
 
     return metadata
 
 
-async def get_cached_tools(func_list: list[Callable]) -> list[dict]:
+async def get_cached_tools_metadata(func_list: list[Callable] = None, model_name=None, **kwargs) -> list[dict]:
     redis = get_redis()
-    tools = list(Function_MetaData_Store.values())
-
     if not func_list:
+        tools_metadata = list(Function_MetaData_Store.values())
         keys = await redis.keys("funcmeta:*")
         if keys:
             cached_values = await redis.mget(*keys)
-            tools = [json.loads(v) for v in cached_values if v]
-        return tools
+            tools_metadata = [json.loads(v) for v in cached_values if v]  # set(cached_values
+        return tools_metadata
 
-    for func in func_list:
-        cache_key, metadata = get_metadata_from_cache(func, redis)
-        if metadata:
-            tools.append(metadata)
-        else:
-            # 若没缓存，可选择调用 generate_function_metadata(func)
-            print(f"[tools] 未找到缓存: {func.__name__}")
-    return tools
+    # global_function_registry
+    tasks = [generate_function_metadata(_f, model_name, redis=redis, **kwargs) for _f in func_list]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    tools_metadata: list[dict] = [metadata for metadata in results if isinstance(metadata, dict)]
+    return tools_metadata
 
 
 def metadata_decorator(func: Callable) -> Callable:
@@ -247,9 +309,9 @@ def metadata_decorator(func: Callable) -> Callable:
     if inspect.isfunction(func):  # 普通函数
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(generate_function_metadata(func))
+            asyncio.ensure_future(generate_function_metadata(func, redis=get_redis()))
         else:
-            asyncio.run(generate_function_metadata(func))
+            asyncio.run(generate_function_metadata(func, redis=get_redis()))
 
     # @wraps(func)
     # def wrapper(*args, **kwargs):
@@ -259,9 +321,14 @@ def metadata_decorator(func: Callable) -> Callable:
     return func  # wrapper
 
 
+async def generate_tools_metadata(model_name=None, **kwargs) -> list[dict]:
+    global_function: list[Callable] = [v for k, v in global_function_registry(func_name=None).items()]
+    return AI_Tools + await get_cached_tools_metadata(func_list=global_function, model_name=model_name, **kwargs)
+
+
 # @mcp.tool()
-async def ai_tool_response(messages, tools: list = None, model_name=Config.DEFAULT_MODEL, model_id=1,
-                           top_p=0.95, temperature=0.01, **kwargs):
+async def ai_tools_response(messages, tools: list[dict] = None, model_name=Config.DEFAULT_MODEL_FUNCTION, model_id=1,
+                            top_p=0.95, temperature=0.01, **kwargs):
     """
       调用 AI 模型接口，使用提供的工具集和对话消息，返回模型的响应。qwen
         :return: 模型响应的消息对象
@@ -269,12 +336,15 @@ async def ai_tool_response(messages, tools: list = None, model_name=Config.DEFAU
     model_info, name = find_ai_model(model_name, model_id)
     client = AI_Client.get(model_info['name'], None)
     if not tools:
-        tools = get_cached_tools(func_list=[])
-    # tools = [{"type": "web_search", "web_search": {
-    #         "enable": True  # 启用网络搜索
-    #         "search_query": "自定义搜索的关键词",
-    #          "search_result": True,#默认为禁用,允许用户获取详细的网页搜索来源信息
-    #     }}]
+        tools = await get_cached_tools_metadata(func_list=[])
+        # tools = [{"type": "web_search",
+        #          "web_search": {
+        #         "enable": True  # 启用网络搜索
+        #         "search_query": "自定义搜索的关键词",
+        #          "search_result": True,#默认为禁用,允许用户获取详细的网页搜索来源信息
+        #     }}]
+
+    tools = deduplicate_tools_by_name(tools)
     if client:
         try:
             completion = await client.chat.completions.create(
@@ -287,19 +357,18 @@ async def ai_tool_response(messages, tools: list = None, model_name=Config.DEFAU
                 **kwargs,
             )
             return completion.choices[0].message
-            # return completion.model_dump()
-            # response['choices'][0]['message']
+
         except Exception as e:
             print(f"OpenAI error occurred: {e}")
 
-    return None  # await ai_chat_post(model_info, payload)
+    return None  # await ai_chat(model_info, payload)
 
 
 Function_Registry_Global: Optional[Dict[str, Callable[..., Any]]] = {}
 
 
 def global_function_registry(func_name: str = None, use_keywords: bool = False) -> Union[
-    Callable[..., Any], None, Dict[str, Callable[..., Any]]]:
+    Callable[..., Any], Dict[str, Callable[..., Any]]]:
     """
     获取全局本地函数注册表中的函数或整个注册表。
     - use_keywords: 使用带关键字映射的注册（如自定义 lambda,用户网络请求运行函数,伪接口数据插入）
@@ -315,28 +384,35 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
         'map_search': search_amap_location,
         'web_search': web_search_async,
         'tavily_search': web_search_tavily,
+        'tavily_extract': web_extract_tavily,
         'news_search': lambda x: web_search_tavily(x, topic='news', time_range='w'),
         'baidu_search': lambda x: search_by_api(x, engine='baidu'),
         'wiki_search': wikipedia_search,
         'translate': baidu_translate,
+        'http_request': call_http_request,
+        "execute_code": execute_code_results,
         'auto_calls': ai_auto_calls,
 
         'visitor_records': ideatech_visitor_records,
     }
 
     global Function_Registry_Global
-    if not Function_Registry_Global:  # 动态性延迟加载,全局注册表初始化
+    if not Function_Registry_Global:  # 动态性延迟加载,全局注册表初始化,调用可能需要确定某些参数
         Function_Registry_Global = functions_registry(functions_list=[
             "get_times_shift", "date_range_calculator",
             "get_day_range", "get_week_range", "get_month_range",
             "get_quarter_range", "get_year_range", "get_half_year_range",
-            'knowledge:ideatech_knowledge'
+            "execute_code_results", "extract_web_content", "remove_markdown", "extract_table_segments",
+            "generates:auto_translate", 'database:patent_search',
+            'knowledge:ideatech_knowledge', 'generates:ideatech_visitor_records'
             # 添加更多可调用函数
         ])
         Function_Registry_Global.update(functions_registry(
-            functions_list=["get_weather", "duckduckgo_search", "web_search_tavily", "web_search_async",
-                            "search_by_api", "search_bmap_location", "auto_translate", 'ideatech_visitor_records', ],
-            module_name='generates'))
+            functions_list=["web_search_async", "get_weather", "duckduckgo_search",
+                            "web_search_tavily", "web_extract_tavily", "search_by_api", 'serper_search',
+                            "get_amap_location",  # "search_bmap_location",
+                            "baidu_translate", "tencent_translate", "xunfei_translate"],
+            module_name="agents.ai_search"))
         Function_Registry_Global.update(keywords_registry)  # 合并 keywords 映射
         print(Function_Registry_Global)
 
@@ -369,9 +445,7 @@ async def ideatech_visitor_records(prompt: str, customer_name: str | list | tupl
                    topn=20, score_threshold=0.5, exact=False,
                    embeddings_calls=ai_embeddings, model_name='BAAI/bge-large-zh-v1.5')
     payload.update(kwargs)
-    search_res = await search_by_embeddings(**payload)
-    print(search_res)
-    return search_res
+    return await search_by_embeddings(**payload)
 
 
 def convert_to_callable_list(tool_list: List[Tuple[str, Any]],
@@ -480,27 +554,20 @@ async def ai_tools_results(response_message):
     return messages  # [*tool_mmessages,]
 
 
-async def ai_auto_calls(question, **kwargs) -> list:
+async def ai_auto_calls(question, model_name=Config.DEFAULT_MODEL_FUNCTION, get_messages=False, **kwargs) -> list:
     messages = [{"role": "system", "content": System_content.get('31')},
                 {"role": "user", "content": question}]
-    tool_messages = await ai_tool_response(messages=messages, tools=AI_Tools + get_cached_tools([]),
-                                           **kwargs)  # "role": "assistant","tool_calls"
+    tools = AI_Tools + await get_cached_tools_metadata([])
+    tool_messages = await ai_tools_response(messages=messages, tools=tools, model_name=model_name, **kwargs)
+    # "role": "assistant","tool_calls"
     if tool_messages:
         final_messages = await ai_tools_results(tool_messages)
-        return [{msg['name']: msg['content']} for msg in final_messages if msg['role'] == "tool"]  # "role": "tool",
-        # [{func_name:func_result}, {"role": "system", "content": f"已调用函数 {func_name}，结果如下：{func_result}"}]
+        if not get_messages:
+            return [(msg['name'], msg['content']) for msg in final_messages if msg['role'] == "tool"]  # "role": "tool",
+            # [{func_name:func_result}
+        tool_results = [f"[function:{msg['name']},result:{msg['content']}]" for msg in final_messages if
+                        msg['role'] == "tool"]
 
-    return []
-
-
-async def ai_auto_calls_msg(question, **kwargs) -> list:
-    messages = [{"role": "system", "content": System_content.get('31')},
-                {"role": "user", "content": question}]
-    tool_messages = await ai_tool_response(messages=messages, tools=AI_Tools,
-                                           **kwargs)  # "role": "assistant","tool_calls"
-    if tool_messages:
-        final_messages = await ai_tools_results(tool_messages)
-        results = [{msg['name']: msg['content']} for msg in final_messages if msg['role'] == "tool"]  # "role": "tool",
         result_messages = [{"role": "user", "content": question}]
         for msg in final_messages:
             if msg["role"] == "assistant" and "tool_calls" in msg:
@@ -508,12 +575,11 @@ async def ai_auto_calls_msg(question, **kwargs) -> list:
                 msg["content"] = json.dumps(msg["tool_calls"], indent=2, ensure_ascii=False)
                 result_messages.append(msg)
 
-        tool_results = [f"[function:{i['name']},result:{i['content']}]" for i in results]
         joined_results = '\n'.join(tool_results)
         result_messages.append({
             "role": "system",  # "user"
             "content": f"results:{joined_results}"  # question:{question},\n
-        })
+        })  # {"role": "system", "content": f"已调用函数 {func_name}，结果如下：{func_result}"}]
         return result_messages
 
     return []
@@ -537,15 +603,14 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
         if not file_path_obj.exists():  # .is_file()
             continue
 
-        if client:  # purpose=Literal["assistants", "batch", "fine-tune", "vision"]
+        if client:  # purpose=Literal["assistants", "batch", "fine-tune", "vision","batch_output"]
             file_object = await client.files.create(file=file_path_obj, purpose="file-extract")
-            if model_info['name'] == 'qwen':
+            if model_info['name'] in ('qwen', 'openai'):  # fileid 引用协议
                 messages.append({"role": "system", "content": f"fileid://{file_object.id}", })
                 # client.files.list()
-                # 文件信息client.files.retrieve(file_object.id)
-                # 文件内容client.files.content(file_object.id)
-            elif model_info['name'] == 'moonshot':
-                file_content = await client.files.content(file_id=file_object.id)
+                # 文件信息 file_info = await client.files.retrieve(file_object.id)
+            else:  # 直接读取内容注入到 prompt 中,内容大小有限制,通用性最强,Claude、Mistral、Gemini、moonshot
+                file_content = await client.files.content(file_id=file_object.id)  # 文件内容
                 messages.append({"role": "system", "content": file_content.text, })
         else:
             dashscope_file_upload(messages, file_path=str(file_path_obj))
@@ -564,14 +629,34 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
 Embedding_Cache = {}
 
 
-# def get_cached_embedding(inputs, model_name='MiniLM-L6-v2', model_id=0, **kwargs):
-#     """检查缓存，如果没有就计算嵌入"""
-#     cache_key = generate_hash_key(inputs, model_name, model_id)
-#     if cache_key in Embedding_Cache:
-#         return Embedding_Cache[cache_key]
-#     embedding = ai_embeddings(inputs, model_name, model_id, **kwargs)
-#     Embedding_Cache[cache_key] = embedding
-#     return embedding
+async def get_embedding_from_cache(inputs: Union[str, List[str], Tuple[str]], model_name=Config.DEFAULT_MODEL_EMBEDDING,
+                                   arg_list: list = None, redis=None):
+    """检查缓存，如果没有就计算嵌入"""
+    global Embedding_Cache
+    cache_key = generate_hash_key(inputs, model_name, arg_list)
+
+    try:
+        if redis:
+            cached_embedding = await redis.get(f"embedding:{cache_key}")
+            await redis.expire(f"embedding:{cache_key}", Config.REDIS_CACHE_SEC)
+        else:
+            raise Exception
+    except:
+        cached_embedding = Embedding_Cache.get(cache_key, [])
+
+    if cached_embedding:
+
+        embedding = json.loads(cached_embedding) if isinstance(cached_embedding, str) else cached_embedding
+        if isinstance(embedding, list) and all(isinstance(vec, list) for vec in embedding):
+            return cache_key, embedding
+    return cache_key, []
+
+    # if cache_key in Embedding_Cache:
+    #     print(cache_key)
+    #     return Embedding_Cache[cache_key]
+    # embedding = ai_embeddings(inputs, model_name, model_id, **kwargs)
+    # Embedding_Cache[cache_key] = embedding
+    # return embedding
 
 
 # https://www.openaidoc.com.cn/docs/guides/embeddings
@@ -596,11 +681,12 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str]], model_name: s
     if not inputs:
         return []
 
-    global Embedding_Cache
-    cache_key = generate_hash_key(inputs, model_name, [model_id, get_embedding, normalize])
-    if cache_key in Embedding_Cache:
-        # print(cache_key)
-        return Embedding_Cache[cache_key]
+    redis = get_redis()
+    cache_key, embedding = await get_embedding_from_cache(inputs, model_name, [model_id, get_embedding, normalize],
+                                                          redis=redis)
+    if embedding:
+        # print(f"Embedding already cached for key: {cache_key}")
+        return embedding
 
     try:
         model_info, name = find_ai_model(model_name, model_id, 'embedding')
@@ -658,7 +744,12 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str]], model_name: s
         if normalize and not any(embedding is None for embedding in embeddings):
             embeddings = normalize_embeddings(embeddings, to_list=True)
 
-        if not has_error and len(embeddings) > batch_size:
+        if not has_error:  # and len(embeddings) > batch_size
+            if redis:
+                try:
+                    await redis.setex(f"embedding:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(embeddings))
+                except Exception as e:
+                    print(e)
             Embedding_Cache[cache_key] = embeddings
 
         return embeddings
@@ -704,6 +795,11 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str]], model_name: s
         embeddings = normalize_embeddings(embeddings, to_list=True)
 
     if not has_error:
+        if redis:
+            try:
+                await redis.setex(f"embedding:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(embeddings))
+            except Exception as e:
+                print(e)
         Embedding_Cache[cache_key] = embeddings
 
     return embeddings
@@ -940,7 +1036,7 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
             else:  # isinstance(keyword, str)
                 items_to_process.append(item)  # keyword
 
-    # 多个tool_calls to process items,kwargs func参数
+    # 多个tool_calls to process items,kwargs func参数,agent控制
     for _func in filter(callable, tool_calls):
         if _func.__name__ == '<lambda>' and _func() == []:  # empty_lambda
             continue
@@ -948,10 +1044,10 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
             callable_key = generate_hash_key(id(_func), item, **kwargs)
             bound_func = partial(_func, item, **kwargs)
             callables[callable_key] = bound_func
-            # if inspect.iscoroutinefunction(func):
-            #     tasks.append(func(item, **kwargs))
+            # if inspect.iscoroutinefunction(_func):
+            #     tasks.append(_func(item, **kwargs))
             # else:
-            #     tasks.append(wrap_sync(func, item, **kwargs))
+            #     tasks.append(wrap_sync(_func, item, **kwargs))
 
     # print(callables)
     for _key, bound_func in callables.items():
@@ -1055,10 +1151,12 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
         # top_k=50,
         max_tokens=max_tokens,
         stream=False,
-        tools=tools,  # retrieval、web_search、function
         # extra_body = {"prefix": "```python\n", "suffix":"后缀内容"} 希望的前缀内容,基于用户提供的前缀信息来补全其余的内容
         # response_format={"type": "json_object"}
     )
+
+    if tools and any(tools):  # 一旦你传了 tools 字段，它 必须 至少包含一个合法的 tool
+        payload['tools'] = tools  # retrieval、web_search、function
     if model_type == 'baidu':
         payload['system'] = system
 
@@ -1118,6 +1216,64 @@ def get_chat_payload_post(model_info: Dict[str, Any], payload: dict):
     return url, headers, payload
 
 
+async def stream_chat_completion(client, payload: dict, get_content: bool = True) -> dict | str:
+    payload["stream"] = True
+    payload["stream_options"] = {"include_usage": True}  # 可选，配置以后会在流式输出的最后一行展示token使用信息
+
+    try:
+        stream = await client.chat.completions.create(**payload)
+
+        if not stream or not hasattr(stream, "__aiter__"):
+            raise TypeError("Returned stream is not async iterable")
+
+        content = ''
+        results_data = None
+
+        async for chunk in stream:
+            if not chunk:
+                continue
+
+            # 若 choices 为空但包含 usage，说明是 stream 末尾数据
+            if not hasattr(chunk, "choices") or not chunk.choices:
+                results_data = chunk
+                # {"id": "chatcmpl-xxx", "choices": [], "created": 1719286190, "model": "qwen-plus",
+                #  "object": "chat.completion.chunk", "system_fingerprint": null,
+                #  "usage": {"completion_tokens": 16, "prompt_tokens": 22, "total_tokens": 38}}
+                # {'id': 'chatcmpl-eba4e423-a1bf-90d6-b296-3e526727a0f0', 'choices': [], 'created': 1744611825,
+                #  'model': 'qwq-plus', 'object': 'chat.completion.chunk', 'service_tier': None,
+                #  'system_fingerprint': None,'usage': {'completion_tokens': 196, 'prompt_tokens': 14, 'total_tokens': 210,
+                #            'completion_tokens_details': None, 'prompt_tokens_details': None}}
+
+                break
+
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                content += delta.content
+
+        if not content:
+            raise ValueError("OpenAI API returned an empty stream response.")
+
+        if get_content:  # 以两个换行符 \n\n 结束当前传输的数据块
+            return content  # completion.append(delta.content)
+
+        # 构建最终 completion 格式
+        completion = results_data.model_dump() if results_data else {}
+        completion.update({
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+        })
+        return completion
+
+    except Exception as e:
+        raise RuntimeError(f"[stream_chat_completion] Failed to complete streaming call: {e}") from e
+
+
 async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, get_content: bool = True,
                   **kwargs) -> Union[str, Dict]:
     """
@@ -1144,7 +1300,7 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
             completion = await client.chat.completions.create(**payload)
             if completion is None:
                 raise ValueError("OpenAI API returned None instead of a valid response")
-            if not hasattr(completion, "choices"):
+            if not hasattr(completion, "choices") or not hasattr(completion.choices[0], "message"):
                 raise ValueError(f"Unexpected API response: {completion}")
 
             return completion.choices[0].message.content if get_content else completion.model_dump()  # 自动序列化为 JSON
@@ -1177,53 +1333,7 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
             ]
 
             if any(p in error_message.lower() for p in stream_required_phrases):
-                payload["stream"] = True
-                payload["stream_options"] = {"include_usage": True}  # 可选，配置以后会在流式输出的最后一行展示token使用信息
-
-                stream = await client.chat.completions.create(**payload)
-                if not stream or not hasattr(stream, "__aiter__"):
-                    raise TypeError("Returned stream is not async iterable")
-
-                content = ''
-                results_data = None
-                async for chunk in stream:  # for chunk in stream
-                    if not chunk:
-                        continue
-
-                    if not hasattr(chunk, "choices") or not chunk.choices:
-                        results_data = chunk  # 存储 usage 信息
-                        # {"id": "chatcmpl-xxx", "choices": [], "created": 1719286190, "model": "qwen-plus",
-                        #  "object": "chat.completion.chunk", "system_fingerprint": null,
-                        #  "usage": {"completion_tokens": 16, "prompt_tokens": 22, "total_tokens": 38}}
-                        # {'id': 'chatcmpl-eba4e423-a1bf-90d6-b296-3e526727a0f0', 'choices': [], 'created': 1744611825,
-                        #  'model': 'qwq-plus', 'object': 'chat.completion.chunk', 'service_tier': None,
-                        #  'system_fingerprint': None,'usage': {'completion_tokens': 196, 'prompt_tokens': 14, 'total_tokens': 210,
-                        #            'completion_tokens_details': None, 'prompt_tokens_details': None}}
-
-                        break
-
-                    delta = chunk.choices[0].delta
-                    if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                        content += delta.content  # completion.append(delta.content)
-
-                if not content:
-                    raise ValueError(f"OpenAI API returned an empty stream,{error_message}")
-
-                if get_content:
-                    return content
-
-                completion = results_data.model_dump() if results_data else {}
-                completion.update({
-                    "object": "chat.completion",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": content, },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                })
-                return completion
+                return await stream_chat_completion(client, payload, get_content)
             else:
                 # length_required_phrases = [
                 #     "range of input length",
@@ -1447,263 +1557,6 @@ async def forward_stream(response):
                 yield {"text": line_data}
 
 
-async def tokenize_with_zhipu(content: str, model: str = "glm-4-plus", api_key: str = Config.GLM_Service_Key):
-    url = "https://open.bigmodel.cn/api/paas/v4/tokenizer"
-    headers = {
-        "Authorization": api_key,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": content}]
-    }
-
-    async with httpx.AsyncClient() as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return data["usage"]  # ["prompt_tokens"]
-
-
-async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **kwargs) -> List[Dict]:
-    msg = [{"role": "user", "content": text}]
-    tool = "web-search-pro"
-    url = "https://open.bigmodel.cn/api/paas/v4/tools"
-    data = {
-        "request_id": str(uuid.uuid4()),
-        "tool": tool,
-        "stream": False,
-        "messages": msg
-    }
-    if kwargs:
-        data.update(kwargs)
-
-    headers = {'Authorization': api_key}
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        try:
-            response = await cx.post(url, json=data, headers=headers)
-            response.raise_for_status()
-
-            data = response.json()
-            results = data['choices'][0]['message']['tool_calls'][1]['search_result']
-            return [{
-                'title': result.get('title'),
-                'content': result.get('content'),
-                'link': result.get('link'),
-                'media': result.get('media')
-            } for result in results]
-
-            # return resp.text  # resp.content.decode()
-
-        except httpx.HTTPStatusError as exc:
-            if exc.response is not None and exc.response.status_code == 429:
-                print(f"请求过快，等待 5 秒后重试...")
-            return [{'error': f"HTTP error: {exc.response.status_code} -{exc}"}]
-        except Exception as exc:
-            return [{'error': str(exc)}]
-
-        # https://portal.azure.com/#home
-
-
-async def web_search_tavily(text: str, topic: Literal["general", "news"] = "general",
-                            time_range: Literal['day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'] = 'month',
-                            search_depth: Literal["basic", "advanced"] = "basic", days: int = 7,
-                            api_key: str = Config.TAVILY_Api_Key, **kwargs):
-    # https://docs.tavily.com/api-reference/endpoint/search
-    url = "https://api.tavily.com/search"
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {api_key}'
-    }
-    payload = {
-        "query": text,
-        "search_depth": search_depth,
-        "topic": topic,  # finance,news
-        "time_range": time_range,
-        "max_results": 5,  # 0 <= x <= 20
-        "include_answer": True,  # basic,true,advanced
-        # "include_raw_content": False,
-        # "include_images": False,
-        # "include_image_descriptions": False,
-        # "include_domains": [],
-        # "exclude_domains": []
-    }
-    if topic == 'news':
-        payload['days'] = days  # x >= 0,Available only if topic is .news
-    if kwargs:
-        payload.update(kwargs)
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        # base_url="https://api.tavily.com",client.post("/search", content=json.dumps(data))
-        response = await cx.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data['results']  # "url,title,score,published_date,content
-        else:
-            print(f"Error: {response.status_code}")
-            response.raise_for_status()
-            return [{'error': response.text}]
-
-
-async def web_extract_tavily(urls, api_key: str = Config.TAVILY_Api_Key):
-    # 从一个或多个指定的 URL 中提取网页内容
-    url = "https://api.tavily.com/search"
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {api_key}'
-    }
-    payload = {
-        "urls": urls,
-        "include_images": False,
-        "extract_depth": "basic"  # basic, advanced
-    }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data['results']
-        else:
-            print(f"Error: {response.status_code}")
-            response.raise_for_status()
-
-
-async def search_by_api(query: str, location: str = None, engine: Literal[
-    'google', 'bing', "baidu", 'naver', "yahoo", "youtube",
-    "google_videos", "google_news", "google_images", "amazon_search", "shein_search"] = 'google',
-                        api_key=Config.SearchApi):
-    # https://www.searchapi.io/docs/google
-    if engine is None:
-        if "视频" in query or "movie" in query:
-            engine = "google_videos"
-        elif "新闻" in query or "news" in query:
-            engine = "google_news"
-        elif "图片" in query or "image" in query:
-            engine = "google_images"
-        elif "购物" in query or "buy" in query:
-            engine = "amazon_search"
-        elif "shein" in query.lower():
-            engine = "shein_search"
-        elif location:
-            if "中国" in location:
-                engine = "baidu"
-            elif "韩国" in location:
-                engine = "naver"
-            elif "日本" in location:
-                engine = "yahoo"
-            else:
-                engine = "google"
-        else:
-            engine = "google"
-
-    url = "https://www.searchapi.io/api/v1/search"
-    params = {
-        "engine": engine,
-        "q": query,
-        "api_key": api_key,
-        # "google_domain": "google.com",
-        # "hl": "en",
-        # "gl": "us"
-        # 'country_code'
-        # 'language': 'zh-hans',
-    }
-    if location:
-        params['location'] = location
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("organic_results", data)  # "knowledge_graph,answer_box,top_searches,top_stories
-        else:
-            print(f"Error: {response.status_code}")
-            response.raise_for_status()
-
-
-async def duckduckgo_search(query):
-    url = "https://api.duckduckgo.com/"
-    params = {
-        'q': query,  # 搜索查询
-        'format': 'json',  # 返回 JSON 格式
-        'no_redirect': 1,  # 防止重定向
-        'no_html': 1,  # 去除 HTML
-        'skip_disambig': 1,  # 跳过歧义提示
-    }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data
-        else:
-            print(f"Error: {response.status_code}")
-            response.raise_for_status()
-
-
-def bing_search(query, bing_api_key):
-    url = f"https://api.bing.microsoft.com/v7.0/search?q={query}"
-    headers = {"Ocp-Apim-Subscription-Key": bing_api_key}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    search_results = response.json()
-
-    results = []
-    for result in search_results.get('webPages', {}).get('value', []):
-        title = result.get('name')
-        snippet = result.get('snippet')
-        link = result.get('url')
-        results.append((title, snippet, link))
-    return results  # "\n".join([f"{i+1}. {title}: {snippet} ({link})" for i, (title, snippet, link) in enumerate(search_results[:5])])
-
-
-# https://ziyuan.baidu.com/fastcrawl/index
-def baidu_search(query, baidu_api_key, baidu_secret_key):
-    access_token = get_baidu_access_token(baidu_api_key, baidu_secret_key)
-    search_url = "https://aip.baidubce.com/rest/2.0/knowledge/v1/search"  # https://aip.baidubce.com/rpc/2.0/unit/service/v3/chat
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    search_params = {
-        "access_token": access_token,
-        "query": query,
-        "scope": 1,  # 搜索范围
-        "page_no": 1,
-        "page_size": 5
-    }
-    search_response = requests.post(search_url, headers=headers, data=search_params)
-
-    if search_response.status_code == 401:  # 如果token失效
-        # global baidu_access_token
-        # baidu_access_token = None
-        search_params["access_token"] = get_baidu_access_token(baidu_api_key, baidu_secret_key)
-        search_response = requests.post(search_url, headers=headers, data=search_params)
-
-    search_response.raise_for_status()
-
-    search_results = search_response.json()
-    results = []
-    for result in search_results.get('result', []):
-        title = result.get('title')
-        content = result.get('content')
-        url = result.get('url')
-        results.append((title, content, url))
-    return results  # "\n".join([f"{i+1}. {title}: {content} ({url})" for i, (title, content, url) in enumerate(search_results[:5])])
-
-
-def wikipedia_search(query):
-    response = requests.get(f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json",
-                            timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
-    search_results = response.json().get('query', {}).get('search', [])
-    if search_results:
-        page_id = search_results[0]['pageid']
-        page_response = requests.get(
-            f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&pageids={page_id}&format=json",
-            timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
-        page_data = page_response.json()['query']['pages'][str(page_id)]
-        return page_data.get('extract', 'No extract found.')
-    return "No information found."
-
-
 Assistant_Cache = {}
 
 
@@ -1753,7 +1606,7 @@ async def ai_assistant_run(user_request: str, instructions: str, user_name: str,
         return assistant
 
     assistant_data = assistant['assistant_data']
-    headers = assistant['headers']
+    headers: dict = assistant.get('headers', {})
     messages_url = f'{assistant["threads_url"]}/{assistant["threads_id"]}/messages'
     threads_url = f'{assistant["threads_url"]}/{assistant["threads_id"]}/runs'
 
@@ -2003,267 +1856,6 @@ async def find_closest_matches_embeddings(querys: List[str], tokens: List[str],
     return matches
 
 
-def is_city(city, region='全国'):
-    # https://restapi.amap.com/v3/geocode/geo?parameters
-    response = requests.get(url="http://api.map.baidu.com/place/v2/suggestion",
-                            params={'query': city, 'region': region,
-                                    "output": "json", "ak": Config.BMAP_API_Key, })
-    data = response.json()
-
-    # 判断返回结果中是否有城市匹配
-    for result in data.get('result', []):
-        if result.get('city') == city:
-            return True
-    return False
-
-
-def get_bmap_location(address, city=''):
-    response = requests.get(url="https://api.map.baidu.com/geocoding/v3",
-                            params={"address": address,
-                                    "city": city,
-                                    "output": "json",
-                                    "ak": Config.BMAP_API_Key, })
-    if response.status_code == 200:
-        locat = response.json()['result']['location']
-        return round(locat['lng'], 6), round(locat['lat'], 6)
-    else:
-        print(response.text)
-    return None, None
-
-
-# https://lbsyun.baidu.com/faq/api?title=webapi/place-suggestion-api
-async def search_bmap_location(query, region='', limit=True):
-    url = "http://api.map.baidu.com/place/v2/suggestion"  # 100
-    params = {
-        "query": query,
-        "region": region,
-        "city_limit": 'true' if (region and limit) else 'false',
-        "output": "json",
-        "ak": Config.BMAP_API_Key,
-    }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.get(url, params=params)
-        res = []
-        if response.status_code == 200:
-            js = response.json()
-            for result in js.get('result', []):
-                res.append({'lng_lat': (round(result['location']['lng'], 6), round(result['location']['lat'], 6)),
-                            'name': result["name"], 'address': result['address']})
-        else:
-            print(response.text)
-        return res  # baidu_nlp(nlp_type='address', text=region+query+result["name"]+ result['address'])
-
-
-def get_amap_location(address, city=''):
-    response = requests.get(url="https://restapi.amap.com/v3/geocode/geo?parameters",
-                            params={"address": address,
-                                    "city": city,
-                                    "output": "json",
-                                    "key": Config.AMAP_API_Key, })
-
-    if response.status_code == 200:
-        js = response.json()
-        if js['status'] == '1':
-            s1, s2 = js['geocodes'][0]['location'].split(',')
-            return float(s1), float(s2)  # js['geocodes'][0]['formatted_address']
-    else:
-        print(response.text)
-
-    return None, None
-
-
-# https://lbs.amap.com/api/webservice/guide/api-advanced/search
-async def search_amap_location(query, region='', limit=True):
-    url = "https://restapi.amap.com/v5/place/text?parameters"  # 100
-    params = {
-        "keywords": query,
-        "region": region,
-        "city_limit": 'true' if (region and limit) else 'false',
-        "output": "json",
-        "key": Config.AMAP_API_Key,
-    }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.get(url, params=params)
-        res = []
-        if response.status_code == 200:
-            js = response.json()
-            if js['status'] == '1' and int(js['count']) > 0:
-                for result in js.get('pois', []):
-                    s1, s2 = result['location'].split(',')
-                    res.append({'lng_lat': (float(s1), float(s2)),
-                                'name': result["name"], 'address': result['address']})
-            else:
-                print(response.text)
-        return res
-
-
-# https://console.bce.baidu.com/ai/#/ai/machinetranslation/overview/index
-async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en', trans_type='texttrans'):
-    """百度翻译 API"""
-    salt = str(random.randint(32768, 65536))  # str(int(time.time() * 1000))
-    sign_str = Config.BAIDU_trans_AppId + text + salt + Config.BAIDU_trans_Secret_Key
-    sign = md5_sign(sign_str)  # 需要计算 sign = MD5(appid+q+salt+密钥)
-    url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
-    lang_map = {'fa': 'fra', 'ja': 'jp', 'ar': 'ara', 'ko': 'kor', 'es': 'spa', 'zh-TW': 'cht', 'vi': 'vie'}
-
-    if from_lang in lang_map.keys():
-        from_lang = lang_map[from_lang]
-    if to_lang in lang_map.keys():
-        to_lang = lang_map[to_lang]
-
-    if to_lang == 'auto':
-        to_lang = 'zh'
-
-    params = {
-        "q": text,
-        "from": from_lang,
-        "to": to_lang,
-        "appid": Config.BAIDU_trans_AppId,
-        "salt": salt,
-        "sign": sign
-    }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.get(url, params=params)
-
-    data = response.json()
-    if "trans_result" in data:
-        return data["trans_result"][0]["dst"]
-
-    print(response.text)
-    # texttrans-with-dict
-    url = f"https://aip.baidubce.com/rpc/2.0/mt/{trans_type}/v1?access_token=" + get_baidu_access_token(
-        Config.BAIDU_translate_API_Key, Config.BAIDU_translate_Secret_Key)
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    }
-    payload = json.dumps({
-        "from": from_lang,
-        "to": to_lang
-    })
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-
-    data = response.json()
-    if "trans_result" in data:
-        return data["trans_result"][0]["dst"]
-
-    # print(response.text)
-    return {'error': data.get('error_msg', 'Unknown error')}
-
-
-# https://cloud.tencent.com/document/product/551/15619
-async def tencent_translate(text: str, source: str, target: str):
-    payload = {
-        "SourceText": text,
-        "Source": source,
-        "Target": target,
-        "ProjectId": 0
-    }
-    url = "https://tmt.tencentcloudapi.com"
-    headers = get_tencent_signature(service="tmt", host="tmt.tencentcloudapi.com", body=payload,
-                                    action='TextTranslate',
-                                    secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
-                                    timestamp=int(time.time()), version='2018-03-21')
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
-
-    # 检查响应状态码和内容
-    if response.status_code != 200:
-        print(f"Error: Received status code {response.status_code},Response content: {response.text}")
-        return {'error': f'{response.status_code},Request failed'}
-
-    try:
-        data = response.json()
-    except Exception as e:
-        print(f"Failed to decode JSON: {e},Response text: {response.text}")
-        return {'error': f"Failed to decode JSON: {e},Response text: {response.text}"}
-
-    if "Response" in data and "TargetText" in data["Response"]:
-        return data["Response"]["TargetText"]
-    else:
-        print(f"Unexpected response: {data}")
-        return {'error': f"Tencent API Error: {data.get('Response', 'Unknown error')}"}
-
-
-# https://www.xfyun.cn/doc/nlp/xftrans/API.html
-async def xunfei_translate(text: str, source: str = 'en', target: str = 'cn'):
-    # 将文本进行base64编码
-    encoded_text = base64.b64encode(text.encode('utf-8')).decode('utf-8')
-
-    # 构造请求数据
-    request_data = {
-        "header": {
-            "app_id": Config.XF_AppID,  # 你在平台申请的appid
-            "status": 3,
-            # "res_id": "your_res_id"  # 可选：自定义术语资源id
-        },
-        "parameter": {
-            "its": {
-                "from": source,
-                "to": target,
-                "result": {}
-            }
-        },
-        "payload": {
-            "input_data": {
-                "encoding": "utf8",
-                "status": 3,
-                "text": encoded_text
-            }
-        }
-    }
-
-    headers, url = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
-                                           host="itrans.xf-yun.com", path="/v1/its", method='POST')
-    url = 'https://itrans.xf-yun.com/v1/its'
-
-    # 异步发送请求
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, json=request_data, headers=headers)
-        if response.status_code == 200:
-            response_data = response.json()
-
-            # 解码返回结果中的text字段
-            if "payload" in response_data and "result" in response_data["payload"]:
-                base64_text = response_data["payload"]["result"]["text"]
-                decoded_result = base64.b64decode(base64_text).decode('utf-8')
-                data = json.loads(decoded_result)
-                if "trans_result" in data:
-                    return data["trans_result"]["dst"]
-            else:
-                return {"error": "Unexpected response format"}
-        else:
-            return {"error": f"HTTP Error: {response.status_code}"}
-
-
-# https://docs.caiyunapp.com/lingocloud-api/
-def caiyun_translate(source, direction="auto2zh"):
-    url = "http://api.interpreter.caiyunai.com/v1/translator"
-
-    # WARNING, this token is a test token for new developers,
-    token = Config.CaiYun_Token
-
-    payload = {
-        "source": source,
-        "trans_type": direction,
-        "request_id": "demo",
-        "detect": True,
-    }
-
-    headers = {
-        "content-type": "application/json",
-        "x-authorization": "token " + token,
-    }
-
-    response = requests.request("POST", url, data=json.dumps(payload), headers=headers)
-    return json.loads(response.text)["target"]
-
-
 # https://ai.youdao.com/
 # https://hcfy.ai/docs/services/youdao-api
 async def auto_translate(text: str, model_name='baidu', source: str = 'auto', target: str = 'auto'):
@@ -2321,520 +1913,10 @@ async def auto_translate(text: str, model_name='baidu', source: str = 'auto', ta
     return {"translated": error, 'from': source, 'to': target, "model": model_name}
 
 
-def xunfei_ppt_theme(industry, style="简约", color="蓝色", appid: str = Config.XF_AppID,
-                     api_secret: str = Config.XF_Secret_Key):
-    url = "https://zwapi.xfyun.cn/api/ppt/v2/template/list"
-    timestamp = int(time.time())
-    signature = get_xfyun_signature(appid, api_secret, timestamp)
-    headers = {
-        "appId": appid,
-        "timestamp": str(timestamp),
-        "signature": signature,
-        "Content-Type": "application/json; charset=utf-8"
-    }
-    # body ={
-    #     "query": text,
-    #     "templateId": templateId  # 模板ID举例，具体使用 /template/list 查询
-    # }
-    body = {
-        "payType": "not_free",
-        "style": style,  # 支持按照类型查询PPT 模板,风格类型： "简约","卡通","商务","创意","国风","清新","扁平","插画","节日"
-        "color": color,  # 支持按照颜色查询PPT 模板,颜色类型： "蓝色","绿色","红色","紫色","黑色","灰色","黄色","粉色","橙色"
-        "industry": industry,
-        # 支持按照颜色查询PPT 模板,行业类型： "科技互联网","教育培训","政务","学院","电子商务","金融战略","法律","医疗健康","文旅体育","艺术广告","人力资源","游戏娱乐"
-        "pageNum": 2,
-        "pageSize": 10
-    }
-
-    response = requests.request("GET", url=url, headers=headers, params=body).text
-    return response
-
-
-# https://www.xfyun.cn/doc/spark/PPTv2.html
-async def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str = Config.XF_AppID,
-                            api_secret: str = Config.XF_Secret_Key, max_retries=20):
-    from requests_toolbelt.multipart.encoder import MultipartEncoder
-
-    url = 'https://zwapi.xfyun.cn/api/ppt/v2/create'
-    timestamp = int(time.time())
-    signature = get_xfyun_signature(appid, api_secret, timestamp)
-    form_data = MultipartEncoder(
-        fields={
-            # "file": (path, open(path, 'rb'), 'text/plain'),  # 如果需要上传文件，可以将文件路径通过path 传入
-            # "fileUrl":"",   #文件地址（file、fileUrl、query必填其一）
-            # "fileName":"",   # 文件名(带文件名后缀；如果传file或者fileUrl，fileName必填)
-            "query": text,
-            "templateId": templateid,  # 模板的ID,从PPT主题列表查询中获取
-            "author": "XXXX",  # PPT作者名：用户自行选择是否设置作者名
-            "isCardNote": str(True),  # 是否生成PPT演讲备注, True or False
-            "search": str(True),  # 是否联网搜索,True or False
-            "isFigure": str(True),  # 是否自动配图, True or False
-            "aiImage": "normal"  # ai配图类型： normal、advanced （isFigure为true的话生效）；
-            # normal-普通配图，20%正文配图；advanced-高级配图，50%正文配图
-        }
-    )
-
-    print(form_data)
-    headers = {
-        "appId": appid,
-        "timestamp": str(timestamp),
-        "signature": signature,
-        "Content-Type": form_data.content_type
-    }
-
-    response = requests.request(method="POST", url=url, data=form_data, headers=headers).text
-    resp = json.loads(response)
-    if resp.get('code') != 0:
-        print('创建PPT任务失败,生成PPT返回结果：', response)
-        return None
-
-    task_id = resp['data']['sid']
-    ppt_url = ''
-    retries = 0
-    # 轮询任务进度
-    await asyncio.sleep(5)
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        while task_id is not None and retries < max_retries:
-            task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
-            response = await cx.get(url=task_url, headers=headers)
-            response.raise_for_status()
-            resp = json.loads(response)
-            task_status = resp['data']['pptStatus']
-            aiImageStatus = resp['data']['aiImageStatus']
-            cardNoteStatus = resp['data']['cardNoteStatus']
-
-            if ('done' == task_status and 'done' == aiImageStatus and 'done' == cardNoteStatus):
-                ppt_url = resp['data']['pptUrl']
-                break
-
-            await asyncio.sleep(3)
-            retries += 1
-
-    return ppt_url
-
-
-# https://www.xfyun.cn/doc/spark/ImageGeneration.html#%E9%89%B4%E6%9D%83%E8%AF%B4%E6%98%8E
-async def xunfei_picture(text: str, data_folder=None):
-    headers, url = get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secret_Key,
-                                           host="spark-api.cn-huabei-1.xf-yun.com", path="/v2.1/tti", method='POST')
-    url = 'http://spark-api.cn-huabei-1.xf-yun.com/v2.1/tti' + "?" + urlencode(headers)
-    # 构造请求数据
-    request_body = {
-        "header": {
-            "app_id": Config.XF_AppID,  # 你在平台申请的appid
-            # 'uid'
-            # "res_id": "your_res_id"  # 可选：自定义术语资源id
-        },
-        "parameter": {
-            "chat": {
-                "domain": "general",
-                "temperature": 0.5,
-                # "max_tokens": 4096,
-                "width": 640,  # 默认大小 512*512
-                "height": 480
-            }
-        },
-        "payload": {
-            "message": {
-                "text": [
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ]
-            }
-        }
-    }
-    # 异步发送请求
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, json=request_body, headers={'content-type': "application/json"})
-        if response.status_code != 200:
-            return None, {"error": f"HTTP Error: {response.status_code}"}
-
-        data = response.json()  # json.loads(response.text)
-        code = data['header']['code']
-        if code != 0:
-            return None, {"error": f'请求错误: {code}, {data}'}
-
-        text = data["payload"]["choices"]["text"]
-        image_base = text[0]["content"]  # base64图片结果,base64_string_data
-        image_id = data['header']['sid']
-        # 解码 Base64 图像数据
-        file_data = base64.b64decode(image_base)
-        if data_folder:
-            # 将解码后的数据转换为图片
-            file_path = f"{data_folder}/{image_id}.jpg"  # .png
-            img = Image.open(io.BytesIO(file_data))
-            # r, g, b, a = img.split()
-            # img = img.convert('RGB') 转换为 RGB 格式
-            img.save(file_path)
-
-            # buffer = io.BytesIO()
-            # img.save(buffer, format="JPEG")  # 保存为 JPEG 格式
-            # buffer.seek(0)
-            # async with aiofiles.open(file_path, 'wb') as file:
-            #     await file.write(buffer.read())
-            return file_path, {"urls": '', 'id': image_id}
-
-        return file_data, {"urls": '', 'id': image_id}
-
-
-# https://www.volcengine.com/docs/6791/1361423
-async def ark_visual_picture(image_data, image_urls: List[str], prompt: str = None, logo_info=None, style_name='3D风',
-                             return_url=False, data_folder=None):
-    style_mapping = {
-        "3D风": ("img2img_disney_3d_style", ""),
-        "写实风": ("img2img_real_mix_style", ""),
-        "天使风": ("img2img_pastel_boys_style", ""),
-        "动漫风": ("img2img_cartoon_style", ""),
-        "日漫风": ("img2img_makoto_style", ""),
-        "公主风": ("img2img_rev_animated_style", ""),
-        "梦幻风": ("img2img_blueline_style", ""),
-        "水墨风": ("img2img_water_ink_style", ""),
-        "新莫奈花园": ("i2i_ai_create_monet", ""),
-        "水彩风": ("img2img_water_paint_style", ""),
-        "莫奈花园": ("img2img_comic_style", "img2img_comic_style_monet"),
-        "精致美漫": ("img2img_comic_style", "img2img_comic_style_marvel"),
-        "赛博机械": ("img2img_comic_style", "img2img_comic_style_future"),
-        "精致韩漫": ("img2img_exquisite_style", ""),
-        "国风-水墨": ("img2img_pretty_style", "img2img_pretty_style_ink"),
-        "浪漫光影": ("img2img_pretty_style", "img2img_pretty_style_light"),
-        "陶瓷娃娃": ("img2img_ceramics_style", ""),
-        "中国红": ("img2img_chinese_style", ""),
-        "丑萌粘土": ("img2img_clay_style", "img2img_clay_style_3d"),
-        "可爱玩偶": ("img2img_clay_style", "img2img_clay_style_bubble"),
-        "3D-游戏_Z时代": ("img2img_3d_style", "img2img_3d_style_era"),
-        "动画电影": ("img2img_3d_style", "img2img_3d_style_movie"),
-        "玩偶": ("img2img_3d_style", "img2img_3d_style_doll"),
-        # "文生图-2.0": ("high_aes_general_v20", ''),
-        "文生图-2.0Pro": ("high_aes_general_v20_L", ''),
-        "文生图-2.1": ("high_aes_general_v21_L", ''),
-        "角色特征保持": ("high_aes_ip_v20", ''),
-        "人像融合": ('face_swap3_6', ''),  # 换脸图在前（最多三张），模板图在后（最多一张）
-    }
-    # inpainting涂抹消除,inpainting涂抹编辑,outpainting智能扩图
-    request_body = {'req_key': style_mapping.get(style_name)[0],
-                    'sub_req_key': style_mapping.get(style_name)[1],
-                    'return_url': return_url  # 链接有效期为24小时
-                    }
-    if 'general' in request_body['req_key'] or prompt:
-        request_body["prompt"] = prompt
-        request_body["use_sr"] = True  # AIGC超分
-        request_body["scale"] = 3.6  # 影响文本描述的程度
-        request_body["seed"] = -1  # -1为不随机种子
-        # request_body["use_pre_llm"] = True  #use_rephraser, prompt扩写, 对输入prompt进行扩写优化,辅助生成图片的场景下传True
-    if image_urls and all(image_urls):
-        request_body["image_urls"] = image_urls
-    if image_data:  # 目标图片需小于 5 MB,小于4096*4096,支持JPG、JPEG、PNG格式,仅支持一张图,优先生效
-        request_body["binary_data_base64"] = [base64.b64encode(image_data).decode("utf-8")]  # 输入图片base64数组
-    if logo_info:
-        request_body["logo_info"] = logo_info
-        # {
-        #     "add_logo": True,
-        #     "position": 0,
-        #     "language": 0,
-        #     "opacity": 0.3,
-        #     "logo_text_content": "这里是明水印内容"
-        # }
-    # 'CVSync2AsyncSubmitTask',JPCartoon
-    headers, url = get_ark_signature(action='CVProcess', service='cv', host='visual.volcengineapi.com',
-                                     region="cn-north-1", version="2022-08-31", http_method="POST", body=request_body,
-                                     access_key_id=Config.VOLC_AK_ID_admin,
-                                     secret_access_key=Config.VOLC_Secret_Key_admin,
-                                     timenow=None)
-
-    # print(headers,request_body)
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, json=request_body, headers=headers)
-        if response.status_code != 200:
-            return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-        response.raise_for_status()
-        response_data = response.json()
-        # print(response_data.keys())
-        # {'code': 10000, 'data': {'1905703073': 1905703073, 'algorithm_base_resp': {'status_code': 0, 'status_message': 'Success'}, 'animeoutlineV4_16_strength_clip': 0.2, 'animeoutlineV4_16_strength_model': 0.2, 'apply_id_layer': '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15', 'binary_data_base64': [], 'clip_skip': -2, 'cn_mode': 2, 'comfyui_cost': 4, 'controlnet_weight': 1, 'ddim_steps': 20, 'i2t_tag_text': '', 'id_weight': 0, 'image_urls': ['https://p26-aiop-sign.byteimg.com/tos-cn-i-vuqhorh59i/20241225114813D0211FF38607A612BD65-0~tplv-vuqhorh59i-image.image?rk3s=7f9e702d&x-expires=1735184899&x-signature=A1Jay2TWwSsmtwRjDGzK71gzXpg%3D'], 'long_resolution': 832, 'lora_map': {'animeoutlineV4_16': {'strength_clip': 0.2, 'strength_model': 0.2}, 'null': {'strength_clip': 0.7000000000000001, 'strength_model': 0.7000000000000001}}, 'null_strength_clip': 0.7000000000000001, 'null_strength_model': 0.7000000000000001, 'prompt': '(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,', 'return_url': True, 'scale': 5, 'seed': -1, 'strength': 0.58, 'sub_prompts': ['(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,'], 'sub_req_key': ''}, 'message': 'Success', 'request_id': '20241225114813D0211FF38607A612BD65', 'status': 10000, 'time_elapsed': '6.527672506s'}
-        if response_data["status"] == 10000:
-            image_base = response_data["data"].get("binary_data_base64", [])
-            image_urls = response_data["data"].get("image_urls", [''])
-            request_id = response_data["request_id"]
-            if len(image_base) == 1:
-                image_decode = base64.b64decode(image_base[0])
-                if data_folder:
-                    # 将解码后的数据转换为图片
-                    file_path = f"{data_folder}/{request_id}.jpg"
-                    img = Image.open(io.BytesIO(image_decode))
-                    img.save(file_path)
-                    return file_path, {"urls": image_urls, 'id': request_id}
-                return image_decode, {"urls": image_urls, 'id': request_id}
-            return None, {"urls": image_urls, 'id': request_id}
-        return None, response_data
-
-
-async def ark_drawing_picture(image_data, image_urls: List[str], whitening: float = 1.0, dermabrasion: float = 1.2,
-                              logo_info=None, style_name='3d人偶', return_url=False):
-    style_mapping = {
-        # 头像风格（单人、男女均支持)
-        "美漫风格": "img2img_photoverse_american_comics",
-        "商务证件照": "img2img_photoverse_executive_ID_photo",
-        "3d人偶": "img2img_photoverse_3d_weird",
-        "赛博朋克": "img2img_photoverse_cyberpunk",
-        # 胸像写真风格(单人、只支持女生)
-        "古堡": "img2img_xiezhen_gubao",
-        "芭比牛仔": "img2img_xiezhen_babi_niuzai",
-        "浴袍风格": "img2img_xiezhen_bathrobe",
-        "蝴蝶机械": "img2img_xiezhen_butterfly_machine",
-        "职场证件照": "img2img_xiezhen_zhichangzhengjianzhao",
-        "圣诞": "img2img_xiezhen_christmas",
-        "美式甜点师": "img2img_xiezhen_dessert",
-        "old_money": "img2img_xiezhen_old_money",
-        "最美校园": "img2img_xiezhen_school"
-    }
-
-    request_body = {'req_key': style_mapping.get(style_name),
-                    'return_url': return_url,  # 链接有效期为24小时
-                    "beautify_info": {"whitening": whitening,  # 自定义美白参数，float类型，数值越大，效果越明显，未做参数范围校验，建议[0, 2]
-                                      "dermabrasion": dermabrasion  # 自定义磨皮参数，float类型, 数值越大，效果越明显，未做参数范围校验，建议[0, 2]
-                                      }
-                    }
-    if image_urls and all(image_urls):
-        request_body["image_urls"] = image_urls
-    if image_data:  # 输入图片base64数组,仅支持一张图,优先生效
-        request_body["binary_data_base64"] = [base64.b64encode(image_data).decode("utf-8")]
-    if logo_info:
-        request_body["logo_info"] = logo_info
-
-    headers, url = get_ark_signature(action='HighAesSmartDrawing', service='cv', host='visual.volcengineapi.com',
-                                     region="cn-north-1", version="2022-08-31", http_method="POST", body=request_body,
-                                     access_key_id=Config.VOLC_AK_ID_admin,
-                                     secret_access_key=Config.VOLC_Secret_Key_admin,
-                                     timenow=None)
-
-    # print(headers,request_body)
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, json=request_body, headers=headers)
-        if response.status_code != 200:
-            return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-        response.raise_for_status()
-        response_data = response.json()
-        if response_data["status"] == 10000:
-            image_base = response_data["data"].get("binary_data_base64", [])
-            image_urls = response_data["data"].get("image_urls", [''])
-            if len(image_base) == 1:
-                image_decode = base64.b64decode(image_base[0])
-                return image_decode, {"urls": image_urls, 'id': response_data["request_id"]}
-            return None, {"urls": image_urls, 'id': response_data["request_id"]}
-        return None, response_data
-
-
-# https://help.aliyun.com/zh/viapi/developer-reference/api-overview?spm=a2c4g.11186623.help-menu-142958.d_4_3_1.13e65733U2m63s
-# https://help.aliyun.com/zh/viapi/developer-reference/api-version?spm=a2c4g.11186623.help-menu-142958.d_4_3_0.290f6593LRs5Lt&scm=20140722.H_464194._.OR_help-T_cn~zh-V_1
-async def ali_cartoon_picture(image_url, style_name='复古漫画'):
-    style_mapping = {
-        "复古漫画": '0',
-        "3D童话": '1',
-        "二次元": '2',
-        "小清新": '3',
-        "未来科技": '4',
-        "国画古风": '5',
-        "将军百战": '6',
-        "炫彩卡通": '7',
-        "清雅国风": '8'
-    }
-    # 图片大小不超过10MB。支持的图片类型：JPEG、PNG、JPG、BMP、WEBP。
-    request_body = {'Index': style_mapping.get(style_name, '0'),
-                    'ImageUrl': image_url, }
-    # 视觉智能开放平台各服务支持的区域为华东2（上海）
-    parameters, url = get_aliyun_access_token(service="imageenhan", region="cn-shanghai",
-                                              action='GenerateCartoonizedImage', http_method="POST",
-                                              body=request_body, version='2019-09-30')
-
-    print(request_body)
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        try:
-            response = await cx.post(url, json=request_body)  # , headers=headers
-            print(response.text)
-            if response.status_code != 200:
-                return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-
-            response.raise_for_status()
-            response_data = response.json()
-            request_body = {'JobId': response_data["RequestId"]}
-
-            parameters, url = get_aliyun_access_token(service="imageenhan", region="cn-shanghai",
-                                                      action='GetAsyncJobResult', http_method="POST",
-                                                      body=request_body, version='2019-09-30')
-            response = await cx.post(url, json=request_body)  # , headers=headers
-            # response_data["Data"].get("ResultUrl")
-            print(response.text)
-            # 图片链接非法，请检查图片链接是否可访问 ,图片链接地域不对，请参考https://help.aliyun.com/document_detail/155645.html - imageUrl is invalid region oss url
-            if response.status_code != 200:
-                return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-            response_data = response.json()
-            if response_data["Data"]["Status"] == "PROCESS_SUCCESS":
-                image_url = response_data["Data"]["Result"].get("ImageUrls")
-
-                return {"urls": image_url, 'id': response_data["RequestId"]}
-        except httpx.ConnectError as e:
-            print(f"Connection error: {e},Request URL: {url},Request body: {request_body}")
-
-
-# https://cloud.tencent.com/document/product/1668/88066
-# https://cloud.tencent.com/document/product/1668/107799
-async def tencent_drawing_picture(image_data, image_url: str = '', prompt: str = '', negative_prompt: str = '',
-                                  style_name='日系动漫', return_url=False):
-    # 单边分辨率小于5000且大于50，转成 Base64 字符串后小于 8MB，格式支持 jpg、jpeg、png、bmp、tiff、webp。
-    style_mapping = {
-        "水彩画": '104',
-        "卡通插画": '107',
-        "3D 卡通": '116',
-        "日系动漫": '201',
-        "唯美古风": '203',
-        "2.5D 动画": '210',
-        "木雕": '120',
-        "黏土": '121',
-        "清新日漫": '123',
-        "小人书插画": '124',
-        "国风工笔": '125',
-        "玉石": '126',
-        "瓷器": '127',
-        "毛毡（亚洲版）": '135',
-        "毛毡（欧美版）": '128',
-        "美式复古": '129',
-        "蒸汽朋克": '130',
-        "赛博朋克": '131',
-        "素描": '132',
-        "莫奈花园": '133',
-        "厚涂手绘": '134',
-        "复古繁花": "flower",
-        "芭比": "babi",
-        "白领精英": "commerce",
-        "婚纱日记": "wedding",
-        "醉梦红尘": "gufeng",
-        "暴富": "coin",
-        "夏日水镜": "water",
-        "复古港漫": "retro",
-        "游乐场": "amusement",
-        "宇航员": "astronaut",
-        "休闲时刻": "cartoon",
-        "回到童年": "star",
-        "多巴胺": "dopamine",
-        "心动初夏": "comic",
-        "夏日沙滩": "beach"
-    }
-
-    style_type = style_mapping.get(style_name, '201')
-    if style_type.isdigit():
-        action = 'ImageToImage'  # 图像风格化
-        payload = {'Strength': 0.6,  # 生成自由度(0, 1]
-                   'EnhanceImage': 1,  # 画质增强开关
-                   'RestoreFace': 1,  # 细节优化的面部数量上限，支持0 ~ 6，默认为0。
-                   'RspImgType': 'url' if return_url else 'base64',
-                   'Styles': [style_type],
-                   'LogoAdd': 0
-                   # 'ResultConfig': {"Resolution": "768:768"},  # origin
-                   }
-        if prompt:
-            payload["Prompt"] = prompt
-        if negative_prompt:
-            payload["NegativePrompt"] = negative_prompt
-    else:
-        action = 'GenerateAvatar'  # 百变头像
-        payload = {'RspImgType': 'url' if return_url else 'base64',
-                   'Style': style_type,
-                   'Type': 'human',  # pet,图像类型
-                   'Filter': 1,  # 人像图的质量检测开关，默认开启，仅在人像模式下生效。
-                   'LogoAdd': 0
-                   }
-    if image_data:
-        payload["InputImage"] = base64.b64encode(image_data).decode("utf-8")
-    if image_url:
-        payload["InputUrl"] = image_url
-
-    url = "https://aiart.tencentcloudapi.com"
-    headers = get_tencent_signature(service="aiart", host="aiart.tencentcloudapi.com", body=payload,
-                                    action=action, timestamp=int(time.time()), region="ap-shanghai",
-                                    version='2022-12-29')
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        if response.status_code != 200:
-            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
-
-        response_data = response.json()["Response"]
-        if return_url:
-            return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
-
-        image_decode = base64.b64decode(response_data["ResultImage"])
-        return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
-
-
-# https://cloud.tencent.com/document/product/1729/108738
-async def tencent_generate_image(prompt: str = '', negative_prompt: str = '', style_name='不限定风格',
-                                 return_url=False):
-    style_mapping = {
-        "默认": "000",
-        "不限定风格": "000",
-        "水墨画": "101",
-        "概念艺术": "102",
-        "油画1": "103",
-        "油画2（梵高）": "118",
-        "水彩画": "104",
-        "像素画": "105",
-        "厚涂风格": "106",
-        "插图": "107",
-        "剪纸风格": "108",
-        "印象派1（莫奈）": "109",
-        "印象派2": "119",
-        "2.5D": "110",
-        "古典肖像画": "111",
-        "黑白素描画": "112",
-        "赛博朋克": "113",
-        "科幻风格": "114",
-        "暗黑风格": "115",
-        "3D": "116",
-        "蒸汽波": "117",
-        "日系动漫": "201",
-        "怪兽风格": "202",
-        "唯美古风": "203",
-        "复古动漫": "204",
-        "游戏卡通手绘": "301",
-        "通用写实风格": "401"
-    }
-    payload = {'Style': style_mapping.get(style_name, '000'),
-               'Prompt': prompt,
-               'RspImgType': 'url' if return_url else 'base64',
-               'LogoAdd': 0,
-               "Resolution": "1024:1024",  # origin
-               }
-
-    if negative_prompt:
-        payload["NegativePrompt"] = negative_prompt
-
-    url = "https://hunyuan.tencentcloudapi.com"
-    headers = get_tencent_signature(service="hunyuan", host="hunyuan.tencentcloudapi.com", body=payload,
-                                    action='TextToImageLite', timestamp=int(time.time()), region="ap-guangzhou",
-                                    version='2023-09-01')
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        if response.status_code != 200:
-            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
-
-        response_data = response.json()["Response"]
-        if return_url:
-            return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
-
-        image_decode = base64.b64decode(response_data["ResultImage"])
-        return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
-
-
 async def siliconflow_generate_image(prompt: str = '', negative_prompt: str = '', model_name='siliconflow', model_id=0):
     model_info, name = find_ai_model(model_name, model_id, 'image')
 
-    url = "https://api.siliconflow.cn/v1/images/generations"
-
+    url = model_info.get('image_url') or "https://api.siliconflow.cn/v1/images/generations"
     payload = {
         "model": name,
         "prompt": prompt,
@@ -2857,45 +1939,6 @@ async def siliconflow_generate_image(prompt: str = '', negative_prompt: str = ''
         response_data = response.json()
 
         return None, {"urls": [i['url'] for i in response_data["images"]], 'id': response_data["seed"]}
-
-
-async def embed_images_as_base64(md_content, image_dir):
-    """异步将Markdown中的图片转换为Base64并嵌入到Markdown中"""
-    lines = md_content.split('\n')
-    new_lines = []
-
-    for line in lines:
-        if line.startswith("![") and "](" in line and ")" in line:
-            start_idx = line.index("](") + 2
-            end_idx = line.index(")", start_idx)
-            img_rel_path = line[start_idx:end_idx]
-
-            img_name = os.path.basename(img_rel_path)
-            img_path = os.path.join(image_dir, img_name)
-
-            if os.path.exists(img_path):
-                # 异步读取并转换图片为Base64
-                async with aiofiles.open(img_path, 'rb') as img_file:
-                    img_data = await img_file.read()
-                    img_base64 = base64.b64encode(img_data).decode('utf-8')
-
-                img_extension = os.path.splitext(img_name)[-1].lower()
-                # 根据扩展名确定 MIME 类型
-                if img_extension in ['.jpg', '.jpeg']:
-                    mime_type = 'image/jpeg'
-                elif img_extension == '.gif':
-                    mime_type = 'image/gif'
-                else:
-                    mime_type = 'image/png'
-                # 修改Markdown中的图片路径为Base64编码
-                new_line = f'{line[:start_idx]}data:{mime_type};base64,{img_base64}{line[end_idx:]}'
-                new_lines.append(new_line)
-            else:  # 图片文件不存在，保留原始Markdown格式
-                new_lines.append(line)
-        else:  # 保留非图片链接的原始行
-            new_lines.append(line)
-
-    return '\n'.join(new_lines)
 
 
 async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
@@ -2942,149 +1985,6 @@ async def baidu_nlp(nlp_type='ecnet', **kwargs):  # text': text
         return data
 
 
-# https://ai.baidu.com/ai-doc/OCR/Ek3h7y961,  https://aip.baidubce.com/rest/2.0/solution/v1/iocr/recognise"
-# https://console.bce.baidu.com/ai/#/ai/ocr/overview/index
-async def baidu_ocr_recognise(image_data, image_url, ocr_type='accurate_basic'):
-    '''
-    general:通用文字识别(含位置)
-    accurate:通用文字识别(高进度含位置)
-    accurate_basic:通用文字识别（高进度）
-    general_basic:通用文字识别
-    doc_analysis_office:办公文档识别
-    idcard:身份证识别
-    table:表格文字识别
-    numbers:数字识别
-    qrcode:二维码识别
-    account_opening:开户许可证识别
-    handwriting:手写文字识别
-    webimage:
-    '''
-    headers = {
-        'Content-Type': "application/x-www-form-urlencoded",
-        'Accept': 'application/json',
-        # 'charset': "utf-8",
-    }
-    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/{ocr_type}"
-    access_token = get_baidu_access_token(Config.BAIDU_ocr_API_Key, Config.BAIDU_ocr_Secret_Key)
-    params = {
-        "access_token": access_token,
-        "language_type": 'CHN_ENG',
-    }
-    if image_url:
-        params["url"] = image_url
-    if image_data:
-        params["image"] = base64.b64encode(image_data).decode("utf-8")
-    # 将图像数据编码为base64
-    # image_b64 = base64.b64encode(image_data).decode().replace("\r", "")
-    # if template_sign:
-    #     params["templateSign"] = template_sign
-    # if classifier_id:
-    #     params["classifierId"] = classifier_id
-    # # 请求模板的bodys
-    # recognise_bodys = "access_token=" + access_token + "&templateSign=" + template_sign + "&image=" + quote(image_b64.encode("utf8"))
-    # # 请求分类器的bodys
-    # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
-    # request_body = "&".join(f"{key}={value}" for key, value in params.items())
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, data=params)
-        response.raise_for_status()
-        data = response.json()
-        for key in ['result', 'results', 'error_msg']:
-            if key in data:
-                return data[key]
-        return data
-
-
-# https://cloud.tencent.com/document/product/866/36210
-async def tencent_ocr_recognise(image_data, image_url, ocr_type='GeneralBasicOCR'):
-    '''
-    GeneralBasicOCR:通用印刷体识别,TextDetections
-    RecognizeTableDDSNOCR: 表格识别,TableDetections
-    RecognizeGeneralTextImageWarn:证件有效性检测告警
-    GeneralAccurateOCR:通用印刷体识别（高精度版）
-    VatInvoiceOCR:增值税发票识别
-    VatInvoiceVerifyNew:增值税发票核验
-    ImageEnhancement:文本图像增强,包括切边增强、图像矫正、阴影去除、摩尔纹去除等；
-    QrcodeOCR:条形码和二维码的识别
-    SmartStructuralOCRV2:智能结构化识别,智能提取各类证照、票据、表单、合同等结构化场景的key:value字段信息
-    '''
-    url = 'https://ocr.tencentcloudapi.com'
-    host = url.split("//")[-1]
-    payload = {
-        # 'Action': ocr_type,
-        # 'Version': '2018-11-19'
-        # 'Region': 'ap-shanghai',
-        # 'ImageBase64': '',
-        # 'ImageUrl': image_url,
-    }
-    if image_url:
-        payload['ImageUrl'] = image_url
-    else:
-        if isinstance(image_data, bytes):
-            payload['ImageBase64'] = base64.b64encode(image_data).decode("utf-8")
-        else:
-            payload['ImageBase64'] = base64.b64encode(image_data)
-
-    headers = get_tencent_signature('ocr', host, body=payload, action=ocr_type,
-                                    secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
-                                    version='2018-11-19')
-
-    # payload = convert_keys_to_pascal_case(params)
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return data["Response"]  # "TextDetections"
-
-
-# https://help.aliyun.com/zh/ocr/developer-reference/api-ocr-api-2021-07-07-dir/?spm=a2c4g.11186623.help-menu-252763.d_2_2_4.3aba47bauq0U2j
-async def ali_ocr_recognise(image_data, image_url, ocr_type='Advanced'):
-    # accurate,general_basic,webimage
-    # RecognizeAllText
-    url = 'https://ocr-api.cn-hangzhou.aliyuncs.com'
-    token, _ = get_aliyun_access_token(service="ocr-api", region="cn-hangzhou", access_key_id=Config.ALIYUN_AK_ID,
-                                       access_key_secret=Config.ALIYUN_Secret_Key, version='2021-07-07')
-    headers = {
-        'Content-Type': "application/x-www-form-urlencoded",
-        'charset': "utf-8"
-    }
-    try:
-        # 将图像数据编码为base64
-        # image_b64 = base64.b64encode(image_data).decode().replace("\r", "")
-        params = {
-            "access_token": token,
-            "language_type": 'CHN_ENG',
-
-            'Type': ocr_type,  # Advanced,HandWriting,General,Table,GeneralStructure
-            'PageNo': 1,
-            'OutputRow': False,
-            'OutputParagraph': False,
-            'OutputKVExcel': False,
-            'OutputTableHtml': False,
-        }
-        if image_data:
-            params["body"] = base64.b64encode(image_data)  # quote(image_b64.encode("utf8"))
-        if url:
-            params["Url"] = image_url
-
-        # if template_sign:
-        #     params["templateSign"] = template_sign
-        # if classifier_id:
-        #     params["classifierId"] = classifier_id
-        # # 请求模板的bodys
-        # recognise_bodys = "access_token=" + access_token + "&templateSign=" + template_sign + "&image=" + quote(image_b64.encode("utf8"))
-        # # 请求分类器的bodys
-        # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
-        # request_body = "&".join(f"{key}={value}" for key, value in params.items())
-        response = requests.post(url, data=params, headers=headers, timeout=Config.HTTP_TIMEOUT_SEC)
-        response.raise_for_status()
-
-        return response.json()
-    except:
-        pass
-
-
 async def ali_nlp(text):
     url = 'alinlp.cn-hangzhou.aliyuncs.com'
     token, _ = get_aliyun_access_token(service="alinlp", region="cn-hangzhou", access_key_id=Config.ALIYUN_AK_ID,
@@ -3105,272 +2005,6 @@ async def ali_nlp(text):
         'Text': text,
         'TokenizerId': 'GENERAL_CHN',
     }
-
-
-# https://nls-portal.console.aliyun.com/overview
-async def ali_speech_to_text(audio_data, format='pcm'):
-    """阿里云语音转文字"""
-    params = {
-        "appkey": Config.ALIYUN_nls_AppId,
-        "format": format,  # 也可以传入其他格式，如 wav, mp3
-        "sample_rate": 16000,  # 音频采样率
-        "version": "4.0",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "SignatureMethod": "HMAC-SHA1",
-        "SignatureVersion": "1.0",
-        "SignatureNonce": str(uuid.uuid4())
-    }
-    signature = generate_hmac_signature(Config.ALIYUN_Secret_Key, "POST", params)
-    params["signature"] = signature
-    token, _ = get_aliyun_access_token(service="nls-meta", region="cn-shanghai", action='CreateToken',
-                                       http_method="GET",
-                                       access_key_id=Config.ALIYUN_AK_ID, access_key_secret=Config.ALIYUN_Secret_Key)
-    if not token:
-        print("No permission!")
-
-    headers = {
-        "Authorization": f"Bearer {Config.ALIYUN_AK_ID}",
-        # "Content-Type": "audio/pcm",
-        "Content-Type": "application/octet-stream",
-        "X-NLS-Token": token,
-    }
-
-    # host = 'nls-gateway-cn-shanghai.aliyuncs.com'
-    # conn = http.client.HTTPSConnection(host)
-    # http://nls-meta.cn-shanghai.aliyuncs.com/
-    # "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
-    url = "https://nls-gateway.cn-shanghai.aliyuncs.com/stream/v1/asr"
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, params=params, data=audio_data.getvalue())
-
-    result = response.json()
-    if result.get("status") == 20000000:  # "SUCCESS":
-        return {"text": result.get("result")}
-
-    return {"error": result.get('message')}
-
-
-# {
-#     "task_id": "cf7b0c5339244ee29cd4e43fb97f****",
-#     "result": "北京的天气。",
-#     "status":20000000,
-#     "message":"SUCCESS"
-# }
-
-# 1536: 适用于普通话输入法模型（支持简单的英文）。
-# 1537: 适用于普通话输入法模型（纯中文）。
-# 1737: 适用于英文。
-# 1936: 适用于粤语。
-# audio/pcm pcm（不压缩）、wav（不压缩，pcm编码）、amr（压缩格式）、m4a（压缩格式）
-# https://console.bce.baidu.com/ai/#/ai/speech/overview/index
-async def baidu_speech_to_text(audio_data, format='pcm', dev_pid=1536):  #: io.BytesIO
-    url = "https://vop.baidu.com/server_api"  # 'https://vop.baidu.com/pro_api'
-    access_token = get_baidu_access_token(Config.BAIDU_speech_API_Key, Config.BAIDU_speech_Secret_Key)
-    # Config.BAIDU_speech_AppId
-    url = f"{url}?dev_pid={dev_pid}&cuid={Config.DEVICE_ID}&token={access_token}"
-    headers = {'Content-Type': f'audio/{format}; rate=16000'}
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, data=audio_data.getvalue())
-
-    result = response.json()
-    if result.get("err_no") == 0:
-        return {"text": result.get("result")[0]}
-
-    return {"error": result.get('err_msg')}
-
-
-# Paraformer语音识别API基于通义实验室新一代非自回归端到端模型，提供基于实时音频流的语音识别以及对输入的各类音视频文件进行语音识别的能力。可被应用于：
-# 对语音识别结果返回的即时性有严格要求的实时场景，如实时会议记录、实时直播字幕、电话客服等。
-# 对音视频文件中语音内容的识别，从而进行内容理解分析、字幕生成等。
-# 对电话客服呼叫中心录音进行识别，从而进行客服质检等
-async def dashscope_speech_to_text(audio_path, format='wav', language: List[str] = ['zh', 'en']):
-    recognition = Recognition(model='paraformer-realtime-v2', format=format, sample_rate=16000,
-                              language_hints=language, callback=None)
-    result = await asyncio.to_thread(recognition.call, audio_path)  # recognition.call(audio_path)
-    if result.status_code == 200:
-        texts = [sentence.get('text', '') for sentence in result.get_sentence()]
-        return {"text": texts[0]}
-
-    return {"error": result.message}
-
-
-# SenseVoice语音识别大模型专注于高精度多语言语音识别、情感辨识和音频事件检测，支持超过50种语言的识别，整体效果优于Whisper模型，中文与粤语识别准确率相对提升在50%以上。
-# SenseVoice语音识别提供的文件转写API，能够对常见的音频或音视频文件进行语音识别，并将结果返回给调用者。
-# SenseVoice语音识别返回较为丰富的结果供调用者选择使用，包括全文级文字、句子级文字、词、时间戳、语音情绪和音频事件等。模型默认进行标点符号预测和逆文本正则化。
-async def dashscope_speech_to_text_url(file_urls, model='paraformer-v1', language: List[str] = ['zh', 'en']):
-    task_response = Transcription.async_call(
-        model=model,  # paraformer-8k-v1, paraformer-mtl-v1
-        file_urls=file_urls, language_hints=language)
-
-    transcribe_response = Transcription.wait(task=task_response.output.task_id)
-    transcription_texts = []
-    for r in transcribe_response.output["results"]:
-        if r["subtask_status"] == "SUCCEEDED":
-            async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-                response = await client.get(r["transcription_url"])
-                if response.status_code == 200:
-                    transcription_data = response.json()
-                    if len(transcription_data["transcripts"]) > 0:
-                        transcription_texts.append({"file_url": transcription_data["file_url"],
-                                                    "transcripts": transcription_data["transcripts"][0]['text']
-                                                    })  # transcription_data["transcripts"][0]["sentences"][0]["text"]
-                    else:
-                        print(f"No transcription text found in the response.Transcription Result: {response.text}")
-                else:
-                    print(f"Failed to fetch transcription. Status code: {response.status_code}")
-        else:
-            print(f"Subtask status: {r['subtask_status']}")
-
-    if len(file_urls) != len(transcription_texts):
-        print(json.dumps(transcribe_response.output, indent=4, ensure_ascii=False))
-
-    return transcription_texts, task_response.output.task_id
-
-
-# 非流式合成
-async def dashscope_text_to_speech(sentences, model="cosyvoice-v1", voice="longxiaochun"):
-    synthesizer = dashscope.audio.tts_v2.SpeechSynthesizer(model=model, voice=voice)
-    audio_data = synthesizer.call(sentences)  # sample_rate=48000
-    return audio_data, synthesizer.get_last_request_id()
-
-    # SpeechSynthesizer.call(model='sambert-zhichu-v1',
-    #                        text='今天天气怎么样',
-    #                        sample_rate=48000,
-    #                        format='pcm',
-    #                        callback=callback)
-    # if result.get_audio_data() is not None:
-
-
-# https://bailian.console.aliyun.com/?spm=5176.28197581.0.0.2e2d29a4n0Mukq#/model-market/detail/wanx-v1?tabKey=sdk
-def dashscope_image_call(prompt: str, negative_prompt: str = '', image_url: str = '', style_name="默认",
-                         model_name="wanx-v1", data_folder=None):
-    style_mapping = {
-        "默认": "<auto>",
-        "摄影": "<photography>",
-        "人像写真": "<portrait>",
-        "3D卡通": "<3d cartoon>",
-        "动画": "<anime>",
-        "油画": "<oil painting>",
-        "水彩": "<watercolor>",
-        "素描": "<sketch>",
-        "中国画": "<chinese painting>",
-        "扁平插画": "<flat illustration>"
-    }
-    style = style_mapping.get(style_name, "<auto>")
-    rsp = dashscope.ImageSynthesis.call(model=model_name,  # "stable-diffusion-3.5-large"
-                                        api_key=Config.Bailian_Service_Key,
-                                        prompt=prompt, negative_prompt=negative_prompt, ref_img=image_url,
-                                        n=1, size='1024*1024', style=style)
-
-    # ref_strength：控制输出图像与参考图（垫图）的相似度。取值范围为[0.0, 1.0]。取值越大，代表生成的图像与参考图越相似。
-    # ref_mode：基于参考图（垫图）生成图像的方式。取值有：repaint代表参考内容，为默认值；refonly代表参考风格。
-    if rsp.status_code == HTTPStatus.OK:
-        print(rsp)
-        # 保存图片到当前文件夹
-        image_urls = [result.url for result in rsp.output.results]
-        if data_folder:
-            image_path = []
-            for result in rsp.output.results:
-                file_name = PurePosixPath(unquote(urlparse(result.url).path)).parts[-1]
-                file_path = f'{data_folder}/%s' % file_name
-                with open(file_path, 'wb+') as f:
-                    f.write(requests.get(result.url).content)
-                image_path.append(file_path)
-
-            return image_path, {"urls": image_urls, 'id': rsp.request_id}
-        return requests.get(image_urls[0]).content, {"urls": image_urls, 'id': rsp.request_id}
-    return None, {"error": 'Failed, status_code: %s, code: %s, message: %s' % (rsp.status_code, rsp.code, rsp.message)}
-
-
-# https://help.aliyun.com/zh/model-studio/user-guide/cosplay-anime-character-generation?spm=0.0.0.i1
-# https://help.aliyun.com/zh/model-studio/developer-reference/portrait-style-redraw-api-reference?spm=a2c4g.11186623.help-menu-2400256.d_3_3_2_1.3e2f56e5BtF0ok
-async def wanx_image_generation(image_urls, style_name="复古漫画",
-                                api_key=Config.DashScope_Service_Key, max_retries=20):
-    # JPEG，PNG，JPG，BMP，WEB,不超过10M,不小于256*256，不超过5760*3240, 长宽比不超过2:1
-    style_mapping = {
-        "参考上传图像风格": -1,
-        "复古漫画": 0,
-        "3D童话": 1,
-        "二次元": 2,
-        "小清新": 3,
-        "未来科技": 4,
-        "国画古风": 5,
-        "将军百战": 6,
-        "炫彩卡通": 7,
-        "清雅国风": 8,
-        "喜迎新年": 9
-    }
-    if style_name == 'Cosplay动漫人物':
-        model_name = "wanx-style-cosplay-v1"
-        input_params = {
-            "model_index": 1,
-            "face_image_url": image_urls[0],
-            "template_image_url": image_urls[1],
-        }
-    elif len(image_urls) > 1:
-        model_name = "wanx-style-repaint-v1"
-        input_params = {
-            "style_index": -1,
-            "image_url": image_urls[0],
-            'style_ref_url': image_urls[1]
-        }
-    else:  # '人像风格重绘'
-        model_name = "wanx-style-repaint-v1"
-        input_params = {
-            "style_index": style_mapping.get(style_name, 0),
-            "image_url": image_urls[0],
-        }
-
-    url = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/image-generation/generation'
-    headers = {
-        'Content-Type': 'application/json',
-        "Authorization": f'Bearer {api_key}',
-        'X-DashScope-Async': 'enable'  # 使用异步方式提交作业
-    }
-    task_headers = {"Authorization": f'Bearer {api_key}'}
-    body = {
-        "model": model_name,
-        "input": input_params,
-        # "parameters": {
-        #     "style": "<auto>",
-        #     "size": "1024*1024",
-        #     "n": 1
-        # }
-    }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        data = response.json()
-        task_id = data["output"]["task_id"]
-        task_status = data["output"]["task_status"]
-        retries = 0
-        # 轮询任务进度
-        await asyncio.sleep(3)
-        while task_id is not None and retries < max_retries:
-            task_url = f'https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}'
-            task_response = await cx.get(task_url, headers=task_headers)
-            resp = task_response.json()
-            task_status = resp["output"]["task_status"]
-            # "task_status":"PENDING""RUNNING","SUCCEEDED"->"results", "FAILED"->"message"
-            if task_status == 'SUCCEEDED':
-                urls = [item['url'] for item in resp['output'].get('results', []) if 'url' in item]
-                result = {"urls": urls or [resp['output'].get('result_url')], 'id': task_id}
-                if urls:
-                    image_response = await cx.get(urls[0])
-                    return image_response.content, result
-
-                return None, result
-
-            if task_status == "FAILED":
-                print(resp['output']['message'])
-                break
-
-            await asyncio.sleep(3)
-            retries += 1
-
-        return None, {"urls": [], 'id': task_id, 'status': task_status,
-                      'error': "Task did not succeed within the maximum retry limit."}
 
 
 def dashscope_file_upload(messages, file_path='.pdf', api_key=Config.DashScope_Service_Key):
@@ -3444,7 +2078,7 @@ def upload_file_to_oss(bucket, file_obj, object_name, expires: int = 604800):
 
 
 # 获取文件列表
-def list_files(bucket, prefix='upload/', max_keys=100, max_pages=1):
+def oss_list_files(bucket, prefix='upload/', max_keys=100, max_pages=1):
     """
     列出 OSS 中的文件。
     :param bucket: oss2.Bucket 实例
@@ -3513,37 +2147,6 @@ async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
     return None, None
 
 
-# https://www.weatherapi.com/api-explorer.aspx#forecast
-def get_weather(city: str, days: int = 0, date: str = None):
-    # 使用 WeatherAPI 的 API 来获取天气信息
-    api_key = Config.Weather_Service_Key
-    base_url = "http://api.weatherapi.com/v1/current.json"
-    city = convert_to_pinyin(city)
-    params = {
-        'key': api_key,
-        'q': city,
-        # Pass US Zipcode, UK Postcode, Canada Postalcode, IP address, Latitude/Longitude (decimal degree) or city name.
-        'aqi': 'no'  # Get air quality data 空气质量数据
-    }
-    # Number of days of weather forecast. Value ranges from 1 to 10
-    if days > 0:
-        params['days'] = days
-        params['alerts'] = 'no'
-    elif date:
-        # Date on or after 1st Jan, 2010 in yyyy-MM-dd format
-        # Date between 14 days and 300 days from today in the future in yyyy-MM-dd format
-        params['dt'] = date
-
-    response = requests.get(base_url, params=params)
-    if response.status_code == 200:
-        data = response.json()
-        weather = data['current']['condition']['text']
-        temperature = data['current']['temp_c']
-        return f"The weather in {city} is {weather} with a temperature of {temperature}°C."
-    else:
-        return f"Could not retrieve weather information for {city}."
-
-
 async def send_to_wechat(user_name: str, context: str = None, link: str = None, object_name: str = None):
     url = f"{Config.WECHAT_URL}/sendToChat"
     headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
@@ -3568,64 +2171,67 @@ async def send_to_wechat(user_name: str, context: str = None, link: str = None, 
     return None
 
 
+async def send_callback(callback_data: dict, result, **kwargs):
+    url = callback_data.get("url")
+    fallback_url = "http://127.0.0.1:7000/callback"
+    if not url:
+        print(f"[Missing callback URL]:{callback_data}")
+        url = fallback_url
+
+    payload = callback_data.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+
+    mapping = callback_data.get("mapping", {})
+
+    def apply_mapping(data: dict):
+        return {mapping.get(k, k): v for k, v in data.items()} if mapping else data
+
+    def filter_payload(data: dict):
+        return {mapping[k]: data[k] for k in mapping if k in data} if mapping else data
+
+    if isinstance(result, dict):
+        payload.update(result)
+    elif isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
+        payload.update(result[0])
+    else:
+        payload = {**payload, "result": result}
+
+    payload = apply_mapping(payload)
+    headers = callback_data.get("headers") or {}
+    params = callback_data.get("params")
+    if params and isinstance(params, dict):
+        kwargs.update(params)
+
+    res = None
+    format_type = callback_data.get("format", 'json').lower()  # "query" or "json" form"
+    if format_type == "json":
+        res = await post_http_json(url, json=payload, headers=headers, time_out=Config.HTTP_TIMEOUT_SEC, **kwargs)
+    if format_type == "query":  # query 参数或表单参数
+        query_payload = filter_payload(payload)
+        print(query_payload)
+        res = await get_http_query(url, params=query_payload, headers=headers, time_out=Config.HTTP_TIMEOUT_SEC)
+    if format_type == "form":  # 支持 query 或 form
+        res = await post_http_form(url, data=payload, headers=headers, time_out=Config.HTTP_TIMEOUT_SEC)
+
+    if res and res.get('error'):
+        return await post_http_json(fallback_url, json=payload, headers=headers, **kwargs)
+    return res
+
+
 if __name__ == "__main__":
     print(Function_MetaData_Store)
     AccessToken = 'd04149e455d44ac09432f0f89c3e0a41'
-    # https://nls-portal-service.aliyun.com/ptts?p=eyJleHBpcmF0aW9uIjoiMjAyNC0wOS0wNlQwOToxNjoyNy42MDRaIiwiY29uZGl0aW9ucyI6W1sic3RhcnRzLXdpdGgiLCIka2V5IiwidHRwLzEzODE0NTkxNjIwMDc4MjIiXV19&s=k4sDIZ4lCmUiQ%2BV%2FcTEnFteey54%3D&e=1725614187&d=ttp%2F1381459162007822&a=LTAIiIg37IN8xeMa&h=https%3A%2F%2Ftuatara-cn-shanghai.oss-cn-shanghai.aliyuncs.com&u=qnKV1N8muiAIFiL22JTrgdYExxHS%2BPSxccg9VPiL0Nc%3D
-    fileLink = "https://gw.alipayobjects.com/os/bmw-prod/0574ee2e-f494-45a5-820f-63aee583045a.wav"
-    import asyncio
-    import io
 
-    dashscope.api_key = Config.DashScope_Service_Key
-    file_urls = ['https://dashscope.oss-cn-beijing.aliyuncs.com/samples/audio/paraformer/hello_world_female.wav',
-                 'https://dashscope.oss-cn-beijing.aliyuncs.com/samples/audio/paraformer/hello_world_male.wav'
-                 ]
-    # r = requests.get(
-    #     'https://dashscope.oss-cn-beijing.aliyuncs.com/samples/audio/paraformer/hello_world_female2.wav'
-    # )
-    # with open('asr_example.wav', 'wb') as f:
-    #     f.write(r.content)
-
-    # asyncio.run(dashscope_speech_to_text_url(file_urls))
-
-    task_id = "8d47c5d9-06bb-47aa-8986-1df91b6c8dd2"
-    audio_file = 'data/nls-sample-16k.wav'
-
-
-    # with open(audio_file, 'rb') as f:
-    #     audio_data = io.BytesIO(f.read())
-
-    # print(dashscope_speech_to_text('data/nls-sample-16k.wav'))
-
-    # fetch()调用不会阻塞，将立即返回所查询任务的状态和结果
-    # transcribe_response = dashscope.audio.asr.Transcription.fetch(task=task_id)
-    # print(json.dumps(transcribe_response.output, indent=4, ensure_ascii=False))
-    # for r in transcribe_response.output["results"]:
-    #     if r["subtask_status"] == "SUCCEEDED":
-    #         url = r["transcription_url"]
-    #         response = requests.get(url)
-    #         if response.status_code == 200:
-    #             transcription_data = response.text  # 可以使用 response.json() 来处理 JSON 响应
-    #             print(f"Transcription Result: {transcription_data}")
-    #             data = response.json()
-    #             print(data["transcripts"][0]['text'])
-    #         else:
-    #             print(f"Failed to fetch transcription. Status code: {response.status_code}")
-    #     else:
-    #         print(f"Subtask status: {r['subtask_status']}")
 
     async def test():
-        # audio_file = 'data/nls-sample-16k.wav'
-        # with open(audio_file, 'rb') as f:
-        #     audio_data = io.BytesIO(f.read())
-        #
-        # result = await  baidu_speech_to_text(audio_data, 'wav')  # ali_speech_to_text(audio_data,'wav')  #
         result = await web_search_async('易得融信是什么公司')
+        print(result)
+        result = await baidu_nlp("ecnet", text="百度是一家人工只能公司")
         print(result)
 
 
-    # asyncio.run(test())
-    asyncio.run(baidu_nlp("ecnet", text="百度是一家人工只能公司"))
+    asyncio.run(test())
 
     # asyncio.run(tencent_translate('tencent translate is ok', 'en', 'cn'))
     # from lagent import list_tools, get_tool
@@ -3635,9 +2241,51 @@ if __name__ == "__main__":
         from mcp.server.fastmcp import FastMCP
 
         mcp = FastMCP("aigc")
-        mcp.run(transport='stdio')
-    except:
-        pass
+        # mcp.run(transport='stdio')
+        # mcp.mount()  # 将MCP服务器挂载到FastAPI应用中
+
+        # from fastmcp import FastMCP
+        #
+        # mcp_server = FastMCP(host="0.0.0.0", port=8001)
+        # await mcp_server.start()
+        # await mcp_server.stop()
+
+        # def _register_handlers(self):
+        #     """注册所有消息处理器"""
+        #     # 自动将本地服务方法映射为MCP操作
+        #     for method_name in dir(local_service):
+        #         if not method_name.startswith('_'):
+        #             method = getattr(local_service, method_name)
+        #             if callable(method):
+        #                 mcp_server.add_handler(
+        #                     action=method_name,
+        #                     handler=partial(_call_local_method, method)
+        #                 )
+
+        # from fastmcp import FastMCPClient
+        #
+        # client = FastMCPClient(host="other.server.ip", port=8001)
+        # await client.send_message({"action": "greet", "data": "Hello from FastAPI"})
+        # response = await client.receive_message()
+
+        # async def connect_to_other_server(message: dict):#"action","params"
+        #     client = FastMCPClient(host="other.server.ip", port=8001)
+        #     try:
+        #         await client.connect()
+        #         response = await client.send_and_receive(message)
+        #         return response
+        #     except Exception as e:
+        #         return {"error": str(e)}
+        #     finally:
+        #         await client.disconnect()
+
+        # {"role": "tool", "content": json.dumps(mcp_response), "tool_call_id": tool_call.id}
+
+
+
+    except  Exception as e:
+        print('err', str(e))
+
     # stdio：进程间通信，适用于命令行或脚本工具执行
     # SSE：基于http服务器实现事件推送，适合web应用、实时推送等场景
     # 使用标准输入输出传输来运行

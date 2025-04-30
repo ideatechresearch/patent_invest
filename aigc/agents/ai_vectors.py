@@ -121,10 +121,11 @@ async def create_collection(collection_name, client, size, alias_name: str = Non
         # 如果集合不存在，创建新的集合
         if not await client.collection_exists(collection_name=collection_name):
             print(f"Creating new collection: {collection_name}")
-            # 向量配置,  "Cosine","Euclid","Dot","Manhattan"
+            # 向量配置,  "Cosine","Euclid","Dot","Manhattan" ,datatype='float32'
             vector_params = qcm.VectorParams(size=size, distance=qcm.Distance.COSINE, on_disk=vectors_on_disk)
             await client.create_collection(
                 collection_name=collection_name,
+                # map from strings to objects
                 vectors_config={vector_name: vector_params} if vector_name else vector_params,  # 多向量模式 "text","image"
                 # HNSW 配置：是否将 HNSW 索引保存在磁盘上
                 hnsw_config=qcm.HnswConfigDiff(on_disk=hnsw_on_disk),
@@ -161,6 +162,34 @@ async def create_collection(collection_name, client, size, alias_name: str = Non
     #         on_disk=True,
     #     ),
     # }
+
+
+async def export_all_points(collection_name, client, batch=1000):
+    all_points = []
+    scroll_offset = None
+
+    while True:
+        result, scroll_offset = await client.scroll(
+            collection_name=collection_name,
+            limit=batch,
+            with_vectors=True,
+            with_payload=True,
+            offset=scroll_offset
+        )
+        all_points.extend(result)
+        if scroll_offset is None:
+            break
+
+    return all_points
+
+
+# async def update_collection(collection_name, vector_name, client):
+#     vector_params = qcm.VectorParamsDiff(hnsw_config=qcm.HnswConfigDiff(on_disk=True), on_disk=True)
+#     vectors_config = {vector_name if vector_name else '': vector_params}
+#     return await client.update_collection(
+#         vectors_config=vectors_config,
+#         collection_name=collection_name,
+#     )
 
 
 async def create_payload_index(collection_name, client, field_name, field_schema='keyword'):
@@ -201,7 +230,7 @@ async def upsert_points(payloads: list[dict], vectors: list, collection_name: st
 
 
 async def upsert_points_batch(payloads: list[dict], vectors: list, collection_name: str, client,
-                              batch_size: int = 1000):
+                              vector_name: str = None, batch_size: int = 1000):
     """
     批量插入数据到 Qdrant 集合。
 
@@ -209,6 +238,7 @@ async def upsert_points_batch(payloads: list[dict], vectors: list, collection_na
     :param vectors: 向量列表
     :param collection_name: 集合名称
     :param client: Qdrant 客户端实例
+    :param vector_name:
     :param batch_size: 每次插入的批次大小
     """
     assert len(payloads) == len(vectors), "Payloads and vectors must have the same length."
@@ -221,7 +251,8 @@ async def upsert_points_batch(payloads: list[dict], vectors: list, collection_na
         batch_ids = list(range(index, index + points_size))
 
         # 创建 Batch 对象
-        points = qcm.Batch(ids=batch_ids, payloads=batch_payloads, vectors=batch_vectors)
+        points = qcm.Batch(ids=batch_ids, payloads=batch_payloads,
+                           vectors={vector_name: batch_vectors} if vector_name else batch_vectors)
 
         try:
             print(f"Processing batch {i // batch_size + 1} with size {points_size}...")
@@ -240,7 +271,7 @@ async def upsert_points_batch(payloads: list[dict], vectors: list, collection_na
 async def update_points_batch(ids: list, vectors: list, collection_name: str, client, vector_name: str = None,
                               payload: dict = None):
     operations = []
-    if not ids:
+    if not ids:  # upsert
         current_count = await client.count(collection_name=collection_name)
         ids = list(range(current_count.count, current_count.count + len(vectors)))
         # new_points = [qcm.PointStruct(id=_id, vector=vector) for _id, vector in zip(ids,vectors)]# payload={},
@@ -259,6 +290,23 @@ async def update_points_batch(ids: list, vectors: list, collection_name: str, cl
                 set_payload=qcm.SetPayload(payload=payload, points=ids, ))
             operations.append(set_payload_operation)
     return await client.batch_update_points(collection_name, operations)
+
+
+async def update_vectors(vec_ids: list[tuple[str, list[int]]] | list[int],
+                         vecs_list: list[list[list[float]]] | list[list[float]], client,
+                         collection_name: str, vector_name: str = None):
+    points_all = []  # Points with named vectors
+    if isinstance(vec_ids[0], tuple):
+        assert len(vecs_list) == len(vec_ids)
+
+        for (key, ids), vecs in zip(vec_ids, vecs_list):
+            points = [qcm.PointVectors(id=_id, vector={key: vec}, ) for _id, vec in zip(ids, vecs)]
+            points_all.extend(points)
+    else:
+        points_all = [qcm.PointVectors(id=_id, vector={vector_name: vec} if vector_name else vec) for _id, vec in
+                      zip(vec_ids, vecs_list)]
+
+    return await client.update_vectors(points_all, collection_name)
 
 
 # async def inference(q,collection_name: str, dense_model:str,client, vector_name: str ="text"):
@@ -401,7 +449,8 @@ async def search_by_id(name, collection_name, client, _id=-1, key_name='word', m
 
 
 async def search_by_vecs(query_vectors: list[list[float]], collection_name: str, client,
-                         payload_key: str = 'title', match: list = [], not_match: list = [],
+                         payload_key: str = 'title', vector_name: str = None,
+                         match: list = [], not_match: list = [],
                          topn: int = 10, score_threshold: float = 0.0, exact: bool = False):
     """
     使用 Qdrant 批量查询查询词的嵌入，返回与查询最相似的标记和得分。
@@ -420,9 +469,12 @@ async def search_by_vecs(query_vectors: list[list[float]], collection_name: str,
     """
     query_filter = qcm.Filter(must=match, must_not=not_match)  # 缩小查询范围
     search_queries = [
-        qcm.SearchRequest(vector=vec, filter=query_filter, limit=topn, score_threshold=score_threshold,
-                          with_payload=[payload_key] if payload_key else True, params=qcm.SearchParams(exact=exact), )
+        qcm.SearchRequest(vector={"vector": vec, "name": vector_name} if vector_name else vec, filter=query_filter,
+                          limit=topn, score_threshold=score_threshold,
+                          with_payload=[payload_key] if payload_key else True,
+                          params=qcm.SearchParams(exact=exact), )
         for vec in query_vectors]
+
     return await client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
 
 
@@ -441,10 +493,10 @@ async def search_by_ids(ids, collection_name, client, payload_key='word', match=
 
 
 async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: str, client,
-                               payload_key: str | list = 'title', match: list = [], not_match: list = [],
-                               topn: int = 10, score_threshold: float = 0.0, exact: bool = False,
-                               embeddings_calls: Callable[..., Any] = lambda *args, **kwargs: [],
-                               **kwargs):
+                               payload_key: str | list = 'title', vector_name: str = None,
+                               match: list = [], not_match: list = [], topn: int = 10, score_threshold: float = 0.0,
+                               exact: bool = False, get_dict=True,
+                               embeddings_calls: Callable[..., Any] = lambda *args, **kwargs: [], **kwargs):
     """
     使用 Qdrant 批量查询查询词的嵌入，返回与查询最相似的标记和得分。
 
@@ -452,15 +504,19 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
     :param collection_name: Qdrant 集合的名称。
     :param client: Qdrant 客户端实例。
     :param payload_key: 返回的 payload 中的键名，默认是 'word'。
+    :param vector_name:
     :param match: 搜索时需要匹配的过滤条件。
     :param not_match: 搜索时不匹配的过滤条件。
     :param topn: 返回的最相似结果数量。
     :param score_threshold: 返回的最小得分阈值。
     :param exact: 是否进行精确搜索（True）或近似搜索（False）。
+    :param get_dict: 控制返回 dict 还是 tuple
     :param embeddings_calls: 用于生成嵌入向量的可调用函数，默认为 ai_embeddings。
     :param kwargs: 其他参数，传递给 embeddings_calls。
 
     :return: 返回一个包含查询和匹配结果的列表，每个查询对应一个列表，包含匹配标记的 payload、得分和 ID。
+    -> List[dict]
+    -> List[Tuple[str, dict]]
     -> List[Tuple[Any, float, int]]:
     -> List[Tuple[str, List[Tuple[Any, float, int]]]]
     """
@@ -471,13 +527,15 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
     assert len(querys) == len(query_vectors), "Query list and embedding vector list size mismatch."
 
     def extract_payload(p, keys):
+        if get_dict:
+            return p.model_dump(exclude={'vector', 'version', 'shard_key', 'order_value'}, exclude_none=True)
         if keys is True or keys is None:
-            return p.payload
+            return p.payload, p.score, p.id
         if isinstance(keys, str):
-            return p.payload.get(keys, None)
+            return p.payload.get(keys, None), p.score, p.id
         if isinstance(keys, list):
-            return {k: p.payload.get(k) for k in keys}
-        return p.payload
+            return {k: p.payload.get(k) for k in keys}, p.score, p.id
+        return p.payload, p.score, p.id
 
     if len(querys) == 1:
         with_payload = True
@@ -488,8 +546,9 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
                 with_payload = payload_key
 
         query_filter = qcm.Filter(must=match, must_not=not_match)
+        query_vector = {"vector": query_vectors[0], "name": vector_name} if vector_name else query_vectors[0],
         search_hit = await client.search(collection_name=collection_name,
-                                         query_vector=query_vectors[0],  # tolist()
+                                         query_vector=query_vector,  # tolist() Named Vector
                                          query_filter=query_filter,
                                          limit=topn,
                                          score_threshold=score_threshold,
@@ -498,12 +557,12 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
                                          # with_prefix_cache=True #第二次查询会直接命中缓存,在并发查询较多时表现更好
                                          )
         # {k: p.payload.get(k) for k in payload_key}
-        return [(extract_payload(p, payload_key), p.score, p.id) for p in search_hit]
+        return [extract_payload(p, payload_key) for p in search_hit]
 
-    search_hit = await search_by_vecs(query_vectors, collection_name, client, payload_key, match, not_match,
-                                      topn, score_threshold, exact)  # ScoredPoint
+    search_hit = await search_by_vecs(query_vectors, collection_name, client, payload_key, vector_name,
+                                      match, not_match, topn, score_threshold, exact)  # ScoredPoint
 
-    return [(item, [(extract_payload(p, payload_key), p.score, p.id) for p in hit])
+    return [(item, [extract_payload(p, payload_key) for p in hit])
             for item, hit in zip(querys, search_hit)]  # [:topn]
 
 
@@ -830,6 +889,64 @@ async def similar_node_relations(collection_name, client, node_id, node_name, ex
     return {"nodes": nodes, "edges": new_relationships}
 
 
+
+def recreate_with_named_vector(collection_name, named_vector, client, new_collection=None, batch_size=1000):
+    from tqdm import tqdm
+    collection_info = client.get_collection(collection_name)
+    print(collection_info.dict())
+    vector_params = collection_info.config.params.vectors
+    print(vector_params)
+    if named_vector in vector_params:
+        vector_size = vector_params[named_vector].size
+        vector_distance = vector_params[named_vector].distance
+        raise ValueError(f"Vector {named_vector} found in collection {collection_name}")
+
+    vector_size = vector_params.size
+    vector_distance = vector_params.distance
+    all_points = []
+    scroll_offset = None
+
+    while True:
+        result, scroll_offset = client.scroll(
+            collection_name=collection_name,
+            limit=batch_size,
+            with_vectors=True,
+            with_payload=True,
+            offset=scroll_offset
+        )
+        all_points.extend(result)
+        if scroll_offset is None:
+            break
+
+    if not new_collection:
+        new_collection = collection_name
+
+    if new_collection == collection_name and client.collection_exists(collection_name):
+        client.delete_collection(collection_name)  # 删除现有集合
+
+    # 重新创建 collection，并设置新的 vector 配置
+    client.create_collection(
+        collection_name=new_collection,
+        vectors_config={
+            named_vector: qcm.VectorParams(size=vector_size, distance=vector_distance)
+        }
+    )
+
+    named_points = []
+    for point in all_points:
+        named_vector_data = {named_vector: point.vector}
+        named_points.append(
+            qcm.PointStruct(
+                id=point.id,
+                vector=named_vector_data,
+                payload=point.payload
+            )
+        )
+    for i in tqdm(range(0, len(named_points), batch_size)):
+        batch = named_points[i:i + batch_size]
+        client.upsert(collection_name=new_collection, points=batch)
+
+
 if __name__ == "__main__":
     # qc = AsyncQdrantClient(host='47.110.156.41', grpc_port=6334, prefer_grpc=True)
     # http://47.110.156.41:6333/dashboard#/collections
@@ -843,45 +960,66 @@ if __name__ == "__main__":
         model_name_1 = collection_aliases.aliases[0].alias_name.split("_")[-1]
         print(model_name_1)
 
+    print(qc.retrieve(collection_name="places_bank", ids=[2], with_vectors=True))
+
+    # print(qc.update_collection(
+    #     collection_name="places_bank",
+    #     vectors_config={
+    #         "location": qcm.VectorParamsDiff(),
+    #     }
+    # ))
+
+    # recreate_with_named_vector("places_bank", "location", qc, batch=1000)
+
+    print(qc.search(collection_name="places_bank",
+                    query_vector={"vector": [29.86192, 121.60988], "name": "location"},
+                    # neighbor_vector then result_vector tolist()
+                    with_payload=True,
+                    limit=4,  # max_neighbors
+                    score_threshold=0))
+
     # response = qc.query_batch_points(
     #     collection_name="places_bank",
     #     requests=[
     #         qcm.QueryRequest(
-    #             query=[0.1, 0.2],  # 第一个查询向量
-    #             limit=5,  # 取最近的 5 个结果
+    #             query={"location": [29.86192, 121.60988]},  # 第一个查询向量[29.86192, 121.60988],
+    #             limit=1,  # 取最近的 5 个结果
+    #             # with_payload=True,
     #         ),
-    #         qcm.QueryRequest(
-    #             query=[0.4, 0.5],  # 第二个查询向量
-    #             limit=3,  # 取最近的 3 个结果
-    #             filter=qcm.Filter(must=[qcm.FieldCondition(key="color", match=qcm.MatchValue(value="red"))]),
-    #         ),
+    #         # qcm.QueryRequest(
+    #         #     query=[0.4, 0.5],  # 第二个查询向量
+    #         #     limit=3,  # 取最近的 3 个结果
+    #         #     filter=qcm.Filter(must=[qcm.FieldCondition(key="color", match=qcm.MatchValue(value="red"))]),
+    #         # ),
     #
     #     ]
     # )
     # print(response)
     #
     # doc_1 = qcm.Document(text="123", model="Qdrant/bm25")
-    from generates import ai_embeddings, init_ai_clients
-    from config import AI_Models, API_KEYS
-    import numpy as np
-    import pickle
+
     import asyncio
-
-    qc = AsyncQdrantClient(host='47.110.156.41')  # , grpc_port=6334, prefer_grpc=True
-
-    # data = np.load('../data/embeddings_拜访_MiniLM_2.npz')
-    data = np.load('../data/embeddings_拜访_bge-large-zh.npz')
-    text_embeddings = data['embeddings']
-    index = data['index']
-
-    with open("../data/ideatech_跟进记录_record_text.pkl", "rb") as f:
-        payloads = pickle.load(f)
-    assert len(payloads) == text_embeddings.shape[0]
-
-    print(text_embeddings.shape)
 
 
     async def main():
+        from generates import ai_embeddings, init_ai_clients
+        import numpy as np
+        import pickle
+        from config import AI_Models, API_KEYS
+
+        qc = AsyncQdrantClient(host='47.110.156.41')  # , grpc_port=6334, prefer_grpc=True
+
+        # data = np.load('../data/embeddings_拜访_MiniLM_2.npz')
+        data = np.load('../data/embeddings_拜访_bge-large-zh.npz')
+        text_embeddings = data['embeddings']
+        index = data['index']
+
+        with open("../data/ideatech_跟进记录_record_text.pkl", "rb") as f:
+            payloads = pickle.load(f)
+        assert len(payloads) == text_embeddings.shape[0]
+
+        print(text_embeddings.shape)
+
         collection_name = '拜访记录'
         model_name = 'BAAI/bge-large-zh-v1.5'  # 'BAAI/bge-base-zh-v1.5'  # 'all-MiniLM-L6-v2'
         size = text_embeddings.shape[1]

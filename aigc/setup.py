@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='aigc',
-    version='1.2',
+    version='v1.2.2',
     packages=find_packages(),  # include=['agent']
     include_package_data=True,
     package_data={

@@ -69,7 +69,7 @@ class OperationMysql:
             charset=self.charset,
             cursorclass=pymysql.cursors.DictCursor  # 这个定义使数据库里查出来的值为字典类型
         )
-        self.cur = self.conn.cursor()
+        self.cur = self.conn.cursor()  # 原生数据库连接方式
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -102,6 +102,8 @@ class OperationMysql:
             return None
 
     def search(self, sql, params: tuple | dict = None):
+        if not sql.lower().startswith("select"):
+            pass
         if params is None:
             params = ()
         self.cur.execute(sql, params)
@@ -139,75 +141,94 @@ class MysqlData(OperationMysql):
         super().__init__(**type(self).db_config)
 
 
+def patent_search(patent_id, limit=10):
+    table_name = 'patent_all_2408'  # fixed_table '融资公司专利-202406'
+    column_name = '申请号'  # '公开（公告）号'
+    query = text(f'SELECT table_name FROM `{table_name}` WHERE `{column_name}` = :id')
+    with SessionLocal() as session:
+        result = session.execute(query, {'id': patent_id})  # session.结合 ORM 或 Core 的方式来执行原生 SQL
+        row = result.fetchone()
+        if row:
+            table_name = row[0]
+
+        detail_query = text(f'SELECT * FROM `{table_name}` WHERE `{column_name}` = :id LIMIT :limit')
+        result = session.execute(detail_query, {'id': patent_id, 'limit': limit})
+
+        rows = result.fetchall()  # 获取所有行
+        columns = result.keys()  # 获取列名
+        results = [dict(zip(columns, row)) for row in rows]
+        for item in results:
+            for key, value in item.items():
+                if isinstance(value, datetime):
+                    item[key] = value.isoformat()  # 转换为ISO 8601格式
+        return results
+
+
 class IntentMemory:
-    def __init__(self, max_his=5, db=None, table_name="intent_history"):
-        # 使用 defaultdict 来存储用户和机器人的意图历史
+    def __init__(self, max_his=5, redis=None, prefix="intent_history"):
+        # 使用 defaultdict 来存储用户和机器人的意图历史,deque(maxlen=max_his)
         self.history = defaultdict(lambda: defaultdict(list))  # {robot_id: {user_id: [intent_history]}}
         self.max_his = max_his
-        self.table_name = table_name
-        if db:
-            self._load_data(self, db)
+        self.redis = redis
+        self.prefix = prefix
 
-    def _load_data(self, db=None):
-        if isinstance(db, OperationMysql):
-            create_sql = f"""
-                 CREATE TABLE IF NOT EXISTS {self.table_name} (
-                     id INTEGER PRIMARY KEY AUTO_INCREMENT,
-                     robot_id VARCHAR(255),
-                     user_id VARCHAR(255),
-                     intent TEXT,
-                     idx INT
-                 )
-                 """
-            db.run(create_sql)
+    def _generate_key(self, robot_id, user_id):
+        return f"{self.prefix}:{robot_id}:{user_id}"
 
-            select_sql = f"SELECT robot_id, user_id, intent FROM {self.table_name} ORDER BY id ASC"
-            rows = db.search(select_sql)
-            for row in rows:
-                self.append(row["robot_id"], row["user_id"], row["intent"], db=None)
+    async def loads_data(self):
+        """从Redis加载所有历史记录到内存"""
+        if self.redis:
+            try:
+                # 获取所有匹配的键
+                keys = await self.redis.keys(f"{self.prefix}:*")
+                if keys:
+                    # 批量获取对应的值
+                    cached_values = await self.redis.mget(*keys)
+                    for key, value in zip(keys, cached_values):
+                        if value:
+                            key_str = key.decode() if isinstance(key, bytes) else key
+                            parts = key_str.split(":")
+                            if len(parts) == 3:
+                                _, robot_id, user_id = parts
+                                intents = json.loads(value)
+                                self.history[robot_id][user_id] = intents[-self.max_his:]  # 截断最大数量
+            except Exception as e:
+                print(f"Redis loads error: {e}")
 
-        else:
-            with db.cursor() as cur:
-                cur.execute(f"""CREATE TABLE IF NOT EXISTS {self.table_name} (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            robot_id TEXT,
-                            user_id TEXT,
-                            intent TEXT,
-                            idx INTEGER
-                        )""")
-                db.commit()
-                cur.execute(f"SELECT robot_id, user_id, intent FROM {self.table_name} ORDER BY id ASC")
-                for robot_id, user_id, intent in cur.fetchall():
-                    self.append(robot_id, user_id, intent, db=None)
+    async def _load_data(self, robot_id, user_id):
+        """从Redis载入某个用户历史"""
+        if self.redis:
+            key = self._generate_key(robot_id, user_id)
+            try:
+                data = await self.redis.get(key)
+                if data:
+                    intents = json.loads(data)
+                    self.history[robot_id][user_id] = intents[-self.max_his:]  # 截断
+            except Exception as e:
+                print(f"Redis load error: {e}")
 
-    def _save_data(self, robot_id, user_id, intent, db=None):
-        index = len(self.history[robot_id][user_id]) - 1  # 当前记录位置
-        if isinstance(db, OperationMysql):
-            sql = f"""
-                   INSERT INTO {self.table_name} (robot_id, user_id, intent, idx)
-                   VALUES (%s, %s, %s, %s)
-               """
-            db.insert(sql, (robot_id, user_id, intent, index))
-        else:
-            sql = f"""
-                      INSERT INTO {self.table_name} (robot_id, user_id, intent, idx)
-                      VALUES (?, ?, ?, ?)
-                  """
-            with db.cursor() as cur:
-                cur.execute(sql, (robot_id, user_id, intent, index))
-                db.commit()
+    async def _save_data(self, robot_id, user_id):
+        """将某个用户的历史保存到Redis"""
+        if self.redis:
+            his = self.history[robot_id][user_id]
+            # index = len(his) - 1  # 当前记录位置
+            key = self._generate_key(robot_id, user_id)
+            try:
+                await self.redis.setex(key, 7 * 24 * 3600, json.dumps(his))  # 保存7天
+            except Exception as e:
+                print(f"Redis save error: {e}")
 
-    def append(self, robot_id, user_id, intent, db=None):
+    async def append(self, robot_id, user_id, intent, db=None):
         """添加用户的意图到历史记录"""
         if not robot_id or not user_id or not intent:
             return
         self.history[robot_id][user_id].append(intent)
-        if db:
-            self._save_data(robot_id, user_id, intent, db)
 
         # 保持每个用户历史记录最多为 5 条，避免历史记录过长
         if len(self.history[robot_id][user_id]) > self.max_his:
             self.history[robot_id][user_id].pop(0)
+
+        await self._save_data(robot_id, user_id)
 
     def get_last(self, robot_id, user_id):
         """获取指定用户和机器人的最近意图"""
@@ -230,6 +251,11 @@ class IntentMemory:
                         "index": idx
                     })
         return records
+
+        # if self.redis:
+        #     results = await self.redis.lrange(self.redis_key, 0, -1)
+        #     return [item.decode('utf-8') for item in results]
+        # return list(self.history)
 
 
 async def search_from_database(session, sql, **kwargs):
@@ -391,8 +417,10 @@ class BaseChatHistory(Base):
     index: Mapped[int] = mapped_column(Integer, nullable=False)
     # data = Column(JSON, nullable=True)
     reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
-    # summary: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
     transform: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+
+    # prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    # completion_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -655,7 +683,7 @@ class ChatHistory(BaseChatHistory):
         return user_history
 
     def save(self, bot_response: str, refer: Union[List[str], Dict] = None, transform=None,
-             user_request: str = None, model_name: str = None, agent: str = None, db: Session = None):
+             user_request: str = None, model_name: str = None, db: Session = None):
         user_request = user_request or self.user_request
         if not user_request or not bot_response:
             print('no content to save')
@@ -666,11 +694,11 @@ class ChatHistory(BaseChatHistory):
         hist_size = len(self.user_history)
         new_history = [
             {'role': 'user', 'content': user_request, 'name': self.name,
-             'user_id': self.uid, 'robot_id': self.robot_id, 'agent': agent or self.agent,
+             'user_id': self.uid, 'robot_id': self.robot_id, 'agent': self.agent,
              'index': hist_size + 1, 'model': self.model or model_name, 'timestamp': self.timestamp
              },
             {'role': 'assistant', 'content': bot_response, 'name': self.name,
-             'user_id': self.uid, 'robot_id': self.robot_id, 'agent': agent or self.agent,
+             'user_id': self.uid, 'robot_id': self.robot_id, 'agent': self.agent,
              'index': hist_size + 2, 'model': model_name or self.model,
              'reference': json.dumps(refer, ensure_ascii=False, default=str) if refer else None,  # '\n'.join(refer)
              'transform': json.dumps(transform, ensure_ascii=False, default=str) if transform else None
@@ -686,8 +714,13 @@ class ChatHistory(BaseChatHistory):
         except:
             Chat_History_Cache.extend(new_history)
 
+    def save_cache(self):
+        """保存缓存到数据库"""
+        with SessionLocal() as session:
+            BaseChatHistory.sequential_insert(session, robot_id=self.robot_id, user_id=self.user_id)
 
-class BaseRoBot(Base):
+
+class BaseReBot(Base):
     __tablename__ = 'agent_robot'
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -700,36 +733,39 @@ class BaseRoBot(Base):
 
     model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     name: Mapped[str] = mapped_column(String(99), nullable=False, index=True)
-    rebot_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
+    robot_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
     user_id: Mapped[str] = mapped_column(String(99), nullable=True, index=True)
 
     index: Mapped[int] = mapped_column(Integer, nullable=False)
-    reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
     summary: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
     transform: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+
+    # prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    # completion_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
 
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     __table_args__ = (
-        Index('idx_name_time', 'name', 'rebot_id', 'user_id', 'timestamp'),
+        Index('idx_name_time', 'name', 'robot_id', 'user_id', 'timestamp'),
     )
 
-    def __init__(self, user_name, user_content, assistant_content, system_content=None, agent='0', rebot_id=None,
-                 user_id=None, model=None, index=0, reference=None, summary=None, transform=None, timestamp: int = 0):
+    def __init__(self, user_name, user_content, assistant_content, system_content=None, agent='0', robot_id=None,
+                 user_id=None, model=None, index=0, summary=None, reference=None, transform=None, timestamp: int = 0):
         self.user_content = user_content
         self.assistant_content = assistant_content
         self.system_content = system_content
         self.agent = agent
 
         self.name = user_name
-        self.rebot_id = rebot_id
+        self.robot_id = robot_id
         self.user_id = user_id
         self.model = model
         self.index = index
 
-        self.reference = reference
-        self.summary = summary
+        self.summary = summary  # 背景信息
+        self.reference = reference  # 参考信息,rag,tolls
         self.transform = transform
         self.timestamp = timestamp or int(time.time())
         # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
@@ -749,16 +785,15 @@ class BaseRoBot(Base):
             db.rollback()
             return False
 
+
     @classmethod
-    def get(cls, db: Session, name: str, robot_id: str, user_id: str, system_content: str = None,
-            limit: int = 10):
+    def get(cls, db: Session, name: str, robot_id: str, user_id: str, limit: int = 10) -> list[dict]:
         """
         获取某用户的历史对话记录
         :param db: SQLAlchemy Session
         :param name: 用户名
         :param robot_id: 机器人 ID
         :param user_id: 用户 ID
-        :param system_content: 当前对话的系统提示
         :param limit: 限制返回条数
         """
         history = []
@@ -769,10 +804,9 @@ class BaseRoBot(Base):
                 cls.user_id == user_id
             ).order_by(cls.timestamp.desc()).limit(limit).all()
 
-            if system_content:
-                history.append({"role": "system", "content": system_content})
-
             for rec in reversed(records):  # 倒序，保持时间先后
+                if rec.system_content:
+                    history.append({"role": "system", "content": rec.system_content})
                 if rec.user_content:
                     history.append({"role": "user", "content": rec.user_content})
                 if rec.assistant_content:
@@ -784,33 +818,26 @@ class BaseRoBot(Base):
         return history
 
     @classmethod
-    def inserts(cls, content, db: Session):
-        try:
-            if len(content) > 0:
-                db.add_all([cls(**msg) for msg in content])
-                db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Error inserting history: {e}")
-
-    @classmethod
-    def save(cls, user_name, system_content, user_content, reference, assistant_content, user_id, robot_id):
+    def save(cls, user_name, system_content, user_content, assistant_content, user_id, robot_id, model, agent='chat',
+             summary=None, reference=None, transform=None):
         """保存数据库"""
         sql = f"""
         INSERT INTO {cls.__tablename__} (
-            name, system_content, user_content, reference, assistant_content, agent, user_id, robot_id
+            name, system_content, user_content,assistant_content, user_id, robot_id,model,agent,summary,reference,transform
         ) 
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         params = (
-            user_name, system_content, user_content, reference, assistant_content, 'chat', user_id, robot_id
+            user_name, system_content, user_content, assistant_content, user_id, robot_id, model, agent, summary,
+            reference, transform
         )
-        print(f"SQL查询: {sql}, 参数: {params}")
+        print(f"SQL: {sql}, 参数: {params}")
         return MysqlData().insert(sql, params)
 
     @classmethod
-    def history(cls, user_name, system_content, user_content, user_id, robot_id, filter_day):
-        """保存数据库"""
+    def history(cls, user_name, system_content, user_content, user_id, robot_id, agent='chat', filter_day=None,
+                limit: int = 10):
+        """组装hsistory"""
         if not filter_day:
             filter_day = datetime.today().strftime('%Y-%m-%d')
         sql = f"""
@@ -821,24 +848,27 @@ class BaseRoBot(Base):
                 AND user_id = %s 
                 AND robot_id = %s
                 AND name = %s 
-             ORDER BY timestamp ASC
+             ORDER BY timestamp ASC LIMIT {limit}
          """
-        agent = 'chat'
         params = (agent, user_id, robot_id, user_name)
         history = []
         result = MysqlData().search(sql, params)
-        if system_content:
-            history.append({"role": "system", "content": system_content})
-        if result != ():
-            for item in result:
-                question = item['user_content'] or item.get('reference')
-                if question:
-                    history.append({"role": "user", "content": question})
-                answer = item.get('assistant_content') or item.get('transform')  # 答复信息
-                if answer:
-                    history.append({"role": "assistant", "content": answer})
 
-        history.append({"role": "user", "content": user_content})
+        for item in result:
+            system = item.get('system_content') or item.get('summary')  # 系统提示
+            if system:
+                history.append({"role": "system", "content": system, 'name': user_name})
+            question = item['user_content'] or item.get('reference')
+            if question:
+                history.append({"role": "user", "content": question, 'name': user_name})
+            answer = item.get('assistant_content') or item.get('transform')  # 答复信息
+            if answer:
+                history.append({"role": "assistant", "content": answer, 'name': user_name})
+
+        if system_content:
+            history.append({"role": "system", "content": system_content, 'name': user_name})
+        if user_content:
+            history.append({"role": "user", "content": user_content, 'name': user_name})
         return history
 
 

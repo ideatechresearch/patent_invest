@@ -3,8 +3,8 @@ from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, U
 from abc import ABC, abstractmethod
 from enum import Enum as PyEnum
 from enum import IntEnum
-from dataclasses import asdict, dataclass, is_dataclass
-import random, time
+from dataclasses import asdict, dataclass, is_dataclass, field
+import random, time, asyncio
 
 KB = 1 << 10
 MB = 1 << 20
@@ -42,11 +42,19 @@ class BaseTool(ABC, BaseModel):
 
 
 def dataclass2dict(data):
-    def enum_dict_factory(inputs):
-        return {key: (value.value if isinstance(value, IntEnum) else value)
-                for key, value in inputs}
+    """
+    dataclass / 对象转 dict,适合要拿去做序列化、日志打印、数据库写入等场景
+    :param data:
+    :return:
+    """
 
-    return asdict(data, dict_factory=enum_dict_factory)
+    def enum_dict_factory(inputs):
+        return {key: (value.value if isinstance(value, IntEnum) else value) for key, value in inputs}
+
+    if is_dataclass(data):
+        return asdict(data, dict_factory=enum_dict_factory)
+    else:
+        return data.__dict__
 
 
 def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -> Dict[str, str]:
@@ -61,7 +69,7 @@ def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -
         Dict[str, str]: The converted dictionary.
 
     Raises:
-        ValueError: If the variables type is unsupported.
+        ValueError: If the variables type is unsupported.Dict[str, str]
     """
     if variables is None:
         return {}
@@ -96,12 +104,17 @@ class GenerationParams(BaseModel):
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "developer", "tool"]
-    content: Union[str, List[dict]]  # str
+    content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]
     name: Optional[str] = None  # 可以包含 a-z、A-Z、0-9 和下划线，最大长度为 64 个字符
 
     @model_validator(mode="before")
     def set_default_name(cls, values):
         values["name"] = values.get("name", "") or ""
+        role = values.get("role")
+        content = values.get("content")
+        if role != "user" and isinstance(content, list):
+            raise ValueError(f"Role '{role}' must not have list content (only 'user' can have list).")
+
         return values
 
     # @field_validator("name")
@@ -354,6 +367,14 @@ class PromptRequest(BaseModel):
     model: Optional[str] = "deepseek:deepseek-reasoner"
     depth: List[str] = Field(default_factory=lambda: ["73", "71", "72", "74"])
 
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "depth": ["73", "71", "72", "74"],
+                "model": "deepseek:deepseek-reasoner"
+            }
+        }
+
 
 class TranslateRequest(BaseModel):
     text: str = "你好我的朋友。"
@@ -400,7 +421,8 @@ class ToolRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = Field(None)
     tools: Optional[List[Any]] = Field(None)
     prompt: Optional[str] = Field(default=None)
-    model_name: str = 'moonshot'
+    model_name: Optional[str] = 'qwen:qwen-max'
+    model_metadata: str = 'qwen:qwen-coder-plus'
     model_id: int = -1
     top_p: float = 0.95
     temperature: float = 0.01
@@ -421,12 +443,20 @@ class ToolRequest(BaseModel):
                 ],
                 "tools": [],
                 "prompt": '',
-                "model_name": "moonshot",
+                "model_name": "qwen:qwen-max",
+                "model_metadata": "qwen:qwen-coder-plus",
                 "model_id": -1,
                 "top_p": 0.95,
                 "temperature": 0.01
             }
         }
+
+        @classmethod
+        @field_validator("tools")
+        def clean_tools(cls, values):
+            if not values:
+                return []
+            return [t for t in values if isinstance(t, dict) and t]
 
 
 class AssistantToolsEnum(str, PyEnum):
@@ -456,57 +486,120 @@ class TaskStatus(PyEnum):
     RECEIVED = "received"
 
 
+@dataclass
 class TaskNode:
-    def __init__(self, name, description, action: str = None, event=None, data=None, messages=None, params=None,
-                 status=TaskStatus.PENDING, start_time=0, priority=10):
-        self.name = name  # task_id
-        self.description = description
-        self.action = action  # 任务的执行逻辑（可调用对象函数、脚本或引用的操作类型)
-        self.event = event  # 事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据
-        self.priority: int = priority
-        self.status: TaskStatus = status  # 默认状态
+    name: str  # task_id
+    description: str
+    action: Optional[str] = None  # 任务的执行逻辑（可调用对象函数、脚本或引用的操作类型)
+    event: Any = None  # 事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据
 
-        self.data = data
-        self.messages: list = messages
-        self.params = params
-        self.start_time: float = start_time if start_time else time.time()
-        self.end_time: float = 0
-        self.result = None
+    status: TaskStatus = TaskStatus.PENDING
+    priority: int = 10
+    data: Any = field(default_factory=dict)
+    start_time: float = field(default_factory=time.time)
+    end_time: float = 0
+    result: Any = field(default_factory=list)
 
 
-# class TaskManager:
-#     Task_queue: dict[str, TaskNode] = {}
-#     Task_lock = asyncio.Lock()
-#
-#     @classmethod
-#     async def get_task(cls, task_id: str):
-#         async with cls.Task_lock:
-#             task = cls.Task_queue.get(task_id)
-#             if task:
-#                 task.status = TaskStatus.IN_PROGRESS
-#             else:
-#                 print(f"[start_task] Task {task_id} not found.")
-#                 return  None
-#         return task
-#
-#     @classmethod
-#     async def set_task_status(cls, task_id: str, status: TaskStatus):
-#         async with cls.Task_lock:
-#             task = cls.Task_queue.get(task_id)
-#             if task:
-#                 task.status = status
-#             else:
-#                 print(f"[TaskManager.set_task_status] Task {task_id} not found.")
-#
-#     @classmethod
-#     async def add_task(cls, task_id: str, task: TaskNode):
-#         async with cls.Task_lock:
-#             cls.Task_queue[task_id] = task
+class TaskManager:
+    Task_queue: dict[str, TaskNode] = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
+    Task_lock = asyncio.Lock()
+
+    @classmethod
+    async def add_task(cls, task_id: str, task: TaskNode):
+        async with cls.Task_lock:
+            cls.Task_queue[task_id] = task
+
+    @classmethod
+    async def remove_task(cls, task_id: str):
+        async with cls.Task_lock:
+            cls.Task_queue.pop(task_id, None)
+
+    @classmethod
+    async def get_task(cls, task_id: str):
+        async with cls.Task_lock:
+            return cls.Task_queue.get(task_id)
+
+    @classmethod
+    async def get_task_status(cls, task_id: str) -> TaskStatus | None:
+        task = await cls.get_task(task_id)
+        if task:
+            return task.status
+        return None
+
+    @classmethod
+    async def set_task_status(cls, task_id: str, status: TaskStatus):
+        async with cls.Task_lock:
+            task: TaskNode = cls.Task_queue.get(task_id)
+            if task:
+                task.status = status
+            else:
+                print(f"[set_task_status] Task {task_id} not found.")
+
+    @classmethod
+    async def update_task_result(cls, task_id: str, result, status: TaskStatus = TaskStatus.COMPLETED):
+        async with cls.Task_lock:
+            task: TaskNode = cls.Task_queue.get(task_id)
+            if task:
+                task.result = result
+                task.status = status
+                task.end_time = time.time()
+                if task.status in (TaskStatus.COMPLETED, TaskStatus.RECEIVED):
+                    task.data = None
+                elif task.status == TaskStatus.FAILED:
+                    print(f"Task failed: {dataclass2dict(task)}")
+                return task.result
+            else:
+                print(f"[update_task_result] Task {task_id} not found.")
+                return None
+
+    @classmethod
+    async def clean_old_tasks(cls, timeout_received=3600, timeout=86400):
+        current_time = time.time()
+        task_ids_to_delete = []
+
+        for _id, task in cls.Task_queue.items():
+            if task.end_time and (current_time - task.end_time) > timeout_received:
+                if task.status == TaskStatus.RECEIVED:
+                    task_ids_to_delete.append(_id)
+                    print(f"Task {_id} has been marked for cleanup. Status: RECEIVED")
+            elif (current_time - task.start_time) > timeout:
+                task_ids_to_delete.append(_id)
+                print(f"Task {_id} has been marked for cleanup. Timeout exceeded")
+
+        if task_ids_to_delete:
+            async with cls.Task_lock:
+                for _id in task_ids_to_delete:
+                    cls.Task_queue.pop(_id, None)
+
 
 class KeywordItem(BaseModel):
-    function: str
+    function: Optional[str] = None
     args: Optional[List[Any]] = None
     kwargs: Optional[Dict[str, Any]] = None
+
+
+class CallbackUrl(BaseModel):
+    format: Literal["query", "json", "form"] = "json"
+    url: Optional[str] = None
+    payload: Optional[Dict[str, Union[str, int]]] = None
+    mapping: Optional[Dict[str, Union[str, int]]] = None
+    params: Optional[Dict[str, str]] = None
+    headers: Optional[Dict[str, str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def clean_url(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        if "url" in data and isinstance(data["url"], str) and not data["url"].strip():
+            data["url"] = None
+        return data
+
+
+class CompletionResponse(BaseModel):
+    answer: Optional[str] = None
+    transform: Optional[Any] = None
+    reference: Optional[Any] = None
+    id: Optional[int] = None
 
 
 class CompletionParams(BaseModel):
@@ -523,7 +616,8 @@ class CompletionParams(BaseModel):
     suffix: Optional[str] = Field(None, description="The suffix for the AI to respond to completion. ")
     extract: Optional[str] = Field(None,
                                    description="Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
-
+    callback: Optional[CallbackUrl] = Field(default=None,
+                                            description='Callback info: a URL string or a dict with url and optional payload,params,headers')
     model_name: str = Field("moonshot",
                             description=("Specify the name of the model to be used. It can be any available model, "
                                          "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek', or other models."))
@@ -547,6 +641,8 @@ class CompletionParams(BaseModel):
             "API calls, or other utility operations. Each tool can be invoked to enhance the AI's capabilities and provide more "
             "dynamic responses based on the context."
         ))
+
+    images: Optional[List[str]] = None
 
     # score_threshold: float = Field(default=0, ge=-1, le=1, description="The score threshold setting for the model.")
     # top_n: int = Field(10,description="The number of top results to retrieve during vector search. This determines how many of the highest-scoring items will be returned.")
@@ -576,18 +672,20 @@ class CompletionParams(BaseModel):
                     "extract": "code.python",
                     "max_tokens": 4000,
                     "keywords": ["AI智能"],
-                    "tools": [],  # [("tool_name", {"key": "value"})]
+                    "tools": [],
+                    "callback": None
                 },
                 {
                     "stream": False,
                     "extract": "wechat",
+                    "callback": None,
                     "model_name": "doubao",
                     "model_id": -1,
                     "prompt": "",
                     "agent": "42",
                     "top_p": 0.8,
                     "question": "这是什么啊,可以描述一下吗?",
-                    "keywords": [('web_search', "大象")],
+                    "keywords": [('web_search', "大象")],  # [("tool_name", {"key": "value"})]
                     "suffix": "",
                     "temperature": 0.7,
                     "max_tokens": 4096,
@@ -602,6 +700,13 @@ class CompletionParams(BaseModel):
         if not MODEL_LIST.contains(value):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
         return value
+
+    @classmethod
+    @field_validator("tools")
+    def clean_tools(cls, values):
+        if not values:
+            return []
+        return [t for t in values if isinstance(t, dict) and t]
 
     def asdict(self):
         return self.model_dump()  # .dict()
@@ -636,7 +741,7 @@ class SubmitMessagesRequest(BaseModel):
                 "uuid": None,
                 "name": None,
                 "robot_id": None,
-                "user_id": "test",
+                "user_id": "aigc_test",
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
@@ -644,7 +749,7 @@ class SubmitMessagesRequest(BaseModel):
                     {
                         "role": "user",
                         "content": "你好，我的朋友",
-                        "name": '',
+                        "name": 'test',
                     }
                 ],
                 "params": [{
@@ -657,12 +762,12 @@ class SubmitMessagesRequest(BaseModel):
                     "question": "",
                     "keywords": [],
                     "tools": [],
+                    'images': [],
                     "agent": "0",
                     "extract": "json",
+                    "callback": {'url': 'http://127.0.0.1:7000/callback'},
                     "model_name": "moonshot",
                     "model_id": 0,
-                    # "score_threshold": 0.0,
-                    # "top_n": 10,
                 }]
             }
         }
@@ -697,11 +802,11 @@ class ChatCompletionRequest(CompletionParams):
                 "name": None,
                 "user_id": "test",
                 "robot_id": None,
+                "agent": "0",
 
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
-                "agent": "0",
                 "model_name": "moonshot",
                 "model_id": 0,
                 "prompt": '',
@@ -709,7 +814,9 @@ class ChatCompletionRequest(CompletionParams):
                 "messages": [],
                 "keywords": [],
                 "tools": [],
+                'images': [],
                 "extract": 'json',
+                "callback": None,
                 "stream": False,
                 "temperature": 0.4,
                 "top_p": 0.8,

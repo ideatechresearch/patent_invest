@@ -5,7 +5,7 @@ from collections import defaultdict
 import asyncio
 import queue
 from redis.asyncio import Redis, StrictRedis
-from typing import Dict, List, Tuple, Union, Iterable
+from typing import Dict, List, Tuple, Union, Iterable, Callable
 from threading import Thread
 import uuid
 import zmq, zmq.asyncio
@@ -29,6 +29,31 @@ def get_redis() -> Redis:
 async def shutdown_redis():
     if redis_client:
         await redis_client.close()
+
+
+async def do_job_by_lock(func_call: Callable, redis_key: str = None, lock_timeout: int = 600, **kwargs):
+    redis = get_redis()
+    if not redis:
+        await func_call(**kwargs)
+        return
+
+    if not redis_key:
+        redis_key = f'lock:{func_call.__name__}'
+    lock_value = str(time.time())
+    lock_acquired = await redis.set(redis_key, lock_value, nx=True, ex=lock_timeout)
+    if not lock_acquired:
+        print(f"⚠️ 分布式锁已被占用，跳过任务: {func_call.__name__}")
+        return
+
+    try:
+        print(f"🔒 获取锁成功，开始执行任务: {func_call.__name__}")
+        await func_call(**kwargs)
+    except Exception as e:
+        print(f"⚠️ 任务执行出错: {func_call.__name__} -> {e}")
+    finally:
+        current_lock_value = await redis.get(redis_key)
+        if current_lock_value and current_lock_value.decode() == lock_value:
+            await redis.delete(redis_key)
 
 
 class TaskEdge:

@@ -132,6 +132,7 @@ async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
             print(e)
             return None
 
+
 class Local_Aigc:
     HOST = 'aigc'  # '47.110.156.41'
     AI_Models = [
@@ -396,8 +397,8 @@ def request_aigc(history, question, system, model_name, agent='0', stream=False,
 
     body.update(kwargs)
     try:
-        response = RunMethod().post_main(url, json.dumps(body), headers=headers, timeout=(10, 100), stream=stream)
-        data = json.loads(response.content)
+        response = requests.post(url, headers=headers, json=body, timeout=(10, time_out), stream=stream)
+        data = response.json()
 
     except Exception as e:
         print(body)
@@ -456,19 +457,21 @@ async def request_aigc_async(history: list, question, system, model_name, agent=
 
     except (RuntimeError, httpx.HTTPStatusError, httpx.RequestError) as e:
         print(f"[httpx] 请求失败: {e}，尝试 fallback requests...")
-        res = requests.post(url, headers=headers, json=payload, timeout=(10, time_out))
-        if res.status_code == 200:
-            data = res.json()
+        response = RunMethod().post_main(url, json.dumps(payload), headers=headers, timeout=(30, time_out),
+                                         stream=stream)
+
+        if response.status_code == 200:
+            data = json.loads(response.content)  # response.content.decode('utf-8')
             return extract(data)
         else:
-            raise RuntimeError(f"[requests fallback] 返回为空或状态码异常: {res.status_code}, 内容: {res.text}")
+            raise RuntimeError(
+                f"[requests fallback] 返回为空或状态码异常: {response.status_code}, 内容: {response.text}")
 
     except Exception as e:
         print(f"[requests] fallback error: {e}，尝试最终 fallback 函数...")
         # fallback to sync version:can't start new thread
 
     return request_aigc(history, question, system, model_name, agent, stream, host, get_content, time_out, **kwargs)
-
 
 
 async def aigc_completion_wechat(question='', system='', name=None, robot_id='机器人小D',
@@ -496,10 +499,117 @@ async def aigc_completion_wechat(question='', system='', name=None, robot_id='�
     return await request_aigc_async(**payload, get_content=True, time_out=time_out)
 
 
+def aigc_message_callback(question, system, history: list[dict] = None, keywords: list = None,
+                          callback_data: str | dict = None, model_id='moonshot', agent='0', host=AIGC_HOST,
+                          time_out: int | float = 100, **kwargs) -> dict:
+    headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
+    url = f"http://{host}:7000/submit_messages"
+    param = {
+        "stream": False,
+        "temperature": 0.6,
+        "top_p": 0.7,
+        "max_tokens": 4096,
+        "prompt": system,
+        "question": question,
+        "keywords": keywords,
+        "tools": [],
+        'images': [],
+        "callback": {},
+        "agent": agent,
+        "extract": "json",
+        "model_name": model_id,
+        "model_id": 0,
+    }
+    body = {
+        "uuid": None,
+        "name": None,
+        "robot_id": None,
+        "user_id": "idea_ai_robot",
+        "use_hist": False,
+        "filter_limit": -500,
+        "filter_time": 0.0,
+        "messages": history,  # not user_messages and use_hist get message_records from db, else use chat_history
+        "params": [param]
+    }
+    if callback_data:
+        if isinstance(callback_data, str):
+            param["callback"]["url"] = callback_data
+        elif isinstance(callback_data, dict):
+            param["callback"] = callback_data
+
+    for k, v in kwargs.items():
+        if k in param:
+            param[k] = v
+        else:
+            body[k] = v  # 非 params 里的放顶层
+
+    body["params"][0] = param
+
+    try:
+        response = RunMethod().post_main(url, json.dumps(body), headers=headers, timeout=(30, time_out))
+        data = json.loads(response.content)  # response.content.decode('utf-8')
+
+    except Exception as e:
+        print(body)
+        raise RuntimeError(f"[requests] 返回为空或状态码异常: {e}")
+
+    return data
+
+
+def aigc_message_wechat(question, system, name=None, history: list[dict] = None, keywords: list = None,
+                        model_id='moonshot', agent='0', host=AIGC_HOST, time_out: int | float = 100, **kwargs) -> dict:
+    headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
+    url = f"http://{host}:7000/submit_messages"
+
+    body = {
+        "uuid": None,
+        "name": name,
+        "robot_id": None,
+        "user_id": "idea_ai_robot",
+        "use_hist": True,
+        "filter_limit": -500,
+        "filter_time": 0.0,
+        "messages": history,  # not user_messages and use_hist get message_records from db, else use chat_history
+        "params": [{
+            "stream": False,
+            "temperature": 0.8,
+            "top_p": 0.8,
+            "max_tokens": 4096,
+            "prompt": system,
+            "question": question,
+            "keywords": keywords,
+            "tools": [],
+            'images': [],
+            "callback": {},
+            "agent": agent,
+            "extract": "wechat",
+            "model_name": model_id,
+            "model_id": 0,
+            # "score_threshold": 0.0,
+            # "top_n": 10,
+        }]
+    }
+    for k, v in kwargs.items():
+        if k in body["params"][0]:
+            body["params"][0][k] = v
+        else:
+            body[k] = v  # 非 params 里的放顶层
+
+    try:
+        response = RunMethod().post_main(url, json.dumps(body), headers=headers, timeout=(30, time_out))
+        data = json.loads(response.content)  # response.content.decode('utf-8')
+
+    except Exception as e:
+        print(body)
+        raise RuntimeError(f"[requests] 返回为空或状态码异常: {e}")
+
+    return data
+
+
 def aigc_chat(user_request: str, system: str, model="moonshot:moonshot-v1-8k", get_content: bool = True,
               host=AIGC_HOST, time_out: int | float = 100, **kwargs):
     history = [
-        {"role": "system", "content": system},
+        {"role": "system", "content": system or "你是一个智能助手，帮助用户解决问题"},
         {"role": "user", "content": user_request}
     ]
     payload = dict(
@@ -514,14 +624,12 @@ def aigc_chat(user_request: str, system: str, model="moonshot:moonshot-v1-8k", g
     payload.update(kwargs)
 
     headers = {'Content-Type': 'application/json', }
-    url = f"http://{host}:7000/v1/chat/completions"  # 47.110.156.41
+    url = f"http://{host}:7000/v1/chat/completions" 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=(10, time_out))
         data = response.json()
         return data.get('choices', [{}])[0].get('message', {}).get('content') if get_content else data
     except Exception as e:
-        # response = RunMethod().post_main(url, json.dumps(payload), headers=headers, timeout=(10, time_out)
-        # data = json.loads(response.content)
         print(payload)
         return f"HTTP error occurred: {e}" if get_content else {"error": str(e), "status": "failed"}
 
@@ -576,9 +684,20 @@ async def ai_chat_async(messages: list[dict] = None, user_request: str = '', sys
                 print(response.text)
             return data
 
+    except (RuntimeError, httpx.HTTPStatusError, httpx.RequestError) as e:
+        print(f"[httpx] 请求失败: {e}，尝试 fallback requests...")
+        response = RunMethod().post_main(url, json.dumps(payload), headers=headers, timeout=(30, time_out))
+        if response.status_code == 200:
+            data = json.loads(response.content)  # response.content.decode('utf-8')
+            return data.get('choices', [{}])[0].get('message', {}).get('content') if get_content else data
+        else:
+            raise RuntimeError(
+                f"[requests fallback] 返回为空或状态码异常: {response.status_code}, 内容: {response.text}")
+
     except Exception as e:
-        print(f"HTTPx error occurred: {e}")
-        return aigc_chat(user_request, system, model, get_content, host, time_out, **kwargs)
+        print(f"[requests] fallback error: {e}，尝试最终 fallback 函数...")
+
+    return aigc_chat(user_request, system, model, get_content, host, time_out, **kwargs)
 
 
 async def request_llm(question, system, keywords=[], model_name='qwen', agent='0', host=AIGC_HOST, **kwargs):
@@ -670,6 +789,16 @@ async def request_tools(question, tools=[], model_name='qwen-turbo', host=AIGC_H
         return json.loads(response.content)
     except Exception as e:
         print(e)
+
+
+def generate_embeddings(sentences: list, model_name='qwen', host=AIGC_HOST):
+    url = f'http://{host}:7000/embeddings/'
+    payload = {'texts': sentences, 'model_name': model_name, 'model_id': 0}
+    response = requests.post(url, json=payload)
+    if response.status_code == 200:
+        return response.json()['embedding']
+
+    return []
 
 
 async def request_knowledge(question, model_name='BAAI/bge-reranker-v2-m3', version=0, host=AIGC_HOST, **kwargs):
