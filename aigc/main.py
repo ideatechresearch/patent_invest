@@ -1993,6 +1993,7 @@ if __name__ == "__main__":
 
     os.environ['HTTP_PROXY'] = Config.HTTP_Proxies['http']
     os.environ['HTTPS_PROXY'] = Config.HTTP_Proxies['https']
+    # Config.debug()
 
     uvicorn.run(app, host="0.0.0.0", port=7000)
 

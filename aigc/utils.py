@@ -731,6 +731,18 @@ def extract_code_blocks(text, lag='python', **kwargs):
     return {k: f(text) for k, f in funcs.items()}
 
 
+def clean_json_string(json_str):
+    # 1. 去除 // 注释
+    json_str = re.sub(r'//.*', '', json_str)
+    # 2. 修复非法反斜杠：把非法的 \x 转为 x
+    json_str = re.sub(r'\\(.)', fix_invalid_backslashes, json_str)
+    # 3. 替换 HTML 标签、伪标签、非法换行符
+    json_str = json_str.replace('<br>', '\n')
+    json_str = json_str.replace('\\"', '"')
+    json_str = json_str.replace('<', '《').replace('>', '》')  # 修复 <ucam.xxx> 造成的错误
+    return json_str
+
+
 def extract_json_from_string(input_str):
     # 从一个普通字符串中提取 JSON 结构，但可能不处理嵌套的 JSON
     match = re.search(r'\{.*}', input_str, re.DOTALL)
@@ -739,9 +751,8 @@ def extract_json_from_string(input_str):
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e1:
+            json_str = clean_json_string(json_str)
             try:
-                json_str = re.sub(r'//.*', '', json_str)  # 去掉 // 注释
-                json_str = re.sub(r'\\(.)', fix_invalid_backslashes, json_str)
                 return json.loads(json_str)
             except json.JSONDecodeError as e2:
                 print(f"Error decoding JSON: {e2},{input_str}")
@@ -1380,6 +1391,7 @@ async def start_llm_stream(new_llm_stream):
         if idx > 0:
             print(f"🔊 朗读: {text}")
 
+
 def split_text_into_sentences(raw_text):
     # 使用常见的标点符号分割文本，生成句子列表
     sentence_endings = ['。', '！', '？', '；', '.', '!', '?', ';']  # 常见中文/英文标点
@@ -1397,6 +1409,7 @@ def split_text_into_sentences(raw_text):
         sentences.append(current_sentence.strip())
 
     return sentences
+
 
 def split_sentences(text,
                     pattern=(r'[^一二三四五六七八九十\d\r\n]*\b[一二三四五六七八九十]+\、'  # 中文序号 "一、二、"

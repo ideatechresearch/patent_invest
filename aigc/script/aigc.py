@@ -5,13 +5,14 @@ import httpx
 import re, hashlib
 
 try:
-    import aiohttp
-
-    USE_AIOHTTP = True
+    from openai import OpenAI, AsyncOpenAI
 except ImportError:
-    import httpx
+    pass
 
-    USE_AIOHTTP = False
+try:
+    import aiohttp
+except ImportError:
+    pass
 
 AI_API_KEYS = {'moonshot': "",
                'aigc': "token-abc123"}
@@ -145,13 +146,25 @@ class Local_Aigc:
         #  'url': f"http://{AIGC_HOST}:7000/v1/chat/completions", 'base_url': f"http://{AIGC_HOST}:7000/v1"}
     ]
     _client = None  # httpx.AsyncClient | aiohttp.ClientSession
+    _is_openai = False
     _is_aiohttp = False
     _is_sync = False
     _timeout = 100
 
-    def __init__(self, host=AIGC_HOST, haio=USE_AIOHTTP, use_sync=False, time_out: int | float = 100.0):
+    def __init__(self, host=AIGC_HOST, use_sync=False, time_out: int | float = 100.0):
         self.__class__.HOST = host
-        self.__class__._is_aiohttp = haio
+        try:
+            from openai import OpenAI, AsyncOpenAI
+            self.__class__._is_openai = True
+        except ImportError:
+            self.__class__._is_openai = False
+            try:
+                import aiohttp
+                self.__class__._is_aiohttp = True
+            except ImportError:
+                import httpx
+                self.__class__._is_aiohttp = False
+
         self.__class__._is_sync = use_sync
         self.__class__._timeout = time_out
 
@@ -167,16 +180,23 @@ class Local_Aigc:
         """获取每个模型的数据"""
         if cls._client is None:
             if cls._is_sync:
-                cls._client = requests.Session()
-            elif cls._is_aiohttp:
-                connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
-                timeout = aiohttp.ClientTimeout(total=cls._timeout, sock_read=cls._timeout,
-                                                sock_connect=5.0)
-                cls._client = aiohttp.ClientSession(connector=connector, timeout=timeout)
+                if cls._is_openai:
+                    cls._client = OpenAI(base_url=cls.HOST, timeout=cls._timeout, api_key='empty')
+                else:
+                    cls._client = requests.Session()
             else:
-                limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-                timeout = httpx.Timeout(cls._timeout, read=cls._timeout, write=30.0, connect=5.0)
-                cls._client = httpx.AsyncClient(limits=limits, timeout=timeout)
+                if cls._is_openai:
+                    cls._client = AsyncOpenAI(base_url=cls.HOST, timeout=cls._timeout, api_key='empty')
+                elif cls._is_aiohttp:
+                    connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
+                    timeout = aiohttp.ClientTimeout(total=cls._timeout, sock_read=cls._timeout,
+                                                    sock_connect=5.0)
+                    cls._client = aiohttp.ClientSession(connector=connector, timeout=timeout)
+                else:
+                    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+                    timeout = httpx.Timeout(cls._timeout, read=cls._timeout, write=30.0, connect=5.0)
+                    cls._client = httpx.AsyncClient(limits=limits, timeout=timeout)
+            # self.semaphore = asyncio.Semaphore(30)
 
         if not any(model['name'] == 'aigc' for model in cls.AI_Models):
             cls.AI_Models.append(
@@ -247,6 +267,20 @@ class Local_Aigc:
             return resp.json()
 
     @classmethod
+    def _fallback_post(cls, url, json_payload, headers=None, stream=False):
+        try:
+            resp = requests.post(url, headers=headers, json=json_payload, timeout=(5, cls._timeout), stream=stream)
+            if resp.status_code == 200:
+                data = json.loads(resp.content)
+                return data
+            else:
+                raise RuntimeError(
+                    f"[requests fallback] 返回异常: {resp.status_code}, 内容: {resp.text}")
+        except Exception as e:
+            print(f"[requests fallback] 请求失败: {e}")
+            return None
+
+    @classmethod
     def find_model(cls, name: str, model_id: int = 0):
         model = next((model for model in cls.AI_Models if model['name'] == name or name in model['model']), None)
         if model:
@@ -311,12 +345,13 @@ class Local_Aigc:
 
     @classmethod
     async def ai_chat(cls, model_info: dict = None, payload: dict = None, get_content: bool = True,
-                      **kwargs) -> str | dict:
+                      fallback: bool = True, **kwargs) -> str | dict:
         """
         模拟发送请求给AI模型并接收响应。
         :param model_info: 模型信息（如名称、ID、配置等）
         :param payload: 请求的负载，通常是对话或文本输入
         :param get_content: 返回模型响应类型
+        :param fallback: <UNK>
         :param kwargs: 其他额外参数
         :return: 返回模型的响应
         """
@@ -358,6 +393,15 @@ class Local_Aigc:
 
         except Exception as e:
             print(f"HTTP error occurred: {e}", model_info, url)  # can't start new thread
+            if fallback:
+                data = cls._fallback_post(url, payload, headers, stream=False)
+                if get_content:
+                    result = data.get('choices', [{}])[0].get('message', {}).get('content')
+                    if result:
+                        return result
+                    # print(response.text)
+                return data
+
             return f"HTTP error occurred: {e}" if get_content else {
                 "error": str(e),
                 "status": "failed"
@@ -447,7 +491,7 @@ async def request_aigc_async(history: list, question, system, model_name, agent=
 
     # print(headers, payload, url)
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-    timeout = httpx.Timeout(time_out, read=60.0, write=30.0, connect=5.0)
+    timeout = httpx.Timeout(time_out, read=time_out, write=30.0, connect=5.0)
     try:
         async with httpx.AsyncClient(limits=limits, timeout=timeout) as cx:
             response = await cx.post(url, headers=headers, json=payload)
@@ -624,7 +668,7 @@ def aigc_chat(user_request: str, system: str, model="moonshot:moonshot-v1-8k", g
     payload.update(kwargs)
 
     headers = {'Content-Type': 'application/json', }
-    url = f"http://{host}:7000/v1/chat/completions" 
+    url = f"http://{host}:7000/v1/chat/completions"
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=(10, time_out))
         data = response.json()
@@ -670,7 +714,7 @@ async def ai_chat_async(messages: list[dict] = None, user_request: str = '', sys
 
     # print(headers, payload, url)
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-    timeout = httpx.Timeout(time_out, read=60.0, write=30.0, connect=5.0)
+    timeout = httpx.Timeout(time_out, read=time_out, write=30.0, connect=5.0)
     try:
         async with httpx.AsyncClient(limits=limits, timeout=timeout) as cx:
             response = await cx.post(url, headers=headers, json=payload)
@@ -685,7 +729,7 @@ async def ai_chat_async(messages: list[dict] = None, user_request: str = '', sys
             return data
 
     except (RuntimeError, httpx.HTTPStatusError, httpx.RequestError) as e:
-        print(f"[httpx] 请求失败: {e}，尝试 fallback requests...")
+        print(f"[httpx] 请求失败: {e}:{host},尝试 fallback requests...")
         response = RunMethod().post_main(url, json.dumps(payload), headers=headers, timeout=(30, time_out))
         if response.status_code == 200:
             data = json.loads(response.content)  # response.content.decode('utf-8')
@@ -895,7 +939,7 @@ if __name__ == '__main__':
 
 
     async def main():
-        config = Local_Aigc(host="47.110.156.41", haio=True)
+        config = Local_Aigc(host="47.110.156.41")
         # await Local_Aigc.init_clients()
         try:
             res = await Local_Aigc.ai_chat(model='moonshot:moonshot-v1-8k', user_request='你好')

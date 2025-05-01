@@ -10,6 +10,7 @@ recursive-include docker *
 exclude .venv/*
 exclude .git/*
 exclude data/*
+exclude docker_build/*
 recursive-exclude __pycache__/*
 recursive-exclude */__pycache__/*
 exclude nlp.py

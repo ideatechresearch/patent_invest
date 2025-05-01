@@ -1,6 +1,7 @@
 import script.aigc as aigc
 
-aigc.AIGC_HOST = '47.110.156.41'
+aigc_host = '47.110.156.41'
+aigc.AIGC_HOST = aigc_host
 
 import pandas as pd
 from openai import OpenAI, AsyncOpenAI
@@ -54,27 +55,7 @@ async def process_one_contract(file_path_obj, question, client, folder_path):
         # all_msg[str(file_path_obj)] = messages
 
         content = messages[-1]['content']
-        match = re.search(r'\{.*}', content, re.DOTALL)
-        json_data = {}
-        if match:
-            json_str = match.group(0)
-            try:
-                json_data = json.loads(json_str)
-            except json.JSONDecodeError as e1:
-                try:
-                    json_str = re.sub(r'//.*', '', json_str)  # 1. 去掉 // 注释
-
-                    def fix_invalid_backslashes(match):
-                        char = match.group(1)
-                        if char in '"\\/bfnrtu':  # JSON 里合法的转义字符只有这些： " \ bfnrtu
-                            return '\\' + char  # 合法的保留
-                        else:
-                            return '\\\\' + char  # 非法的补成 \\ + 字符
-
-                    json_str = re.sub(r'\\(.)', fix_invalid_backslashes, json_str)
-                    json_data = json.loads(json_str)
-                except json.JSONDecodeError as e2:
-                    print(f"Error decoding JSON: {e2},{content}")
+        json_data = extract_json_from_string(content) or {}
 
         relative_path = os.path.relpath(file_path_obj, folder_path)
         first_folder = relative_path.split(os.sep)[0] if os.sep in relative_path else ''
@@ -103,6 +84,32 @@ async def process_one_contract(file_path_obj, question, client, folder_path):
     except Exception as e:
         print(f"[ERROR] {file_path_obj}: {e}")
         return str(file_path_obj), [], {}
+
+
+def msg_to_fmt_data(all_msg):
+    fmt_data = []
+    for i, (file_path, messages) in enumerate(all_msg.items()):
+        content = messages[-1]['content']
+        json_data = extract_json_from_string(content) or {}
+
+        relative_path = os.path.relpath(file_path, base_path)
+        first_folder = relative_path.split(os.sep)[0] if os.sep in relative_path else ''
+
+        data = {
+            'fileid': messages[0]['content'],
+            'path': relative_path,
+            'folder': first_folder,
+            'content': content,
+            '合同标题': json_data.get('合同标题', ''),
+            '甲方': json_data.get('甲方', ''),
+            '签署日期': json_data.get('签署日期', ''),
+            '合同期限': json_data.get('合同期限', ''),
+            '需求内容': json_data.get('需求模块', ''),
+            '需求摘要': json_data.get('需求摘要', '')
+        }
+        fmt_data.append(data)
+
+    return fmt_data
 
 
 async def get_contracts(client, folder_path):
@@ -223,36 +230,30 @@ async def contracts_sentences_split(raw_text):
     '''
 
     content = await aigc.ai_chat_async(user_request=raw_text, system=system, model="deepseek:deepseek-chat",
-                                       host=aigc.AIGC_HOST, time_out=300, get_content=True)
+                                       host=aigc_host, time_out=300, get_content=True)
 
-    try:
-        parsed = json.loads(content)  # 如果返回的是 JSON 字符串
-        # 如果模型已经返回了列表，可以直接返回
-        if isinstance(parsed, list):
-            return content, [s.strip() for s in parsed if isinstance(s, str) and s.strip()]
-        else:
-            raise ValueError("Unexpected response format.")
-    except json.JSONDecodeError:
-        print("Error: Response is not a valid JSON.")
-        return content, []
-    except Exception as e:
-        print(f"Error processing response: {e}")
-        return content, []
+    parsed = extract_json_from_string(content)
+    if isinstance(parsed, list):
+        return content, [s.strip() for s in parsed if isinstance(s, str) and s.strip()]
+
+    print(content)
+    return content, []
 
 
 async def contracts_df(fmt_data):
     df = pd.DataFrame(fmt_data)
-    df['需求字数'] = df.需求内容.str.len()
+    df['需求字数'] = df.需求模块.str.len()
     df['摘要字数'] = df.需求摘要.str.len()
     df.to_excel('data/合同需求提取.xlsx')
-    df['chunks'] = df['需求内容'].map(
+    print(df)
+    df['chunks'] = df['需求模块'].map(
         lambda txt: cross_sentence_chunk(build_ordered_sentences(txt), 8, 2, 700, tokenizer=None))
 
     async def process_row(text):
         async with sema:
             return await contracts_sentences_split(text)
 
-    tasks = [process_row(txt) for txt in df['需求内容']]
+    tasks = [process_row(txt) for txt in df['需求模块']]
     results = await tqdm_asyncio.gather(*tasks)
     contents, chunk_lists = zip(*results)
 
@@ -263,6 +264,8 @@ async def contracts_df(fmt_data):
     flat = df.reset_index().explode('chunks').rename(
         columns={'index': '原始行索引', 'chunks': 'chunk_text'}).reset_index(drop=True)
     flat['chunk_len'] = flat['chunk_text'].str.len()
+
+    flat.to_excel('data/合同需求分句.xlsx')
     from sklearn.metrics.pairwise import cosine_similarity
     from sklearn.preprocessing import normalize
     # from sentence_transformers import SentenceTransformer
@@ -270,6 +273,9 @@ async def contracts_df(fmt_data):
     # text_encoder = SentenceTransformer('BAAI/bge-large-zh-v1.5')
     # tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-large-zh-v1.5')
     # embeddings = text_encoder.encode(flat['chunk_text'].tolist(), show_progress_bar=True, normalize_embeddings=True)
+    # np.savez('data/embeddings_合同需求分块_bge-large-zh.npz', embeddings=embeddings, index=np.array(flat.index),
+    #          index_old=np.array(flat.原始行索引), chunk_text=np.array(flat.chunk_text))
+
     return df, flat
 
 
@@ -277,17 +283,29 @@ if __name__ == "__main__":
     import nest_asyncio
 
     nest_asyncio.apply()
+    base_path = r'E:\Documents\Jupyter\data\source\合同'
 
 
     async def main():
-        client: AsyncOpenAI = AsyncOpenAI(api_key=Config.DashScope_Service_Key,
-                                          base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")  # OpenAI
+        # client: AsyncOpenAI = AsyncOpenAI(api_key=Config.DashScope_Service_Key,
+        #                                   base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")  # OpenAI
+        #
+        # client = client.with_options(timeout=500, max_retries=3)
 
-        client = client.with_options(timeout=500, max_retries=3)
+        # all_msg, fmt_data = await get_contracts(client, folder_path=base_path)
+        with open("data/合同解析消息.pkl", "rb") as f:
+            all_msg = pickle.load(f)
 
-        all_msg, fmt_data = await get_contracts(client, folder_path=r'E:\Documents\Jupyter\data\source\合同')
+        with open("data/合同解析结果.pkl", "rb") as f:
+            fmt_data = pickle.load(f)
 
-        await contracts_df(fmt_data)
+
+        with open("data/合同分句结果.pkl", "rb") as f:
+            cut_data = pickle.load(f)
+
+        print(cut_data)
+
+        # df, flat = await contracts_df(fmt_data)
 
 
     asyncio.run(main())
