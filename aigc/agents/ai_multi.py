@@ -42,7 +42,7 @@ def xunfei_ppt_theme(industry, style="简约", color="蓝色", appid: str = Conf
 
 # https://www.xfyun.cn/doc/spark/PPTv2.html
 async def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appid: str = Config.XF_AppID,
-                            api_secret: str = Config.XF_Secret_Key, max_retries=20):
+                            api_secret: str = Config.XF_Secret_Key, max_retries=30):
     from requests_toolbelt.multipart.encoder import MultipartEncoder
 
     url = 'https://zwapi.xfyun.cn/api/ppt/v2/create'
@@ -89,7 +89,7 @@ async def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appi
             task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
             response = await cx.get(url=task_url, headers=headers)
             response.raise_for_status()
-            resp = json.loads(response)
+            resp = response.json()
             task_status = resp['data']['pptStatus']
             aiImageStatus = resp['data']['aiImageStatus']
             cardNoteStatus = resp['data']['cardNoteStatus']
@@ -462,7 +462,7 @@ async def tencent_drawing_picture(image_data, image_url: str = '', prompt: str =
 
 # https://cloud.tencent.com/document/product/1729/108738
 async def tencent_generate_image(prompt: str = '', negative_prompt: str = '', style_name='不限定风格',
-                                 return_url=False):
+                                 return_url=True):
     style_mapping = {
         "默认": "000",
         "不限定风格": "000",

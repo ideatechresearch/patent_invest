@@ -34,6 +34,7 @@ def field_match(field_key, match_values):
 
 def field_range(field_key, **kwargs):
     """创建字段的范围查询条件，支持 lt, lte, gt, gte"""
+    # sign = { "<=":{0,1}, "<":{1}, "==":{0}, ">=":{-1,0}, ">":{-1}, "!=":{-1,1}}
     range_params = {}
     for op in ["lt", "lte", "gt", "gte"]:
         if op in kwargs:
@@ -887,7 +888,6 @@ async def similar_node_relations(collection_name, client, node_id, node_name, ex
     ids_name = await  ids_to_names(list({**ids_depth, **new_depth}), collection_name, client, key_name)
     nodes = [{"id": i, "name": ids_name.get(i, 'None'), "depth": d} for i, d in new_depth.items()]
     return {"nodes": nodes, "edges": new_relationships}
-
 
 
 def recreate_with_named_vector(collection_name, named_vector, client, new_collection=None, batch_size=1000):

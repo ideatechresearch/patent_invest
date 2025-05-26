@@ -3,6 +3,7 @@ import logging
 import json
 import httpx
 import re, hashlib
+import asyncio
 
 try:
     from openai import OpenAI, AsyncOpenAI
@@ -17,6 +18,8 @@ except ImportError:
 AI_API_KEYS = {'moonshot': "",
                'aigc': "token-abc123"}
 AIGC_HOST = 'aigc'
+
+USER_ID = 'script'
 
 
 class Res:
@@ -117,10 +120,10 @@ class RunMethod:
                 self.result.set_result(context, res_code)
                 res.close()
                 return self.result  # return res
+            return self.result
         except requests.RequestException as e:
             logging.error("send_request_json_data_post请求出现异常:{0}".format(e))
-
-    # AIGC_HOST= '47.110.156.41'
+            # AIGC_HOST= '47.110.156.41'
 
 
 async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
@@ -132,6 +135,24 @@ async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
         except Exception as e:
             print(e)
             return None
+
+
+def async_to_sync(coro_func, *args, **kwargs):
+    # 如果已经在事件循环中运行（比如 Jupyter），不能直接 run
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            # 若已在事件循环中（如 Jupyter 或 FastAPI），用 create_task + run_until_complete
+            task = asyncio.ensure_future(coro_func(*args, **kwargs))
+            return loop.run_until_complete(task)
+            # while not task.done():
+            #     time.sleep(0.1)
+    except RuntimeError:
+        # 无事件循环（普通脚本）
+        return asyncio.run(coro_func(*args, **kwargs))
+
+    # fallback：若 loop 存在但未运行（极少见）
+    return asyncio.get_event_loop().run_until_complete(coro_func(*args, **kwargs))
 
 
 class Local_Aigc:
@@ -146,6 +167,7 @@ class Local_Aigc:
         #  'url': f"http://{AIGC_HOST}:7000/v1/chat/completions", 'base_url': f"http://{AIGC_HOST}:7000/v1"}
     ]
     _client = None  # httpx.AsyncClient | aiohttp.ClientSession
+    _ai_client = None  # local aigc openai client
     _is_openai = False
     _is_aiohttp = False
     _is_sync = False
@@ -175,19 +197,29 @@ class Local_Aigc:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.__class__.close_http_client()
 
+    def __enter__(self):
+        asyncio.run(self.__class__.init_clients())
+        return self
+
+    def __exit__(self, *args):
+        self.__class__.close()
+
     @classmethod
-    async def init_clients(cls):
+    async def init_clients(cls, api_key=''):
         """获取每个模型的数据"""
+        base_url = f"http://{cls.HOST}:7000/v1"
+        if cls._ai_client is None:
+            if cls._is_openai:
+                if cls._is_sync:
+                    cls._ai_client = OpenAI(base_url=base_url, timeout=cls._timeout, api_key=api_key or 'empty')
+                else:
+                    cls._ai_client = AsyncOpenAI(base_url=base_url, timeout=cls._timeout, api_key=api_key or 'empty')
+
         if cls._client is None:
             if cls._is_sync:
-                if cls._is_openai:
-                    cls._client = OpenAI(base_url=cls.HOST, timeout=cls._timeout, api_key='empty')
-                else:
-                    cls._client = requests.Session()
+                cls._client = requests.Session()
             else:
-                if cls._is_openai:
-                    cls._client = AsyncOpenAI(base_url=cls.HOST, timeout=cls._timeout, api_key='empty')
-                elif cls._is_aiohttp:
+                if cls._is_aiohttp:
                     connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
                     timeout = aiohttp.ClientTimeout(total=cls._timeout, sock_read=cls._timeout,
                                                     sock_connect=5.0)
@@ -200,28 +232,37 @@ class Local_Aigc:
 
         if not any(model['name'] == 'aigc' for model in cls.AI_Models):
             cls.AI_Models.append(
-                {'name': 'aigc', 'type': 'default', 'api_key': '', 'data': None, "model": [],
+                {'name': 'aigc', 'type': 'default', 'api_key': api_key, 'data': [], "model": [],
                  'url': f"http://{cls.HOST}:7000/v1/chat/completions",
-                 'base_url': f"http://{cls.HOST}:7000/v1"
-                 })
+                 'base_url': base_url}
+            )
 
         for model in cls.AI_Models:
-            model_name = model.get('name')
-            api_key = AI_API_KEYS.get(model_name)
-            if api_key:
-                model['api_key'] = api_key
+            if cls._ai_client is not None and model["name"] == "aigc":  # model['base_url'] == base_url:
+                aigc_models = cls._ai_client.models.list() if cls._is_sync else await cls._ai_client.models.list()
+                # print(aigc_models)
+                models_data = [m.model_dump() for m in aigc_models.data]
+            else:
+                if model["data"] is None:  # moonshot 等没有此接口,排除
+                    continue
 
-            # ai_client = OpenAI(api_key=model['api_key'] or 'empty',base_url=model['base_url'])
-            url = model['base_url'] + '/models'
-            try:
-                models = await cls.get_resp(url)  # await call_http_request(url)
-                # aigc_models = [m.model_dump() for m in await client.models.list().data]
-                if models:
-                    model['data'] = models['data']
-                    model["model"] = [m['id'] for m in models['data']]
+                model_name = model.get('name')
+                api_key = AI_API_KEYS.get(model_name)
+                if api_key:
+                    model['api_key'] = api_key
 
-            except Exception as e:
-                print(e)
+                url = model['base_url'] + '/models'
+                try:
+                    models = await cls.get_resp(url)  # await call_http_request(url)
+                    models_data = models['data']
+                except Exception as e:
+                    models_data = None
+                    print(e)
+
+            if models_data:
+                model['data'] = models_data
+                model["model"] = [m['id'] for m in models_data]
+                print(model["model"])
 
     @classmethod
     async def close_http_client(cls):
@@ -234,7 +275,13 @@ class Local_Aigc:
             else:
                 if not cls._client.is_closed:
                     await cls._client.aclose()
+
             cls._client = None
+        cls._ai_client = None
+
+    @classmethod
+    def close(cls):
+        asyncio.run(cls.close_http_client())
 
     @classmethod
     async def get_resp(cls, url, headers=None, **kwargs):
@@ -293,11 +340,13 @@ class Local_Aigc:
         return None, None
 
     @classmethod
-    async def get_chat_payload(cls, messages: list[dict] = None, user_request: str = '', system: str = '',
-                               temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 1024,
+    async def get_chat_payload(cls, messages: list[dict] = None, user_request: str = '', user: str = USER_ID,
+                               system: str = '', temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 2048,
                                model='moonshot', model_id=0, images: list = None):
 
         model_info, name = cls.find_model(model, model_id)
+        if not name:
+            raise ValueError(f"No model found for model={model}, model_id={model_id}")
 
         if isinstance(messages, list) and messages:
             if system:
@@ -339,6 +388,8 @@ class Local_Aigc:
             # response_format={"type": "json_object"}
             # "tools":retrieval、web_search、function
         )
+        if user:
+            payload['user'] = user
         # payload = {**payload, **kwargs}
 
         return model_info, payload
@@ -355,7 +406,7 @@ class Local_Aigc:
         :param kwargs: 其他额外参数
         :return: 返回模型的响应
         """
-        if not cls._client or not any(model['model'] for model in cls.AI_Models):
+        if not (cls._client or cls._ai_client) or not any(model['model'] for model in cls.AI_Models):
             await cls.init_clients()
 
         if not payload:
@@ -366,8 +417,12 @@ class Local_Aigc:
         if not model_info:
             return f"error occurred: no model,{payload}" if get_content else {"error": "no model"}
 
-        # completion = await client.chat.completions.create(**payload)
-        # return completion.choices[0].message.content if get_content else completion.model_dump()
+        if cls._is_openai and model_info["name"] == "aigc":
+            if cls._is_sync:
+                completion = cls._ai_client.chat.completions.create(**payload)
+            else:
+                completion = await cls._ai_client.chat.completions.create(**payload)
+            return completion.choices[0].message.content if get_content else completion.model_dump()
 
         url = model_info['url'] if model_info.get('url') else model_info['base_url'] + '/chat/completions'
         api_key = model_info['api_key']
@@ -407,6 +462,10 @@ class Local_Aigc:
                 "status": "failed"
             }
 
+    @classmethod
+    def chat(cls, **kwargs) -> str | dict:
+        return async_to_sync(cls.ai_chat, **kwargs)
+
 
 def request_aigc(history, question, system, model_name, agent='0', stream=False, host=AIGC_HOST, get_content=False,
                  time_out: int | float = 100, **kwargs) -> str | dict:
@@ -431,7 +490,7 @@ def request_aigc(history, question, system, model_name, agent='0', stream=False,
 
         "name": None,
         "uuid": None,
-        "user_id": "idea_ai_robot",
+        "user": USER_ID,
         "robot_id": None,
 
         "filter_time": 0,
@@ -476,7 +535,7 @@ async def request_aigc_async(history: list, question, system, model_name, agent=
 
         "name": None,
         "uuid": None,
-        "user_id": "idea_ai_robot",
+        "user": USER_ID,
         "robot_id": None,
 
         "filter_time": 0,
@@ -568,7 +627,7 @@ def aigc_message_callback(question, system, history: list[dict] = None, keywords
         "uuid": None,
         "name": None,
         "robot_id": None,
-        "user_id": "idea_ai_robot",
+        "user": USER_ID,
         "use_hist": False,
         "filter_limit": -500,
         "filter_time": 0.0,
@@ -609,7 +668,7 @@ def aigc_message_wechat(question, system, name=None, history: list[dict] = None,
         "uuid": None,
         "name": name,
         "robot_id": None,
-        "user_id": "idea_ai_robot",
+        "user": USER_ID,
         "use_hist": True,
         "filter_limit": -500,
         "filter_time": 0.0,
@@ -678,16 +737,16 @@ def aigc_chat(user_request: str, system: str, model="moonshot:moonshot-v1-8k", g
         return f"HTTP error occurred: {e}" if get_content else {"error": str(e), "status": "failed"}
 
 
-async def ai_chat_async(messages: list[dict] = None, user_request: str = '', system: str = '',
-                        temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 1024, _client=None,
-                        model='moonshot', host=AIGC_HOST, get_content: bool = True, api_key: str = None,
+async def ai_chat_async(messages: list[dict] = None, user_request: str = '', user: str = None, name: str = None,
+                        system: str = '', temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 1024,
+                        _client=None, model='moonshot', host=AIGC_HOST, get_content: bool = True, api_key: str = None,
                         time_out: int | float = 100, **kwargs) -> str | dict:
     if not messages:
         messages = []
     if system and (not messages or messages[0].get("role") != "system"):
         messages.insert(0, {"role": "system", "content": system})
     if user_request and (not messages or messages[-1].get("role") != "user"):
-        messages.append({"role": "user", "content": user_request})
+        messages.append({"role": "user", "content": user_request, "name": name})
 
     payload = dict(
         model=model,  # 默认选择第一个模型
@@ -701,6 +760,8 @@ async def ai_chat_async(messages: list[dict] = None, user_request: str = '', sys
         # response_format={"type": "json_object"}
         # "tools":retrieval、web_search、function
     )
+    if user:
+        payload['user'] = user
     payload.update(kwargs)
 
     if _client:
@@ -935,21 +996,38 @@ def generate_hash_key(*args, **kwargs):
 
 
 if __name__ == '__main__':
-    import asyncio
+    import nest_asyncio
+
+    nest_asyncio.apply()
+    AIGC_HOST = '***.***.***.***'  # 替换为实际的 AIGC 服务地址
 
 
     async def main():
-        config = Local_Aigc(host="47.110.156.41")
+        global AIGC_HOST
+
         # await Local_Aigc.init_clients()
+        async with Local_Aigc(host=AIGC_HOST) as client:
+            print(await client.ai_chat(model="qwen:qwq-plus", user_request="你好"))
+
+        config = Local_Aigc(host=AIGC_HOST, use_sync=True)
         try:
             res = await Local_Aigc.ai_chat(model='moonshot:moonshot-v1-8k', user_request='你好')
             print(res)
             print(await Local_Aigc.ai_chat(model='qwen:qwq-plus', user_request='你好'))
             print(Local_Aigc.AI_Models)
-            res = await ai_chat_async(model='moonshot:moonshot-v1-8k', user_request='你好')
+            res = await ai_chat_async(model='qwen:qwen3-32b', user_request='你好', host=AIGC_HOST)
             print(res)
         finally:
             await Local_Aigc.close_http_client()
 
 
     asyncio.run(main())
+
+    Local_Aigc(host=AIGC_HOST, time_out=300)
+
+    print(Local_Aigc.chat(model='qwen:qwq-plus', user_request='你好啊，谢谢你'))
+
+    Local_Aigc.close()
+
+    with Local_Aigc(host=AIGC_HOST) as cx:
+        print(cx.chat(model='qwen:qwq-plus', user_request='你好啊'))

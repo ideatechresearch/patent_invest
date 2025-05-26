@@ -15,7 +15,7 @@ from enum import Enum
 import math
 import base64
 from pypinyin import lazy_pinyin
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from langdetect import detect, detect_langs
 import jieba
@@ -73,21 +73,7 @@ def serialize(obj):
         return obj  # asdict
 
 
-def parse_json(inputs: dict | str) -> dict:
-    # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
-    if not isinstance(inputs, dict):
-        try:
-            match = re.search(r'^\s*(```json\n)?(.*)\n```\s*$', inputs, re.S)
-            if match:
-                inputs = match.group(2).strip()
-            inputs = json.loads(inputs)
-        except json.JSONDecodeError as exc:
-            raise Exception(f'invalid json format: {inputs}') from exc
-
-    return inputs
-
-
-def extract_json_str(json_code: str):
+def extract_json_str(json_code: str) -> str:
     """
     模型返回的内容，其中 JSON 数据通常被包裹在 Markdown 的代码块标记中（即以 json 开始，以 结束）
     如果未找到起始或结束标记，尝试直接解析整个字符串为 JSON
@@ -105,6 +91,20 @@ def extract_json_str(json_code: str):
             print("Error:", e)
         return ""
     return json_code[start + 7:end]
+
+
+def parse_json(inputs: dict | str) -> dict:
+    # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
+    if not isinstance(inputs, dict):
+        try:
+            match = re.search(r'^\s*(```json\n)?(.*)\n```\s*$', inputs, re.S)
+            if match:
+                inputs = match.group(2).strip()
+            inputs = json.loads(inputs)
+        except json.JSONDecodeError as exc:
+            raise Exception(f'invalid json format: {inputs}') from exc
+
+    return inputs
 
 
 def extract_method_calls(text):
@@ -125,6 +125,7 @@ def extract_method_calls(text):
 
 
 def execute_code_results(text):
+    """执行给定文本中的所有Python代码块，并返回每个代码块的输出、命名空间和错误信息。需要包含Python代码块的文本。"""
     code_blocks = extract_python_code(text)
     results = []
     global_namespace = globals()  # 引用全局命名空间 {"__builtins__": dict(__builtins__)}
@@ -145,7 +146,7 @@ def execute_code_results(text):
             results.append({
                 "output": captured_output.getvalue().strip(),
                 "namespace": local_namespace,
-                "error": f"Error executing code block: {e}"
+                "error": f"Error executing code block: {e},Code:{code}"
             })
         finally:
             captured_output.close()
@@ -313,15 +314,46 @@ def load_datasets(path):
     return samples
 
 
-# @asynccontextmanager
-async def get_httpx_client(time_out=100.0):
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-    timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
-    async with httpx.AsyncClient(limits=limits, timeout=timeout) as cx:
-        yield cx
+_httpx_clients: dict[str, httpx.AsyncClient] = {}
+
+
+def get_httpx_client(time_out: float = 100.0, proxy: str = None) -> httpx.AsyncClient:
+    # Depends
+    key = proxy or "default"
+    global _httpx_clients
+    if key not in _httpx_clients or _httpx_clients[key].is_closed:
+        transport = httpx.AsyncHTTPTransport(proxy=proxy or None)
+        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+        timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
+        _httpx_clients[key] = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
+    return _httpx_clients[key]
+
+
+async def shutdown_httpx():
+    for key, _client in _httpx_clients.items():
+        if _client and not _client.is_closed:
+            await _client.aclose()
+
+
+# # @asynccontextmanager
+# async def get_httpx_client_ones(time_out=100.0, proxy=None):
+#     transport = httpx.AsyncHTTPTransport(proxy=proxy)
+#     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+#     timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
+#     async with httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout) as cx:
+#         yield cx
 
 
 async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
+    """
+    异步调用HTTP请求并返回JSON响应，如果响应不是JSON格式则返回文本内容
+    国内，无代理，可能内容无解析
+    :param url:
+    :param headers:
+    :param time_out:
+    :param kwargs:
+    :return:
+    """
     async with httpx.AsyncClient() as cx:
         try:
             response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)
@@ -346,6 +378,22 @@ async def follow_http_html(url, time_out=100.0, **kwargs):
         except Exception as e:
             print(e)
             return None
+
+
+async def post_aiohttp_stream(url, payload: dict = None, time_out=60, **kwargs):
+    timeout = aiohttp.ClientTimeout(total=time_out, sock_read=60.0, sock_connect=5.0)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload, **kwargs) as response:
+            buffer = b""
+            async for chunk in response.content.iter_any():  # .iter_chunked(1024)
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.strip():
+                        try:
+                            yield json.loads(line.decode("utf-8"))
+                        except json.JSONDecodeError:
+                            continue
 
 
 async def post_http_json(url, json=None, headers: dict = None, time_out=30, **kwargs):
@@ -756,7 +804,8 @@ def extract_json_from_string(input_str):
                 return json.loads(json_str)
             except json.JSONDecodeError as e2:
                 print(f"Error decoding JSON: {e2},{input_str}")
-    return None
+
+    return extract_json_array(input_str)
 
 
 def extract_jsons(input_str):
@@ -779,6 +828,21 @@ def extract_jsons(input_str):
     return json_objects
 
 
+def extract_json_array(input_str) -> list | None:
+    """
+    提取并解析 markdown 包裹的 JSON 数组（尤其是 ```json ... ``` 格式）
+    """
+    # 提取 ```json ... ``` 块中内容
+    match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', input_str, re.DOTALL)
+    if match:
+        json_str = match.group(1)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error: {e}")
+    return None
+
+
 def extract_headers(text):
     # 提取 ## 或 ### 等标题
     headers = re.findall(r'^(#{1,6})\s+(.*)', text, re.MULTILINE)
@@ -787,8 +851,15 @@ def extract_headers(text):
 
 def extract_links(text):
     # 提取 Markdown 格式的链接 [链接文字](链接地址)
-    links = re.findall(r'\[([^\]]+)\]\((https?:\/\/[^\s]+)\)', text)
+    pattern = r'\[([^\]]+)\]\((https?://[^\s)]+)\)'
+    links = re.findall(pattern, text)
     return [{'text': link[0], 'url': link[1]} for link in links]
+
+
+def extract_text_urls(text):
+    # 提取所有 http(s) URL
+    urls = re.findall(r'https?://[^\s)]+', text)
+    return set(urls)
 
 
 def extract_bold(text):
@@ -859,7 +930,17 @@ def extract_tagged_split(text, tag="think"):
         output_content = match.group(2).strip()  # 提取最终输出内容
         return [think_content, output_content]
 
-    return [None, text]
+    return [None, text]  # .split("</think>")[-1]
+
+
+def qwen3_think_index(output_ids):
+    # parsing thinking content
+    try:
+        # rindex finding 151668 (</think>)
+        index = len(output_ids) - output_ids[::-1].index(151668)
+    except ValueError:
+        index = 0
+    return index
 
 
 def process_assistant_think(content):
@@ -964,14 +1045,16 @@ def format_for_html(text):
     # display(Markdown(f"`{export_command}`"))
 
 
-def extract_string(text, extract, **kwargs):
+def extract_string(text, extract: str, **kwargs):
     if not extract:
         return None
     funcs = {
         "json": extract_json_from_string,
         "jsons": extract_jsons,
+        "json_array": extract_json_array,
         "header": extract_headers,
         "links": extract_links,
+        'urls': extract_text_urls,
         "bold": extract_bold,
         "italic": extract_italic,
         "tables": extract_table_data,
@@ -986,6 +1069,7 @@ def extract_string(text, extract, **kwargs):
         'remark': remove_markdown,
         "html": format_for_html,
         "web": extract_web_content,
+        "execute": execute_code_results,
     }
     try:
         if extract in funcs:
@@ -993,8 +1077,7 @@ def extract_string(text, extract, **kwargs):
 
         extract_type = extract.split('.')
         if extract_type[0] == 'code':
-            transform = extract_code_blocks(text, lag=extract_type[1] if len(extract_type) > 1 else '', **kwargs)
-            return transform
+            return extract_code_blocks(text, lag=extract_type[1] if len(extract_type) > 1 else '', **kwargs)
 
         return {k: f(text, **kwargs) for k, f in funcs.items()}  # "type": "all"
     except Exception as e:
@@ -1290,8 +1373,7 @@ def split_whitespace_nonwhitespace(s, max_len=5):
 
 LINE_STOP_FLAG = (
     '.', '!', '?', '。', '！', '？', ')', '）', '"', '”', ':', '：', ';', '；', ']', '】', '}', '}', '>', '》', '、', ',', '，',
-    '-',
-    '—', '–',)
+    '-', '—', '–',)
 LINE_START_FLAG = ('(', '（', '"', '“', '【', '{', '《', '<', '「', '『', '【', '[',)
 
 
@@ -1689,6 +1771,18 @@ def format_date(date_str: str):
     return datetime.strptime(date_str, "%Y/%m/%d %H:%M:%S").date().strftime("%Y-%m-%d")
 
 
+def unix_timestamp(iso_time_str: str) -> float:
+    '''2025-05-21T06:30:59.6050065Z'''
+    # 去除多余的微秒部分，限制到 6 位（Python datetime 支持的上限）
+    iso_time_str = iso_time_str[:26] + 'Z'
+    # 转换为 datetime 对象
+    dt = datetime.strptime(iso_time_str, '%Y-%m-%dT%H:%M:%S.%fZ')
+    # 设置为 UTC 时区
+    dt = dt.replace(tzinfo=timezone.utc)
+    # 转换为 Unix 时间戳（float）
+    return dt.timestamp()
+
+
 def format_date_type(date=None):
     """
     :param date:可以是一个日期字符串或 None（如果传入 None，则使用当前日期）。
@@ -1703,6 +1797,7 @@ def format_date_type(date=None):
             "%Y/%m/%d",
             "%Y-%m-%d %H:%M:%S",
             "%Y/%m/%d %H:%M:%S",
+            '%Y%m%d',
         ]
         for fmt in supported_formats:
             try:
@@ -1714,6 +1809,15 @@ def format_date_type(date=None):
             raise ValueError(f"Invalid date format: {date}. Supported formats are {supported_formats}.")
 
     return date  # isinstance(date, datetime)
+
+
+def get_date_time(date=None):
+    """
+    :param date: 指定的日期（默认为当前日期）。
+    :return: 日期，时间
+    """
+    date = format_date_type(date)
+    return date.strftime('%Y%m%d'), date.strftime('%H:%M:%S.%f')
 
 
 def get_times_shift(days_shift: int = 0, hours_shift: int = 0):
@@ -1923,9 +2027,48 @@ def is_finite(value) -> bool:
 
 
 def cosine_sim(vecs1, vecs2):
-    # 两个向量（1D 数组）之间的余弦相似度
+    # 两个 单个向量（1D 数组）之间的余弦相似度
     dot_product = np.dot(vecs1, vecs2)
     similarity = dot_product / (np.linalg.norm(vecs1) * np.linalg.norm(vecs2))
+    return similarity
+
+
+def cluster_similarity_mean(df, text_embeddings):
+    from sklearn.metrics.pairwise import cosine_similarity
+    similarity_means = np.full(len(df), np.nan)  # [np.nan] * len(df)
+
+    for cluster_id, group in df.groupby('cluster'):
+        if cluster_id == -1:
+            # 忽略 HDBSCAN 中的 noise 点
+            continue
+        indices = group.index.tolist()
+        if len(indices) <= 1:
+            # similarity_means[indices[0]] = np.nan
+            continue
+
+        embs = text_embeddings[indices]
+        sim_matrix = cosine_similarity(embs)
+
+        for i, idx in enumerate(indices):
+            sim_row = np.delete(sim_matrix[i], i)  # 删除对角线
+            similarity_means[idx] = sim_row.mean()
+
+    return similarity_means
+
+
+def pairwise_cosine_similarity(emb1: np.ndarray, emb2: np.ndarray):
+    """
+    计算 emb1[i] 和 emb2[i] 的余弦相似度[cosine_sim(a, b) for a, b in zip(emb1, emb2)]
+    :param emb1: shape = (N, D)
+    :param emb2: shape = (N, D)
+    :return: shape = (N,) 的相似度数组
+    """
+    emb1 = np.asarray(emb1)
+    emb2 = np.asarray(emb2)
+    dot_product = np.sum(emb1 * emb2, axis=1)
+    norm1 = np.linalg.norm(emb1, axis=1)
+    norm2 = np.linalg.norm(emb2, axis=1)
+    similarity = dot_product / (norm1 * norm2 + 1e-8)
     return similarity
 
 
@@ -1964,8 +2107,11 @@ def cosine_similarity_np(ndarr1, ndarr2):
 
 # from scipy.special import softmax
 def softmax_np(x):
-    e_x = np.exp(x - np.max(x))  # Subtract max for numerical stability
-    return e_x / e_x.sum()
+    if x.ndim == 1:
+        e_x = np.exp(x - np.max(x))  # Subtract max for numerical stability
+        return e_x / e_x.sum()
+    e_x = np.exp(x - np.max(x, axis=1, keepdims=True))  # 对每行减去最大值
+    return e_x / np.sum(e_x, axis=1, keepdims=True)
 
 
 def generate_loss_mask(input_ids, bos_id, eos_id, max_length):
@@ -2119,6 +2265,7 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
                 module_path, func_name = name.rsplit(":", 1)
                 _module = importlib.import_module(module_path)
                 func_obj = getattr(_module, func_name, None)
+                name = func_name
             else:
                 func_obj = getattr(module, name) if module else globals().get(name)
 
@@ -2126,6 +2273,12 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
                 raise ValueError(f"函数 {name} 不存在或不是可调用对象,未在当前作用域中找到,可能未导入或模块未指定。")
 
             registry[name] = func_obj
+
+        except ModuleNotFoundError:
+            registry[name] = None
+            print(f"Module '{module_name}','{name}' not found.")
+            # importlib.reload(module_path)
+
         except Exception as e:
             registry[name] = None
             print(f"[⚠️] 加载函数失败: {name} → {type(e).__name__}: {e}")

@@ -184,7 +184,7 @@ class IMessage(ChatMessage):
         return cls(role="assistant", content=content, tool_calls=formatted_calls, **kwargs)
 
 
-from config import ModelListExtract
+from generates import ModelListExtract
 
 MODEL_LIST = ModelListExtract()
 
@@ -211,6 +211,8 @@ class OpenAIRequest(BaseModel):
     response_format: Optional[dict] = None  # 结构化输出,响应符合 JSON 架构
     prediction: Optional[dict] = None  # 预测输出,减少模型响应的延迟
     stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
+    extra_body: Optional[dict] = None
+    metadata: Optional[Dict[str, str]] = None
 
     # file =
     # modalities= ["text", "audio"]
@@ -233,9 +235,11 @@ class OpenAIRequest(BaseModel):
                     }
                 ],
                 "temperature": 1,
+                "user": 'test:robot',
                 "top_p": 1,
                 "max_tokens": 512,
-                "stream": True
+                "stream": False,
+                "extra_body": {"enable_thinking": False}
             }
         }
 
@@ -577,6 +581,7 @@ class KeywordItem(BaseModel):
     function: Optional[str] = None
     args: Optional[List[Any]] = None
     kwargs: Optional[Dict[str, Any]] = None
+    env: Optional[Dict[str, Any]] = None
 
 
 class CallbackUrl(BaseModel):
@@ -719,7 +724,7 @@ class CompletionParams(BaseModel):
 class SubmitMessagesRequest(BaseModel):
     uuid: Optional[str] = None
     name: Optional[str] = None
-    user_id: Optional[str] = None
+    user: Optional[str] = None
     robot_id: Optional[str] = None
     use_hist: bool = Field(default=False, description="Use historical messages.")
     filter_limit: Optional[int] = Field(-500,
@@ -730,7 +735,7 @@ class SubmitMessagesRequest(BaseModel):
                                                   description="A list of message objects representing the current conversation. "
                                                               "If no messages are provided and `use_hist` is set to `True`, "
                                                               "the system will filter existing chat history using the fields "
-                                                              "`username`, `user_id`, and `filter_time`. "
+                                                              "`name`, `user`, and `filter_time`. "
                                                               "If `messages` are provided, the last user message will be used as the question.")
 
     params: Optional[List[CompletionParams]] = None
@@ -740,8 +745,8 @@ class SubmitMessagesRequest(BaseModel):
             "example": {
                 "uuid": None,
                 "name": None,
+                "user": "aigc_test",
                 "robot_id": None,
-                "user_id": "aigc_test",
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
@@ -776,7 +781,7 @@ class SubmitMessagesRequest(BaseModel):
 class ChatCompletionRequest(CompletionParams):
     uuid: Optional[str] = None
     name: Optional[str] = None
-    user_id: Optional[str] = None
+    user: Optional[str] = None
     robot_id: Optional[str] = None
     use_hist: bool = Field(default=False, description="use historical messages.")
     filter_limit: Optional[int] = Field(-500,
@@ -787,7 +792,7 @@ class ChatCompletionRequest(CompletionParams):
                                                   description="A list of message objects representing the current conversation. "
                                                               "If no messages are provided and `use_hist` is set to `True`, "
                                                               "the system will filter existing chat history using the fields "
-                                                              "`username`, `user_id`, and `filter_time`. "
+                                                              "`name`, `user`, and `filter_time`. "
                                                               "If `messages` are provided, the last user message will be used as the question.")
     question: Optional[str] = Field(None,
                                     description="The primary question or prompt for the AI to respond to. "
@@ -800,7 +805,7 @@ class ChatCompletionRequest(CompletionParams):
             "example": {
                 "uuid": None,
                 "name": None,
-                "user_id": "test",
+                "user": "test",
                 "robot_id": None,
                 "agent": "0",
 
@@ -833,7 +838,7 @@ class ClassifyRequest(BaseModel):
     class_default: Optional[str] = Field(None, description="default or last history to fallback.")
 
     # robot_id: str = None
-    # user_id: str = None
+    # user: str = None
     emb_model: Optional[str] = "text-embedding-v2"
     rerank_model: Optional[str] = "BAAI/bge-reranker-v2-m3"
     cutoff: float = 0.85

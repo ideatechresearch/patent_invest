@@ -1,14 +1,25 @@
 import asyncio
 import httpx, aiohttp, requests
 import random
-from config import *
 from typing import List, Dict, Tuple, Any, Union, Iterator, Sequence, Literal
 from utils import convert_to_pinyin
 
+from config import *
 
+
+# Config.load('../config.yaml')
+# Config.debug()
 # from selectolax.parser import HTMLParser
 
 async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **kwargs) -> List[Dict]:
+    """
+    异步执行网页搜索，使用提供的文本,调用远程工具API，并返回搜索结果。
+    :param text:要搜索的文本内容
+    :param api_key:用于授权API请求的密钥,不需要提供
+    :param kwargs:其他可选的关键字参数，将被合并到请求数据中
+    :return:
+    """
+
     msg = [{"role": "user", "content": text}]
     tool = "web-search-pro"
     url = "https://open.bigmodel.cn/api/paas/v4/tools"
@@ -44,7 +55,7 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **k
                 print(f"请求过快，等待 5 秒后重试...")
             return [{'error': f"HTTP error: {exc.response.status_code} -{exc}"}]
         except Exception as exc:
-            return [{'error': str(exc)}]
+            return [{'error': str(exc), 'text': text, 'data': data}]
 
         # https://portal.azure.com/#home
 
@@ -70,6 +81,17 @@ async def web_search_tavily(text: str, topic: Literal["general", "news"] = "gene
                             time_range: Literal['day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'] = 'month',
                             search_depth: Literal["basic", "advanced"] = "basic", days: int = 7,
                             api_key: str = Config.TAVILY_Api_Key, **kwargs):
+    """
+    执行基于 Tavily API 的 Web 搜索，支持指定主题、时间范围、搜索深度和天数等参数。",
+    :param text:搜索查询的文本内容。
+    :param topic:搜索的主题，可以是 'general' 或 'news'
+    :param time_range:搜索的时间范围，可以是 'day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'。
+    :param search_depth:搜索的深度，可以是 'basic' 或 'advanced'
+    :param days:当主题为 'news' 时，指定搜索的天数。
+    :param api_key:Tavily API 的访问密钥。不需要提供
+    :param kwargs:其他可选参数，用于扩展搜索请求。以关键字参数的形式传递。
+    :return:
+    """
     # https://docs.tavily.com/api-reference/endpoint/search
     url = "https://api.tavily.com/search"
     headers = {
@@ -107,7 +129,13 @@ async def web_search_tavily(text: str, topic: Literal["general", "news"] = "gene
 
 
 async def web_extract_tavily(urls: str | list[str], api_key: str = Config.TAVILY_Api_Key):
-    # 从一个或多个指定的 URL 中提取网页内容
+    """
+    提取提取给定 URL 的网页信息,从一个或多个指定的 URL 中提取网页内容,比如获取github内容，已初步解析
+    Tavily是一家专注于AI搜索的公司，他们的搜索会为了LLM进行优化，以便于LLM进行数据检索。
+    :param urls:url or list of urls,要提取信息的 URL 或者列表
+    :param api_key:Tavily API 的访问密钥，不需要指定
+    :return:
+    """
     url = "https://api.tavily.com/extract"
     headers = {
         'Content-Type': 'application/json',
@@ -132,7 +160,7 @@ async def web_extract_tavily(urls: str | list[str], api_key: str = Config.TAVILY
 async def search_by_api(query: str, location: str = None,
                         engine: Literal['google', 'bing', "baidu", 'naver', "yahoo", "youtube",
                         "google_videos", "google_news", "google_images", "amazon_search", "shein_search"] | None = 'google',
-                        api_key=Config.SearchApi):
+                        api_key=Config.SearchApi_Key):
     # https://www.searchapi.io/docs/google
     if engine is None:
         if "视频" in query or "movie" in query:
@@ -178,6 +206,121 @@ async def search_by_api(query: str, location: str = None,
         else:
             print(f"Error: {response.status_code}")
             return [{'error': response.text}]
+
+
+async def brave_search(query: str, api_key=Config.Brave_Api_Key):
+    """
+    查询 Brave Search 并从 Web 取回搜索结果。以下部分介绍如何将请求（包括参数和标头）整理到 Brave Web Search API 并返回 JSON 响应。
+    :param query:
+    :param api_key:
+    :return:
+    """
+    url = "https://api.search.brave.com/res/v1/web/search"  # "https://api.search.brave.com/res/v1/news/search"
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "x-subscription-token": api_key
+    }
+    params = {
+        "q": query,
+        "search_lang": "zh-hans",  # en
+        "country": "CH",  # US
+        "safesearch": "strict",  # Drops all adult content from search results.
+        "count": "10",  # 20
+        "summary": False  # enables summary key generation in web search results
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data.get('web', {}).get('results', [])
+        else:
+            print(f"Error: {response.status_code}")
+            return [{'error': response.text}]
+
+
+async def firecrawl_search(query: str, api_key=Config.Firecrawl_Service_Key):
+    """
+    使用自然语言搜索已爬网数据。
+    "title","description","url","markdown","metadata"
+    """
+    url = 'https://api.firecrawl.dev/v1/search'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "query": query,
+        "limit": 5,  # Maximum number of results to return,1 <= x <= 100
+        "lang": "zh",  # "en"
+        "country": "ch",  # "us"
+        "tbs": "",  # Time-based search parameter
+        "ignoreInvalidURLs": False,
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.post(url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data.get('data', [])
+        else:
+            print(f"Error: {response.status_code},{response.text}")
+            return [{'error': response.text}]
+
+
+async def firecrawl_scrape(url, api_key=Config.Firecrawl_Service_Key):
+    """
+    用于抓取单个 URL。返回带有 URL 内容的 markdown。
+    https://docs.firecrawl.dev/features/scrape
+    """
+    api_url = 'https://api.firecrawl.dev/v1/scrape'  # /crawl
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "url": url,
+        "formats": ["markdown"],  # 'html',"json"
+        "onlyMainContent": True
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.post(api_url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data.get('data', {}).get("metadata")
+        else:
+            print(f"Error: {response.status_code},{response.text}")
+            return {'error': response.text}
+
+
+async def web_extract_firecrawl(prompt: str, urls: list[str], api_key=Config.Firecrawl_Service_Key):
+    """
+    提取,使用 AI 从单个页面、多个页面或整个网站中提取结构化数据。
+    /extract 端点简化了从任意数量的 URL 或整个域收集结构化数据的过程。提供 URL 列表，可选使用通配符（例如 example.com/*）以及描述所需信息的提示或架构。Firecrawl 处理抓取、解析和整理大型或小型数据集的细节。
+    https://docs.firecrawl.dev/features/extract
+    """
+    api_url = 'https://api.firecrawl.dev/v1/extract'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}'
+    }
+    payload = {
+        "urls": urls,
+        "prompt": prompt,
+        "enableWebSearch": True,
+        # "schema": {"type": "object", "properties": {}}
+    }
+    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
+        response = await cx.post(api_url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data.get('data', {})
+        else:
+            print(f"Error: {response.status_code},{response.text}")
+            return {'error': response.text}
 
 
 async def serper_search(query, engine: Literal['search', 'news', 'scholar', 'patents'] | None = 'search', page=2,
@@ -596,9 +739,11 @@ if __name__ == "__main__":
 
 
     async def main():
-        print(await web_search_tavily('季度业绩报告'))
-        r = await web_extract_tavily(
-            'https://en.wikipedia.org/wiki/Artificial_intelligence')
+        # print(await web_search_tavily('季度业绩报告'))
+        # r = await web_extract_tavily('https://en.wikipedia.org/wiki/Artificial_intelligence')
+        # print(r)
+
+        r = await  brave_search('季度业绩报告')  # r.keys(),
         print(r)
 
 

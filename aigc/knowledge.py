@@ -1,10 +1,9 @@
-from utils import cosine_similarity_np,split_sentences
+from utils import cosine_similarity_np, split_sentences
 from generates import *
 from igraph import Graph
 import asyncio
 import PyPDF2
 import re
-
 
 
 def parse_toc(pdf_path, toc_pages=(0, 0)):
@@ -314,6 +313,32 @@ IdeaTech_Graph = None
 
 
 async def ideatech_knowledge(query, rerank_model="BAAI/bge-reranker-v2-m3", file=None, version=0):
+    """
+    智能企业知识检索函数。企业知识库内容关键字包含如:公司管理制度', '公文制度', '人力资源中心', '人力资源管理制度', '考勤管理制度', '公司文化',
+        '出差以及报销的行为规范', '员工福利', '出差及报销管理',
+        '员工绩效考核', '绩效方案', '绩效结构', '绩效评定', '绩效面谈', 'OKR评定流程', 'KPI考核流程',
+        '电脑采购', '员工岗位', '试用期', '产假与年休假', '请假与外出', '考勤修正流程', '部门职能', '审批流程',
+        '因公出差', '报销凭证票据', '费用核算', '招聘内推', '残疾人补贴', '补贴标准', '合同档案管理办法', '财务部门',
+        '财务会计制度', '会计档案', '财会档案管理办法', '管理类职能晋升', '应收款坏账处理', '公司纪律规定',
+        '考勤打卡制度', '新员工入职', 'Icc知识库', '升职加薪', '职务晋升', '薪资调整', '员工行为规范', '员工手册',
+        '招聘流程', '员工激励政策', '员工离职流程', '员工哺乳假',
+        '公司内部培训', '员工发展计划', '岗位职责', '岗位晋升标准', '企业合规管理',
+        '团队管理规定', '会议管理规定', '员工考核标准', '费用核算控制',
+        '员工职业规划', '劳动合同管理'
+    根据查询从知识图谱中检索相似内容，并可选地使用重排序模型对结果进行重排序。
+    :param query:用户输入的查询字符串，用于在知识图谱中检索相关内容。
+    :param rerank_model:默认值 "BAAI/bge-reranker-v2-m3",指定用于重排序相似段落的模型名称，设置为 None 可跳过重排序过程。
+    :param file:上传的文件对象，仅当版本为3时且文件为PDF格式时会被处理。会触发图谱重新构建，支持 aiofiles 异步写入。
+    :param version:默认值 0
+        - version=0：直接在已有图谱中查找最相似段落；
+        - version=1/2：从节点及其下属段落中查找相似内容；
+        - version=3：接收 PDF 文件并重新构建图谱后执行相似查找。
+    :return:
+        - 如果启用了重排序（rerank_model != None）：
+            返回为重新排序后的段落字符串列表；
+        - 否则，返回原始相似段落的结构（包含分数与原文）。
+    """
+
     global IdeaTech_Graph
     if not IdeaTech_Graph:
         file_path = f"{Config.DATA_FOLDER}/ideatech_pdf_graph.pkl"

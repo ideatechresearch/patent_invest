@@ -13,22 +13,22 @@ from config import Config
 
 QUEUE_NAME: str = "message_queue"
 
-redis_client: Redis = None  # StrictRedis(host='localhost', port=6379, db=0)
+_redis_client: Redis = None  # StrictRedis(host='localhost', port=6379, db=0)
 Task_graph = ig.Graph(directed=True)  # 创建有向图
 
 
 def get_redis() -> Redis:
-    global redis_client
-    if redis_client is None:
-        redis_client = Redis(host=Config.REDIS_HOST, port=Config.REDIS_PORT, db=0,
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = Redis(host=Config.REDIS_HOST, port=Config.REDIS_PORT, db=0,
                              decode_responses=True  # 自动解码为字符串
                              )
-    return redis_client
+    return _redis_client
 
 
 async def shutdown_redis():
-    if redis_client:
-        await redis_client.close()
+    if _redis_client:
+        await _redis_client.close()
 
 
 async def do_job_by_lock(func_call: Callable, redis_key: str = None, lock_timeout: int = 600, **kwargs):
@@ -52,7 +52,7 @@ async def do_job_by_lock(func_call: Callable, redis_key: str = None, lock_timeou
         print(f"⚠️ 任务执行出错: {func_call.__name__} -> {e}")
     finally:
         current_lock_value = await redis.get(redis_key)
-        if current_lock_value and current_lock_value.decode() == lock_value:
+        if current_lock_value and current_lock_value == lock_value:
             await redis.delete(redis_key)
 
 

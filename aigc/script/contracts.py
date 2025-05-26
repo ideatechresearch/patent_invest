@@ -229,8 +229,11 @@ async def contracts_sentences_split(raw_text):
     请根据以上规则，对以下合同原文进行分句，并返回扁平的 JSON 数组
     '''
 
-    content = await aigc.ai_chat_async(user_request=raw_text, system=system, model="deepseek:deepseek-chat",
-                                       host=aigc_host, time_out=300, get_content=True)
+    # content = await aigc.ai_chat_async(user_request=raw_text, system=system, model="deepseek:deepseek-chat",
+    #                                    host=aigc_host, time_out=300, get_content=True)
+    content = await aigc.Local_Aigc(host=aigc_host, use_sync=True, time_out=600).ai_chat(
+        model='deepseek:deepseek-chat', max_tokens=8000,  # 8192
+        system=system, user_request=raw_text, get_content=True)
 
     parsed = extract_json_from_string(content)
     if isinstance(parsed, list):
@@ -246,8 +249,9 @@ async def contracts_df(fmt_data):
     df['摘要字数'] = df.需求摘要.str.len()
     df.to_excel('data/合同需求提取.xlsx')
     print(df)
-    df['chunks'] = df['需求模块'].map(
-        lambda txt: cross_sentence_chunk(build_ordered_sentences(txt), 8, 2, 700, tokenizer=None))
+
+    # df['chunks'] = df['需求模块'].map(
+    #     lambda txt: cross_sentence_chunk(build_ordered_sentences(txt), 8, 2, 700, tokenizer=None))
 
     async def process_row(text):
         async with sema:
@@ -260,21 +264,91 @@ async def contracts_df(fmt_data):
     with open("data/合同分句结果.pkl", "wb") as f:
         pickle.dump(contents, f)
 
-    df["chunks"] = chunk_lists
+    df["chunks"] = chunk_lists  # chunk_lists=[extract_json_array(x) for x in cut_data]
+    df["chunks_size"] = df["chunks"].apply(lambda x: len(x) if isinstance(x, list) else 0)
     flat = df.reset_index().explode('chunks').rename(
         columns={'index': '原始行索引', 'chunks': 'chunk_text'}).reset_index(drop=True)
     flat['chunk_len'] = flat['chunk_text'].str.len()
 
     flat.to_excel('data/合同需求分句.xlsx')
-    from sklearn.metrics.pairwise import cosine_similarity
-    from sklearn.preprocessing import normalize
-    # from sentence_transformers import SentenceTransformer
-    # from transformers import AutoTokenizer
-    # text_encoder = SentenceTransformer('BAAI/bge-large-zh-v1.5')
-    # tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-large-zh-v1.5')
-    # embeddings = text_encoder.encode(flat['chunk_text'].tolist(), show_progress_bar=True, normalize_embeddings=True)
-    # np.savez('data/embeddings_合同需求分块_bge-large-zh.npz', embeddings=embeddings, index=np.array(flat.index),
-    #          index_old=np.array(flat.原始行索引), chunk_text=np.array(flat.chunk_text))
+
+    return df, flat
+
+
+def contracts_similarity(flat):
+    try:
+        from sklearn.metrics.pairwise import cosine_similarity
+        from sklearn.preprocessing import normalize
+        from scipy.special import softmax
+        from sentence_transformers import SentenceTransformer
+        from transformers import AutoTokenizer
+        text_encoder = SentenceTransformer('BAAI/bge-large-zh-v1.5')
+        tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-large-zh-v1.5')
+        embeddings = text_encoder.encode(flat['chunk_text'].tolist(), show_progress_bar=True, normalize_embeddings=True)
+        np.savez('data/embeddings_合同需求分块_bge-large-zh.npz', embeddings=embeddings, index=np.array(flat.index),
+                 index_old=np.array(flat.原始行索引), chunk_text=np.array(flat.chunk_text))
+        # df_classes = pd.read_excel('data/账户管理解决方案_系统分模块化报价.xlsx')
+        # text_embeddings0 = text_encoder.encode(df_classes.系统模块.tolist())
+        # text_embeddings1 = text_encoder.encode(df_classes.功能分类.tolist())
+        # text_embeddings2 = text_encoder.encode(df_classes.主要内容.tolist())
+        # combined_embeddings = 1.5 * text_embeddings0 + 1.0 * text_embeddings1 + 1.0 * text_embeddings2
+        # combined_embeddings = normalize(combined_embeddings)
+        # combined_texts = [ f"{a} [SEP] {b} [SEP] {c}"
+        #     for a, b, c in zip(df_classes.系统模块, df_classes.功能分类, df_classes.主要内容)
+        # ]
+        # text_embeddings = text_encoder.encode(combined_texts, normalize_embeddings=True)
+        # np.savez('data/embeddings_账户管理解决方案_bge-large-zh_combined.npz', embeddings=combined_embeddings,
+        #          index=np.array(df_classes.index), module=np.array(df_classes.系统模块),
+        #          classification=np.array(df_classes.功能分类))#content=
+
+        data = np.load('data/embeddings_账户管理解决方案_bge-large-zh_combined.npz', allow_pickle=True)
+        text_embeddings = data['embeddings']
+        module_classification = np.char.add(data['module'].astype(str), ':' + data['classification'].astype(str))
+        sims = cosine_similarity(embeddings, text_embeddings)
+        print(sims.flatten().mean())
+        sim_df = pd.DataFrame(sims, columns=module_classification)
+        sim_flat = pd.concat([flat, sim_df], axis=1)
+        sim_flat['最相关的功能分类'] = module_classification[np.argmax(sims, axis=1)]
+        print(sim_flat['最相关的功能分类'].value_counts())
+        sim_flat['max_probs'] = np.max(softmax(sims, axis=1), axis=1)
+        sim_flat['sim_max'] = np.max(sims, axis=1)
+        sim_flat['sim_mean'] = np.mean(sims, axis=1)
+        sim_flat['sim_std'] = np.std(sims, axis=1)
+        sim_flat['sim_ptp'] = np.ptp(sims, axis=1)
+        print(sim_flat['sim_max'].describe())
+        top_3_indices = np.argsort(sims, axis=1)[:, ::-1][:, :3]
+        top_3_classes = module_classification[top_3_indices]
+        sim_flat['最相关的功能分类_top3'] = [';'.join(classes) for classes in top_3_classes]
+        sim_flat.to_excel('data/合同需求与系统模块分类内容sim_flat.xlsx')
+        return sim_flat
+    except ImportError:
+        pass
+    except Exception as e:
+        print(e)
+
+
+async def contracts_df_lost(df):
+    # df['chunks'] = df['需求模块'].map(
+    #     lambda txt: cross_sentence_chunk(build_ordered_sentences(txt), 8, 2, 700, tokenizer=None))
+
+    async def process_row(text):
+        async with sema:
+            return await contracts_sentences_split(text)
+
+    tasks = [process_row(txt) for txt in df['需求模块']]
+    results = await tqdm_asyncio.gather(*tasks)
+    contents, chunk_lists = zip(*results)
+
+    with open("data/合同分句结果_lost.pkl", "wb") as f:
+        pickle.dump(contents, f)
+
+    df["chunks"] = chunk_lists  # chunk_lists=[extract_json_array(x) for x in cut_data]
+    df["chunks_size"] = df["chunks"].apply(lambda x: len(x) if isinstance(x, list) else 0)
+    flat = df.reset_index().explode('chunks').rename(
+        columns={'index': '原始行索引', 'chunks': 'chunk_text'}).reset_index(drop=True)
+    flat['chunk_len'] = flat['chunk_text'].str.len()
+
+    flat.to_excel('data/合同需求分句_lost.xlsx')
 
     return df, flat
 
@@ -299,13 +373,18 @@ if __name__ == "__main__":
         with open("data/合同解析结果.pkl", "rb") as f:
             fmt_data = pickle.load(f)
 
-
         with open("data/合同分句结果.pkl", "rb") as f:
             cut_data = pickle.load(f)
 
+        with open("data/合同分句结果_lost.pkl", "rb") as f:
+            cut_data = pickle.load(f)
         print(cut_data)
 
         # df, flat = await contracts_df(fmt_data)
+
+        # df = pd.read_excel('data/合同需求提取_lost.xlsx')
+        # df, flat = await contracts_df_lost(df)
+        # contracts_similarity(flat)
 
 
     asyncio.run(main())

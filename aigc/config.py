@@ -3,23 +3,30 @@ import hmac, ecdsa, hashlib
 from jose import JWTError, jwt
 import requests, json
 from urllib.parse import quote_plus, urlencode, urlparse, quote, unquote, parse_qs, unquote_plus
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from wsgiref.handlers import format_date_time
 import time
 import uuid
-import yaml, os
+import os
+from dataclasses import dataclass, asdict
 
 
+@dataclass(kw_only=True)  # , frozen=True
 class Config(object):
-    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://***:{quote_plus("***")}@***:3306/technet?charset=utf8'
-    ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql:///***:{quote_plus("***")}@***:3306/technet?charset=utf8'
+    """
+       全局参数配置（示例结构），涉及配置中的敏感信息，真实环境用从 YAML文件加载配置覆盖，以下为占位内容，仅供结构参考，非真实配置
+    """
+    # {{!IGNORE_START!}} (请忽略以下内容)
+    DATABASE_PWD = "***"
+    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://***:{quote_plus(DATABASE_PWD)}@***.mysql.rds.aliyuncs.com:3306/technet?charset=utf8'
+    ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://***:{quote_plus(DATABASE_PWD)}@***.mysql.rds.aliyuncs.com:3306/h3yun?charset=utf8'
     SQLALCHEMY_COMMIT_ON_TEARDOWN = False
     SQLALCHEMY_TACK_MODIFICATIONS = True
     SQLALCHEMY_ECHO = True
     SECRET_KEY = '***'
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 60
-    HTTP_TIMEOUT_SEC = 60.0
+    HTTP_TIMEOUT_SEC = 100.0
     MAX_TASKS = 1024
     MAX_CACHE = 1024
     MAX_RETRY_COUNT = 3
@@ -27,22 +34,28 @@ class Config(object):
     DEVICE_ID = '***'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
-    _config_path = 'data/.config.yaml'  # 'data/default_config.yaml'
-    _config_dynamic = {}  # 其他默认配置项
+    _config_path = 'config.yaml'
+    __config_data = {}  # 动态加载的数据
+    __config_dynamic = {}  # 其他默认配置项
     WEBUI_NAME = 'aigc'
-    WEBUI_URL = 'http://*:7000'
+    WEBUI_URL = 'http://***:7000'
     # https://api.qdrant.tech/api-reference
+    OLLAMA_HOST = 'localhost'
     QDRANT_HOST = 'qdrant'
-    WECHAT_URL = 'http://*:28089'
-    QDRANT_URL = "http://*:6333"
-    REDIS_HOST = "redis_aigc"  # "localhost"
-    REDIS_PORT =  6379
+    QDRANT_GRPC_PORT = 6334
+    QDRANT_URL = "http://***:6333"  # ":memory:"
+    WECHAT_URL = 'http://idea_ai_robot:28089'
+    REDIS_HOST = "redis_aigc"
+    REDIS_PORT = 6379  # 7007
+    REDIS_CACHE_SEC = 99999  # 86400
 
     VALID_API_KEYS = {"token-abc123", "token-def456"}
     DEFAULT_LANGUAGE = 'Chinese'
     DEFAULT_MODEL = 'moonshot'  # 'qwen'
     DEFAULT_MODEL_ENCODING = "gpt-3.5-turbo"
     DEFAULT_MODEL_EMBEDDING = 'BAAI/bge-large-zh-v1.5'
+    DEFAULT_MODEL_METADATA = 'qwen:qwen-coder-plus'  # qwen-coder-turbo
+    DEFAULT_MODEL_FUNCTION = 'qwen:qwen-max'
     DEFAULT_MAX_TOKENS = 4000
 
     BAIDU_API_Key = '***'
@@ -50,7 +63,7 @@ class Config(object):
     # https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application/v1
     # https://console.bce.baidu.com/iam/?_=1739264215214#/iam/apikey/list
     BAIDU_qianfan_API_Key = '***'  # 45844683
-    BAIDU_qianfan_Secret_Key = '***'  # 'bce-v3/ALTAK-NtpbkKRwgOjSHgtLn4iNl/b92d2895e3016aef5f746283fe99406f841ca10f'
+    BAIDU_qianfan_Secret_Key = '***' 
     QIANFAN_Service_Key = '***'
     # https://console.bce.baidu.com/ai/#/ai/nlp/overview/index
     BAIDU_nlp_API_Key = '***'  # 11266517
@@ -71,7 +84,7 @@ class Config(object):
     BAIDU_translate_API_Key = '***'  # '116451173'
     BAIDU_translate_Secret_Key = '***'
     # https://fanyi-api.baidu.com/api/trans/product/desktop
-    BAIDU_trans_AppId = '***'
+    BAIDU_trans_AppId = '20240525002061478'
     BAIDU_trans_Secret_Key = '***'
     # https://lbsyun.baidu.com/apiconsole/center
     BMAP_API_Key = '***'
@@ -83,15 +96,15 @@ class Config(object):
     DashVectore_Service_Key = '***'
     ALIYUN_AK_ID = '***'
     ALIYUN_Secret_Key = '***'
-    ALIYUN_nls_AppId = '***'
+    ALIYUN_nls_AppId = 'CjIryfx0wqdvCHZk'
 
     ALIYUN_oss_AK_ID = '***'
     ALIYUN_oss_Secret_Key = '***'
     ALIYUN_oss_region = "oss-cn-hangzhou"
     ALIYUN_oss_internal = False  # 是否使用内网地址
     ALIYUN_oss_endpoint = f'https://{ALIYUN_oss_region}.aliyuncs.com'  # 'https://oss-cn-shanghai.aliyuncs.com'
-    ALIYUN_Bucket_Name = '***'  # 存储桶名称
-    ALIYUN_Bucket_Domain = f"https://{ALIYUN_Bucket_Name}.{ALIYUN_oss_region}{'-internal' if ALIYUN_oss_internal else ''}.aliyuncs.com"  # 加速域名"https://rime.oss-accelerate.aliyuncs.com"
+    ALIYUN_Bucket_Name = 'idea-aigc-images'  # 存储桶名称 'rime'
+    ALIYUN_Bucket_Domain = f"https://{ALIYUN_Bucket_Name}.{ALIYUN_oss_region}{'-internal' if ALIYUN_oss_internal else ''}.aliyuncs.com"  # 加速域名"https://***.oss-accelerate.aliyuncs.com"
     # https://console.cloud.tencent.com/hunyuan/api-key
     TENCENT_SecretId = '***'
     TENCENT_Secret_Key = '***'
@@ -101,19 +114,25 @@ class Config(object):
     XF_AppID = 'e823df98'
     XF_API_Key = '***'
     XF_Secret_Key = '***'  # XF_API_Key:XF_Secret_Key
-    XF_API_Password = ['***', '***', '', '']
+    XF_API_Password = ['***', '***', '***', '***', '', '***', '', '']
     # https://aistudio.google.com/apikey
     GEMINI_Service_Key = '***'
     # https://console.anthropic.com/settings/keys
+    # https://www.cursor.com/cn/settings
     Anthropic_Service_Key = '***'
+
+    # https://cnb.cool/profile/token
+    CNB_Server_Token = "***"
 
     # https://cloud.siliconflow.cn/models
     Silicon_Service_Key = '***'
     Moonshot_Service_Key = "***"
+    # https://modelscope.cn/my/myaccesstoken
+    ModelScope_Service_Key = "***"  
     # https://console.x.ai/team/457298eb-40a8-4308-907d-0a36ec706042/api-keys/create
     Grok_Service_Key = '***'
     # https://build.nvidia.com/explore/discover
-    NVIDIA_Service_Key = '***'
+    NVIDIA_Service_Key = '***' 
     # https://platform.openai.com/settings/organization/admin-keys
     OPENAI_Admin_Service_Key = '***'
     OPENAI_Service_Key = '***'
@@ -122,12 +141,12 @@ class Config(object):
     # https://platform.baichuan-ai.com/console/apikey
     Baichuan_Service_Key = '***'
     # https://platform.deepseek.com/usage
-    DeepSeek_Service_Key = '***'
+    DeepSeek_Service_Key = '***'  
     # https://platform.minimaxi.com/user-center/basic-information
-    MINIMAX_Group_ID = '***'
+    MINIMAX_Group_ID = '1887488082316366022'
     MINIMAX_Service_Key = '***'
     # https://ai.youdao.com/console/#/
-    YOUDAO_AppID = '***'
+    YOUDAO_AppID = '775f6562be8c52e4'
     YOUDAO_Service_Key = '***'
     CaiYun_Token = "***"
     HF_Service_Key = '***'
@@ -139,12 +158,12 @@ class Config(object):
     JINA_Service_Key = '***'
     # https://www.firecrawl.dev/app
     # https://docs.firecrawl.dev/introduction
-    Firecrawl_Service_Key = '***'
+    Firecrawl_Service_Key = '***'  # 'fc-2d8b0b801164476aa2c20b826c06c21d'
     # https://console.volcengine.com/iam/keymanage
     VOLC_AK_ID = '***'
     VOLC_Secret_Key = '***'
     VOLC_AK_ID_admin = '***' 
-    VOLC_Secret_Key_admin = '***'
+    VOLC_Secret_Key_admin = '***' 
     ARK_Service_Key = '***'
 
     # https://vanna.ai/account/models 基于大模型和RAG的Text2SQL
@@ -155,10 +174,12 @@ class Config(object):
     # https://www.comet.com/opik/dooven-prime/get-started
     # https://www.comet.com/opik/dooven-prime/home
     OPIK_Api_Key = '***'
-    OPIK_Workspace = '***'
+    OPIK_Workspace = 'dooven-prime'
     # https://www.searchapi.io/
-    SearchApi = '***'
-    # https://api.search.brave.com/app/dashboard
+    SearchApi_Key = '***'  # TLvdjLW2QAgdotQyYMpcXeqx
+    # https://api-dashboard.search.brave.com/app/keys
+    # https://api-dashboard.search.brave.com/app/dashboard
+    Brave_Api_Key = "***"
     # https://serper.dev/api-key
     SERPER_Api_Key = '***'
     # https://console.deepgram.com/project/
@@ -170,7 +191,7 @@ class Config(object):
     # https://www.alphavantage.co/support/#api-key
     AlphaVantage_Api_Key = '***'
     # https://app.tavily.com/home
-    TAVILY_Api_Key = '***'
+    TAVILY_Api_Key = '***'  # 88YHAKX5YS9EMHGW6EGZN871
     # https://github.com/settings/personal-access-tokens
     GITHUB_Access_Tokens = '***'
     # https://studio.d-id.com/
@@ -188,58 +209,207 @@ class Config(object):
     # https://gitee.com/personal_access_tokens
     GITEE_Access_Tokens = '***'
 
-    HTTP_Proxy = 'http://***:9030'# socks5://10.10.10.3:9793
+    HTTP_Proxy = 'http://***:***@w***:7930'
     HTTP_Proxies = {
-        'http': HTTP_Proxy,  
+        'http': HTTP_Proxy,
         'https': HTTP_Proxy,
     }
+
+    # {{!IGNORE_END!}}
+
+    def copy_and_update(self, *args, **kwargs):
+        """
+        Copy the object and update it with the given Info
+        instance and/or other keyword arguments.
+        """
+        new_info = asdict(self)
+
+        for si in args:
+            if isinstance(si, Config):
+                new_info.update({k: v for k, v in asdict(si).items() if v is not None})
+            elif isinstance(si, dict):
+                new_info.update({k: v for k, v in si.items() if v is not None})
+
+        if len(kwargs) > 0:
+            new_info.update(kwargs)
+
+        return Config(**new_info)
+
+    @classmethod
+    def debug(cls):
+        cls.SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://***:***@10.10.10.5:3306/kettle?charset=utf8mb4'
+        cls.ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://***:***@10.10.10.5:3306/kettle?charset=utf8'
+        cls.WEBUI_URL = 'http://127.0.0.1:7000'
+        # https://api.qdrant.tech/api-reference
+        cls.QDRANT_GRPC_PORT = None
+        cls.WECHAT_URL = 'http://***:28089'
+        cls.REDIS_HOST = 'localhost' 
+        cls.HTTP_Proxy = 'http://***:***@10.10.10.3:7890'
+        # cls.HTTP_Proxies = {'http': cls.HTTP_Proxy,'https': cls.HTTP_Proxy}
+        os.environ['HTTP_PROXY'] = cls.HTTP_Proxies['http']
+        os.environ['HTTPS_PROXY'] = cls.HTTP_Proxies['https']
+
+        cls.Moonshot_Service_Key = "***"
+        cls.DeepSeek_Service_Key = '***'
+        cls.DashScope_Service_Key = '***'
+
+        cls.print_config()
 
     @classmethod
     def save(cls, filepath=None):
         """将配置项保存到YAML文件"""
+        import joblib, yaml
         config_data = {key: getattr(cls, key) for key in dir(cls)
                        if not key.startswith('__')
+                       and not key.startswith('_')
                        and not callable(getattr(cls, key))
-                       and not isinstance(getattr(cls, key), classmethod)}
+                       and not isinstance(getattr(cls, key), (classmethod, staticmethod))}
 
-        path = filepath or getattr(cls, '_config_path', 'data/default_config.yaml')
-        with open(path, "w") as f:
+        if not cls.__config_data and any(isinstance(value, str) and set(value) == {"*"}
+                                         for value in config_data.values()):
+            cls.load(filepath)
+
+        config_data.update(cls.__config_data)
+        for key, value in config_data.items():
+            if isinstance(value, str) and set(value) == {"*"}:
+                print(f"配置文件保存失败，包含占位符 '***','{key}': 当前值 = {value}")
+                return config_data
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        joblib.dump(config_data, f'data/config_{timestamp}.pkl')
+        path = filepath or getattr(cls, '_config_path', 'data/.config.yaml')
+        with open(path, "w", encoding="utf-8") as f:
             yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
 
-        print(f"已保存配置文件 {path}")
+        print(f"已保存配置文件 {path},data/config_{timestamp}.pkl")
+        return config_data
 
     @classmethod
     def load(cls, filepath=None):
         """从YAML文件加载配置项"""
-        path = filepath or getattr(cls, '_config_path', 'data/default_config.yaml')
+        if cls.__config_data:  # is_loaded
+            return
+
+        import yaml
+        path = filepath or getattr(cls, '_config_path', 'data/.config.yaml')
         if not os.path.exists(path):
             print(f"配置文件 {path} 不存在，使用默认配置")
             return
 
-        with open(path, "r") as f:
-            config_data = yaml.safe_load(f)
+        with open(path, "r", encoding='utf-8') as f:
+            cls.__config_data = yaml.safe_load(f)
 
         # print('load yaml:', config_data)
         # 将文件中的配置覆盖类中的默认值,cls优先,无值则导入
-        for key, value in config_data.items():
+        for key, value in cls.__config_data.items():
             if hasattr(cls, key):
                 current_value = getattr(cls, key)
                 if current_value is None or (isinstance(current_value, str) and all(c == '*' for c in current_value)):
+                    setattr(cls, key, value)
+                elif key.endswith('DATABASE_URI'):
                     setattr(cls, key, value)
                 elif current_value != value:
                     print(f"配置项 '{key}' 不一致: 当前值 = {current_value}, 加载值 = {value}")
             else:
                 # 添加到动态配置
-                cls._config_dynamic[key] = value
+                cls.__config_dynamic[key] = value
 
         print("配置已加载并更新")
+        return cls.__config_dynamic
+
+    @classmethod
+    def __getattr__(cls, name):
+        # 访问不存在的属性时被调用,第一次访问属性时触发
+        if not cls.__config_data:
+            cls.load()
+            if name in cls.__config_data:
+                return cls.__config_data[name]
+        raise AttributeError(f"Config has no attribute '{name}'")
+
+    @classmethod
+    def get(cls, key):
+        value = getattr(cls, key, None)
+        if isinstance(value, str) and all(c == '*' for c in value):
+            return getattr(cls, "__config_data", {}).get(key)
+        return value
 
     @classmethod
     def print_config(cls):
         """打印当前的配置项"""
         for key, value in cls.__dict__.items():
-            if not key.startswith('__') and not isinstance(value, classmethod):  # callable(value)
+            if not key.startswith('__') and not callable(value) and not isinstance(value, classmethod):
                 print(f"{key}: {value}")
+
+    @staticmethod
+    def mask_sensitive(filepath="config.py"):
+        import re
+        with open(filepath, 'r', encoding='utf-8') as f:
+            code = f.read()
+
+        # 匹配 class Config: 块类体（包括空行/注释）
+        config_pattern = re.compile(r'^class\s+Config\s*(\(.*?\))?\s*:\s*$', re.MULTILINE)
+        class_match = config_pattern.search(code)
+        if not class_match:
+            print("❌ 未找到 Config 类。")
+            return
+
+        class_start = class_match.end()
+        lines = code[class_start:].splitlines(keepends=True)
+
+        # 提取 Config 类体（缩进的部分）
+        class_body_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if re.match(r'^(@|def |class )', stripped):
+                break  # 跳过方法定义、装饰器、嵌套类等
+            if re.match(r'^(async\s+)?def\b', stripped):
+                break  # async def 支持
+            if not line.strip() == "" and not re.match(r'^[ \t]+', line):
+                break  # 到达类体外部，结束
+            # 保留赋值语句、空行、注释
+            class_body_lines.append(line)
+
+        class_header = class_match.group(0)
+        class_body = "".join(class_body_lines)
+        print(class_header, class_body)
+
+        # 匹配每一行的赋值语句
+        line_pattern = re.compile(
+            r'^([ \t]+)([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([\'"])(.*?)(\3)',
+            re.MULTILINE
+        )
+        # 在 class Config 体内部，查找敏感字段赋值
+        sensitive_keywords = {'password', 'pwd', 'token', 'tokens', 'secret', 'apikey', 'key', 'access', 'auth',
+                              'ak_id'}
+
+        def is_sensitive(key):
+            key_lower = key.lower()
+            return any(k in key_lower for k in sensitive_keywords)
+
+        def replacer(m):
+            indent, key, quote, value, _ = m.groups()
+            if is_sensitive(key):
+                print(f"替换字段：{key} = {quote}{value}{quote}")
+                return f"{indent}{key} = {quote}***{quote}"
+            return m.group(0)
+
+        new_body = line_pattern.sub(replacer, class_body)
+
+        # 替换整体代码中的 config 类体
+        modified_code = code.replace(class_body, new_body)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"data/{filepath}.{timestamp}.bak"
+
+        with open(backup_path, "w", encoding="utf-8") as f:  # 备份
+            f.write(code)
+
+        with open(filepath, "w", encoding="utf-8") as f:  # 写回
+            f.write(modified_code)
+
+        print(f"✅ 已更新 Config 类中的敏感字段，并备份到 {filepath}.bak")
+
+        return class_body, new_body
 
 
 # 模型编码:0默认，1小，-1最大
@@ -249,17 +419,17 @@ AI_Models = [
     # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
     {'name': 'qwen', 'type': 'default', 'api_key': '',
      "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct",
-               "qwen2.5-32b-instruct", "qwq-32b", "qwq-32b-preview", "qwen-72b-chat",
+               "qwen2.5-32b-instruct", "qwen2.5-72b-instruct",
+               "qwen3-14b", "qwen3-32b", "qwq-32b", "qwq-32b-preview", "qwen-72b-chat",
                "qwen-omni-turbo", "qwen-vl-plus", "qwen-coder-plus", "qwen-math-plus",
                'qwen-long', "qwen-turbo", "qwen-turbo-latest", "qwen-plus", "qwen-plus-latest",
-               "qwen-max", "qwen-max-latest",
-               'qwq-plus', "qwq-plus-latest",
+               "qwen-max", "qwen-max-latest", 'qwq-plus', "qwq-plus-latest", "qwen-plus-2025-04-28",
                "tongyi-intent-detect-v3", "abab6.5t-chat", 'abab6.5s-chat',
                "deepseek-r1-distill-qwen-1.5b", "deepseek-r1-distill-qwen-7b",
                "deepseek-r1-distill-qwen-14b", "deepseek-r1-distill-qwen-32b",
                "deepseek-r1-distill-llama-8b", "deepseek-r1-distill-llama-70b",
                "deepseek-v3", "deepseek-r1", ],
-     # "qwen-math-plus",'qwen-plus','baichuan2-7b-chat-v1','baichuan2-turbo'
+     # "qwen-math-plus",'baichuan2-7b-chat-v1','baichuan2-turbo'
      "generation": ["qwen-coder-turbo", "qwen2.5-coder-7b-instruct", "qwen2.5-coder-14b-instruct",
                     "qwen2.5-coder-32b-instruct", "qwen-coder-turbo-latest"],
      'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
@@ -435,19 +605,20 @@ AI_Models = [
      'model': ["mistral-small-latest", 'open-mistral-nemo', 'open-codestral-mamba', 'codestral-latest',
                'pixtral-12b-2409'],
      'embedding': ["mistral-embed"],
-     'url': 'https://api.mistral.ai/v1/chat/completions',
+     'url': 'https://api.mistral.ai/v1/chat/completions',  # https://codestral.mistral.ai/v1/chat/completions
      'agent_url': 'https://api.mistral.ai/v1/agents/completions',
      'embedding_url': 'https://api.mistral.ai/v1/embeddings',
      'base_url': 'https://api.mistral.ai/v1', 'supported_openai': True, 'proxy': True, "timeout": 200},
     # https://ai.google.dev/gemini-api/docs/openai?hl=zh-cn#python
     {'name': 'gemini', 'type': 'default', 'api_key': '',
-     'model': ["gemini-1.5-flash", 'gemini-1.5-flash-8b', 'gemini-1.5-pro', 'gemini-2.0-flash'],  # 'aqa'
-     'embedding': ['text-embedding-004', ],
+     'model': ["gemini-1.5-flash", 'gemini-1.5-flash-8b', 'gemini-1.5-pro',
+               'gemini-2.0-flash-lite', 'gemini-2.0-flash'],  # 'aqa'
+     'embedding': ['text-embedding-004', 'gemini-embedding-exp'],
      'url': 'https://generativelanguage.googleapis.com/v1beta/models/',
      'base_url': "https://generativelanguage.googleapis.com/v1beta/openai/", 'supported_openai': True, 'proxy': True},
     # https://docs.x.ai/docs/overview
     {'name': 'grok', 'type': 'default', 'api_key': '',
-     'model': ["grok-2-latest", "grok-2-vision-1212"],
+     'model': ["grok-2-latest", "grok-2-vision-1212", "grok-3-mini", "grok-3-mini-fast", "grok-3", "grok-3-fast"],
      'url': 'https://api.x.ai/v1/chat/completions',
      'base_url': "https://api.x.ai/v1", 'supported_openai': True, 'proxy': True, "timeout": 200},
     # https://modelscope.cn/my/modelService/deploy?page=1&type=free
@@ -457,7 +628,16 @@ AI_Models = [
      'url': 'https://ms-fc-283a6661-de97.api-inference.modelscope.cn/v1',
      'base_url': "https://api-inference.modelscope.cn/v1", 'supported_openai': True, "timeout": 100},
     # https://platform.openai.com/docs/overview
-    {'name': 'gpt', 'type': 'default', 'api_key': '', 'model': ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
+    {'name': 'gpt', 'type': 'default', 'api_key': '',
+     'model': ["o3-mini", "o3-mini-2025-01-31", "o1", "o1-2024-12-17", "o1-preview", "o1-preview-2024-09-12", "o1-mini",
+               "o1-mini-2024-09-12", "gpt-4o", "gpt-4o-2024-11-20", "gpt-4o-2024-08-06", "gpt-4o-2024-05-13",
+               "gpt-4o-audio-preview", "gpt-4o-audio-preview-2024-10-01", "gpt-4o-audio-preview-2024-12-17",
+               "gpt-4o-mini-audio-preview", "gpt-4o-mini-audio-preview-2024-12-17", "chatgpt-4o-latest", "gpt-4o-mini",
+               "gpt-4o-mini-2024-07-18", "gpt-4-turbo", "gpt-4-turbo-2024-04-09", "gpt-4-0125-preview",
+               "gpt-4-turbo-preview", "gpt-4-1106-preview", "gpt-4-vision-preview", "gpt-4", "gpt-4-0314", "gpt-4-0613",
+               "gpt-4-32k", "gpt-4-32k-0314", "gpt-4-32k-0613", "gpt-3.5-turbo", "gpt-3.5-turbo-16k",
+               "gpt-3.5-turbo-0301", "gpt-3.5-turbo-0613", "gpt-3.5-turbo-1106", "gpt-3.5-turbo-0125",
+               "gpt-3.5-turbo-16k-0613"],
      'generation': ["text-davinci-003", "text-davinci-002", "text-davinci-003", "text-davinci-004"],
      'embedding': ["text-embedding-ada-002", "text-search-ada-doc-001", "text-similarity-babbage-001",
                    "code-search-ada-code-001", "search-babbage-text-001"],
@@ -468,26 +648,29 @@ AI_Models = [
      },
 
 ]
+
+
 # moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,spark,baichuan,deepseek
-API_KEYS = {
-    'moonshot': Config.Moonshot_Service_Key,
-    'glm': Config.GLM_Service_Key,
-    'qwen': Config.DashScope_Service_Key,
-    'doubao': Config.ARK_Service_Key,
-    'silicon': Config.Silicon_Service_Key,
-    'spark': Config.XF_API_Password,
-    'ernie': Config.QIANFAN_Service_Key,
-    'baichuan': Config.Baichuan_Service_Key,
-    # 'You exceeded your current quota, please check your plan and billing details.'
-    'hunyuan': Config.TENCENT_Service_Key,
-    'deepseek': Config.DeepSeek_Service_Key,
-    'minimax': Config.MINIMAX_Service_Key,
-    'mistral': Config.MISTRAL_API_KEY,
-    'gemini': Config.GEMINI_Service_Key,
-    'modelscope': Config.ModelScope_Service_Key
-    # 'grok': Config.Grok_Service_Key,
-    # 'gpt': Config.OPENAI_Service_Key
-}
+def model_api_keys():
+    return {
+        'moonshot': Config.Moonshot_Service_Key,
+        'glm': Config.GLM_Service_Key,
+        'qwen': Config.DashScope_Service_Key,
+        'doubao': Config.ARK_Service_Key,
+        'silicon': Config.Silicon_Service_Key,
+        'spark': Config.XF_API_Password,
+        'ernie': Config.QIANFAN_Service_Key,
+        'baichuan': Config.Baichuan_Service_Key,
+        # 'You exceeded your current quota, please check your plan and billing details.'
+        'hunyuan': Config.TENCENT_Service_Key,
+        'deepseek': Config.DeepSeek_Service_Key,
+        'minimax': Config.MINIMAX_Service_Key,
+        'mistral': Config.MISTRAL_API_KEY,
+        'gemini': Config.GEMINI_Service_Key,
+        'modelscope': Config.ModelScope_Service_Key,
+        'grok': Config.Grok_Service_Key,
+        # 'gpt': Config.OPENAI_Service_Key
+    }
 
 
 # SUPPORTED_OPENAI_MODELS = {'moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan', 'deepseek', 'minimax',
@@ -520,52 +703,6 @@ def extract_ai_model(search_field: str = "model"):
             extracted_data.append((name, [field_value]))
 
     return extracted_data
-
-
-class ModelListExtract:
-    models = []
-
-    # import asyncio
-    # model_lock = asyncio.Lock()
-
-    # def __init__(self):
-    #     self.models = self.extract()
-
-    @classmethod
-    def extract(cls):
-        """
-        提取 AI_Models 中的 name 以及 search_field 中的所有值，并存入一个大列表。
-
-        返回：
-        - List[str]: 包含所有模型名称及其子模型的列表
-        """
-        # list(itertools.chain(*[sublist[1] for sublist in extract_ai_model("model")]))
-        extracted_data = extract_ai_model("model")
-        return [i for item in extracted_data for i in [item[0]] + item[1]]  # flattened_list
-
-    @classmethod
-    def set(cls):
-        """更新 MODEL_LIST"""
-        cls.models = cls.extract()
-        # print("MODEL_LIST updated:", cls.models)
-
-    # @classmethod
-    # async def async_set(cls):
-    #     """更新模型列表"""
-    #     async with cls.model_lock:
-    #         cls.models = cls.extract()
-
-    @classmethod
-    def get(cls):
-        return cls.models
-
-    @classmethod
-    def contains(cls, value):
-        if ':' in value:
-            owner, name = value.split(':')
-            return owner in cls.models or name in cls.models
-
-        return value in cls.models
 
 
 # Api_Tokens = [
@@ -1106,6 +1243,9 @@ if __name__ == "__main__":
     # cx = OpenAI(api_key=Config.DeepSeek_Service_Key, base_url="https://api.deepseek.com")
     # print(cx.models.list().model_dump_json())
 
-    Config.save()
-    # Config.load()
+    print(Config.save())
+
+    Config.mask_sensitive()
+
+    print(Config.load())
     Config.print_config()

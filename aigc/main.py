@@ -28,7 +28,8 @@ from passlib.context import CryptContext
 
 from config import *
 
-#Config.debug()
+Config.load()
+# Config.debug()  # 测试环境配置,生产环境注释
 
 from structs import *
 from database import *
@@ -57,7 +58,7 @@ async def lifespan(app: FastAPI):
         if not scheduler.running:
             scheduler.start()
 
-        await init_ai_clients(AI_Models, API_KEYS, get_data=False)
+        await init_ai_clients(AI_Models, get_data=False)
 
         # print(json.dumps(AI_Models, indent=4))
         # task1 = asyncio.create_task(message_zero_mq.start())
@@ -72,8 +73,10 @@ async def lifespan(app: FastAPI):
         print("Shutting down.")
         scheduler.shutdown()
         engine.dispose()
+        # MysqlData().close()
 
         # await async_engine.dispose()
+        await shutdown_httpx()
         await shutdown_redis()
 
     # task1.cancel()
@@ -113,16 +116,24 @@ try:
 except:
     w3 = None
 
+MTick_Time: datetime = None
+
 
 async def tick():
-    if len(TaskManager.Task_queue):
-        # print(len(TaskManager.Task_queue), 'Tick! The time is: %s' % datetime.now())
-        await TaskManager.clean_old_tasks()
+    global MTick_Time
+    tick_now = datetime.now()
+    if not MTick_Time or MTick_Time.minute != tick_now.minute:
+        MTick_Time = tick_now.replace(second=0, microsecond=0)
+        # print(f"Tick new bar! The time is: {MTick_Time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    if len(Chat_History_Cache):
-        # print(len(Chat_History_Cache), 'Tick! The time is: %s' % datetime.now())
-        with SessionLocal() as session:
-            ChatHistory.sequential_insert(session)
+        if len(TaskManager.Task_queue):
+            # print(len(TaskManager.Task_queue), 'Tick! The time is: %s' % tick_now)
+            await TaskManager.clean_old_tasks()
+
+        if len(Chat_History_Cache):
+            # print(len(Chat_History_Cache), 'Tick! The time is: %s' % tick_now)
+            with SessionLocal() as session:
+                ChatHistory.sequential_insert(session)
 
 
 async def async_cron():
@@ -523,6 +534,10 @@ async def retrieval(text: str, platform: Optional[str] = None):
         results = await web_search_tavily(text)
     elif platform == 'serper':
         results = await serper_search(text)
+    elif platform == 'brave':
+        results = await brave_search(text)
+    elif platform == 'firecrawl':
+        results = await firecrawl_search(text)
     elif platform in ('google', 'bing', "baidu", "yahoo"):
         results = await search_by_api(text, engine=platform)
     elif platform == 'zhipu':
@@ -531,6 +546,8 @@ async def retrieval(text: str, platform: Optional[str] = None):
         results = await search_by_api(text, engine=None, location='中国')
     elif platform == 'patent':
         results = patent_search(text, limit=3)
+    elif platform == 'invest':
+        results = company_search(text, search_type='invest', limit=10)
     else:
         results = await retrieved_reference(text, keywords=[text])
 
@@ -935,7 +952,7 @@ async def generate_message(request: ChatCompletionRequest,
     model_name = request.model_name
     agent = request.agent
     extract = request.extract
-    chat_history = ChatHistory(request.user_id, request.name, request.robot_id, agent, model_name,
+    chat_history = ChatHistory(request.user, request.name, request.robot_id, agent, model_name,
                                timestamp=time.time(), request_uuid=request.uuid)
 
     if not extract:
@@ -1012,17 +1029,16 @@ async def get_embeddings(request: OpenAIEmbeddingRequest):
 # /v1/audio/transcriptions
 # @require_api_key
 @app.post("/v1/chat/completions", response_model=OpenAIResponse)
-async def chat_completions(request: OpenAIRequest):
+async def chat_completions(request: OpenAIRequest, background_tasks: BackgroundTasks):
     """
     兼容 OpenAI API 的 /v1/chat/completions 路径，返回类似 OpenAI API 的格式
     """
     # print(request.dict())
-    kwargs = request.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream'})
-    # messages = kwargs.pop('messages', None)
+    kwargs = request.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream', 'user'})
+    messages = [msg.dict() for msg in request.messages]
     if request.stream:
         async def fake_stream_response():
-            async for chunk in ai_chat_async(model_info=None, messages=[msg.dict() for msg in request.messages],
-                                             user_request=None, system=None,
+            async for chunk in ai_chat_async(model_info=None, messages=messages, user_request=None, system=None,
                                              model_name=request.model, model_id=0, get_content=False, **kwargs):
                 # print(chunk.encode("utf-8"))
                 yield f"data: {chunk}\n\n"
@@ -1033,11 +1049,15 @@ async def chat_completions(request: OpenAIRequest):
 
         return StreamingResponse(fake_stream_response(), media_type="text/event-stream")
 
-    response = await ai_chat(model_info=None, messages=[msg.dict() for msg in request.messages],
-                             user_request=None, system=None,
+    response = await ai_chat(model_info=None, messages=messages, user_request=None, system=None,
                              # temperature=request.temperature, max_tokens=request.max_tokens,top_p=request.top_p,
                              model_name=request.model, model_id=0, get_content=False, **kwargs)
-    # print(response)
+
+    instance = BaseReBot(user=request.user)
+    if request.user and ':' in request.user:
+        instance.user, instance.robot_id = request.user.split(':')
+    background_tasks.add_task(instance.save, instance.user, instance.robot_id, request.model, instance=instance,
+                              messages=messages, model_response=response)
     return JSONResponse(content=response)  # Response(content=json.dumps(data), media_type="application/json")
 
 
@@ -1084,7 +1104,7 @@ async def get_models(model: Optional[str] = Query(None,
                 } for i, (owner, models) in enumerate(extracted_data)
                 for j, model_id in enumerate(models)]
         }
-        # print(len(MODEL_LIST.models))
+        # print(len(ModelListExtract.models))
         # response_data['data'].append({"id": 'gpt-4o-mini',
         #                               "object": "model", "created": 0, "owned_by": 'openai'})
     return JSONResponse(content=response_data)
@@ -1106,13 +1126,13 @@ async def websocket_chat(websocket: WebSocket):
             agent = request.get('agent', '0')
             extract = request.get('extract')
             name = request.get('username')
+            user = request.get('user')
             robot_id = request.get('robot_id')
-            user_id = request.get('user_id')
             current_timestamp = time.time()
 
             # 构建聊天历史记录
             history, user_request, hist_size = build_chat_history(
-                request.get('question'), user_id, name, robot_id, db=db,
+                request.get('question'), user, name, robot_id, db=db,
                 user_history=request.get('messages', []), use_hist=request.get('use_hist', True),
                 filter_limit=request.get('filter_limit', -500), filter_time=request.get('filter_time', 0.0),
                 agent=agent, request_uuid=request.get('uuid')
@@ -1150,7 +1170,7 @@ async def websocket_chat(websocket: WebSocket):
 
                     # 保存聊天记录
                     save_chat_history(
-                        user_request, bot_response, user_id, name, robot_id, agent,
+                        user_request, bot_response, user, name, robot_id, agent,
                         hist_size, model_name, current_timestamp, db=db,
                         refer=refer, transform=transform, request_uuid=request.get('uuid'))
 
@@ -1164,7 +1184,7 @@ async def websocket_chat(websocket: WebSocket):
 
                 # 保存聊天记录
                 save_chat_history(
-                    user_request, bot_response, user_id, name, robot_id, agent,
+                    user_request, bot_response, user, name, robot_id, agent,
                     hist_size, model_name, current_timestamp, db=db,
                     refer=refer, transform=transform, request_uuid=request.get('uuid')
                 )
@@ -1187,14 +1207,14 @@ async def websocket_chat(websocket: WebSocket):
 
 
 @app.get("/get_messages/")
-async def get_messages(request: Request, user_id: str = Query(""), name: str = None,
+async def get_messages(request: Request, user: str = Query(""), name: str = None,
                        robot_id: str = None, filter_time: float = Query(0.0),
                        agent: str = None, db: Session = Depends(get_db)):
-    request_uuid = request.session.get('user_id', '')
-    if not user_id and not request_uuid:
+    request_uuid = request.session.get('user', '')
+    if not user and not request_uuid:
         return JSONResponse(status_code=400, content={"error": "No user id found in session"})
     # filter_time = filter_time / 1000.0
-    filter_history = get_user_history(user_id, name, robot_id, filter_time, db, agent=agent,
+    filter_history = get_user_history(user, name, robot_id, filter_time, db, agent=agent,
                                       request_uuid=request_uuid)
     for item in filter_history:
         if isinstance(item.get('created_at'), datetime):
@@ -1216,18 +1236,18 @@ async def submit_messages(request: SubmitMessagesRequest,
                             content={'task_id': '', 'error': 'Please provide messages or a question to process.'})
 
     current_timestamp = time.time()
-    chat_history = ChatHistory(request.user_id, request.name, request.robot_id, agent=None, model_name=None,
+    chat_history = ChatHistory(request.user, request.name, request.robot_id, agent=None, model_name=None,
                                timestamp=current_timestamp, request_uuid=request.uuid)
 
     history = chat_history.build('', request.messages, request.use_hist,
                                  request.filter_limit, request.filter_time, db=db)
 
     # history, user_request, hist_size = build_chat_history(
-    #     "", request.user_id, request.name, request.robot_id, db, user_history=request.messages,
+    #     "", request.user, request.name, request.robot_id, db, user_history=request.messages,
     #     use_hist=request.use_hist, filter_limit=request.filter_limit, filter_time=request.filter_time,
     #     agent=None, request_uuid=request.uuid)
 
-    # generate_hash_key(request.user_id, request.name,request.robot_id, request.model_id,
+    # generate_hash_key(request.user, request.name,request.robot_id, request.model_id,
     #                   datetime.datetime.now().date().isoformat())
     task_id = str(uuid.uuid4())
     redis = get_redis()
@@ -1250,6 +1270,7 @@ async def submit_messages(request: SubmitMessagesRequest,
         TaskManager.Task_queue[task_id] = task
         if request.params:
             asyncio.create_task(process_task_ai(task, redis))
+            # asyncio.create_task(asyncio.to_thread(
             # background_tasks.add_task(process_task_ai, task_id)
 
     return JSONResponse(content={'task_id': task_id, 'url': f'{Config.WEBUI_URL}/task/{task_id}',
@@ -1816,15 +1837,19 @@ async def text_to_audio(sentences: str, platform: str = "cosyvoice-v1"):
 
 
 @app.post("/tti")
-async def text_to_image(prompt: str, negative_prompt: str = '', style_name: str = '人像写真', model_id: int = 0):
-    if model_id == 0:
+async def text_to_image(prompt: str, negative_prompt: str = '', style_name: str = '人像写真',
+                        model_name: str = 'dashscope:wanx-v1'):
+    owner = model_name
+    if ':' in model_name:
+        owner, model_name = model_name.split(':')
+    if owner == 'dashscope':
         image_decode, result = dashscope_image_call(prompt, negative_prompt=negative_prompt, image_url='',
-                                                    style_name=style_name, model_name="wanx-v1", data_folder=None)
+                                                    style_name=style_name, model_name=model_name, data_folder=None)
 
-    elif model_id == 1:
+    elif owner == 'tencent':
         image_decode, result = await tencent_generate_image(prompt, negative_prompt, style_name, return_url=False)
-    elif model_id == 2:
-        image_decode, result = await siliconflow_generate_image(prompt, negative_prompt, model_name=style_name,
+    elif owner == 'siliconflow':
+        image_decode, result = await siliconflow_generate_image(prompt, negative_prompt, model_name=model_name,
                                                                 model_id=0)
     else:
         image_decode, result = await xunfei_picture(prompt, data_folder=None)
@@ -1991,10 +2016,7 @@ if __name__ == "__main__":
 
     LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(asctime)s-%(levelprefix)s %(message)s"  # uvicorn / FastAPI
 
-    os.environ['HTTP_PROXY'] = Config.HTTP_Proxies['http']
-    os.environ['HTTPS_PROXY'] = Config.HTTP_Proxies['https']
-    # Config.debug()
-
+    # Config.debug()  # 测试环境配置,生产环境注释
     uvicorn.run(app, host="0.0.0.0", port=7000)
 
     # pip install -r requirements.txt
