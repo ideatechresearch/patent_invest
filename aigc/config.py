@@ -158,7 +158,7 @@ class Config(object):
     JINA_Service_Key = '***'
     # https://www.firecrawl.dev/app
     # https://docs.firecrawl.dev/introduction
-    Firecrawl_Service_Key = '***'  # 'fc-2d8b0b801164476aa2c20b826c06c21d'
+    Firecrawl_Service_Key = '***'  
     # https://console.volcengine.com/iam/keymanage
     VOLC_AK_ID = '***'
     VOLC_Secret_Key = '***'
@@ -176,7 +176,7 @@ class Config(object):
     OPIK_Api_Key = '***'
     OPIK_Workspace = 'dooven-prime'
     # https://www.searchapi.io/
-    SearchApi_Key = '***'  # TLvdjLW2QAgdotQyYMpcXeqx
+    SearchApi_Key = '***' 
     # https://api-dashboard.search.brave.com/app/keys
     # https://api-dashboard.search.brave.com/app/dashboard
     Brave_Api_Key = "***"
@@ -191,7 +191,7 @@ class Config(object):
     # https://www.alphavantage.co/support/#api-key
     AlphaVantage_Api_Key = '***'
     # https://app.tavily.com/home
-    TAVILY_Api_Key = '***'  # 88YHAKX5YS9EMHGW6EGZN871
+    TAVILY_Api_Key = '***'  
     # https://github.com/settings/personal-access-tokens
     GITHUB_Access_Tokens = '***'
     # https://studio.d-id.com/
