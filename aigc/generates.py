@@ -4,8 +4,7 @@ from typing import List, Dict, Tuple, Any, Union, Callable, Literal, Iterator, S
     get_origin, get_args
 
 from openai import OpenAI, AsyncOpenAI, AsyncClient, DefaultHttpxClient, BadRequestError
-# from mcp.server.fastmcp import FastMCP
-# from mcp.server.sse import SseServerTransport
+
 from utils import *
 from agents.ai_tools import *
 from agents.ai_prompt import *
@@ -23,17 +22,35 @@ async def get_data_for_model(model: dict):
     """获取每个模型的数据"""
     model_name = model.get('name')
     client = AI_Client.get(model_name)
+
     if client:
         try:
             models = await client.models.list()
-            model['data'] = [m.model_dump() for m in models.data]
+            return [m.model_dump() for m in models.data]
         except Exception as e:
-            print(f"OpenAI {model_name} error occurred: {e}")
+            print(f"OpenAI error occurred:{e},name:{model_name}")
     else:
         url = model['base_url'] + '/models'
         models = await call_http_request(url)
         if models:
-            model['data'] = models.get('data')
+            return models.get('data')
+
+    return None
+
+
+async def set_data_for_model(model: dict, redis=None):
+    key = f"model_data_list:{model.get('name')}"
+    data = await redis.get(key) if redis else None
+    if data:
+        model['data'] = json.loads(data)
+        return
+
+    data = await get_data_for_model(model)
+    if data:
+        model['data'] = data
+        if redis:
+            await redis.set(key, json.dumps(data, ensure_ascii=False))
+        print('model:', model.get('name'), 'data:', data)
 
 
 class ModelListExtract:
@@ -53,13 +70,13 @@ class ModelListExtract:
         return [i for item in extracted_data for i in [item[0]] + item[1]]  # flattened_list
 
     @classmethod
-    async def set(cls):
+    async def set(cls, redis=None):
         """更新 MODEL_LIST,并保存到 Redis"""
         cls.models = cls.extract()
         if cls._redis is None:
-            cls._redis = get_redis()
+            cls._redis = redis or get_redis()
         if cls._redis:
-            await cls._redis.set("model_list", json.dumps(cls.models))
+            await cls._redis.set("model_list", json.dumps(cls.models, ensure_ascii=False))
 
     @classmethod
     async def get(cls):
@@ -83,9 +100,8 @@ class ModelListExtract:
         return value in models
 
 
-async def init_ai_clients(ai_models=AI_Models, get_data=False):
+async def init_ai_clients(ai_models=AI_Models, get_data=False, redis=None):
     api_keys = model_api_keys()
-    tasks = []
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
     transport = httpx.AsyncHTTPTransport(proxy=Config.HTTP_Proxy)
     # proxies = {"http://": Config.HTTP_Proxy, "https://": Config.HTTP_Proxy}
@@ -107,13 +123,12 @@ async def init_ai_clients(ai_models=AI_Models, get_data=False):
                 if http_client is None:
                     AI_Client[model_name] = AI_Client[model_name].with_options(timeout=time_out, max_retries=3)
 
-                if get_data:
-                    tasks.append(get_data_for_model(model))
-
     if get_data:
+        tasks = [set_data_for_model(model, redis=redis) for model in ai_models if
+                 model.get('supported_list') and model.get('api_key')]
         await asyncio.gather(*tasks)
 
-    await ModelListExtract.set()
+    await ModelListExtract.set(redis)
     # print(len(ModelListExtract.models))
 
 
@@ -172,7 +187,7 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple
 
 
 async def ai_generate_metadata(function_code: str, metadata: dict = None, model_name=Config.DEFAULT_MODEL_METADATA,
-                               **kwargs) -> dict:
+                               description: str = None, code_type: str = "Python", **kwargs) -> dict:
     if not model_name:
         model_name = Config.DEFAULT_MODEL_METADATA
 
@@ -185,11 +200,17 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
 
     client = AI_Client.get(model_info['name'], None)
     if client:
-        prompt = System_content.get('84').format(function_code=function_code)
+        prompt = System_content.get('84').format(function_code=function_code, code_type=code_type)
+        lines = [f"帮我根据函数代码生成提取函数元数据（JSON格式）。"]
+        if metadata:
+            lines.append(f"初始元数据结构如下:{json.dumps(metadata, ensure_ascii=False)}")
+        if description:
+            lines.append(f"工具描述为:{description}")
+        prompt_user = "\n".join(lines)
+
         if chat:
             messages = [{"role": "system", "content": prompt},
-                        {"role": "user",
-                         "content": f"帮我根据函数代码生成提取函数元数据,初始结构为{json.dumps(metadata, ensure_ascii=False)}"}]
+                        {"role": "user", "content": prompt_user}]
             payload = dict(model=name,
                            messages=messages,
                            max_tokens=1000,
@@ -201,7 +222,7 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
         else:
             response = await client.completions.create(
                 model=name,
-                prompt=prompt,
+                prompt=prompt + '\n' + prompt_user,
                 max_tokens=1000,
                 temperature=0.3,
                 stream=False,
@@ -209,9 +230,9 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
             )
             content = response.choices[0].text.strip()
 
-        match = re.search(r'\{.*}', content, re.DOTALL)
+        match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
         if match:
-            json_str = match.group(0)
+            json_str = match.group(1)
             try:
                 metadata = json.loads(json_str)
             except json.JSONDecodeError as e:
@@ -225,7 +246,7 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
 Function_MetaData_Store = {}  # cache_func_key:cached_metadata
 
 
-async def get_metadata_from_cache(func: Callable, redis=None):
+async def get_metadata_from_cache(func: Callable, redis=None, key: str = "funcmeta"):
     # 获取函数的名称、参数以及docstring
     func_name = func.__name__
     function_code = remove_function_decorators(func)
@@ -234,8 +255,8 @@ async def get_metadata_from_cache(func: Callable, redis=None):
 
     try:
         if redis:
-            cached_metadata = await redis.get(f"funcmeta:{cache_key}")
-            await redis.expire(f"funcmeta:{cache_key}", Config.REDIS_CACHE_SEC)
+            cached_metadata = await redis.get(f"{key}:{cache_key}")
+            await redis.expire(f"{key}:{cache_key}", Config.REDIS_CACHE_SEC)
         else:
             raise Exception
     except:
@@ -248,72 +269,14 @@ async def get_metadata_from_cache(func: Callable, redis=None):
     return cache_key, {}
 
 
-def python_type_to_json_schema_type(python_type):
-    origin = get_origin(python_type) or python_type
-
-    # 处理 Union/Optional
-    if origin is Union:
-        args = [a for a in get_args(python_type) if a is not type(None)]
-        if len(args) == 1:
-            return python_type_to_json_schema_type(args[0])
-        else:
-            return "string"  # fallback for complex Unions
-
-    mapping = {
-        str: "string",
-        int: "integer",
-        float: "number",
-        bool: "boolean",
-        list: "array",
-        dict: "object",
-    }
-    return mapping.get(origin, "string")
-
-
-async def generate_function_metadata(func: Callable, model_name=None, redis=None, **kwargs) -> Optional[Dict]:
-    cache_key, metadata = await get_metadata_from_cache(func, redis)
+async def generate_function_metadata(func: Callable, model_name=None, redis=None, key="funcmeta", **kwargs) -> Optional[
+    Dict]:
+    cache_key, metadata = await get_metadata_from_cache(func, redis, key)
     if metadata:
         return metadata
 
-    # 获取函数的名称、参数以及docstring
-    func_name = func.__name__
     function_code = remove_function_decorators(func)
-    # print(f"[tools] 未找到缓存: {func_name},生成 metadata")
-    # 获取函数参数列表
-    signature = inspect.signature(func)
-    docstring = func.__doc__
-
-    parameters = {}
-    required_params = []
-
-    for param_name, param in signature.parameters.items():
-        param_type = param.annotation if param.annotation != inspect.Parameter.empty else str
-        json_type = python_type_to_json_schema_type(param_type)
-        # 如果有类型提示，推断参数类型str(param.annotation).replace("<class '", "").replace("'>", "")
-        param_info = {
-            "type": json_type,
-            "description": f"Description of the {param_name} parameter."
-        }
-
-        if param.default == inspect.Parameter.empty:
-            required_params.append(param_name)
-        else:
-            param_info["default"] = param.default
-        parameters[param_name] = param_info
-
-    # 初始metadata结构
-    metadata = {
-        "type": "function",
-        "function": {
-            "name": func_name,
-            "description": docstring or "No description available.",
-            "parameters": {
-                "type": "object",
-                "properties": parameters
-            },
-            "required": required_params
-        }
-    }
+    metadata = extract_function_metadata(func)
     # print(f"""
     # Extract the metadata for this Python function:
     # {function_code}
@@ -325,7 +288,8 @@ async def generate_function_metadata(func: Callable, model_name=None, redis=None
 
     if redis:
         try:
-            await redis.setex(f"funcmeta:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(metadata, ensure_ascii=False))
+            await redis.setex(f"{key}:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(metadata, ensure_ascii=False))
+            # await redis.set(f‘function:{ metadata["function"]["name"]}', str(metadata))  # 用函数名作为Redis的键,存储为JSON格式
         except Exception as e:
             print(e)
     Function_MetaData_Store[cache_key] = metadata
@@ -336,15 +300,12 @@ async def generate_function_metadata(func: Callable, model_name=None, redis=None
 async def get_cached_tools_metadata(func_list: list[Callable] = None, model_name=None, **kwargs) -> list[dict]:
     redis = get_redis()
     if not func_list:
-        tools_metadata = list(Function_MetaData_Store.values())
-        keys = await redis.keys("funcmeta:*")
-        if keys:
-            cached_values = await redis.mget(*keys)
-            tools_metadata = [json.loads(v) for v in cached_values if v]  # set(cached_values
+        tools_metadata = await scan_from_redis(redis, "funcmeta", batch_count=30) or list(
+            Function_MetaData_Store.values())
         return tools_metadata
 
     # global_function_registry
-    tasks = [generate_function_metadata(_f, model_name, redis=redis, **kwargs) for _f in func_list]
+    tasks = [generate_function_metadata(_f, model_name, redis=redis, key="funcmeta", **kwargs) for _f in func_list]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     tools_metadata: list[dict] = [metadata for metadata in results if isinstance(metadata, dict)]
     return tools_metadata
@@ -431,7 +392,7 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
         'web_search': web_search_async,
         'tavily_search': web_search_tavily,
         'tavily_extract': web_extract_tavily,
-        'firecrawl_extract': web_extract_firecrawl,
+        'jina_extract': web_extract_jina,
         'news_search': lambda x: web_search_tavily(x, topic='news', time_range='w'),
         'baidu_search': lambda x: search_by_api(x, engine='baidu'),
         'wiki_search': wikipedia_search,
@@ -448,8 +409,8 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
     if not Function_Registry_Global or len(Function_Registry_Global) < len(keywords_registry):
         Function_Registry_Global = functions_registry(functions_list=[
             "get_times_shift", "date_range_calculator",
-            "get_day_range", "get_week_range", "get_month_range",
-            "get_quarter_range", "get_year_range", "get_half_year_range", 'call_http_request',
+            "get_day_range", "get_week_range", "get_month_range", "lang_token_size",
+            "get_quarter_range", "get_year_range", "get_half_year_range", 'call_http_request', "math_solver",
             "extract_links", "extract_web_content", "remove_markdown", "extract_table_segments",
             "generates:auto_translate", 'database:patent_search', 'database:company_search',
             'generates:siliconflow_generate_image',
@@ -463,11 +424,23 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
         Function_Registry_Global.update(functions_registry(
             functions_list=["web_search_async", "tokenize_with_zhipu", "get_weather", "duckduckgo_search",
                             "web_search_tavily", "web_extract_tavily",
+                            "web_search_jina", "web_extract_jina", "segment_with_jina",
                             "search_by_api", "serper_search", "brave_search",
+                            "exa_search", "web_extract_exa", "exa_retrieved",
                             "firecrawl_search", "firecrawl_scrape", "web_extract_firecrawl",
-                            'wikipedia_search', "get_amap_location",  # "search_bmap_location",
+                            'wikipedia_search', 'arxiv_search', "get_amap_location",  # "search_bmap_location",
                             "baidu_translate", "tencent_translate", "xunfei_translate"],
             module_name="agents.ai_search"))
+
+        Function_Registry_Global.update(functions_registry(
+            functions_list=['annual_report_info', 'base_account_record', 'case_filing', 'company_black_list',
+                            'company_exception_list', 'company_out_investment', 'company_personnel_risk',
+                            'company_stock_relation', 'court_announcement', 'court_notice_info', 'dishonesty_info',
+                            'equity_share_list',
+                            'exact_saic_info', 'final_beneficiary', 'implements_info', 'judgment_doc',
+                            'real_time_saic_info',
+                            'saic_basic_info', 'shell_company', 'simple_cancellation', 'stock_freeze'],
+            module_name="agents.ai_company"))
 
         Function_Registry_Global.update(keywords_registry)  # 合并 keywords 映射
         print(Function_Registry_Global)
@@ -478,14 +451,16 @@ def global_function_registry(func_name: str = None, use_keywords: bool = False) 
     return Function_Registry_Global.get(func_name, None) if func_name else Function_Registry_Global  # 从注册表中获取函数
 
 
-def agent_func_calls(agent: str, messages: list = None) -> List[Callable[..., Any]]:  #
+def agent_func_calls(agent: str, messages: list = None, model: str = None, prompt: str = None) -> List[
+    Callable[..., Any]]:  #
     from knowledge import ideatech_knowledge
     callable_map_agent = {
         'default': [lambda *args, **kwargs: [], ],  # 默认返回一个空函数列表
         '2': [named_partial('search_by_baidu', search_by_api, engine='baidu'), web_search_async],
         '9': [named_partial('auto_translate_baidu', auto_translate, model_name='baidu')],
         '29': [ideatech_knowledge],
-        '31': [named_partial('auto_calls_any', ai_auto_calls, user_messages=messages, agent='31', get_messages=False)],
+        '31': [named_partial('auto_calls_any', ai_auto_calls, user_messages=messages,
+                             system_prompt=System_content.get('31'), get_messages=False)],
         '32': [ai_auto_calls],
         '37': [web_search_async]
         # 扩展更多的 agent 类型，映射到多个函数
@@ -527,6 +502,23 @@ def convert_to_callable_list(tool_list: List[Tuple[str, Any]],
         # else:
         #     print(f"Tool '{tool_name}' not found in callable_map.")
     return callable_list
+
+
+async def execute_function_call(func_name: str, arguments: dict):
+    redis = get_redis()
+    key = f"registry:{func_name}"
+    data = await redis.get(key)
+    if not data:
+        return None
+
+    registry = json.loads(data)
+
+    # 判断是否是远程调用
+    if "x-url" in registry:
+        return await send_callback(registry["x-url"], arguments)
+    registry["parameters"] = registry.get("parameters", {})
+    registry["parameters"]["arguments"] = arguments
+    return registry
 
 
 async def ai_tools_results(tool_messages) -> list[dict]:
@@ -587,14 +579,14 @@ async def ai_tools_results(tool_messages) -> list[dict]:
                 else:
                     func_out = func_reg(**func_args)
             else:
-                func_names = extract_method_calls(func_name)
-                if func_names:
-                    func_name = func_names[-1]
-                    # compile(code, '<string>', 'eval')
-                    # eval(expression, globals=None, locals=None)执行单个表达式,动态计算简单的表达式或从字符串中解析值
-                    func_out = eval(f'{func_name}(**{func_args})')
-                else:
-                    error = f'Error in {func_name}: Function {func_names} extract method,not found.'
+                func_out = await execute_function_call(func_name, arguments=func_args)
+                if not func_out:
+                    func_names = extract_method_calls(func_name)
+                    if func_names:
+                        func_name = func_names[-1]
+                        func_out = safe_eval_call(func_name, func_args)
+                    else:
+                        error = f'Error in {func_name}: Function {func_names} extract method,not found.'
 
             messages.append({
                 'role': 'tool',
@@ -616,27 +608,29 @@ async def ai_tools_results(tool_messages) -> list[dict]:
     return messages  # [*tool_mmessages,]
 
 
-async def ai_auto_calls(question, user_messages: list = None, agent: str = '31',
+async def ai_auto_calls(question, user_messages: list = None, system_prompt: str = None,
                         model_name=Config.DEFAULT_MODEL_FUNCTION,
                         get_messages=False, **kwargs) -> list:
     """
+    call_tool
     自动推理并调用工具，返回调用结果或消息列表
     :param question: 从问题里面获取意图选择工具调用
     :param user_messages: 从对话上下文里面获取意图选择工具调用，两者选一项
-    :param agent:获取系统提示词
+    :param system_prompt:获取系统提示词
     :param model_name: 默认使用qwen-max
     :param get_messages: 是否组装成方法：结果列表
     :param kwargs:
     :return: 结果列表或者 模型messages回复+本地执行方法结果
     """
     # 构造对话上下文
-    system = System_content.get(agent)
+    if not system_prompt:
+        system_prompt = System_content.get('31')
     if user_messages and isinstance(user_messages, list):
-        user_messages = user_messages[-6:].copy()
+        user_messages = user_messages[-8:].copy()
         if not any(msg.get('role') == 'system' for msg in user_messages):
-            user_messages.insert(0, {"role": "system", "content": system})
+            user_messages.insert(0, {"role": "system", "content": system_prompt})
     else:
-        user_messages = [{"role": "system", "content": system},
+        user_messages = [{"role": "system", "content": system_prompt},
                          {"role": "user", "content": question}]
         # 获取工具列表
     tools = AI_Tools + await get_cached_tools_metadata([])
@@ -744,7 +738,8 @@ async def get_embedding_from_cache(inputs: Union[str, List[str], Tuple[str]], mo
 
 
 # https://www.openaidoc.com.cn/docs/guides/embeddings
-async def ai_embeddings(inputs: Union[str, List[str], Tuple[str]], model_name: str = Config.DEFAULT_MODEL_EMBEDDING,
+async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str, str]]],
+                        model_name: str = Config.DEFAULT_MODEL_EMBEDDING,
                         model_id: int = 0, get_embedding: bool = True, normalize: bool = False,
                         **kwargs) -> Union[List[List[float]], Dict]:
     """
@@ -852,25 +847,25 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str]], model_name: s
     }
     payload.update(kwargs)
     embeddings = []
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
     try:
-        async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-            if isinstance(inputs, (list, tuple)) and len(inputs) > batch_size:
-                for i in range(0, len(inputs), batch_size):
-                    batch = inputs[i:i + batch_size]
-                    payload["input"] = batch  # {"texts":batch}
-                    response = await cx.post(url, headers=headers, json=payload)
-                    response.raise_for_status()
-                    data = response.json().get('data')  # "output"
-                    if data and len(data) == len(batch):
-                        embeddings += [emb.get('embedding') for emb in data]
-                    else:
-                        print(f"Error: Batch {i // batch_size + 1} response size mismatch.")
-                        has_error = True
-            else:
+        if isinstance(inputs, (list, tuple)) and len(inputs) > batch_size:
+            for i in range(0, len(inputs), batch_size):
+                batch = inputs[i:i + batch_size]
+                payload["input"] = batch  # {"texts":batch}
                 response = await cx.post(url, headers=headers, json=payload)
                 response.raise_for_status()
-                data = response.json().get('data')
-                embeddings = [emb.get('embedding') for emb in data]
+                data = response.json().get('data')  # "output"
+                if data and len(data) == len(batch):
+                    embeddings += [emb.get('embedding') for emb in data]
+                else:
+                    print(f"Error: Batch {i // batch_size + 1} response size mismatch.")
+                    has_error = True
+        else:
+            response = await cx.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json().get('data')
+            embeddings = [emb.get('embedding') for emb in data]
 
     except (httpx.HTTPStatusError, httpx.RequestError) as exc:
         print(exc)
@@ -923,52 +918,6 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
         else:
             print(response.text)
     return []
-
-
-# 生成:conversation or summary,Fill-In-the-Middle
-async def ai_generate(prompt: str, user_request: str = '', suffix: str = None, stream=False, temperature: float = 0.7,
-                      max_tokens: int = 4096, model_name='silicon', model_id=0, get_content=True, **kwargs):
-    '''
-    Completions足以解决几乎任何语言处理任务，包括内容生成、摘要、语义搜索、主题标记、情感分析等等。
-    需要注意的一点限制是，对于大多数模型，单个API请求只能在提示和完成之间处理最多4096个标记。
-    '''
-    model_info, name = find_ai_model(model_name, model_id, "generation")
-    if not name:
-        return await ai_chat(model_info={}, messages=None, user_request=user_request, system=prompt,
-                             temperature=temperature, max_tokens=max_tokens, top_p=0.8, model_name=model_name,
-                             model_id=model_id, get_content=get_content, **kwargs)
-
-    if user_request:
-        prompt += '\n\n' + user_request
-
-    if model_info['name'] == 'qwen':
-        response = dashscope.Generation.call(model=name, prompt=prompt)
-        return response.output.text
-
-    client = AI_Client.get(model_info['name'], None)
-    # client.completions.create,
-    # <|fim_prefix|>{prefix_content}<|fim_suffix|>
-    # <|fim_prefix|>{prefix_content}<|fim_suffix|>{suffix_content}<|fim_middle|>
-    response = await client.completions.create(
-        # engine=name,
-        model=name,
-        prompt=prompt,
-        suffix=suffix,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        stream=stream,
-        stop=None,
-        **kwargs,
-        # n=1,
-    )
-    if stream:
-        async def stream_data():
-            async for chunk in response:
-                yield chunk.choices[0].text if get_content else chunk.model_dump_json()
-
-        return stream_data()
-
-    return response.choices[0].text.strip() if get_content else response.model_dump()
 
 
 async def call_ollama(prompt: str | list[str] = None, messages: list[dict] = None, model_name="mistral",
@@ -1036,9 +985,11 @@ async def openai_ollama_chat_completions(messages: list, model_name="qwen3:14b",
       - 如果 stream=False，返回完整 JSON 响应
       ['model', 'created_at', 'response', 'done', 'done_reason', 'context', 'total_duration', 'load_duration', 'prompt_eval_count', 'prompt_eval_duration', 'eval_count', 'eval_duration']
     """
+
     prompt = build_prompt(messages, use_role=True) + "\nAssistant:"
     response = await call_ollama(prompt, messages=messages, model_name=model_name, host=host, time_out=time_out,
                                  stream=stream, **kwargs)
+    tokenizer = get_tokenizer(Config.DEFAULT_MODEL_ENCODING)
     if stream:
         async def stream_data():
             async for chunk in response:
@@ -1068,9 +1019,9 @@ async def openai_ollama_chat_completions(messages: list, model_name="qwen3:14b",
             }
         ],
         "usage": {
-            "prompt_tokens": lang_token_size(prompt),
-            "completion_tokens": lang_token_size(content),  # .split()
-            "total_tokens": lang_token_size(prompt) + lang_token_size(content),
+            "prompt_tokens": lang_token_size(prompt, tokenizer),
+            "completion_tokens": lang_token_size(content, tokenizer),  # .split()
+            "total_tokens": lang_token_size(prompt, tokenizer) + lang_token_size(content, tokenizer),
         },
     }
 
@@ -1107,7 +1058,8 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
     tasks = []  # asyncio.create_task(),创建任务对象并将其加入任务列表
 
     if not keywords:
-        items_to_process = [user_request]  # ','.join(keywords)
+        if user_request:
+            items_to_process = [user_request]  # ','.join(keywords)
     else:
         if all(not is_empty_lambda(_func) for _func in tool_calls):  # and _func()
             tool_calls.append(web_search_async)  # append auto func to run. ai_auto_calls
@@ -1269,7 +1221,6 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
         # top_k=50,
         max_tokens=max_tokens,
         stream=False,
-        extra_body={"enable_thinking": False},  # 开启深度思考
         # extra_body = {"prefix": "```python\n", "suffix":"后缀内容"} 希望的前缀内容,基于用户提供的前缀信息来补全其余的内容
         # response_format={"type": "json_object"}
     )
@@ -1278,6 +1229,10 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
         payload['tools'] = tools  # retrieval、web_search、function
     if model_type == 'baidu':
         payload['system'] = system
+    if model_info['name'] == 'qwen':
+        payload['extra_body'] = {"enable_thinking": False}  # 开启深度思考
+    if name == 'o3-mini':
+        payload['max_completion_tokens'] = payload.pop('max_tokens', max_tokens)
 
     # 1. 系统设定（system）
     # 2. 原始提问（user）
@@ -1335,7 +1290,95 @@ def get_chat_payload_post(model_info: Dict[str, Any], payload: dict):
     return url, headers, payload
 
 
-async def stream_chat_completion(client, payload: dict) -> tuple[str, str, dict]:
+async def get_generate_payload(prompt: str, user_request: str = '', suffix: str = None, stream=False,
+                               temperature: float = 0.7, top_p: float = 1, max_tokens: int = 4096,
+                               model_name=Config.DEFAULT_MODEL, model_id=0, agent: str = None,
+                               keywords: List[Union[str, Tuple[str, ...]]] = None,
+                               **kwargs):
+    chat = False
+    try:
+        model_info, name = find_ai_model(model_name, model_id, search_field="generation")
+    except:
+        model_info, name = find_ai_model(model_name, model_id)
+        chat = True
+
+    if chat or not name:
+        model_info, payload, refer = await get_chat_payload(messages=None, user_request=user_request, system=prompt,
+                                                            temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+                                                            model_name=model_name, model_id=model_id,
+                                                            agent=agent, tools=None, keywords=keywords, **kwargs)
+
+    else:
+        tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent)
+        # 检索参考资料
+        refer = await retrieved_reference(user_request, keywords, tool_callable, **kwargs)
+        # 如果检索到内容，就把它拼到 user_request 里
+        if refer:
+            formatted_refer = "\n".join(map(str, refer))
+            user_request = f"参考材料:\n{formatted_refer}\n材料仅供参考,请回答下面的问题: {user_request}"
+
+        if user_request:
+            prompt += '\n\n' + user_request
+
+        payload = dict(model=name,
+                       prompt=prompt,
+                       suffix=suffix,
+                       max_tokens=max_tokens,
+                       temperature=temperature,
+                       top_p=top_p,
+                       stream=stream,
+                       stop=kwargs.get("stop", None),
+                       )
+
+    return model_info, payload, refer
+
+
+# 生成:conversation or summary,Fill-In-the-Middle
+async def ai_generate(model_info: Optional[Dict[str, Any]], payload: dict = None, get_content=True,
+                      **kwargs):
+    '''
+    Completions足以解决几乎任何语言处理任务，包括内容生成、摘要、语义搜索、主题标记、情感分析等等。
+    需要注意的一点限制是，对于大多数模型，单个API请求只能在提示和完成之间处理最多4096个标记。
+    '''
+    if not payload:
+        model_info, payload, _ = await get_generate_payload(**kwargs)
+    else:
+        payload.update(kwargs)  # 修改更新 payload
+
+    stream = payload.get("stream", False)
+    if 'messages' in payload:
+        if stream:
+            async def stream_data():
+                async for chunk in ai_chat_stream(model_info, payload, get_content):
+                    yield chunk
+
+            return stream_data()
+        else:
+            return await ai_chat(model_info, payload, get_content)
+
+    if model_info['name'] == 'qwen' and not stream:
+        response = dashscope.Generation.call(model=payload['model'], prompt=payload['prompt'])
+        return response.output.text if get_content else response.model_dump()
+
+    client = AI_Client.get(model_info['name'], None)
+    if not client:
+        raise ValueError(f"Client for model {model_info['name']} not found")
+
+    # <|fim_prefix|>{prefix_content}<|fim_suffix|>
+    # <|fim_prefix|>{prefix_content}<|fim_suffix|>{suffix_content}<|fim_middle|>
+    response = await client.completions.create(**payload)
+
+    if stream:
+        async def stream_data():
+            async for chunk in response:
+                yield chunk.choices[0].text if get_content else chunk.model_dump_json()
+
+        return stream_data()  # async generator 对象
+
+    return response.choices[0].text.strip() if get_content else response.model_dump()
+
+
+async def stream_chat_completion(client, payload: dict) -> tuple[str, dict]:
     payload["stream"] = True
     payload["stream_options"] = {"include_usage": True}  # 可选，配置以后会在流式输出的最后一行展示token使用信息
     payload["extra_body"] = {"enable_thinking": True}  # enable_thinking 参数开启思考过程，该参数对 QwQ 模型无效
@@ -1387,10 +1430,13 @@ async def stream_chat_completion(client, payload: dict) -> tuple[str, str, dict]
                     "index": 0,
                     "message": {"role": "assistant", "content": content},  # .split("</think>")[-1]
                     "finish_reason": "stop",
+                    "metadata": {
+                        "reasoning": thinking
+                    }
                 }
             ],
         })
-        return content, thinking, completion
+        return content, completion
 
     except Exception as e:
         raise RuntimeError(f"[stream_chat_completion] Failed to complete streaming call: {e}") from e
@@ -1459,7 +1505,7 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
             ]
 
             if any(p in error_message.lower() for p in stream_required_phrases):
-                content, _, completion = await stream_chat_completion(client, payload)
+                content, completion = await stream_chat_completion(client, payload)
                 return content if get_content else completion
             else:
                 # length_required_phrases = [
@@ -1503,51 +1549,48 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
 
     url, headers, payload = get_chat_payload_post(model_info, payload)
     # print(headers, payload)
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    timeout = httpx.Timeout(Config.HTTP_TIMEOUT_SEC, read=60.0, write=30.0, connect=5.0)
     parse_rules = {
         'baidu': lambda d: d.get('result'),
         'tencent': lambda d: d.get('Response', {}).get('Choices', [{}])[0].get('Message', {}).get('Content'),
         # d.get('Choices')[0].get('Message').get('Content')
         'default': lambda d: d.get('choices', [{}])[0].get('message', {}).get('content')
     }
-
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
     try:
-        async with httpx.AsyncClient(limits=limits, timeout=timeout) as cx:
-            response = await cx.post(url, headers=headers, json=payload)
-            response.raise_for_status()  # 如果请求失败，则抛出异常
-            data = response.json()
-            if get_content:
-                result = parse_rules.get(model_info['type'], parse_rules['default'])(data)
-                if result:
-                    return result
-                print(response.text)
+        response = await cx.post(url, headers=headers, json=payload)
+        response.raise_for_status()  # 如果请求失败，则抛出异常
+        data = response.json()
+        if get_content:
+            result = parse_rules.get(model_info['type'], parse_rules['default'])(data)
+            if result:
+                return result
+            print(response.text)
 
-            if model_info['type'] == 'tencent':
-                return convert_keys_to_lower_case(data)
+        if model_info['type'] == 'tencent':
+            return convert_keys_to_lower_case(data)
 
-            if model_info['type'] == 'baidu':
-                content = data.pop('result', data.get("error_msg", ""))
-                data.update({
-                    "model": payload.get('model', 'unknown'),
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": content, },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                })
-                return data
-
+        if model_info['type'] == 'baidu':
+            content = data.pop('result', data.get("error_msg", ""))
+            data.update({
+                "model": payload.get('model', 'unknown'),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content, },
+                        "finish_reason": "stop",
+                    }
+                ],
+            })
             return data
+
+        return data
 
     except Exception as e:
         # print(response.text)
         return f"HTTP error occurred: {e},{response.text}"
 
 
-async def ai_chat_async(model_info: Optional[Dict[str, Any]], payload=None, get_content=True, **kwargs):
+async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, get_content=True, **kwargs):
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
@@ -1601,15 +1644,13 @@ async def ai_chat_async(model_info: Optional[Dict[str, Any]], payload=None, get_
         return  # 异步生成器的结束无需返回值
 
     url, headers, payload = get_chat_payload_post(model_info, payload)
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=10)
-    timeout = httpx.Timeout(60.0, read=60.0)
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
     try:
-        async with httpx.AsyncClient(limits=limits, timeout=timeout) as cx:
-            async with cx.stream("POST", url, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                async for content in process_line_stream(response, model_info['type']):
-                    # print(chunk["choices"][0]["delta"].get("content", ""), end="", flush=True)
-                    yield content
+        async with cx.stream("POST", url, headers=headers, json=payload) as response:
+            response.raise_for_status()
+            async for content in process_line_stream(response, model_info['type']):
+                # print(chunk["choices"][0]["delta"].get("content", ""), end="", flush=True)
+                yield content
     except httpx.RequestError as e:
         yield str(e)
 
@@ -1715,18 +1756,18 @@ async def ai_assistant_create(instructions: str, user_name: str,
         "tools": [{"type": tools_type}],  # web_search,code_interpreter,function
         "model": model_name
     }
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
     try:
-        async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-            assistant_response = await cx.post(assistants_url, headers=headers, json=payload)
-            assistant_response.raise_for_status()
-            threads_response = await cx.post(threads_url, headers=headers, json={})
-            threads_response.raise_for_status()
-            results = {'headers': headers,
-                       'assistant_data': assistant_response.json(),
-                       'threads_url': threads_url,
-                       'threads_id': threads_response.json()['id']}
-            Assistant_Cache[cache_key] = results  # assistant_response.json()["id"],assistant_id
-            return results
+        assistant_response = await cx.post(assistants_url, headers=headers, json=payload)
+        assistant_response.raise_for_status()
+        threads_response = await cx.post(threads_url, headers=headers, json={})
+        threads_response.raise_for_status()
+        results = {'headers': headers,
+                   'assistant_data': assistant_response.json(),
+                   'threads_url': threads_url,
+                   'threads_id': threads_response.json()['id']}
+        Assistant_Cache[cache_key] = results  # assistant_response.json()["id"],assistant_id
+        return results
     except Exception as e:
         return {"error": f"Unexpected error: {str(e)}"}
 
@@ -1742,46 +1783,45 @@ async def ai_assistant_run(user_request: str, instructions: str, user_name: str,
     messages_url = f'{assistant["threads_url"]}/{assistant["threads_id"]}/messages'
     threads_url = f'{assistant["threads_url"]}/{assistant["threads_id"]}/runs'
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        messages_response = await cx.post(messages_url, headers=headers, json={"role": "user", "content": user_request})
-        messages_response.raise_for_status()
-        run_response = await cx.post(threads_url, headers=headers, json={"assistant_id": assistant_data['id']})
-        run_response.raise_for_status()
-        run_id = run_response.json().get('id')
-        run_url = f'{threads_url}/{run_id}'
-        retries = 0
-        while retries < max_retries:
-            try:
-                run_status_response = await cx.get(run_url, headers=headers)  # 定期检索 run id 的运行状态
-                # print(retries,run_status_response.status_code, run_status_response.headers, run_status_response.text)
-
-                run_status_response.raise_for_status()
-                status_data = run_status_response.json()
-
-                if status_data.get('status') == 'completed':
-                    messages_status_response = await cx.get(messages_url, headers=headers)
-                    run_status_response.raise_for_status()
-                    status_data = messages_status_response.json()
-                    # print(status_data)
-                    return status_data.get('data')
-
-                await asyncio.sleep(interval)
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    messages_response = await cx.post(messages_url, headers=headers, json={"role": "user", "content": user_request})
+    messages_response.raise_for_status()
+    run_response = await cx.post(threads_url, headers=headers, json={"assistant_id": assistant_data['id']})
+    run_response.raise_for_status()
+    run_id = run_response.json().get('id')
+    run_url = f'{threads_url}/{run_id}'
+    retries = 0
+    current_interval = interval
+    while retries < max_retries:
+        try:
+            run_status_response = await cx.get(run_url, headers=headers)  # 定期检索 run id 的运行状态
+            # print(retries,run_status_response.status_code, run_status_response.headers, run_status_response.text)
+            if run_status_response.status_code == 429:
+                await asyncio.sleep(current_interval)
                 retries += 1
+                current_interval *= backoff_factor
+                continue
 
-            except httpx.HTTPStatusError as http_error:
-                if run_status_response.status_code == 429:
-                    await asyncio.sleep(interval)
-                    retries += 1
-                    interval *= backoff_factor
-                    continue
+            run_status_response.raise_for_status()
+            status_data = run_status_response.json()
 
-                return {"error": f"HTTP error: {str(http_error)}"}  # status_data['error']
+            if status_data.get('status') == 'completed':
+                messages_status_response = await cx.get(messages_url, headers=headers)
+                run_status_response.raise_for_status()
+                status_data = messages_status_response.json()
+                # print(status_data)
+                return status_data.get('data')
 
-            except Exception as e:
-                return {"error": f"Unexpected error: {str(e)}"}
+            await asyncio.sleep(current_interval)
+            retries += 1
 
-        return {
-            "error": f"Timeout: The task did not complete within the expected time. status:{status_data},retries:{retries}"}
+        except httpx.HTTPStatusError as http_error:
+            return {"error": f"HTTP error: {str(http_error)}"}  # status_data['error']
+
+        except Exception as e:
+            return {"error": f"Unexpected error: {str(e)}"}
+
+    return {"error": "Max retries reached, task not completed"}
 
 
 # （1）文本数量不超过 16。 （2）每个文本长度不超过 512 个 token，超出自动截断，token 统计信息，token 数 = 汉字数+单词数*1.3 （仅为估算逻辑，以实际返回为准)。
@@ -2033,10 +2073,10 @@ async def auto_translate(text: str, model_name='baidu', source: str = 'auto', ta
         model_name = 'qwen'
 
     translated_text = await ai_generate(
+        model_info=None,
         prompt=system_prompt,
         user_request=text,
         model_name=model_name,
-        model_id=0,
         stream=False,
     )
     if translated_text:
@@ -2062,15 +2102,14 @@ async def siliconflow_generate_image(prompt: str = '', negative_prompt: str = ''
         "Authorization": f"Bearer {Config.Silicon_Service_Key}",
         "Content-Type": "application/json"
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        if response.status_code != 200:
-            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    if response.status_code != 200:
+        return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
 
-        response_data = response.json()
-
-        return None, {"urls": [i['url'] for i in response_data["images"]], 'id': response_data["seed"]}
+    response_data = response.json()
+    return None, {"urls": [i['url'] for i in response_data["images"]], 'id': response_data["seed"]}
 
 
 async def baidu_nlp(text: str | list[str] = None, nlp_type='ecnet', **kwargs):  # text': text
@@ -2107,17 +2146,17 @@ async def baidu_nlp(text: str | list[str] = None, nlp_type='ecnet', **kwargs):  
     if text:
         body['text'] = text
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        data = response.json()  # .get('items')
-        # 遍历键列表，返回第一个找到的键对应的值
-        for key in ['items', 'item', 'results', 'results_list', 'error_msg']:
-            if key in data:
-                if key == 'error_msg':
-                    print(response.text)
-                return data[key]
-        return data
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=body)
+    response.raise_for_status()
+    data = response.json()  # .get('items')
+    # 遍历键列表，返回第一个找到的键对应的值
+    for key in ['items', 'item', 'results', 'results_list', 'error_msg']:
+        if key in data:
+            if key == 'error_msg':
+                print(response.text)
+            return data[key]
+    return data
 
 
 async def ali_nlp(text):
@@ -2288,11 +2327,10 @@ async def send_to_wechat(user_name: str, context: str = None, link: str = None, 
             'object_name': object_name, 'file_type': get_file_type_wx(object_name)}
 
     try:
-        async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-            response = await cx.post(url, json=body, headers=headers)
-            response.raise_for_status()
+        cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+        response = await cx.post(url, json=body, headers=headers)
+        response.raise_for_status()
         return response.json()
-
         # with httpx.Client(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
         #     response = cx.post(url, json=body, headers=headers)
         #     response.raise_for_status()
@@ -2390,66 +2428,4 @@ if __name__ == "__main__":
                                                       host='10.168.1.10', stream=False)
         print(result)
 
-
-    asyncio.run(test())
-
-    # asyncio.run(tencent_translate('tencent translate is ok', 'en', 'cn'))
-    # from lagent import list_tools, get_tool
-    #
-    # list_tools()
-    try:
-        from mcp.server.fastmcp import FastMCP
-
-        mcp = FastMCP("aigc")
-        # mcp.run(transport='stdio')
-        # mcp.mount()  # 将MCP服务器挂载到FastAPI应用中
-
-        # from fastmcp import FastMCP
-        #
-        # mcp_server = FastMCP(host="0.0.0.0", port=8001)
-        # await mcp_server.start()
-        # await mcp_server.stop()
-
-        # def _register_handlers(self):
-        #     """注册所有消息处理器"""
-        #     # 自动将本地服务方法映射为MCP操作
-        #     for method_name in dir(local_service):
-        #         if not method_name.startswith('_'):
-        #             method = getattr(local_service, method_name)
-        #             if callable(method):
-        #                 mcp_server.add_handler(
-        #                     action=method_name,
-        #                     handler=partial(_call_local_method, method)
-        #                 )
-
-        # from fastmcp import FastMCPClient
-        #
-        # client = FastMCPClient(host="other.server.ip", port=8001)
-        # await client.send_message({"action": "greet", "data": "Hello from FastAPI"})
-        # response = await client.receive_message()
-
-        # async def connect_to_other_server(message: dict):#"action","params"
-        #     client = FastMCPClient(host="other.server.ip", port=8001)
-        #     try:
-        #         await client.connect()
-        #         response = await client.send_and_receive(message)
-        #         return response
-        #     except Exception as e:
-        #         return {"error": str(e)}
-        #     finally:
-        #         await client.disconnect()
-
-        # {"role": "tool", "content": json.dumps(mcp_response), "tool_call_id": tool_call.id}
-
-
-
-    except  Exception as e:
-        print('err', str(e))
-
-    # stdio：进程间通信，适用于命令行或脚本工具执行
-    # SSE：基于http服务器实现事件推送，适合web应用、实时推送等场景
-    # 使用标准输入输出传输来运行
-    # if transport == "stdio":
-    #     anyio.run(self.run_stdio_async)
-    # else:  # 作为独立服务器传输事件
-    #     anyio.run(self.run_sse_async)
+    # asyncio.run(test())

@@ -5,6 +5,13 @@ import asyncio
 # from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue,PointStruct,DiscoverQuery,ContextQuery,NearestQuery,RecommendQuery
 import qdrant_client.models as qcm
 from typing import Callable, Any
+from abc import ABC, abstractmethod
+
+
+class DataProcessor(ABC):
+    @abstractmethod
+    def process(self, intermediate: dict) -> dict:
+        raise NotImplementedError("必须实现此方法")
 
 
 def empty_match(field_key):
@@ -21,7 +28,7 @@ def null_match(field_key):
     return [qcm.IsNullCondition(is_null=qcm.PayloadField(key=field_key), )]
 
 
-def field_match(field_key, match_values):
+def field_match(field_key: str, match_values):
     """匹配字段值，支持单值和多值匹配"""
     if not field_key or not match_values:
         return []
@@ -143,6 +150,7 @@ async def create_collection(collection_name, client, size, alias_name: str = Non
     except Exception as e:
         print(f"Error while creating or managing the collection {collection_name}: {e}")
         return None
+    # .upload_collection(
     # vectors_config = {
     #     "image": qcm.VectorParams(
     #         size=20,
@@ -162,6 +170,7 @@ async def create_collection(collection_name, client, size, alias_name: str = Non
     #         ),
     #         on_disk=True,
     #     ),
+    # "sparse": VectorParams(size=tfidf_dim, distance=Distance.DOT),
     # }
 
 
@@ -198,8 +207,10 @@ async def create_payload_index(collection_name, client, field_name, field_schema
     res = await client.create_payload_index(collection_name=collection_name,
                                             field_name=field_name,  # 需要索引的字段
                                             field_schema=field_schema,  # 分类、数值筛选、时间查询、全文搜索
-                                            # keyword、integer、float、datetime、text
+                                            # keyword、integer、float、datetime、text、bool、geo、uuid
+                                            # field_schema=qcm.PayloadFieldSchema(qcm.KeywordIndexParams(on_disk=True))
                                             )
+
     return res.model_dump()
 
 
@@ -547,7 +558,7 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
                 with_payload = payload_key
 
         query_filter = qcm.Filter(must=match, must_not=not_match)
-        query_vector = {"vector": query_vectors[0], "name": vector_name} if vector_name else query_vectors[0],
+        query_vector = {"vector": query_vectors[0], "name": vector_name} if vector_name else query_vectors[0]
         search_hit = await client.search(collection_name=collection_name,
                                          query_vector=query_vector,  # tolist() Named Vector
                                          query_filter=query_filter,
@@ -555,8 +566,18 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
                                          score_threshold=score_threshold,
                                          with_payload=with_payload,
                                          # params=qcm.SearchParams(exact=exact),
-                                         # with_prefix_cache=True #第二次查询会直接命中缓存,在并发查询较多时表现更好
                                          )
+
+        missing_hits = [h for h in search_hit if not getattr(h, 'payload', None)]  # or h.payload is None
+        if missing_hits:
+            id_records = await client.retrieve(collection_name, [h.id for h in missing_hits], with_payload=with_payload)
+            # fallback：用 retrieve 填充 回填对应的 payload
+            id_map = {r.id: r for r in id_records}
+            for h in missing_hits:
+                record = id_map.get(h.id)
+                if record:
+                    h.payload = record.payload
+
         # {k: p.payload.get(k) for k in payload_key}
         return [extract_payload(p, payload_key) for p in search_hit]
 

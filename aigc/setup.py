@@ -1,8 +1,9 @@
 from setuptools import setup, find_packages
+from config import Config
 
 setup(
     name='aigc',
-    version='v1.2.2',
+    version=Config.Version,
     packages=find_packages(),  # include=['agent']
     include_package_data=True,
     package_data={

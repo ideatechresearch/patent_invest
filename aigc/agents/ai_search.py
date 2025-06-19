@@ -1,15 +1,40 @@
 import asyncio
-import httpx, aiohttp, requests
+import httpx, requests
 import random
 from typing import List, Dict, Tuple, Any, Union, Iterator, Sequence, Literal
 from utils import convert_to_pinyin
 
 from config import *
 
-
 # Config.load('../config.yaml')
 # Config.debug()
 # from selectolax.parser import HTMLParser
+_httpx_clients: dict[str, httpx.AsyncClient] = {}
+
+
+def get_httpx_client(time_out: float = Config.HTTP_TIMEOUT_SEC, proxy: str = None) -> httpx.AsyncClient:
+    # @asynccontextmanager
+    key = proxy or "default"
+    global _httpx_clients
+    if key not in _httpx_clients or _httpx_clients[key].is_closed:
+        transport = httpx.AsyncHTTPTransport(proxy=proxy or None)
+        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+        timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
+        _httpx_clients[key] = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
+    # try:
+    #     yield _httpx_clients[key] #Depends(get_httpx_client)
+    # finally:
+    #     # 注意：不要在这里关闭客户端，因为它是单例，全局用的
+    #     pass
+
+    return _httpx_clients[key]
+
+
+async def shutdown_httpx():
+    for key, _client in _httpx_clients.items():
+        if _client and not _client.is_closed:
+            await _client.aclose()
+
 
 async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **kwargs) -> List[Dict]:
     """
@@ -33,29 +58,28 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **k
         data.update(kwargs)
 
     headers = {'Authorization': api_key}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    try:
+        response = await cx.post(url, json=data, headers=headers)
+        response.raise_for_status()
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        try:
-            response = await cx.post(url, json=data, headers=headers)
-            response.raise_for_status()
+        data = response.json()
+        results = data['choices'][0]['message']['tool_calls'][1]['search_result']
+        return [{
+            'title': result.get('title'),
+            'content': result.get('content'),
+            'link': result.get('link'),
+            'media': result.get('media')
+        } for result in results]
 
-            data = response.json()
-            results = data['choices'][0]['message']['tool_calls'][1]['search_result']
-            return [{
-                'title': result.get('title'),
-                'content': result.get('content'),
-                'link': result.get('link'),
-                'media': result.get('media')
-            } for result in results]
+        # return resp.text  # resp.content.decode()
 
-            # return resp.text  # resp.content.decode()
-
-        except httpx.HTTPStatusError as exc:
-            if exc.response is not None and exc.response.status_code == 429:
-                print(f"请求过快，等待 5 秒后重试...")
-            return [{'error': f"HTTP error: {exc.response.status_code} -{exc}"}]
-        except Exception as exc:
-            return [{'error': str(exc), 'text': text, 'data': data}]
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code == 429:
+            print(f"请求过快，等待 5 秒后重试...")
+        return [{'error': f"HTTP error: {exc.response.status_code} -{exc}"}]
+    except Exception as exc:
+        return [{'error': str(exc), 'text': text, 'data': data}]
 
         # https://portal.azure.com/#home
 
@@ -70,11 +94,10 @@ async def tokenize_with_zhipu(content: str, model: str = "glm-4-plus", api_key: 
         "model": model,
         "messages": [{"role": "user", "content": content}]
     }
-
-    async with httpx.AsyncClient() as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        data = response.json()
-        return data["usage"]  # ["prompt_tokens"]
+    cx = get_httpx_client()
+    response = await cx.post(url, headers=headers, json=payload)
+    data = response.json()
+    return data["usage"]  # ["prompt_tokens"]
 
 
 async def web_search_tavily(text: str, topic: Literal["general", "news"] = "general",
@@ -104,37 +127,39 @@ async def web_search_tavily(text: str, topic: Literal["general", "news"] = "gene
         "topic": topic,  # finance,news
         "time_range": time_range,
         "max_results": 5,  # 0 <= x <= 20
-        "include_answer": True,  # basic,true,advanced
-        # "include_raw_content": False,
+        "include_answer": True,  # basic,true,advanced,包括 LLM 生成的对所提供查询的答案。 或返回快速答案。 返回更详细的答案
+        "include_raw_content": False,  # 包括每个搜索结果的已清理和解析的 HTML 内容。 或以 Markdown 格式返回搜索结果内容。 从结果中返回纯文本，这可能会增加延迟
         # "include_images": False,
         # "include_image_descriptions": False,
         # "include_domains": [],
-        # "exclude_domains": []
+        # "exclude_domains": [],
+        # "country": None #提升来自特定国家/地区的搜索结果,仅当 topic 为 时可用
     }
     if topic == 'news':
         payload['days'] = days  # x >= 0,Available only if topic is .news
     if kwargs:
         payload.update(kwargs)
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        # base_url="https://api.tavily.com",client.post("/search", content=json.dumps(data))
-        response = await cx.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data['results']  # "url,title,score,published_date,content
-        else:
-            print(f"Error: {response.status_code}")
-            return [{'error': response.text}]
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    # base_url="https://api.tavily.com",client.post("/search", content=json.dumps(data))
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data['results']  # "url,title,score,published_date,content
+    else:
+        print(f"Error: {response.status_code}")
+        return [{'error': response.text}]
 
 
-async def web_extract_tavily(urls: str | list[str], api_key: str = Config.TAVILY_Api_Key):
+async def web_extract_tavily(urls: str | list[str], extract_depth: Literal["basic", "advanced"] = "basic",
+                             api_key: str = Config.TAVILY_Api_Key):
     """
     提取提取给定 URL 的网页信息,从一个或多个指定的 URL 中提取网页内容,比如获取github内容，已初步解析
     Tavily是一家专注于AI搜索的公司，他们的搜索会为了LLM进行优化，以便于LLM进行数据检索。
     :param urls:url or list of urls,要提取信息的 URL 或者列表
     :param api_key:Tavily API 的访问密钥，不需要指定
-    :return:
+    :return:"url","raw_content"
     """
     url = "https://api.tavily.com/extract"
     headers = {
@@ -144,23 +169,107 @@ async def web_extract_tavily(urls: str | list[str], api_key: str = Config.TAVILY
     payload = {
         "urls": urls,
         "include_images": False,
-        "extract_depth": "basic"  # basic, advanced
+        "extract_depth": extract_depth,  # basic, advanced
+        "format": "markdown"  # markdown, text
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data['results']
-        else:
-            print(f"Error: {response.status_code},{response.text}")
-            return [{'error': response.text}]
+
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data.get("failed_results") or data['results']
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return [{'error': response.text}]
+
+
+async def web_search_jina(text: str, api_key: str = Config.JINA_Service_Key, **kwargs):
+    """
+    搜索网络并获取 SERP,搜索网络并将结果转换为大模型友好文本，返回 url,title,description,content
+    """
+    # https://docs.tavily.com/api-reference/endpoint/search
+    url = "https://s.jina.ai/"
+    headers = {
+        "Accept": "application/json",
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}',
+        "X-Engine": "direct"
+        # "X-Respond-With": "no-content"
+    }
+    payload = {
+        "q": text,
+        "gl": "CN"
+    }
+    if kwargs:
+        payload.update(kwargs)
+
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        return data["data"]
+    else:
+        print(f"Error: {response.status_code}")
+        return [{'error': response.text}]
+
+
+async def web_extract_jina(url: str, api_key: str = Config.JINA_Service_Key):
+    """
+    读取 URL 并获取其内容，20-500 RPM，Reader API 可免费使用，并提供灵活的速率限制和定价。可以提取GitHub项目等页面的文本信息
+    支持 PDF 读取。它兼容大多数 PDF，包括包含大量图片的 PDF,比如获取github内容，已部分解析并结构化
+    返回"title","description","content","url"，"usage"
+    """
+    url = f"https://r.jina.ai/{url}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "X-Return-Format": "markdown"
+
+    }
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data["data"]
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return [{'error': response.text}]
+
+
+async def segment_with_jina(content: str, tokenizer: str = "o200k_base", api_key: str = Config.JINA_Service_Key):
+    # 对长文本进行分词分句，20-200 RPM
+    url = 'https://api.jina.ai/v1/segment'
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+
+    }
+    payload = {
+        "content": content,
+        "tokenizer": tokenizer,  # cl100k_base
+        # "return_tokens": True,
+        "return_chunks": True,
+        "max_chunk_length": 1000
+    }
+    cx = get_httpx_client()
+    response = await cx.post(url, headers=headers, json=payload)
+    return response.json()  # "chunk_positions","chunks"
 
 
 async def search_by_api(query: str, location: str = None,
-                        engine: Literal['google', 'bing', "baidu", 'naver', "yahoo", "youtube",
+                        engine: Literal["google", "bing", "baidu", "naver", "yahoo", "youtube",
                         "google_videos", "google_news", "google_images", "amazon_search", "shein_search"] | None = 'google',
                         api_key=Config.SearchApi_Key):
+    """
+    通过指定的搜索引擎API进行搜索，并返回搜索结果。
+    :param query:搜索查询字符串，必填项。
+    :param location:搜索的位置信息，可选，默认为空。
+    :param engine:使用的搜索引擎，可选值包括：'google', 'bing', 'baidu', 'naver', 'yahoo', 'youtube', 'google_videos', 'google_news', 'google_images', 'amazon_search', 'shein_search'，默认为'google'。
+    :param api_key:API密钥，用于访问搜索API。默认从配置中读取
+    :return:
+    """
     # https://www.searchapi.io/docs/google
     if engine is None:
         if "视频" in query or "movie" in query:
@@ -198,6 +307,7 @@ async def search_by_api(query: str, location: str = None,
     }
     if location:
         params['location'] = location
+
     async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy, verify=False) as cx:
         response = await cx.get(url, params=params)
         if response.status_code == 200:
@@ -229,21 +339,104 @@ async def brave_search(query: str, api_key=Config.Brave_Api_Key):
         "count": "10",  # 20
         "summary": False  # enables summary key generation in web search results
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.get(url, headers=headers, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data.get('web', {}).get('results', [])
-        else:
-            print(f"Error: {response.status_code}")
-            return [{'error': response.text}]
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.get(url, headers=headers, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data.get('web', {}).get('results', [])
+    else:
+        print(f"Error: {response.status_code}")
+        return [{'error': response.text}]
+
+
+async def exa_search(query: str, category: Literal[
+    "research paper", "company", "news", "pdf", "github", "tweet", "personal site", "linkedin profile", "financial report"] = "research paper",
+                     api_key=Config.Exa_Api_Key):
+    """
+    The search endpoint lets you intelligently search the web and extract contents from the results.
+    By default, it automatically chooses between traditional keyword search and Exa’s embeddings-based model, to find the most relevant results for your query.
+    """
+    url = "https://api.exa.ai/search"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key
+    }
+    payload = {
+        "query": query,
+        "text": True,
+        'category': category,
+        "numResults": 10,
+    }
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get('results', [])
+    else:
+        print(f"Error: {response.status_code}")
+        return [{'error': response.text}]
+
+
+async def web_extract_exa(urls: list[str], api_key: str = Config.Exa_Api_Key):
+    """
+    Get the full page contents, summaries, and metadata for a list of URLs.
+    Returns instant results from our cache, with automatic live crawling as fallback for uncached pages.
+    """
+    url = "https://api.exa.ai/contents"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key
+    }
+    payload = {
+        "urls": urls,
+        "text": True
+    }
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get('results', [])
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return [{'error': response.text}]
+
+
+async def exa_retrieved(query: str, api_key=Config.Exa_Api_Key):
+    """
+    https://docs.exa.ai/reference/answer
+    Get an LLM answer to a question informed by Exa search results. /answer performs an Exa search and uses an LLM to generate either:
+
+    A direct answer for specific queries. (i.e. “What is the capital of France?” would return “Paris”)
+    A detailed summary with citations for open-ended queries (i.e. “What is the state of ai in healthcare?” would return a summary with citations to relevant sources)
+    :param query:
+    :param api_key:
+    :return:
+    """
+    url = "https://api.exa.ai/answer"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key
+    }
+    payload = {
+        "query": query,
+        "text": True,
+        "model": 'exa'  # exa-pro
+    }
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        return {"answer": data.get("answer"), "citations": data.get("citations", [])}
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return {'error': response.text}
 
 
 async def firecrawl_search(query: str, api_key=Config.Firecrawl_Service_Key):
     """
     使用自然语言搜索已爬网数据。
-    "title","description","url","markdown","metadata"
+    返回结构 {"title","description","url","markdown","metadata"}
     """
     url = 'https://api.firecrawl.dev/v1/search'
     headers = {
@@ -258,21 +451,22 @@ async def firecrawl_search(query: str, api_key=Config.Firecrawl_Service_Key):
         "tbs": "",  # Time-based search parameter
         "ignoreInvalidURLs": False,
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data.get('data', [])
-        else:
-            print(f"Error: {response.status_code},{response.text}")
-            return [{'error': response.text}]
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data.get('data', [])
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return [{'error': response.text}]
 
 
 async def firecrawl_scrape(url, api_key=Config.Firecrawl_Service_Key):
+    #   https://docs.firecrawl.dev/features/scrape
     """
     用于抓取单个 URL。返回带有 URL 内容的 markdown。
-    https://docs.firecrawl.dev/features/scrape
+    返回结构化数据，比如{"description","title","hostname","favicon"},简要描述网站数据集的细节
     """
     api_url = 'https://api.firecrawl.dev/v1/scrape'  # /crawl
     headers = {
@@ -281,25 +475,31 @@ async def firecrawl_scrape(url, api_key=Config.Firecrawl_Service_Key):
     }
     payload = {
         "url": url,
-        "formats": ["markdown"],  # 'html',"json"
+        "formats": ["markdown"],  # "json",'html',
         "onlyMainContent": True
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.post(api_url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data.get('data', {}).get("metadata")
-        else:
-            print(f"Error: {response.status_code},{response.text}")
-            return {'error': response.text}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.post(api_url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data.get('data', {}).get("metadata")
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return {'error': response.text}
 
 
 async def web_extract_firecrawl(prompt: str, urls: list[str], api_key=Config.Firecrawl_Service_Key):
+    # https://docs.firecrawl.dev/features/extract
     """
     提取,使用 AI 从单个页面、多个页面或整个网站中提取结构化数据。
-    /extract 端点简化了从任意数量的 URL 或整个域收集结构化数据的过程。提供 URL 列表，可选使用通配符（例如 example.com/*）以及描述所需信息的提示或架构。Firecrawl 处理抓取、解析和整理大型或小型数据集的细节。
-    https://docs.firecrawl.dev/features/extract
+    可能没有返回内容或请求失败
+    - 目标网页可能有反爬虫措施（如验证码、限制IP、动态加载等）
+    - 请求头或参数设置不正确
+    - 网页内容较复杂，需特殊解析
+    /extract 端点简化了从任意数量的 URL 或整个域收集结构化数据的过程。提供 URL 列表，以及描述所需信息的提示或架构。Firecrawl 处理抓取、解析和整理大型或小型数据集的细节。
+     :param prompt:描述所需信息的提示或架构
+     :param urls:URL 列表
     """
     api_url = 'https://api.firecrawl.dev/v1/extract'
     headers = {
@@ -312,15 +512,15 @@ async def web_extract_firecrawl(prompt: str, urls: list[str], api_key=Config.Fir
         "enableWebSearch": True,
         # "schema": {"type": "object", "properties": {}}
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.post(api_url, headers=headers, json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data.get('data', {})
-        else:
-            print(f"Error: {response.status_code},{response.text}")
-            return {'error': response.text}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.post(api_url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data.get('data', {})
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return {'error': response.text}
 
 
 async def serper_search(query, engine: Literal['search', 'news', 'scholar', 'patents'] | None = 'search', page=2,
@@ -342,18 +542,18 @@ async def serper_search(query, engine: Literal['search', 'news', 'scholar', 'pat
         'X-API-KEY': api_key,
         'Content-Type': 'application/json'
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            try:
-                data = response.json()
-                # print(json.dumps(data, indent=4))  # 打印响应数据
-                return data.get("organic") or data.get(engine)
-            except json.JSONDecodeError as e:
-                return {'text': response.text}
-        else:
-            print(f"Error: {response.status_code},{response.text}")
-            return [{'error': response.text}]
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        try:
+            data = response.json()
+            # print(json.dumps(data, indent=4))  # 打印响应数据
+            return data.get("organic") or data.get(engine)
+        except json.JSONDecodeError as e:
+            return {'text': response.text}
+    else:
+        print(f"Error: {response.status_code},{response.text}")
+        return [{'error': response.text}]
     # response = requests.request("POST", url, headers=headers, data=json.dumps(payload))
 
 
@@ -366,16 +566,15 @@ async def duckduckgo_search(query):
         'no_html': 1,  # 去除 HTML
         'skip_disambig': 1,  # 跳过歧义提示
     }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy) as cx:
-        response = await cx.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
-            return data
-        else:
-            print(f"Error: {response.status_code}")
-            return [{'error': response.text}]
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    response = await cx.get(url, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        # print(json.dumps(data, indent=4))  # 打印响应数据
+        return data
+    else:
+        print(f"Error: {response.status_code}")
+        return [{'error': response.text}]
 
 
 def bing_search(query, bing_api_key):
@@ -426,18 +625,157 @@ def baidu_search(query, baidu_api_key, baidu_secret_key):
     return results  # "\n".join([f"{i+1}. {title}: {content} ({url})" for i, (title, content, url) in enumerate(search_results[:5])])
 
 
-def wikipedia_search(query):
-    response = requests.get(f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json",
-                            timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
-    search_results = response.json().get('query', {}).get('search', [])
-    if search_results:
-        page_id = search_results[0]['pageid']
-        page_response = requests.get(
-            f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&pageids={page_id}&format=json",
-            timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
-        page_data = page_response.json()['query']['pages'][str(page_id)]
-        return page_data.get('extract', 'No extract found.')
-    return "No information found."
+async def wikipedia_search(query: str) -> dict:
+    """
+    异步搜索 Wikipedia 词条并返回结构化摘要信息
+
+    参数:
+        query: 查询词
+
+    返回:
+        包含 title, page_id, summary, url 的字典
+    """
+    base_url = "https://en.wikipedia.org/w/api.php"
+
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    try:
+        # ① 搜索页面
+        search_resp = await cx.get(base_url, params={
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "format": "json"
+        })
+        search_resp.raise_for_status()
+
+        search_results = search_resp.json().get('query', {}).get('search', [])
+        if not search_results:
+            return {"success": False, "msg": "No search results found."}
+
+        top_result = search_results[0]
+        page_id = top_result['pageid']
+        title = top_result['title']
+
+        # ② 获取摘要内容
+        detail_resp = await cx.get(base_url, params={
+            "action": "query",
+            "prop": "extracts",
+            "pageids": page_id,
+            "format": "json",
+            "explaintext": 1
+        })
+        detail_resp.raise_for_status()
+
+        page_data = detail_resp.json()['query']['pages'][str(page_id)]
+        summary = page_data.get('extract', 'No extract found.')
+
+        return {
+            "success": True,
+            "title": title,
+            "page_id": page_id,
+            "summary": summary.strip(),
+            "url": f"https://en.wikipedia.org/?curid={page_id}"
+        }
+
+    except httpx.RequestError as e:
+        response = requests.get(f"{base_url}?action=query&list=search&srsearch={query}&format=json",
+                                timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
+        search_results = response.json().get('query', {}).get('search', [])
+        if search_results:
+            page_id = search_results[0]['pageid']
+            page_response = requests.get(f"{base_url}?action=query&prop=extracts&pageids={page_id}&format=json",
+                                         timeout=Config.HTTP_TIMEOUT_SEC, proxies=Config.HTTP_Proxies)
+            page_data = page_response.json()['query']['pages'][str(page_id)]
+            return {"success": True, "summary": page_data.get('extract', 'No extract found.')}
+        return {"success": False, "msg": f"HTTP请求失败: {e}"}
+    except Exception as e:
+        return {"success": False, "msg": f"解析失败: {e}"}
+
+
+async def arxiv_search(query: str, arxiv_id: str = None, max_results: int = 10,
+                       sort_by: str = 'submittedDate') -> list[dict]:
+    """
+    异步方式检索arXiv论文
+
+    参数:
+        query: 搜索查询字符串
+        arxiv_id: 如果提供则按 ID 查询（如 1706.03762）
+        max_results: 返回结果数量
+        sort_by: 排序方式(submittedDate, lastUpdatedDate, relevance)
+
+    返回:
+        论文信息字典列表
+    """
+    base_url = "http://export.arxiv.org/api/query"
+    headers = {
+        'User-Agent': 'Mozilla/5.0'
+    }
+    if arxiv_id:
+        query = f"id:{arxiv_id}"
+    params = {
+        'search_query': query,
+        'start': 0,
+        'max_results': max_results,
+        'sortBy': sort_by,
+        'sortOrder': 'descending'
+    }
+
+    def parse_arxiv_xml(xml_text):
+        import xml.etree.ElementTree as ET
+        ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+        root = ET.fromstring(xml_text)
+        entries = []
+
+        for entry in root.findall("atom:entry", ns):
+            title = entry.findtext("atom:title", default="", namespaces=ns)
+            summary = entry.findtext("atom:summary", default="", namespaces=ns)
+            published = entry.findtext("atom:published", default="", namespaces=ns)
+            updated = entry.findtext("atom:updated", default="", namespaces=ns)
+            _id = entry.findtext("atom:id", default="", namespaces=ns).split("/abs/")[-1]
+
+            authors = [author.findtext("atom:name", default="", namespaces=ns)
+                       for author in entry.findall("atom:author", ns)]
+
+            primary_cat_elem = entry.find("arxiv:primary_category", ns)
+            primary_category = primary_cat_elem.get("term") if primary_cat_elem is not None else ""
+
+            categories = [cat.get("term") for cat in entry.findall("atom:category", ns)]
+
+            pdf_url = ""
+            for link in entry.findall("atom:link", ns):
+                if link.get("type") == "application/pdf":
+                    pdf_url = link.get("href")
+                    break
+
+            entries.append({
+                "title": title.strip(),
+                "summary": summary.strip(),
+                "authors": authors,
+                "published": published,
+                "updated": updated,
+                "arxiv_id": _id,
+                "primary_category": primary_category,
+                "categories": categories,
+                "pdf_url": pdf_url,
+            })
+
+        return entries
+
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
+    try:
+        # import feedparser  # 用于解析arXiv的Atom feed
+        # 异步HTTP请求
+        response = await cx.get(base_url, params=params, headers=headers)
+        response.raise_for_status()
+        # print(response.text)
+
+        return parse_arxiv_xml(response.text)
+    except httpx.HTTPError as e:
+        print(f"arXiv请求错误: {e}")
+        return []
+    except Exception as e:
+        print(f"解析错误: {e}")
+        return []
 
 
 def is_city(city, region='全国'):
@@ -478,18 +816,17 @@ async def search_bmap_location(query, region='', limit=True):
         "output": "json",
         "ak": Config.BMAP_API_Key,
     }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.get(url, params=params)
-        res = []
-        if response.status_code == 200:
-            js = response.json()
-            for result in js.get('result', []):
-                res.append({'lng_lat': (round(result['location']['lng'], 6), round(result['location']['lat'], 6)),
-                            'name': result["name"], 'address': result['address']})
-        else:
-            print(response.text)
-        return res  # baidu_nlp(nlp_type='address', text=region+query+result["name"]+ result['address'])
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.get(url, params=params)
+    res = []
+    if response.status_code == 200:
+        js = response.json()
+        for result in js.get('result', []):
+            res.append({'lng_lat': (round(result['location']['lng'], 6), round(result['location']['lat'], 6)),
+                        'name': result["name"], 'address': result['address']})
+    else:
+        print(response.text)
+    return res  # baidu_nlp(nlp_type='address', text=region+query+result["name"]+ result['address'])
 
 
 def get_amap_location(address, city=''):
@@ -520,20 +857,19 @@ async def search_amap_location(query, region='', limit=True):
         "output": "json",
         "key": Config.AMAP_API_Key,
     }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.get(url, params=params)
-        res = []
-        if response.status_code == 200:
-            js = response.json()
-            if js['status'] == '1' and int(js['count']) > 0:
-                for result in js.get('pois', []):
-                    s1, s2 = result['location'].split(',')
-                    res.append({'lng_lat': (float(s1), float(s2)),
-                                'name': result["name"], 'address': result['address']})
-            else:
-                print(response.text)  # {"count":"0","infocode":"10000","pois":[],"status":"1","info":"OK"}
-        return res
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.get(url, params=params)
+    res = []
+    if response.status_code == 200:
+        js = response.json()
+        if js['status'] == '1' and int(js['count']) > 0:
+            for result in js.get('pois', []):
+                s1, s2 = result['location'].split(',')
+                res.append({'lng_lat': (float(s1), float(s2)),
+                            'name': result["name"], 'address': result['address']})
+        else:
+            print(response.text)  # {"count":"0","infocode":"10000","pois":[],"status":"1","info":"OK"}
+    return res
 
 
 # https://www.weatherapi.com/api-explorer.aspx#forecast
@@ -592,9 +928,8 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
         "salt": salt,
         "sign": sign
     }
-
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.get(url, params=params)
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.get(url, params=params)
 
     data = response.json()
     if "trans_result" in data:
@@ -612,9 +947,8 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
         "from": from_lang,
         "to": to_lang
     })
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
 
+    response = await cx.post(url, headers=headers, json=payload)
     data = response.json()
     if "trans_result" in data:
         return data["trans_result"][0]["dst"]
@@ -637,8 +971,8 @@ async def tencent_translate(text: str, source: str, target: str):
                                     secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
                                     timestamp=int(time.time()), version='2018-03-21')
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
 
     # 检查响应状态码和内容
     if response.status_code != 200:
@@ -691,22 +1025,22 @@ async def xunfei_translate(text: str, source: str = 'en', target: str = 'cn'):
     url = 'https://itrans.xf-yun.com/v1/its'
 
     # 异步发送请求
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, json=request_data, headers=headers)
-        if response.status_code == 200:
-            response_data = response.json()
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, json=request_data, headers=headers)
+    if response.status_code == 200:
+        response_data = response.json()
 
-            # 解码返回结果中的text字段
-            if "payload" in response_data and "result" in response_data["payload"]:
-                base64_text = response_data["payload"]["result"]["text"]
-                decoded_result = base64.b64decode(base64_text).decode('utf-8')
-                data = json.loads(decoded_result)
-                if "trans_result" in data:
-                    return data["trans_result"]["dst"]
-            else:
-                return {"error": "Unexpected response format"}
+        # 解码返回结果中的text字段
+        if "payload" in response_data and "result" in response_data["payload"]:
+            base64_text = response_data["payload"]["result"]["text"]
+            decoded_result = base64.b64decode(base64_text).decode('utf-8')
+            data = json.loads(decoded_result)
+            if "trans_result" in data:
+                return data["trans_result"]["dst"]
         else:
-            return {"error": f"HTTP Error: {response.status_code}"}
+            return {"error": "Unexpected response format"}
+    else:
+        return {"error": f"HTTP Error: {response.status_code}"}
 
 
 # https://docs.caiyunapp.com/lingocloud-api/
@@ -733,9 +1067,18 @@ def caiyun_translate(source, direction="auto2zh"):
 
 
 if __name__ == "__main__":
-    from utils import print_functions
+    from utils import get_module_functions
 
-    print_functions('agents.ai_search')
+    funcs = get_module_functions('agents.ai_search')
+    print([i[0] for i in funcs])
+
+    __all__ = ['arxiv_search', 'baidu_search', 'baidu_translate', 'bing_search', 'brave_search', 'caiyun_translate',
+               'duckduckgo_search', 'exa_retrieved', 'exa_search', 'firecrawl_scrape', 'firecrawl_search',
+               'get_amap_location', 'get_bmap_location', 'get_httpx_client', 'get_weather', 'is_city',
+               'search_amap_location', 'search_bmap_location', 'search_by_api', 'segment_with_jina', 'serper_search',
+               'shutdown_httpx', 'tencent_translate', 'tokenize_with_zhipu', 'web_extract_exa', 'web_extract_firecrawl',
+               'web_extract_jina', 'web_extract_tavily', 'web_search_async', 'web_search_jina', 'web_search_tavily',
+               'wikipedia_search', 'xunfei_translate']
 
 
     async def main():
@@ -745,6 +1088,16 @@ if __name__ == "__main__":
 
         r = await  brave_search('季度业绩报告')  # r.keys(),
         print(r)
+
+        paper = await  arxiv_search(query='', arxiv_id="1706.03762")
+        print(paper)
+        # [{'title': 'Attention Is All You Need', 'summary': 'The dominant sequence transduction models are based on complex recurrent or\nconvolutional neural networks in an encoder-decoder configuration. The best\nperforming models also connect the encoder and decoder through an attention\nmechanism. We propose a new simple network architecture, the Transformer, based\nsolely on attention mechanisms, dispensing with recurrence and convolutions\nentirely. Experiments on two machine translation tasks show these models to be\nsuperior in quality while being more parallelizable and requiring significantly\nless time to train. Our model achieves 28.4 BLEU on the WMT 2014\nEnglish-to-German translation task, improving over the existing best results,\nincluding ensembles by over 2 BLEU. On the WMT 2014 English-to-French\ntranslation task, our model establishes a new single-model state-of-the-art\nBLEU score of 41.8 after training for 3.5 days on eight GPUs, a small fraction\nof the training costs of the best models from the literature. We show that the\nTransformer generalizes well to other tasks by applying it successfully to\nEnglish constituency parsing both with large and limited training data.', 'authors': ['Ashish Vaswani', 'Noam Shazeer', 'Niki Parmar', 'Jakob Uszkoreit', 'Llion Jones', 'Aidan N. Gomez', 'Lukasz Kaiser', 'Illia Polosukhin'], 'published': '2017-06-12T17:57:34Z', 'updated': '2023-08-02T00:41:18Z', 'arxiv_id': '1706.03762v7', 'primary_category': 'cs.CL', 'categories': ['cs.CL', 'cs.LG'], 'pdf_url': 'http://arxiv.org/pdf/1706.03762v7'}]
+        paper = await  wikipedia_search('道法自然')
+        print(paper)
+
+        se = await  segment_with_jina(
+            '''{"status": "000000", "message": "查询成功", "data": {"name": "宁波尚缔电器有限公司", "historyName": "宁波久刈网络科技有限公司", "registNo": "330215000140739", "unityCreditCode": "91330201MA281N399X", "type": "有限责任公司(自然人投资或控股)", "legalPerson": "黄发虎", "registFund": "100万人民币", "openDate": "2016年03月21日", "startDate": "2016年03月21日", "endDate": "9999年12月31日", "registOrgan": "宁波市市场监督管理局高新技术产业开发区分局", "licenseDate": "2017年04月26日", "state": "吊销，未注销", "address": "宁波高新区创苑路750号001幢759室", "scope": "电器、日用百货、母婴用品的批发、零售及网上销售；网络技术、电子商务技术开发、技术服务；网络工程设计；网页设计；市场营销推广宣传；国内各类广告设计、制作、发布、代理；图文设计、制作；企业形象设计；摄影服务。（依法须经批准的项目，经相关部门批准后方可开展经营活动）", "revokeDate": "2022年04月29日", "isOnStock": null, "lastUpdateDate": "2024年06月28日", "priIndustry": "批发和零售业", "industryCategoryCode": "F", "subIndustry": "批发业", "industryLargeClassCode": "51", "middleCategory": "纺织、服装及家庭用品批发", "middleCategoryCode": "513", "smallCategory": "", "smallCategoryCode": null, "legalPersonSurname": "黄", "legalPersonName": "发虎", "registCapital": "1,000,000.000", "registCurrency": "CNY", "typeCode": "F", "country": "中国", "province": "浙江省", "city": "宁波市", "area": "市辖区", "partners": [{"name": "黄发虎", "type": "自然人股东", "identifyType": null, "identifyNo": null, "shouldType": "", "shouldCapi": "50.0", "shoudDate": "2016年03月21日", "realType": "", "realCapi": "0.0", "realDate": null}, {"name": "曹颖", "type": "自然人股东", "identifyType": null, "identifyNo": null, "shouldType": "", "shouldCapi": "30.0", "shoudDate": "2016年03月21日", "realType": "", "realCapi": "0.0", "realDate": null}, {"name": "王菊美", "type": "自然人股东", "identifyType": null, "identifyNo": null, "shouldType": "", "shouldCapi": "20.0", "shoudDate": "2016年03月21日", "realType": "", "realCapi": "0.0", "realDate": null}], "employees": [{"name": "黄发虎", "job": "执行董事兼总经理"}, {"name": "曹颖", "job": "监事"}], "branchs": [], "changes": [{"changesType": "行业代码变更", "changesBeforeContent": "6420:互联网信息服务", "changesAfterContent": "5137:家用电器批发", "changesDate": "2017年04月26日"}, {"changesType": "其他事项备案", "changesBeforeContent": "6420:互联网信息服务", "changesAfterContent": "5137:家用电器批发", "changesDate": "2017年04月26日"}, {"changesType": "经营范围变更（含业务范围变更）", "changesBeforeContent": "网络技术、电子商务技术开发、技术服务；网络工程设计；网页设计；市场营销推广宣传；国内各类广告设计、制作、发布、代理；图文设计、制作；企业形象设计；摄影服务；日用百货、母婴用品、电器网上销售及批发、零售。", "changesAfterContent": "电器、日用百货、母婴用品的批发、零售及网上销售；网络技术、电子商务技术开发、技术服务；网络工程设计；网页设计；市场营销推广宣传；国内各类广告设计、制作、发布、代理；图文设计、制作；企业形象设计；摄影服务。（依法须经批准的项目，经相关部门批准后方可开展经营活动）", "changesDate": "2017年04月26日"}, {"changesType": "名称变更（字号名称、集团名称等）", "changesBeforeContent": "宁波久刈网络科技有限公司", "changesAfterContent": "宁波尚缔电器有限公司", "changesDate": "2017年04月26日"}]}}''')
+        print(se)
 
 
     asyncio.run(main())

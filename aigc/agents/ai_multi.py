@@ -7,6 +7,7 @@ import dashscope
 # import qianfan
 from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription, RecognitionCallback
+from agents.ai_search import get_httpx_client
 
 
 # from lagent import tool_api
@@ -84,22 +85,22 @@ async def xunfei_ppt_create(text: str, templateid: str = "20240718489569D", appi
     # 轮询任务进度
     await asyncio.sleep(5)
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        while task_id is not None and retries < max_retries:
-            task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
-            response = await cx.get(url=task_url, headers=headers)
-            response.raise_for_status()
-            resp = response.json()
-            task_status = resp['data']['pptStatus']
-            aiImageStatus = resp['data']['aiImageStatus']
-            cardNoteStatus = resp['data']['cardNoteStatus']
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    while task_id is not None and retries < max_retries:
+        task_url = f"https://zwapi.xfyun.cn/api/ppt/v2/progress?sid={task_id}"
+        response = await cx.get(url=task_url, headers=headers)
+        response.raise_for_status()
+        resp = response.json()
+        task_status = resp['data']['pptStatus']
+        aiImageStatus = resp['data']['aiImageStatus']
+        cardNoteStatus = resp['data']['cardNoteStatus']
 
-            if ('done' == task_status and 'done' == aiImageStatus and 'done' == cardNoteStatus):
-                ppt_url = resp['data']['pptUrl']
-                break
+        if ('done' == task_status and 'done' == aiImageStatus and 'done' == cardNoteStatus):
+            ppt_url = resp['data']['pptUrl']
+            break
 
-            await asyncio.sleep(3)
-            retries += 1
+        await asyncio.sleep(3)
+        retries += 1
 
     return ppt_url
 
@@ -137,37 +138,37 @@ async def xunfei_picture(text: str, data_folder=None):
         }
     }
     # 异步发送请求
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, json=request_body, headers={'content-type': "application/json"})
-        if response.status_code != 200:
-            return None, {"error": f"HTTP Error: {response.status_code}"}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, json=request_body, headers={'content-type': "application/json"})
+    if response.status_code != 200:
+        return None, {"error": f"HTTP Error: {response.status_code}"}
 
-        data = response.json()  # json.loads(response.text)
-        code = data['header']['code']
-        if code != 0:
-            return None, {"error": f'请求错误: {code}, {data}'}
+    data = response.json()  # json.loads(response.text)
+    code = data['header']['code']
+    if code != 0:
+        return None, {"error": f'请求错误: {code}, {data}'}
 
-        text = data["payload"]["choices"]["text"]
-        image_base = text[0]["content"]  # base64图片结果,base64_string_data
-        image_id = data['header']['sid']
-        # 解码 Base64 图像数据
-        file_data = base64.b64decode(image_base)
-        if data_folder:
-            # 将解码后的数据转换为图片
-            file_path = f"{data_folder}/{image_id}.jpg"  # .png
-            img = Image.open(io.BytesIO(file_data))
-            # r, g, b, a = img.split()
-            # img = img.convert('RGB') 转换为 RGB 格式
-            img.save(file_path)
+    text = data["payload"]["choices"]["text"]
+    image_base = text[0]["content"]  # base64图片结果,base64_string_data
+    image_id = data['header']['sid']
+    # 解码 Base64 图像数据
+    file_data = base64.b64decode(image_base)
+    if data_folder:
+        # 将解码后的数据转换为图片
+        file_path = f"{data_folder}/{image_id}.jpg"  # .png
+        img = Image.open(io.BytesIO(file_data))
+        # r, g, b, a = img.split()
+        # img = img.convert('RGB') 转换为 RGB 格式
+        img.save(file_path)
 
-            # buffer = io.BytesIO()
-            # img.save(buffer, format="JPEG")  # 保存为 JPEG 格式
-            # buffer.seek(0)
-            # async with aiofiles.open(file_path, 'wb') as file:
-            #     await file.write(buffer.read())
-            return file_path, {"urls": '', 'id': image_id}
+        # buffer = io.BytesIO()
+        # img.save(buffer, format="JPEG")  # 保存为 JPEG 格式
+        # buffer.seek(0)
+        # async with aiofiles.open(file_path, 'wb') as file:
+        #     await file.write(buffer.read())
+        return file_path, {"urls": '', 'id': image_id}
 
-        return file_data, {"urls": '', 'id': image_id}
+    return file_data, {"urls": '', 'id': image_id}
 
 
 # https://www.volcengine.com/docs/6791/1361423
@@ -235,29 +236,29 @@ async def ark_visual_picture(image_data, image_urls: list[str], prompt: str = No
                                      timenow=None)
 
     # print(headers,request_body)
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, json=request_body, headers=headers)
-        if response.status_code != 200:
-            return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-        response.raise_for_status()
-        response_data = response.json()
-        # print(response_data.keys())
-        # {'code': 10000, 'data': {'1905703073': 1905703073, 'algorithm_base_resp': {'status_code': 0, 'status_message': 'Success'}, 'animeoutlineV4_16_strength_clip': 0.2, 'animeoutlineV4_16_strength_model': 0.2, 'apply_id_layer': '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15', 'binary_data_base64': [], 'clip_skip': -2, 'cn_mode': 2, 'comfyui_cost': 4, 'controlnet_weight': 1, 'ddim_steps': 20, 'i2t_tag_text': '', 'id_weight': 0, 'image_urls': ['https://p26-aiop-sign.byteimg.com/tos-cn-i-vuqhorh59i/20241225114813D0211FF38607A612BD65-0~tplv-vuqhorh59i-image.image?rk3s=7f9e702d&x-expires=1735184899&x-signature=A1Jay2TWwSsmtwRjDGzK71gzXpg%3D'], 'long_resolution': 832, 'lora_map': {'animeoutlineV4_16': {'strength_clip': 0.2, 'strength_model': 0.2}, 'null': {'strength_clip': 0.7000000000000001, 'strength_model': 0.7000000000000001}}, 'null_strength_clip': 0.7000000000000001, 'null_strength_model': 0.7000000000000001, 'prompt': '(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,', 'return_url': True, 'scale': 5, 'seed': -1, 'strength': 0.58, 'sub_prompts': ['(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,'], 'sub_req_key': ''}, 'message': 'Success', 'request_id': '20241225114813D0211FF38607A612BD65', 'status': 10000, 'time_elapsed': '6.527672506s'}
-        if response_data["status"] == 10000:
-            image_base = response_data["data"].get("binary_data_base64", [])
-            image_urls = response_data["data"].get("image_urls", [''])
-            request_id = response_data["request_id"]
-            if len(image_base) == 1:
-                image_decode = base64.b64decode(image_base[0])
-                if data_folder:
-                    # 将解码后的数据转换为图片
-                    file_path = f"{data_folder}/{request_id}.jpg"
-                    img = Image.open(io.BytesIO(image_decode))
-                    img.save(file_path)
-                    return file_path, {"urls": image_urls, 'id': request_id}
-                return image_decode, {"urls": image_urls, 'id': request_id}
-            return None, {"urls": image_urls, 'id': request_id}
-        return None, response_data
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, json=request_body, headers=headers)
+    if response.status_code != 200:
+        return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+    response.raise_for_status()
+    response_data = response.json()
+    # print(response_data.keys())
+    # {'code': 10000, 'data': {'1905703073': 1905703073, 'algorithm_base_resp': {'status_code': 0, 'status_message': 'Success'}, 'animeoutlineV4_16_strength_clip': 0.2, 'animeoutlineV4_16_strength_model': 0.2, 'apply_id_layer': '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15', 'binary_data_base64': [], 'clip_skip': -2, 'cn_mode': 2, 'comfyui_cost': 4, 'controlnet_weight': 1, 'ddim_steps': 20, 'i2t_tag_text': '', 'id_weight': 0, 'image_urls': ['https://p26-aiop-sign.byteimg.com/tos-cn-i-vuqhorh59i/20241225114813D0211FF38607A612BD65-0~tplv-vuqhorh59i-image.image?rk3s=7f9e702d&x-expires=1735184899&x-signature=A1Jay2TWwSsmtwRjDGzK71gzXpg%3D'], 'long_resolution': 832, 'lora_map': {'animeoutlineV4_16': {'strength_clip': 0.2, 'strength_model': 0.2}, 'null': {'strength_clip': 0.7000000000000001, 'strength_model': 0.7000000000000001}}, 'null_strength_clip': 0.7000000000000001, 'null_strength_model': 0.7000000000000001, 'prompt': '(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,', 'return_url': True, 'scale': 5, 'seed': -1, 'strength': 0.58, 'sub_prompts': ['(masterpiece), (((best quality))),light tone, sunny day, shinne,tyndall effect light， landscape in the movie of Suzume no Tojimari, daytime, meteor, aurora,'], 'sub_req_key': ''}, 'message': 'Success', 'request_id': '20241225114813D0211FF38607A612BD65', 'status': 10000, 'time_elapsed': '6.527672506s'}
+    if response_data["status"] == 10000:
+        image_base = response_data["data"].get("binary_data_base64", [])
+        image_urls = response_data["data"].get("image_urls", [''])
+        request_id = response_data["request_id"]
+        if len(image_base) == 1:
+            image_decode = base64.b64decode(image_base[0])
+            if data_folder:
+                # 将解码后的数据转换为图片
+                file_path = f"{data_folder}/{request_id}.jpg"
+                img = Image.open(io.BytesIO(image_decode))
+                img.save(file_path)
+                return file_path, {"urls": image_urls, 'id': request_id}
+            return image_decode, {"urls": image_urls, 'id': request_id}
+        return None, {"urls": image_urls, 'id': request_id}
+    return None, response_data
 
 
 async def ark_drawing_picture(image_data, image_urls: list[str], whitening: float = 1.0, dermabrasion: float = 1.2,
@@ -300,20 +301,20 @@ async def ark_drawing_picture(image_data, image_urls: list[str], whitening: floa
                                      timenow=None)
 
     # print(headers,request_body)
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, json=request_body, headers=headers)
-        if response.status_code != 200:
-            return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-        response.raise_for_status()
-        response_data = response.json()
-        if response_data["status"] == 10000:
-            image_base = response_data["data"].get("binary_data_base64", [])
-            image_urls = response_data["data"].get("image_urls", [''])
-            if len(image_base) == 1:
-                image_decode = base64.b64decode(image_base[0])
-                return image_decode, {"urls": image_urls, 'id': response_data["request_id"]}
-            return None, {"urls": image_urls, 'id': response_data["request_id"]}
-        return None, response_data
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, json=request_body, headers=headers)
+    if response.status_code != 200:
+        return None, {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+    response.raise_for_status()
+    response_data = response.json()
+    if response_data["status"] == 10000:
+        image_base = response_data["data"].get("binary_data_base64", [])
+        image_urls = response_data["data"].get("image_urls", [''])
+        if len(image_base) == 1:
+            image_decode = base64.b64decode(image_base[0])
+            return image_decode, {"urls": image_urls, 'id': response_data["request_id"]}
+        return None, {"urls": image_urls, 'id': response_data["request_id"]}
+    return None, response_data
 
 
 # https://help.aliyun.com/zh/viapi/developer-reference/api-overview?spm=a2c4g.11186623.help-menu-142958.d_4_3_1.13e65733U2m63s
@@ -339,34 +340,34 @@ async def ali_cartoon_picture(image_url, style_name='复古漫画'):
                                               body=request_body, version='2019-09-30')
 
     print(request_body)
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        try:
-            response = await cx.post(url, json=request_body)  # , headers=headers
-            print(response.text)
-            if response.status_code != 200:
-                return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    try:
+        response = await cx.post(url, json=request_body)  # , headers=headers
+        print(response.text)
+        if response.status_code != 200:
+            return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
 
-            response.raise_for_status()
-            response_data = response.json()
-            request_body = {'JobId': response_data["RequestId"]}
+        response.raise_for_status()
+        response_data = response.json()
+        request_body = {'JobId': response_data["RequestId"]}
 
-            parameters, url = get_aliyun_access_token(service="imageenhan", region="cn-shanghai",
-                                                      action='GetAsyncJobResult', http_method="POST",
-                                                      body=request_body, version='2019-09-30')
-            response = await cx.post(url, json=request_body)  # , headers=headers
-            # response_data["Data"].get("ResultUrl")
-            print(response.text)
-            # 图片链接非法，请检查图片链接是否可访问 ,图片链接地域不对，请参考https://help.aliyun.com/document_detail/155645.html - imageUrl is invalid region oss url
-            if response.status_code != 200:
-                return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
-            response_data = response.json()
-            if response_data["Data"]["Status"] == "PROCESS_SUCCESS":
-                image_url = response_data["Data"]["Result"].get("ImageUrls")
-                return {"urls": image_url, 'id': response_data["RequestId"]}
+        parameters, url = get_aliyun_access_token(service="imageenhan", region="cn-shanghai",
+                                                  action='GetAsyncJobResult', http_method="POST",
+                                                  body=request_body, version='2019-09-30')
+        response = await cx.post(url, json=request_body)  # , headers=headers
+        # response_data["Data"].get("ResultUrl")
+        print(response.text)
+        # 图片链接非法，请检查图片链接是否可访问 ,图片链接地域不对，请参考https://help.aliyun.com/document_detail/155645.html - imageUrl is invalid region oss url
+        if response.status_code != 200:
+            return {"error": f"HTTP Error: {response.status_code},\n{response.text}"}
+        response_data = response.json()
+        if response_data["Data"]["Status"] == "PROCESS_SUCCESS":
+            image_url = response_data["Data"]["Result"].get("ImageUrls")
+            return {"urls": image_url, 'id': response_data["RequestId"]}
 
-            return {"error": "PROCESS"}
-        except httpx.ConnectError as e:
-            return {'error': f"Connection error: {e},Request URL: {url},Request body: {request_body}"}
+        return {"error": "PROCESS"}
+    except httpx.ConnectError as e:
+        return {'error': f"Connection error: {e},Request URL: {url},Request body: {request_body}"}
 
 
 # https://cloud.tencent.com/document/product/1668/88066
@@ -446,18 +447,18 @@ async def tencent_drawing_picture(image_data, image_url: str = '', prompt: str =
                                     action=action, timestamp=int(time.time()), region="ap-shanghai",
                                     version='2022-12-29')
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        if response.status_code != 200:
-            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    if response.status_code != 200:
+        return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
 
-        response_data = response.json()["Response"]
-        if return_url:
-            return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
+    response_data = response.json()["Response"]
+    if return_url:
+        return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
 
-        image_decode = base64.b64decode(response_data["ResultImage"])
-        return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
+    image_decode = base64.b64decode(response_data["ResultImage"])
+    return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
 
 
 # https://cloud.tencent.com/document/product/1729/108738
@@ -507,18 +508,18 @@ async def tencent_generate_image(prompt: str = '', negative_prompt: str = '', st
                                     action='TextToImageLite', timestamp=int(time.time()), region="ap-guangzhou",
                                     version='2023-09-01')
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        if response.status_code != 200:
-            return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    if response.status_code != 200:
+        return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
 
-        response_data = response.json()["Response"]
-        if return_url:
-            return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
+    response_data = response.json()["Response"]
+    if return_url:
+        return None, {"urls": [response_data["ResultImage"]], 'id': response_data["RequestId"]}
 
-        image_decode = base64.b64decode(response_data["ResultImage"])
-        return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
+    image_decode = base64.b64decode(response_data["ResultImage"])
+    return image_decode, {"urls": [''], 'id': response_data["RequestId"]}
 
 
 # https://ai.baidu.com/ai-doc/OCR/Ek3h7y961,  https://aip.baidubce.com/rest/2.0/solution/v1/iocr/recognise"
@@ -564,14 +565,14 @@ async def baidu_ocr_recognise(image_data, image_url, ocr_type='accurate_basic'):
     # # 请求分类器的bodys
     # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
     # request_body = "&".join(f"{key}={value}" for key, value in params.items())
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, data=params)
-        response.raise_for_status()
-        data = response.json()
-        for key in ['result', 'results', 'error_msg']:
-            if key in data:
-                return data[key]
-        return data
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, data=params)
+    response.raise_for_status()
+    data = response.json()
+    for key in ['result', 'results', 'error_msg']:
+        if key in data:
+            return data[key]
+    return data
 
 
 # https://cloud.tencent.com/document/product/866/36210
@@ -609,12 +610,12 @@ async def tencent_ocr_recognise(image_data, image_url, ocr_type='GeneralBasicOCR
                                     version='2018-11-19')
 
     # payload = convert_keys_to_pascal_case(params)
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return data["Response"]  # "TextDetections"
+    response = await cx.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    data = response.json()
+    return data["Response"]  # "TextDetections"
 
 
 # https://help.aliyun.com/zh/ocr/developer-reference/api-ocr-api-2021-07-07-dir/?spm=a2c4g.11186623.help-menu-252763.d_2_2_4.3aba47bauq0U2j
@@ -645,6 +646,7 @@ async def ali_ocr_recognise(image_data, image_url, ocr_type='Advanced'):
         params["body"] = base64.b64encode(image_data)  # quote(image_b64.encode("utf8"))
     if url:
         params["Url"] = image_url
+
     try:
         # if template_sign:
         #     params["templateSign"] = template_sign
@@ -655,12 +657,10 @@ async def ali_ocr_recognise(image_data, image_url, ocr_type='Advanced'):
         # # 请求分类器的bodys
         # classifier_bodys = "access_token=" + access_token + "&classifierId=" + classifier_id + "&image=" + quote(image_b64.encode("utf8"))
         # request_body = "&".join(f"{key}={value}" for key, value in params.items())
-
-        async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-            response = await cx.post(url, headers=headers, json=params)
-            response.raise_for_status()
-            return response.json()
-
+        cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+        response = await cx.post(url, headers=headers, json=params)
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
         print(e)
         # data=params ➔ 发送成表单 (Content-Type: application/x-www-form-urlencoded)
@@ -766,39 +766,39 @@ async def wanx_image_generation(image_urls, style_name="复古漫画",
         #     "n": 1
         # }
     }
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        response = await cx.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        data = response.json()
-        task_id = data["output"]["task_id"]
-        task_status = data["output"]["task_status"]
-        retries = 0
-        # 轮询任务进度
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=body)
+    response.raise_for_status()
+    data = response.json()
+    task_id = data["output"]["task_id"]
+    task_status = data["output"]["task_status"]
+    retries = 0
+    # 轮询任务进度
+    await asyncio.sleep(3)
+    while task_id is not None and retries < max_retries:
+        task_url = f'https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}'
+        task_response = await cx.get(task_url, headers=task_headers)
+        resp = task_response.json()
+        task_status = resp["output"]["task_status"]
+        # "task_status":"PENDING""RUNNING","SUCCEEDED"->"results", "FAILED"->"message"
+        if task_status == 'SUCCEEDED':
+            urls = [item['url'] for item in resp['output'].get('results', []) if 'url' in item]
+            result = {"urls": urls or [resp['output'].get('result_url')], 'id': task_id}
+            if urls:
+                image_response = await cx.get(urls[0])
+                return image_response.content, result
+
+            return None, result
+
+        if task_status == "FAILED":
+            print(resp['output']['message'])
+            break
+
         await asyncio.sleep(3)
-        while task_id is not None and retries < max_retries:
-            task_url = f'https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}'
-            task_response = await cx.get(task_url, headers=task_headers)
-            resp = task_response.json()
-            task_status = resp["output"]["task_status"]
-            # "task_status":"PENDING""RUNNING","SUCCEEDED"->"results", "FAILED"->"message"
-            if task_status == 'SUCCEEDED':
-                urls = [item['url'] for item in resp['output'].get('results', []) if 'url' in item]
-                result = {"urls": urls or [resp['output'].get('result_url')], 'id': task_id}
-                if urls:
-                    image_response = await cx.get(urls[0])
-                    return image_response.content, result
+        retries += 1
 
-                return None, result
-
-            if task_status == "FAILED":
-                print(resp['output']['message'])
-                break
-
-            await asyncio.sleep(3)
-            retries += 1
-
-        return None, {"urls": [], 'id': task_id, 'status': task_status,
-                      'error': "Task did not succeed within the maximum retry limit."}
+    return None, {"urls": [], 'id': task_id, 'status': task_status,
+                  'error': "Task did not succeed within the maximum retry limit."}
 
 
 # https://nls-portal.console.aliyun.com/overview
@@ -834,8 +834,8 @@ async def ali_speech_to_text(audio_data, format='pcm'):
     # http://nls-meta.cn-shanghai.aliyuncs.com/
     # "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
     url = "https://nls-gateway.cn-shanghai.aliyuncs.com/stream/v1/asr"
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, params=params, data=audio_data.getvalue())
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, params=params, data=audio_data.getvalue())
 
     result = response.json()
     if result.get("status") == 20000000:  # "SUCCESS":
@@ -857,9 +857,8 @@ async def baidu_speech_to_text(audio_data, format='pcm', dev_pid=1536):  #: io.B
     url = f"{url}?dev_pid={dev_pid}&cuid={Config.DEVICE_ID}&token={access_token}"
     headers = {'Content-Type': f'audio/{format}; rate=16000'}
 
-    async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-        response = await client.post(url, headers=headers, data=audio_data.getvalue())
-
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, data=audio_data.getvalue())
     result = response.json()
     if result.get("err_no") == 0:
         return {"text": result.get("result")[0]}
@@ -894,18 +893,18 @@ async def dashscope_speech_to_text_url(file_urls, model='paraformer-v1', languag
     transcription_texts = []
     for r in transcribe_response.output["results"]:
         if r["subtask_status"] == "SUCCEEDED":
-            async with httpx.AsyncClient(timeout=Config.HTTP_TIMEOUT_SEC) as client:
-                response = await client.get(r["transcription_url"])
-                if response.status_code == 200:
-                    transcription_data = response.json()
-                    if len(transcription_data["transcripts"]) > 0:
-                        transcription_texts.append({"file_url": transcription_data["file_url"],
-                                                    "transcripts": transcription_data["transcripts"][0]['text']
-                                                    })  # transcription_data["transcripts"][0]["sentences"][0]["text"]
-                    else:
-                        print(f"No transcription text found in the response.Transcription Result: {response.text}")
+            cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+            response = await cx.get(r["transcription_url"])
+            if response.status_code == 200:
+                transcription_data = response.json()
+                if len(transcription_data["transcripts"]) > 0:
+                    transcription_texts.append({"file_url": transcription_data["file_url"],
+                                                "transcripts": transcription_data["transcripts"][0]['text']
+                                                })  # transcription_data["transcripts"][0]["sentences"][0]["text"]
                 else:
-                    print(f"Failed to fetch transcription. Status code: {response.status_code}")
+                    print(f"No transcription text found in the response.Transcription Result: {response.text}")
+            else:
+                print(f"Failed to fetch transcription. Status code: {response.status_code}")
         else:
             print(f"Subtask status: {r['subtask_status']}")
 

@@ -1,15 +1,15 @@
 from pydantic import BaseModel, Field, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from abc import ABC, abstractmethod
-from enum import Enum as PyEnum
-from enum import IntEnum
+from enum import IntEnum, Enum
 from dataclasses import asdict, dataclass, is_dataclass, field
-import random, time, asyncio
+from datetime import datetime
+import random, time, asyncio, json
 
-KB = 1 << 10
-MB = 1 << 20
-GB = 1 << 30
-T = 1e12
+_KB = 1 << 10
+_MB = 1 << 20
+_GB = 1 << 30
+_T = 1e12
 SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
 
 
@@ -43,18 +43,32 @@ class BaseTool(ABC, BaseModel):
 
 def dataclass2dict(data):
     """
-    dataclass / 对象转 dict,适合要拿去做序列化、日志打印、数据库写入等场景
-    :param data:
-    :return:
+    通用的递归转换函数，支持 dataclass、BaseModel、Enum、datetime、列表、字典等嵌套结构。serialize
     """
 
-    def enum_dict_factory(inputs):
-        return {key: (value.value if isinstance(value, IntEnum) else value) for key, value in inputs}
+    def convert(obj):
+        if isinstance(obj, Enum):
+            return obj.value
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, BaseModel):
+            return obj.model_dump()
+        elif is_dataclass(obj):
+            return {k: convert(v) for k, v in asdict(obj).items()}
+        elif isinstance(obj, dict):
+            return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            return [convert(v) for v in obj]  # list(obj)
+        elif hasattr(obj, "__dict__"):
+            return {k: convert(v) for k, v in vars(obj).items() if not k.startswith("_")}
+        elif hasattr(obj, "model_dump") and callable(obj.model_dump):  # 兼容 Pydantic v2 的 BaseMode
+            return obj.model_dump()
+        elif hasattr(obj, "dict") and callable(obj.dict):  # 兼容 Pydantic v1 或其他自定义对象实现的 .dict() 方法
+            return obj.dict()
+        else:
+            return obj
 
-    if is_dataclass(data):
-        return asdict(data, dict_factory=enum_dict_factory)
-    else:
-        return data.__dict__
+    return convert(data)
 
 
 def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -> Dict[str, str]:
@@ -76,12 +90,10 @@ def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -
     if isinstance(variables, BaseModel):
         return variables.dict()
     if is_dataclass(variables):
-        return asdict(variables)
+        return dataclass2dict(variables)
     if isinstance(variables, dict):
         return variables
-    raise ValueError(
-        'Unsupported variables type. Must be a dict, BaseModel, or '
-        'dataclass.')
+    raise ValueError('Unsupported variables type.')
 
 
 class GeneratorWithReturn:
@@ -108,6 +120,7 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None  # 可以包含 a-z、A-Z、0-9 和下划线，最大长度为 64 个字符
 
     @model_validator(mode="before")
+    @classmethod
     def set_default_name(cls, values):
         values["name"] = values.get("name", "") or ""
         role = values.get("role")
@@ -192,11 +205,59 @@ MODEL_LIST = ModelListExtract()
 class OpenAIRequest(BaseModel):
     # model: Literal[*tuple(MODEL_LIST.models)]
     model: Annotated[str, lambda v: MODEL_LIST.contains(v)]
+    prompt: Optional[Union[str, List[str]]] = None
+    suffix: Optional[str] = None
+    temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[conint(ge=1)] = 512
+    stream: Optional[bool] = False
+    store: Optional[bool] = False
+
+    tools: Optional[List[dict]] = None  # 工具参数,在生成过程中调用外部工具
+    stop: Optional[Union[str, List[str]]] = None  # 停止词，用于控制生成的停止条件 ["\n"],
+    presence_penalty: Optional[float] = 0.0  # 避免生成重复内容 condecimal(ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = 0.0  # 避免过于频繁的内容 condecimal(ge=-2.0, le=2.0)
+    logit_bias: Optional[Dict[int, float]] = None  # 特定 token 的偏置
+    logprobs: Optional[int] = None
+    user: Optional[str] = None  # 用户标识符,最终用户的唯一标识符
+
+    prediction: Optional[dict] = None  # 预测输出,减少模型响应的延迟
+    stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
+    extra_body: Optional[dict] = None
+    extra_query: Optional[Dict[str, Any]] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model": "silicon:Qwen/Qwen2.5-Coder-7B-Instruct",
+                "prompt": "User:你好,有问题要问你; Assistant:好的; User:请问1到100的和怎么计算?",
+                "suffix": "Assistant:",
+                "temperature": 1,
+                "user": 'test:test',
+                "top_p": 1,
+                "max_tokens": 512,
+                "stream": False,
+                # "stop": '\n\n',
+                # "extra_body": {"enable_thinking": False}
+            }
+        }
+
+    @classmethod
+    @field_validator("model")
+    def validate_model(cls, value):
+        if not MODEL_LIST.contains(value):
+            raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
+        return value
+
+
+class OpenAIRequestMessage(BaseModel):
+    # model: Literal[*tuple(MODEL_LIST.models)]
+    model: Annotated[str, lambda v: MODEL_LIST.contains(v)]
     messages: List[ChatMessage]
     temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
     top_p: Optional[float] = 1.0
     max_tokens: Optional[conint(ge=1)] = 512
-    stream: Optional[bool] = True
+    stream: Optional[bool] = False
     store: Optional[bool] = False
 
     tools: Optional[List[dict]] = None  # 工具参数,在生成过程中调用外部工具
@@ -212,6 +273,7 @@ class OpenAIRequest(BaseModel):
     prediction: Optional[dict] = None  # 预测输出,减少模型响应的延迟
     stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
     extra_body: Optional[dict] = None
+    extra_query: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, str]] = None
 
     # file =
@@ -235,7 +297,7 @@ class OpenAIRequest(BaseModel):
                     }
                 ],
                 "temperature": 1,
-                "user": 'test:robot',
+                "user": 'test:test',
                 "top_p": 1,
                 "max_tokens": 512,
                 "stream": False,
@@ -246,8 +308,6 @@ class OpenAIRequest(BaseModel):
     @classmethod
     @field_validator("model")
     def validate_model(cls, value):
-        if value == 'gpt-4o-mini':
-            return 'qwen-turbo'
         if not MODEL_LIST.contains(value):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
         return value
@@ -415,7 +475,7 @@ class FuzzyMatchRequest(BaseModel):
     method: str = 'levenshtein'
 
 
-class PlatformEnum(str, PyEnum):
+class PlatformEnum(str, Enum):
     baidu = "baidu"
     ali = "ali"
     dashscope = "dashscope"
@@ -424,6 +484,7 @@ class PlatformEnum(str, PyEnum):
 class ToolRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = Field(None)
     tools: Optional[List[Any]] = Field(None)
+    user: Optional[str] = Field(default=None)
     prompt: Optional[str] = Field(default=None)
     model_name: Optional[str] = 'qwen:qwen-max'
     model_metadata: str = 'qwen:qwen-coder-plus'
@@ -447,6 +508,7 @@ class ToolRequest(BaseModel):
                 ],
                 "tools": [],
                 "prompt": '',
+                "user": '',
                 "model_name": "qwen:qwen-max",
                 "model_metadata": "qwen:qwen-coder-plus",
                 "model_id": -1,
@@ -463,7 +525,7 @@ class ToolRequest(BaseModel):
             return [t for t in values if isinstance(t, dict) and t]
 
 
-class AssistantToolsEnum(str, PyEnum):
+class AssistantToolsEnum(str, Enum):
     code = "code_interpreter"
     web = "web_search"
     function = "function_calling"
@@ -478,103 +540,6 @@ class AssistantRequest(BaseModel):
 
     class Config:
         protected_namespaces = ()
-
-
-class TaskStatus(PyEnum):
-    PENDING = "pending"  # 等待条件满足
-    READY = "ready"  # 条件满足，可以执行
-    IN_PROGRESS = "running"  # processing
-
-    COMPLETED = "done"
-    FAILED = "failed"
-    RECEIVED = "received"
-
-
-@dataclass
-class TaskNode:
-    name: str  # task_id
-    description: str
-    action: Optional[str] = None  # 任务的执行逻辑（可调用对象函数、脚本或引用的操作类型)
-    event: Any = None  # 事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据
-
-    status: TaskStatus = TaskStatus.PENDING
-    priority: int = 10
-    data: Any = field(default_factory=dict)
-    start_time: float = field(default_factory=time.time)
-    end_time: float = 0
-    result: Any = field(default_factory=list)
-
-
-class TaskManager:
-    Task_queue: dict[str, TaskNode] = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
-    Task_lock = asyncio.Lock()
-
-    @classmethod
-    async def add_task(cls, task_id: str, task: TaskNode):
-        async with cls.Task_lock:
-            cls.Task_queue[task_id] = task
-
-    @classmethod
-    async def remove_task(cls, task_id: str):
-        async with cls.Task_lock:
-            cls.Task_queue.pop(task_id, None)
-
-    @classmethod
-    async def get_task(cls, task_id: str):
-        async with cls.Task_lock:
-            return cls.Task_queue.get(task_id)
-
-    @classmethod
-    async def get_task_status(cls, task_id: str) -> TaskStatus | None:
-        task = await cls.get_task(task_id)
-        if task:
-            return task.status
-        return None
-
-    @classmethod
-    async def set_task_status(cls, task_id: str, status: TaskStatus):
-        async with cls.Task_lock:
-            task: TaskNode = cls.Task_queue.get(task_id)
-            if task:
-                task.status = status
-            else:
-                print(f"[set_task_status] Task {task_id} not found.")
-
-    @classmethod
-    async def update_task_result(cls, task_id: str, result, status: TaskStatus = TaskStatus.COMPLETED):
-        async with cls.Task_lock:
-            task: TaskNode = cls.Task_queue.get(task_id)
-            if task:
-                task.result = result
-                task.status = status
-                task.end_time = time.time()
-                if task.status in (TaskStatus.COMPLETED, TaskStatus.RECEIVED):
-                    task.data = None
-                elif task.status == TaskStatus.FAILED:
-                    print(f"Task failed: {dataclass2dict(task)}")
-                return task.result
-            else:
-                print(f"[update_task_result] Task {task_id} not found.")
-                return None
-
-    @classmethod
-    async def clean_old_tasks(cls, timeout_received=3600, timeout=86400):
-        current_time = time.time()
-        task_ids_to_delete = []
-
-        for _id, task in cls.Task_queue.items():
-            if task.end_time and (current_time - task.end_time) > timeout_received:
-                if task.status == TaskStatus.RECEIVED:
-                    task_ids_to_delete.append(_id)
-                    print(f"Task {_id} has been marked for cleanup. Status: RECEIVED")
-            elif (current_time - task.start_time) > timeout:
-                task_ids_to_delete.append(_id)
-                print(f"Task {_id} has been marked for cleanup. Timeout exceeded")
-
-        if task_ids_to_delete:
-            async with cls.Task_lock:
-                for _id in task_ids_to_delete:
-                    cls.Task_queue.pop(_id, None)
 
 
 class KeywordItem(BaseModel):
@@ -600,6 +565,20 @@ class CallbackUrl(BaseModel):
         return data
 
 
+class MetadataRequest(BaseModel):
+    function_code: str = Field(..., description="函数源码")
+    user: str = Field(default='test', description="用户ID")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="预设元数据结构")
+    model_name: Optional[str] = Field(default='qwen:qwen-coder-plus', description="使用的大模型名称")
+    description: Optional[str] = Field(default=None, description="函数功能描述")
+    callback: Optional[CallbackUrl] = Field(default=None, description="外部函数调用信息")
+    code_type: Optional[str] = Field(default="Python", description="代码类型")
+    cache_sec: Optional[int] = Field(default=0, description="缓存秒数，0 表示使用默认")
+
+    class Config:
+        protected_namespaces = ()
+
+
 class CompletionResponse(BaseModel):
     answer: Optional[str] = None
     transform: Optional[Any] = None
@@ -615,12 +594,13 @@ class CompletionParams(BaseModel):
 
     prompt: Optional[str] = Field(default=None,
                                   description="The initial system content or prompt used to guide the AI's response.")
-    question: Optional[str] = Field(None, description="The primary question or prompt for the AI to respond to. ")
+    question: Optional[Union[str, List[str]]] = Field(None,
+                                                      description="The primary question or prompt for the AI to respond to. ")
     agent: Optional[str] = Field(default=None,
                                  description="System content identifier. This index represents different scenarios or contexts for AI responses, allowing the selection of different system content.")
     suffix: Optional[str] = Field(None, description="The suffix for the AI to respond to completion. ")
-    extract: Optional[str] = Field(None,
-                                   description="Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
+    extract: Optional[Union[str, List[str]]] = Field(None,
+                                                     description="Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
     callback: Optional[CallbackUrl] = Field(default=None,
                                             description='Callback info: a URL string or a dict with url and optional payload,params,headers')
     model_name: str = Field("moonshot",
@@ -665,10 +645,9 @@ class CompletionParams(BaseModel):
         json_schema_extra = {
             "examples": [
                 {
-                    'prompt': '请解释人工智能的原理。',
-                    "question": "",
+                    'prompt': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
+                    "question": ["请解释人工智能的原理。", "AI是什么啊,可以描述一下吗?"],
                     "agent": "0",
-                    "suffix": "",
                     "stream": False,
                     "temperature": 0.7,
                     "top_p": 0.8,
@@ -686,12 +665,12 @@ class CompletionParams(BaseModel):
                     "callback": None,
                     "model_name": "doubao",
                     "model_id": -1,
-                    "prompt": "",
+                    "prompt": "这是什么啊,可以描述一下吗?。",
                     "agent": "42",
                     "top_p": 0.8,
-                    "question": "这是什么啊,可以描述一下吗?",
+                    "question": "",
                     "keywords": [('web_search', "大象")],  # [("tool_name", {"key": "value"})]
-                    "suffix": "",
+                    "suffix": "这是",
                     "temperature": 0.7,
                     "max_tokens": 4096,
                     "tools": []
@@ -722,7 +701,7 @@ class CompletionParams(BaseModel):
 
 
 class SubmitMessagesRequest(BaseModel):
-    uuid: Optional[str] = None
+    request_id: Optional[str] = None
     name: Optional[str] = None
     user: Optional[str] = None
     robot_id: Optional[str] = None
@@ -743,7 +722,7 @@ class SubmitMessagesRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "uuid": None,
+                "request_id": None,
                 "name": None,
                 "user": "aigc_test",
                 "robot_id": None,
@@ -779,7 +758,7 @@ class SubmitMessagesRequest(BaseModel):
 
 
 class ChatCompletionRequest(CompletionParams):
-    uuid: Optional[str] = None
+    request_id: Optional[str] = None
     name: Optional[str] = None
     user: Optional[str] = None
     robot_id: Optional[str] = None
@@ -803,7 +782,7 @@ class ChatCompletionRequest(CompletionParams):
     class Config:
         json_schema_extra = {
             "example": {
-                "uuid": None,
+                "request_id": None,
                 "name": None,
                 "user": "test",
                 "robot_id": None,

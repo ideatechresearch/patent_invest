@@ -2,7 +2,7 @@ import requests
 import logging
 import json
 import httpx
-import re, hashlib
+import re, hashlib, time
 import asyncio
 
 try:
@@ -126,33 +126,54 @@ class RunMethod:
             # AIGC_HOST= '47.110.156.41'
 
 
-async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
+async def call_http_request(url: str, headers=None, time_out=100.0, **kwargs):
+    """
+    异步调用HTTP请求并返回JSON响应，如果响应不是JSON格式则返回文本内容
+    国内，无代理，可能内容无解析
+    :param url: 请求地址
+    :param headers: 请求头
+    :param time_out: 请求超时时间
+    :param kwargs: 其他传递给 httpx 的参数
+    :return: dict 或 None
+    """
     async with httpx.AsyncClient() as cx:
         try:
-            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)
+            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)  # 请求级别的超时优先级更高
             response.raise_for_status()
-            return response.json()
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type or not content_type:
+                try:
+                    return response.json()
+                except json.JSONDecodeError:
+                    pass
+
+            return {'text': response.text}
         except Exception as e:
             print(e)
             return None
 
 
 def async_to_sync(coro_func, *args, **kwargs):
-    # 如果已经在事件循环中运行（比如 Jupyter），不能直接 run
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            # 若已在事件循环中（如 Jupyter 或 FastAPI），用 create_task + run_until_complete
-            task = asyncio.ensure_future(coro_func(*args, **kwargs))
-            return loop.run_until_complete(task)
-            # while not task.done():
-            #     time.sleep(0.1)
+            # 如果已在事件循环中运行（Jupyter、FastAPI），不能直接 run
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+                return loop.run_until_complete(coro_func(*args, **kwargs))
+            except ImportError:
+                task = asyncio.ensure_future(coro_func(*args, **kwargs))  # 返回 Task，需手动 await
+                while not task.done():
+                    time.sleep(0.05)  # 阻塞直到完成
+                return task.result()
     except RuntimeError:
-        # 无事件循环（普通脚本）
+        # 无事件循环（普通脚本），未在协程内
         return asyncio.run(coro_func(*args, **kwargs))
 
-    # fallback：若 loop 存在但未运行（极少见）
-    return asyncio.get_event_loop().run_until_complete(coro_func(*args, **kwargs))
+    # loop 存在但未运行（极少见）, fallback
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro_func(*args, **kwargs))
 
 
 class Local_Aigc:
@@ -169,7 +190,7 @@ class Local_Aigc:
     _client = None  # httpx.AsyncClient | aiohttp.ClientSession
     _ai_client = None  # local aigc openai client
     _is_openai = False
-    _is_aiohttp = False
+    _is_httpx = False
     _is_sync = False
     _timeout = 100
 
@@ -181,11 +202,11 @@ class Local_Aigc:
         except ImportError:
             self.__class__._is_openai = False
             try:
-                import aiohttp
-                self.__class__._is_aiohttp = True
-            except ImportError:
                 import httpx
-                self.__class__._is_aiohttp = False
+                self.__class__._is_httpx = True
+            except ImportError:
+                import aiohttp
+                self.__class__._is_httpx = False
 
         self.__class__._is_sync = use_sync
         self.__class__._timeout = time_out
@@ -217,17 +238,21 @@ class Local_Aigc:
 
         if cls._client is None:
             if cls._is_sync:
-                cls._client = requests.Session()
+                if cls._is_httpx:
+                    cls._client = httpx.Client(timeout=cls._timeout)  # 底层为 httpcore
+                else:
+                    cls._client = requests.Session()  # 基于 urllib3
             else:
-                if cls._is_aiohttp:
+                if cls._is_httpx:
+                    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+                    timeout = httpx.Timeout(cls._timeout, read=cls._timeout, write=30.0, connect=5.0)
+                    cls._client = httpx.AsyncClient(limits=limits, timeout=timeout)
+                else:
                     connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
                     timeout = aiohttp.ClientTimeout(total=cls._timeout, sock_read=cls._timeout,
                                                     sock_connect=5.0)
                     cls._client = aiohttp.ClientSession(connector=connector, timeout=timeout)
-                else:
-                    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-                    timeout = httpx.Timeout(cls._timeout, read=cls._timeout, write=30.0, connect=5.0)
-                    cls._client = httpx.AsyncClient(limits=limits, timeout=timeout)
+
             # self.semaphore = asyncio.Semaphore(30)
 
         if not any(model['name'] == 'aigc' for model in cls.AI_Models):
@@ -269,12 +294,12 @@ class Local_Aigc:
         if cls._client:
             if cls._is_sync:
                 cls._client.close()
-            elif cls._is_aiohttp:
-                if not cls._client.closed:
-                    await cls._client.close()
-            else:
+            elif cls._is_httpx:
                 if not cls._client.is_closed:
                     await cls._client.aclose()
+            else:
+                if not cls._client.closed:
+                    await cls._client.close()
 
             cls._client = None
         cls._ai_client = None
@@ -286,32 +311,40 @@ class Local_Aigc:
     @classmethod
     async def get_resp(cls, url, headers=None, **kwargs):
         if cls._is_sync:
-            resp = cls._client.get(url, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)  # params=data
+            if cls._is_httpx:
+                resp = cls._client.get(url, headers=headers, **kwargs)  # params=data
+            else:
+                resp = cls._client.get(url, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
             resp.raise_for_status()
             return resp.json()
-        elif cls._is_aiohttp:
-            async with cls._client.get(url, headers=headers or {}, **kwargs) as resp:
-                resp.raise_for_status()
-                return await resp.json()  # await resp.text()
         else:
-            resp = await cls._client.get(url, headers=headers, **kwargs)
-            resp.raise_for_status()  # 如果请求失败，则抛出异常
-            return resp.json()
+            if cls._is_httpx:
+                resp = await cls._client.get(url, headers=headers, **kwargs)
+                resp.raise_for_status()  # 如果请求失败，则抛出异常
+                return resp.json()
+            else:
+                async with cls._client.get(url, headers=headers or {}, **kwargs) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()  # await resp.text()
 
     @classmethod
     async def post_resp(cls, url, json=None, headers=None, **kwargs):
         if cls._is_sync:
-            resp = cls._client.post(url, json=json, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
+            if cls._is_httpx:
+                resp = cls._client.post(url, json=json, headers=headers, **kwargs)
+            else:
+                resp = cls._client.post(url, json=json, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
             resp.raise_for_status()
             return resp.json()
-        elif cls._is_aiohttp:
-            async with cls._client.post(url, json=json, headers=headers or {}, **kwargs) as resp:
-                resp.raise_for_status()
-                return await resp.json()
         else:
-            resp = await cls._client.post(url, json=json, headers=headers, **kwargs)
-            resp.raise_for_status()  # 如果请求失败，则抛出异常
-            return resp.json()
+            if cls._is_httpx:
+                resp = await cls._client.post(url, json=json, headers=headers, **kwargs)
+                resp.raise_for_status()  # 如果请求失败，则抛出异常
+                return resp.json()
+            else:
+                async with cls._client.post(url, json=json, headers=headers or {}, **kwargs) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
 
     @classmethod
     def _fallback_post(cls, url, json_payload, headers=None, stream=False):
@@ -341,7 +374,8 @@ class Local_Aigc:
 
     @classmethod
     async def get_chat_payload(cls, messages: list[dict] = None, user_request: str = '', user: str = USER_ID,
-                               system: str = '', temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 2048,
+                               user_name: str = None, system: str = '',
+                               temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 2048,
                                model='moonshot', model_id=0, images: list = None):
 
         model_info, name = cls.find_model(model, model_id)
@@ -374,7 +408,8 @@ class Local_Aigc:
         if images:  # 图片内容理解,(str, list[dict[str, str | Any]]))
             messages[-1]['content'] = [{"type": "text", "text": user_request}]  # text-prompt 请详细描述一下这几张图片。这是哪里？
             messages[-1]['content'] += [{"type": "image_url", "image_url": {"url": image}} for image in images]
-
+        if user_name:
+            messages[-1]['name'] = user_name
         # print(messages)
         payload = dict(
             model=name,  # 默认选择第一个模型
@@ -461,6 +496,46 @@ class Local_Aigc:
                 "error": str(e),
                 "status": "failed"
             }
+
+    @classmethod
+    async def chat_run(cls, rows: list, system: str, model="qwen:qwen3-32b", max_concurrent: int = 100,
+                       max_tries: int = 3, **kwargs) -> list:
+        """
+        异步并发分类任务执行器。
+
+        每条 row 可以是 dict（自动格式化为 key,value 拼接）或 str（直接作为 prompt），
+        system prompt 通用传入，适用于 prompt 已在外部构造的情形。
+        """
+
+        def format_user_request(row):
+            if isinstance(row, dict):
+                return '|'.join(
+                    f"{k}:{v.strip() if isinstance(v, str) else v}" for k, v in row.items() if v is not None)
+            return str(row)
+
+        async def limited_run(semaphore, row):
+            async with semaphore:
+                for attempt in range(1, max_tries + 1):
+                    result = await cls.ai_chat(model=model, system=system, user_request=format_user_request(row),
+                                               **kwargs)
+                    if isinstance(result, dict):
+                        content = result.get('choices', [{}])[0].get('message', {}).get('content')
+                    else:
+                        content = str(result) if result is not None else ''
+
+                    if 'Error code: 429' in content or 'error' in content.lower():
+                        print(f"[重试] 第 {attempt} 次失败，内容: {content}")
+                        await asyncio.sleep(2 * attempt)
+                        continue
+
+                    return result
+
+                print("error: Failed after tries", f"row: {row}")
+                return result
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+        tasks = [limited_run(semaphore, row) for row in rows]
+        return await asyncio.gather(*tasks)
 
     @classmethod
     def chat(cls, **kwargs) -> str | dict:
@@ -995,11 +1070,28 @@ def generate_hash_key(*args, **kwargs):
     return hashlib.md5(joined_key.encode()).hexdigest()
 
 
+def map_fields(data: dict, mapping: dict) -> dict:
+    def translate_key(prefix, key):
+        full_key = f"{prefix}.{key}" if prefix else key
+        return mapping.get(full_key, mapping.get(key, key))
+
+    def recursive_map(obj, prefix=""):
+        if isinstance(obj, dict):
+            return {translate_key(prefix, k): recursive_map(v, f"{prefix}.{k}" if prefix else k)
+                    for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [recursive_map(item, prefix) for item in obj]
+        else:
+            return obj
+
+    return recursive_map(data)
+
+
 if __name__ == '__main__':
     import nest_asyncio
 
     nest_asyncio.apply()
-    AIGC_HOST = '***.***.***.***'  # 替换为实际的 AIGC 服务地址
+    AIGC_HOST = '47.110.156.41'
 
 
     async def main():
@@ -1009,7 +1101,7 @@ if __name__ == '__main__':
         async with Local_Aigc(host=AIGC_HOST) as client:
             print(await client.ai_chat(model="qwen:qwq-plus", user_request="你好"))
 
-        config = Local_Aigc(host=AIGC_HOST, use_sync=True)
+        config = Local_Aigc(host=AIGC_HOST, use_sync=False)
         try:
             res = await Local_Aigc.ai_chat(model='moonshot:moonshot-v1-8k', user_request='你好')
             print(res)
@@ -1023,7 +1115,7 @@ if __name__ == '__main__':
 
     asyncio.run(main())
 
-    Local_Aigc(host=AIGC_HOST, time_out=300)
+    Local_Aigc(host=AIGC_HOST, time_out=300, use_sync=True)
 
     print(Local_Aigc.chat(model='qwen:qwq-plus', user_request='你好啊，谢谢你'))
 

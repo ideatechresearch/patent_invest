@@ -1,6 +1,6 @@
-import re, json, io, os, sys, threading, time, pickle, struct
+import re, json, io, os, sys, threading, platform, time, pickle, struct
 import httpx, aiohttp, aiofiles, asyncio, joblib
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 import inspect, importlib, ast, requests
 from itertools import groupby
 import yaml
@@ -9,20 +9,37 @@ from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
 from functools import partial, wraps  # cache, lru_cache, partial, wraps
-from collections import OrderedDict, Counter, deque
 import numpy as np
 from enum import Enum
-import math
 import base64
+from typing import Union, get_origin, get_args
+
 from pypinyin import lazy_pinyin
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from langdetect import detect, detect_langs
-import jieba
+
+_tokenizer_cache = {}
 
 
-# import tiktoken
-# tokenizer = tiktoken.encoding_for_model("gpt-3.5-turbo")
+def get_tokenizer(model_name: str = "gpt-3.5-turbo"):
+    if not model_name:
+        return None
+    if model_name in _tokenizer_cache:
+        return _tokenizer_cache[model_name]
+
+    try:
+        import tiktoken
+        tokenizer = tiktoken.encoding_for_model(model_name)
+        _tokenizer_cache[model_name] = tokenizer
+        return tokenizer
+    except ImportError:
+        print("[Tokenizer Init] tiktoken not installed.")
+    except Exception as e:
+        print(f"[Tokenizer Init] Failed to get tokenizer for model '{model_name}': {e}")
+
+    return None
+
 
 def get_function_parameters(func):
     signature = inspect.signature(func)
@@ -59,6 +76,7 @@ def convert_keys_to_lower_case(d):
 
 
 def serialize(obj):
+    '''将复杂对象（包括自定义类、Pydantic模型、Enum等）递归转换为 可序列化的Python原生数据结构（dict/list/primitive types）'''
     if isinstance(obj, Enum):  # 处理 Enum 类型
         return obj.value
     elif hasattr(obj, "dict"):  # 处理 Pydantic 模型
@@ -71,6 +89,40 @@ def serialize(obj):
         return {key: serialize(value) for key, value in obj.items()}
     else:
         return obj  # asdict
+
+
+def map_fields(data: dict, mapping: dict) -> dict:
+    '''递归遍历字典，根据提供的映射规则修改键名'''
+
+    def translate_key(prefix, key):
+        full_key = f"{prefix}.{key}" if prefix else key
+        return mapping.get(full_key, mapping.get(key, key))
+
+    def recursive_map(obj, prefix=""):
+        if isinstance(obj, dict):
+            return {translate_key(prefix, k): recursive_map(v, f"{prefix}.{k}" if prefix else k)
+                    for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [recursive_map(item, prefix) for item in obj]
+        else:
+            return obj
+
+    return recursive_map(data)
+
+
+def slice_json(data, prefix=''):
+    '''将嵌套结构完全展开为扁平字典（键变为路径字符串）'''
+    slices = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            slices.update(slice_json(value, f"{prefix}{key}."))
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            slices.update(slice_json(item, f"{prefix}{i}."))
+    else:
+        slices[prefix[:-1]] = data
+
+    return slices
 
 
 def extract_json_str(json_code: str) -> str:
@@ -125,7 +177,13 @@ def extract_method_calls(text):
 
 
 def execute_code_results(text):
-    """执行给定文本中的所有Python代码块，并返回每个代码块的输出、命名空间和错误信息。需要包含Python代码块的文本。"""
+    """
+    执行给定文本中的所有Python代码块，并返回每个代码块的输出、命名空间和错误信息。需要包含Python代码块的文本。
+    仅用于已知安全的本地代码块执行。不要用于下载、安装或系统级操作。
+    仅限本地已经有的或明确指出的，仅限本地环境、只读、无外部依赖的代码块。不支持 pip 安装、系统命令（如 cd、git、curl 等）。仅当已知代码可信且执行环境支持时调用。
+    :param text:包含一个或多个 Python 代码块的纯文本内容。支持 Markdown 风格的 ```python ``` 格式。
+    :return:运行结果
+    """
     code_blocks = extract_python_code(text)
     results = []
     global_namespace = globals()  # 引用全局命名空间 {"__builtins__": dict(__builtins__)}
@@ -154,16 +212,73 @@ def execute_code_results(text):
     return results
 
 
-def pip_install(*args):
-    import subprocess  # nosec
-    # import platform
-    cli_args = []
-    for arg in args:
-        cli_args.extend(str(arg).split(" "))  # export_command.split(" "),
+def safe_eval_call(func_name: str, func_args: dict):
+    allowed_names = {
+        **globals(), **locals(),
+        "__builtins__": {"str": str, "int": int, "float": float, "list": list, "dict": dict}
+    }
+    if func_name not in allowed_names:
+        raise ValueError(f"不允许动态调用函数：{func_name}")
+    # compile(code, '<string>', 'eval')
+    # eval(expression, globals=None, locals=None) 执行单个表达式,动态计算简单的表达式或从字符串中解析值
+    return eval(f'{func_name}(**{func_args})', allowed_names)
 
-    subprocess.run([sys.executable, "-m", "pip", "install", *cli_args],
-                   # shell=(platform.system() == "Windows"),
-                   check=True)
+
+def pip_installed_list():
+    # from importlib.metadata import distributions
+    # return sorted(
+    #     [{"name": d.metadata["Name"], "version": d.version} for d in distributions()],
+    #     key=lambda x: x["name"].lower()
+    # )
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "list", "--format=json"],
+        capture_output=True, text=True, check=True
+    )
+    return json.loads(result.stdout)
+
+
+def pip_install(*packages, index_url="https://pypi.tuna.tsinghua.edu.cn/simple"):
+    """
+    安装 pip 包（支持空格/逗号分隔的多个包），并尝试 import。
+
+    示例：
+    pip_install("pandas")
+    pip_install("pandas scikit-learn")
+    pip_install("numpy", "matplotlib==3.7.1")
+    """
+    import subprocess  # nosec
+    pkg_list = []
+    for p in packages:
+        # 拆分支持空格、逗号等格式
+        if isinstance(p, str):
+            parts = p.replace(",", " ").split()
+            pkg_list.extend(parts)
+        else:
+            pkg_list.append(str(p))
+
+    try:
+        print(f"正在安装: {pkg_list}")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-i", index_url, *pkg_list],
+                       # shell=(platform.system() == "Windows"),
+                       check=True)
+    except subprocess.CalledProcessError as e:
+        print("❌ 安装失败:", str(e))
+        return {"error": str(e), "installed": pkg_list}
+
+    return pkg_list
+
+
+def import_packages(pkg_list):
+    success_imports = []
+    for pkg in pkg_list:
+        try:
+            mod_name = pkg.split("==")[0].split(">")[0].split("<")[0]
+            importlib.import_module(mod_name)
+            success_imports.append(mod_name)
+        except Exception as e:
+            print(f"⚠️ 无法自动导入 {pkg}: {e}")
+    return success_imports
 
 
 def git_repo_clone(repo_url: str, revision: str = None, add_to_sys_path: bool = True) -> Path:
@@ -260,6 +375,87 @@ def download_by_requests(url: str, save_path, chunk_size=4096, in_decode=False):
         return response.text if in_decode else response.content  # 直接获取文本,同步直接返回全部内容
 
 
+async def backup_to_webdev(file_path: str | Path, api_url: str, api_key: str = None,
+                           username: str = None, password: str = None, metadata: dict = None,
+                           timeout: float = 60.0, max_retries: int = 3, retry_delay: float = 2.0):
+    """
+    异步将本地文件备份到 WebDev 服务的 API，支持 API Key 或 Basic Auth 鉴权
+    """
+    # 转换路径对象并验证文件存在
+    file_path = Path(file_path)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"备份文件不存在: {file_path}")
+
+    # 准备请求头
+    headers = {
+        "User-Agent": "WebDevBackup/1.0",
+        "X-Backup-Source": "backup-client-script"
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    auth = aiohttp.BasicAuth(login=username, password=password) if username and password else None
+
+    # 重试机制
+    for attempt in range(max_retries + 1):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=headers,
+                                             auth=auth) as session:
+
+                async with aiofiles.open(file_path, "rb") as f:
+                    file_content = await f.read()
+
+                form = aiohttp.FormData()
+                if metadata:
+                    form.add_field("metadata", json.dumps(metadata), content_type="application/json")
+
+                form.add_field(name="backup_file", value=file_content,
+                               filename=file_path.name, content_type="application/octet-stream")
+
+                async with session.post(url=api_url, data=form) as response:
+                    # 检查HTTP状态
+                    if response.status != 200:
+                        error_text = await response.text()
+                        print(f"API返回错误状态: {response.status} - {error_text}")
+                        raise aiohttp.ClientResponseError(
+                            request_info=response.request_info,
+                            history=response.history,
+                            status=response.status,
+                            message=f"API错误: {error_text[:200]}"
+                        )
+
+                    # 解析JSON响应
+                    try:
+                        result = await response.json()
+                    except json.JSONDecodeError:
+                        error_text = await response.text()
+                        raise ValueError(f"无效的JSON响应: {error_text[:200]}")
+
+                    # 验证业务逻辑成功
+                    if not result.get("success"):
+                        error_msg = result.get("error", "未知API错误")
+                        raise ValueError(f"API业务错误: {error_msg}")
+
+                    # 获取备份ID
+                    backup_id = result.get("backup_id")
+                    if not backup_id:
+                        raise ValueError("响应中缺少backup_id字段")
+
+                    print(f"备份成功！文件ID: {backup_id}, 大小: {result.get('size')}字节")
+                    return backup_id
+
+        except (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError) as e:
+            if attempt < max_retries:
+                print(f"网络错误 ({str(e)}), 尝试 {attempt + 1}/{max_retries}...")
+                await asyncio.sleep(retry_delay * (attempt + 1))
+            else:
+                raise ConnectionError(f"网络连接失败: {str(e)}") from e
+
+        except aiohttp.ClientError as e:
+            raise ConnectionError(f"HTTP客户端错误: {str(e)}") from e
+
+    return None
+
+
 async def upload_by_httpx(url: str, files_path=('example.txt', b'Hello World')):
     files = {'file': files_path}
     async with httpx.AsyncClient() as client:
@@ -305,61 +501,46 @@ def load_models(model_names: list, model_dir='data/models/'):
     return models
 
 
+def save_dictjson(dictionary, file_path, encoding='utf-8', ascii=False):
+    with open(file_path, 'w', encoding=encoding) as file:
+        json.dump(dictionary, file, ensure_ascii=ascii)
+
+
+def load_dictjson(file_path, encoding='utf-8'):
+    with open(file_path, 'r', encoding=encoding) as file:
+        dictionary = json.load(file)
+    return dictionary
+
+
 def load_datasets(path):
     samples = []
     with open(path, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
-            data = json.loads(line.strip())
-            samples.append(data)
+            samples.append(json.loads(line.strip()))
     return samples
 
 
-_httpx_clients: dict[str, httpx.AsyncClient] = {}
-
-
-def get_httpx_client(time_out: float = 100.0, proxy: str = None) -> httpx.AsyncClient:
-    # Depends
-    key = proxy or "default"
-    global _httpx_clients
-    if key not in _httpx_clients or _httpx_clients[key].is_closed:
-        transport = httpx.AsyncHTTPTransport(proxy=proxy or None)
-        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-        timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
-        _httpx_clients[key] = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
-    return _httpx_clients[key]
-
-
-async def shutdown_httpx():
-    for key, _client in _httpx_clients.items():
-        if _client and not _client.is_closed:
-            await _client.aclose()
-
-
-# # @asynccontextmanager
-# async def get_httpx_client_ones(time_out=100.0, proxy=None):
-#     transport = httpx.AsyncHTTPTransport(proxy=proxy)
-#     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-#     timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
-#     async with httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout) as cx:
-#         yield cx
-
-
-async def call_http_request(url, headers=None, time_out=100.0, **kwargs):
+async def call_http_request(url: str, headers=None, time_out=100.0, **kwargs):
     """
     异步调用HTTP请求并返回JSON响应，如果响应不是JSON格式则返回文本内容
     国内，无代理，可能内容无解析
-    :param url:
-    :param headers:
-    :param time_out:
-    :param kwargs:
-    :return:
+    :param url: 请求地址
+    :param headers: 请求头
+    :param time_out: 请求超时时间
+    :param kwargs: 其他传递给 httpx 的参数
+    :return: dict 或 None
     """
     async with httpx.AsyncClient() as cx:
         try:
-            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)
+            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)  # 请求级别的超时优先级更高
             response.raise_for_status()
-            return response.json()
-        except json.JSONDecodeError as e:
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type or not content_type:
+                try:
+                    return response.json()
+                except json.JSONDecodeError:
+                    pass
+
             return {'text': response.text}
         except Exception as e:
             print(e)
@@ -549,7 +730,29 @@ def remove_function_decorators(func):
     # textwrap.dedent(source)  # 处理缩进
 
 
-def extract_function_metadata(code, r=None):
+def python_type_to_json_schema_type(python_type):
+    origin = get_origin(python_type) or python_type
+
+    # 处理 Union/Optional
+    if origin is Union:
+        args = [a for a in get_args(python_type) if a is not type(None)]
+        if len(args) == 1:
+            return python_type_to_json_schema_type(args[0])
+        else:
+            return "string"  # fallback for complex Unions
+
+    mapping = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+    }
+    return mapping.get(origin, "string")
+
+
+def extract_function_metadatas(code):
     # 用于解析Python函数并提取元数据,从源代码级别提取详细的代码信息
     # 使用AST来解析Python代码,将 Python 源代码（字符串形式）转换为抽象语法树（AST）
     tree = ast.parse(code)
@@ -572,11 +775,52 @@ def extract_function_metadata(code, r=None):
                 'code': function_code
             }
             functions.append(metadata)
-            if r:
-                key = f"function:{function_name}"  # 用函数名作为Redis的键
-                r.set(key, str(metadata))  # 存储为JSON格式
 
     return functions
+
+
+def extract_function_metadata(func) -> dict:
+    # 获取函数的名称、参数以及docstring
+    func_name = func.__name__
+    # print(f"[tools] 未找到缓存: {func_name},生成 metadata")
+    # 获取函数参数列表
+    signature = inspect.signature(func)
+    docstring = func.__doc__
+
+    parameters = {}
+    required_params = []
+
+    for param_name, param in signature.parameters.items():
+        param_type = param.annotation if param.annotation != inspect.Parameter.empty else str
+        json_type = python_type_to_json_schema_type(param_type)
+        # 如果有类型提示，推断参数类型str(param.annotation).replace("<class '", "").replace("'>", "")
+        param_info = {
+            "type": json_type,
+            "description": f"Description of the {param_name} parameter."
+        }
+
+        if param.default == inspect.Parameter.empty:
+            required_params.append(param_name)
+        else:
+            param_info["default"] = param.default
+        parameters[param_name] = param_info
+
+    # 初始metadata结构
+    metadata = {
+        "type": "function",
+        "function": {
+            "name": func_name,
+            "description": docstring or "No description available.",
+            "parameters": {
+                "type": "object",
+                "properties": parameters,
+                "required": required_params
+            },
+            # "x-url":工具的实际 API 地址
+        },
+        # "func": func,
+    }
+    return metadata
 
 
 def extract_sql_code(text):
@@ -849,6 +1093,34 @@ def extract_headers(text):
     return [{'level': len(header[0]), 'text': header[1]} for header in headers]
 
 
+def is_url(url: str) -> bool:
+    """更准确地判断是否为URL"""
+    # url.startswith("http://") or url.startswith("https://")
+    parsed = urlparse(url)
+    # return all([parsed.scheme, parsed.netloc])
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+class Url:
+    def __init__(this, host, path, schema):
+        this.host = host
+        this.path = path
+        this.schema = schema
+        pass
+
+
+def parse_url(requset_url):
+    stidx = requset_url.index("://")
+    host = requset_url[stidx + 3:]
+    schema = requset_url[:stidx + 3]
+    edidx = host.index("/")
+    if edidx <= 0:
+        raise Exception("invalid request url:" + requset_url)
+    path = host[edidx:]
+    host = host[:edidx]
+    return Url(host, path, schema)
+
+
 def extract_links(text):
     # 提取 Markdown 格式的链接 [链接文字](链接地址)
     pattern = r'\[([^\]]+)\]\((https?://[^\s)]+)\)'
@@ -859,7 +1131,7 @@ def extract_links(text):
 def extract_text_urls(text):
     # 提取所有 http(s) URL
     urls = re.findall(r'https?://[^\s)]+', text)
-    return set(urls)
+    return list(set(urls))
 
 
 def extract_bold(text):
@@ -930,7 +1202,7 @@ def extract_tagged_split(text, tag="think"):
         output_content = match.group(2).strip()  # 提取最终输出内容
         return [think_content, output_content]
 
-    return [None, text]  # .split("</think>")[-1]
+    return [None, text]
 
 
 def qwen3_think_index(output_ids):
@@ -1002,7 +1274,7 @@ def remove_markdown(text):
 
 
 def format_for_wechat(text):
-    formatted_text = extract_tagged_split(text, tag="think")[1]  # text
+    formatted_text = text.split("</think>")[-1]  # text:extract_tagged_split(text, tag="think")[1]
     formatted_text = re.sub(r'\*\*(.*?)\*\*', r'✦\1✦', formatted_text)  # **粗体** 转换为 ✦粗体✦样式
     formatted_text = re.sub(r'!!(.*?)!!', r'❗\1❗', formatted_text)  # !!高亮!! 转换为 ❗符号包围
     # formatted_text = re.sub(r'__(.*?)__', r'※\1※', formatted_text)  # __斜体__ 转换为星号包围的样式
@@ -1011,8 +1283,8 @@ def format_for_wechat(text):
     formatted_text = re.sub(r'######\s+(.*?)(\n|$)', r'[\1]\n', formatted_text)  # ###### 六级标题
     formatted_text = re.sub(r'#####\s+(.*?)(\n|$)', r'《\1》\n', formatted_text)  # ##### 五级标题
     formatted_text = re.sub(r'####\s+(.*?)(\n|$)', r'【\1】\n', formatted_text)  # #### 标题转换
-    formatted_text = re.sub(r'###\s+(.*?)(\n|$)', r'— \1 —\n', formatted_text)  # ### 三级标题
-    formatted_text = re.sub(r'##\s+(.*?)(\n|$)', r'—— \1 ——\n', formatted_text)  # ## 二级标题
+    formatted_text = re.sub(r'###\s+(.*?)(\n|$)', r'=== \1 ===\n', formatted_text)  # ### 三级标题
+    formatted_text = re.sub(r'##\s+(.*?)(\n|$)', r'— \1 —\n', formatted_text)  # ## 二级标题
     formatted_text = re.sub(r'#\s+(.*?)(\n|$)', r'※ \1 ※\n', formatted_text)  # # 一级标题
     # formatted_text = re.sub(r'```([^`]+)```',
     #                         lambda m: '\n'.join([f'｜ {line}' for line in m.group(1).splitlines()]) + '\n',
@@ -1021,6 +1293,8 @@ def format_for_wechat(text):
     # formatted_text = re.sub(r'>\s?(.*)', r'💬 \1', formatted_text)  # > 引用文本，转换为聊天符号包围
     # formatted_text = re.sub(r'^\s*[-*+]\s+', '• ', formatted_text, flags=re.MULTILINE)  # 无序列表项
     # formatted_text = re.sub(r'^\s*\d+\.\s+',f"{next(ordinal_iter)} ", formatted_text, flags=re.MULTILINE)  # 有序列表项
+    formatted_text = re.sub(r'\n---+\n', '\n——————————————\n', formatted_text, flags=re.MULTILINE)  # 替换水平线 r'^---+$'
+    formatted_text = re.sub(r'\?{4}', '✨', formatted_text)
     formatted_text = re.sub(r'\n{2,}', '\n\n', formatted_text)  # 转换换行以避免多余空行
 
     return formatted_text.strip()
@@ -1045,7 +1319,7 @@ def format_for_html(text):
     # display(Markdown(f"`{export_command}`"))
 
 
-def extract_string(text, extract: str, **kwargs):
+def extract_string(text, extract: str | list, **kwargs):
     if not extract:
         return None
     funcs = {
@@ -1071,15 +1345,33 @@ def extract_string(text, extract: str, **kwargs):
         "web": extract_web_content,
         "execute": execute_code_results,
     }
-    try:
-        if extract in funcs:
-            return funcs[extract](text, **kwargs)
 
-        extract_type = extract.split('.')
+    def run_extract(e):
+        if e in funcs:
+            return funcs[e](text, **kwargs)  # str,list,dict,set
+        extract_type = e.split('.')
         if extract_type[0] == 'code':
             return extract_code_blocks(text, lag=extract_type[1] if len(extract_type) > 1 else '', **kwargs)
+        return None
 
-        return {k: f(text, **kwargs) for k, f in funcs.items()}  # "type": "all"
+    try:
+        if isinstance(extract, str):
+            result = run_extract(extract)
+            if result:
+                return result
+
+            if extract not in funcs:
+                return {k: f(text, **kwargs) for k, f in funcs.items()}  # "type": "all", dict
+
+        elif isinstance(extract, list):
+            results = {}
+            for e in extract:
+                val = run_extract(e)
+                if val is not None:
+                    results[e] = val
+            if results:
+                return results  # dict
+
     except Exception as e:
         print(e)
 
@@ -1119,6 +1411,15 @@ def list_to_xml(tag, lst):
         item_elem = ET.SubElement(elem, "item")
         item_elem.text = str(item)
     return ET.tostring(elem, encoding='unicode')
+
+
+def defaultdict_to_dict(d):
+    from collections import defaultdict
+    if isinstance(d, defaultdict):
+        d = {k: defaultdict_to_dict(v) for k, v in d.items()}
+    elif isinstance(d, dict):
+        d = {k: defaultdict_to_dict(v) for k, v in d.items()}
+    return d
 
 
 def df2doc(data, use_index=True):
@@ -1252,6 +1553,14 @@ def find_similar_words(query, tokens, top_n=3):
     return results
 
 
+def fuzzy_match_template(query, template_list, threshold=0.8):
+    if not isinstance(query, str):
+        return None
+
+    matches = get_close_matches(query, template_list, n=1, cutoff=threshold)
+    return matches[0] if matches else None
+
+
 def contains_chinese(text):
     # 检测字符串中是否包含中文字符
     chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
@@ -1284,30 +1593,33 @@ def lang_detect_to_trans(text):
     return t
 
 
-def lang_token_size(text, tokenizer=None):
-    """计算每段文本的token长度，如果没有提供tokenizer则返回字符长度"""
+def lang_token_size(text, tokenizer=None, model_name="gpt-3.5-turbo"):
+    """
+    计算文本的大致 token 数。
+    - 优先使用提供的 tokenizer 或根据 model_name 获取的 tokenizer。
+    - 若无 tokenizer，使用语言检测 + 启发式估算。
+
+    参数：
+        text: 文本内容
+        tokenizer: tiktoken tokenizer（可选）
+        model_name: 模型名称，用于获取默认 tokenizer（若未传入）
+
+    返回：
+        token 数量（估算或精确）
+    """
+    if not text:
+        return 0
+    tokenizer = tokenizer or get_tokenizer(model_name)
     if tokenizer:
         return len(tokenizer.encode(text))
     # 中文平均1字≈1 token，英文≈4字=1 token，粗略估算
-    lang = detect(text)
+    lang = detect(text[:100])
     if lang in ('en', 'fr', 'es', 'de'):
-        # 对于英文、法语、西班牙语、德语等，使用空格分词
-        return len(text.split())
+        return len(text.split())  # 对于英文、法语、西班牙语、德语等，使用空格分词,基于空格分词的近似 token 数
         # len(text) // 3
 
     # 'zh-cn','zh-hk','zh-tw','ja','ar',简体中文,日语,阿拉伯语，返回字符数
     return len(text)
-
-
-def cut_text(text, tokenizer=None):
-    # 去除标点/数字/空格
-    text = re.sub(r'[^\u4e00-\u9fa5]', '', str(text))
-    if tokenizer:
-        token_ids = tokenizer.encode(text)
-        tokens = [tokenizer.decode([tid]) for tid in token_ids]  # tokenizer.tokenize
-    else:
-        tokens = jieba.lcut(text, cut_all=False)
-    return tokens  # ' '.join(tokens)
 
 
 def get_max_tokens_from_string(text: str, max_tokens: int, tokenizer) -> str:
@@ -1361,6 +1673,62 @@ def alternate_chat_history(messages: list):
                 i -= 1
         i += 1
     return messages
+
+
+def cut_chat_history(user_history: list[dict], max_size=33000, max_pairs=0, model_name="gpt-3.5-turbo"):
+    """
+    根据 token 数截断对话历史，保留最近的上下文。
+
+    :param user_history: 完整的消息列表，每项 {'role':..., 'content':...}
+    :param max_size: 最大允许的 token 数
+    :param max_pairs: 最大允许的 消息对数
+    :param  model_name: tokenizer model
+    :return: 截断后的消息列表
+    32K tokens
+    64K tokens
+    128K token
+    """
+
+    if max_size <= 0 and max_pairs <= 0:
+        return user_history
+
+    tokenizer = get_tokenizer(model_name)
+
+    pair_count = 0
+    total_size = 0
+    last_records = []
+
+    i = len(user_history) - 1
+    while i >= 0:
+        if i >= 1:
+            # 尝试组成 user+assistant 对
+            if user_history[i - 1].get("role") == "user" and user_history[i].get("role") == "assistant":
+                pair = user_history[i - 1:i + 1]
+                pair_len = sum(lang_token_size(record.get("content", ""), tokenizer) for record in pair)
+
+                if max_pairs > 0 and pair_count >= max_pairs:
+                    break
+                if max_size > 0 and total_size + pair_len > max_size:
+                    break
+
+                last_records = pair + last_records
+                total_size += pair_len
+                pair_count += 1
+                i -= 2
+                continue
+
+        # 否则单条处理（如开头或非成对）
+        pair = [user_history[i]]
+        pair_len = lang_token_size(pair[0].get("content", ""), tokenizer)
+
+        if max_size > 0 and total_size + pair_len > max_size:
+            break
+
+        last_records = pair + last_records
+        total_size += pair_len
+        i -= 1
+
+    return last_records
 
 
 def split_whitespace_nonwhitespace(s, max_len=5):
@@ -1419,25 +1787,28 @@ def get_string_no_punctuation_or_emoji(s):
     return ''.join(chars[start:end + 1])
 
 
-LLM_Abort_Event = asyncio.Event()  # threading.Event() 线程安全
+try:
+    from agents.ai_tasks import AsyncAbortController
+
+    LLM_Controller = AsyncAbortController()
+except ImportError:
+    LLM_Controller = None
 
 
-async def llm_abort_stop():
-    LLM_Abort_Event.set()  # 触发终止,是否提前终止
-
-
-async def process_llm_stream(llm_responses_stream, token_size=20):
+async def process_llm_stream(llm_responses_stream, token_size=20, model_name="gpt-3.5-turbo"):
     """
     处理大模型返回的文本流，并按标点符号分割交给 TTS 朗读。
     :param llm_responses_stream: 大模型返回的文本流
     :param token_size: 标点不足时，允许的最小缓冲区长度
+    :param  model_name: tokenizer model
     """
     response_message = []
     text_index = 0
     processed_chars = 0
+    tokenizer = get_tokenizer(model_name)
     async for content in llm_responses_stream:
         response_message.append(content)
-        if LLM_Abort_Event.is_set():  # 实时检查是否终止
+        if LLM_Controller.should_abort():  # 实时检查是否终止
             break
 
         # 获取当前未处理的文本
@@ -1446,7 +1817,7 @@ async def process_llm_stream(llm_responses_stream, token_size=20):
 
         # 查找最后一个有效标点
         last_punct_pos = find_last_punctuation(current_text)
-        if last_punct_pos != -1 or lang_token_size(current_text) > token_size:
+        if last_punct_pos != -1 or lang_token_size(current_text, tokenizer) > token_size:
             split_pos = last_punct_pos if last_punct_pos != -1 else token_size  # 选取最合适的切割点
             segment_text_raw = current_text[:split_pos + 1]
             segment_text = get_string_no_punctuation_or_emoji(segment_text_raw)  # 处理无效字符
@@ -1468,7 +1839,7 @@ async def process_llm_stream(llm_responses_stream, token_size=20):
 
 async def start_llm_stream(new_llm_stream):
     """复位终止信号，并重新启动大模型流"""
-    LLM_Abort_Event.clear()  # 重新启动前复位
+    LLM_Controller.reset()  # 重新启动前复位
     async for text, idx in process_llm_stream(new_llm_stream):
         if idx > 0:
             print(f"🔊 朗读: {text}")
@@ -2170,6 +2541,66 @@ def float16_to_bin(num):
     return binary_representation
 
 
+def math_solver(input_str=None, math_expr=None, operation="evaluate", values=None, symbol="x", limits=None):
+    """
+    自动数学求解 + 数值代入计算
+
+    Params:
+    - input_str: 原始自然语言描述，尝试从自然语言中粗略提取表达式，可以不填
+    - math_expr: 数学表达式（如 "x^2 + 3x + 1"）
+    - operation: 操作类型（"evaluate" 为数值计算，还有 diff，integrate，factorial，sum..）
+    - values: dict，变量数值，如 {"x": 2}
+    - symbol: 默认变量符号 "x"
+    - limits: 对于求和，可传如 ("i", 1, 10),其他情况可以不填
+
+    Returns:
+    - str：结果数值
+    """
+    expr_text = math_expr or input_str
+    if math_expr is None and input_str:
+        # 尝试从自然语言中粗略提取表达式
+        patterns = {
+            r'加|plus|add|sum': '+',
+            r'减|minus': '-',
+            r'乘|times|multiplied by|dot': '*',
+            r'除以|除|divided by|divide': '/',
+            r'平方|square': '**2',
+            r'\^|次方|power': '**',
+        }
+        for pattern, repl in patterns.items():
+            expr_text = re.sub(pattern, repl, expr_text)
+    if not expr_text:
+        return "请提供数学表达式或输入描述"
+
+    try:
+        import sympy
+        expr = sympy.sympify(expr_text.replace("^", "**"))
+        sym = sympy.symbols(symbol)
+        if operation == "evaluate":
+            if values:
+                subs_dict = {sympy.symbols(k): v for k, v in values.items()}
+                return float(expr.evalf(subs=subs_dict))
+            else:
+                return float(expr.evalf())
+        elif operation == "diff":  # 对表达式关于某个变量求导
+            return str(sympy.diff(expr, sym))
+        elif operation == "integrate":  # 求不定积分
+            return str(sympy.integrate(expr, sym))
+        elif operation == "factorial":  # 整数的阶乘
+            return sympy.factorial(int(expr))
+        elif operation == "sum":
+            if limits and len(limits) == 3:
+                var = sympy.symbols(limits[0])
+                return sympy.summation(expr, (var, limits[1], limits[2]))
+            else:
+                return "请提供 limits 参数，如 ('i', 1, 10)"
+        else:
+            return f"未知操作类型：{operation}"
+
+    except Exception as e:
+        return f"解析失败：{e}"
+
+
 def get_memory_info():
     """从 /proc/self/status 获取内存使用（Linux Only）"""
     try:
@@ -2204,7 +2635,6 @@ def get_open_fds_count() -> int:
 
 
 def count_http_connections(port=8000):
-    import platform
     if platform.system() != "Linux":
         print("Warning: count_http_connections is only supported on Linux.")
         return -1
@@ -2218,6 +2648,25 @@ def count_http_connections(port=8000):
             if int(local_port_hex, 16) == port:
                 count += 1
     return count
+
+
+def configure_event_loop():
+    if platform.system() != "Windows":
+        try:
+            import uvloop
+            uvloop.install()
+            print("🚀 uvloop activated (non-Windows environment)")
+        except ImportError:
+            print("⚠️ uvloop not available, using default event loop")
+    else:
+        # 启用IOCP
+        if sys.platform.startswith('win'):
+            if sys.version_info >= (3, 8):
+                # Python 3.8+ 使用更高效的 Proactor
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            else:
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # 使用 Selector
+        print("🖥️ Windows detected, using optimized event loop policy")
 
 
 def named_partial(name, func, *args, **kwargs):
@@ -2235,11 +2684,14 @@ def is_empty_lambda(func):
     return False
 
 
-def print_functions(module_name: str = None):
+def get_module_functions(module_name: str = None):
     module = importlib.import_module(module_name) if module_name else inspect.getmodule(inspect.currentframe())
+    module_name = module.__name__
     funcs = inspect.getmembers(module, inspect.isfunction)
-    for name, _func in funcs:
-        print(f"Function: {name}")
+    local_funcs = [(name, func) for name, func in funcs if func.__module__ == module_name]
+    # for name, _func in funcs:
+    #     print(f"Function: {name}")
+    return local_funcs
 
 
 def functions_registry(functions_list: list, safe_path=True, module_name: str = None) -> dict:
@@ -2371,166 +2823,9 @@ def deduplicate_tools_by_name(tools: list[dict]) -> list[dict]:
 #         os.kill(pid, signal.SIGKILL)
 
 
-class BM25:
-    def __init__(self, corpus, k1=1.5, b=0.75):
-        self.k1 = k1
-        self.b = b
-        self.corpus = [jieba.lcut(doc) for doc in corpus]  # 使用 jieba 对文档进行分词, cut_all=False
-        self.doc_lengths = [len(doc) for doc in self.corpus]
-        self.avg_doc_length = sum(self.doc_lengths) / len(self.doc_lengths)
-        self.doc_count = len(self.corpus)
-        self.doc_term_freqs = [Counter(doc) for doc in self.corpus]
-        self.inverted_index = self.build_inverted_index()
-        self.idf_cache = {}  # 增加一个 IDF 缓存，提高效率
-
-    def build_inverted_index(self):
-        inverted_index = {}
-        for doc_id, doc_term_freq in enumerate(self.doc_term_freqs):
-            for term, freq in doc_term_freq.items():
-                if term not in inverted_index:
-                    inverted_index[term] = []
-                inverted_index[term].append((doc_id, freq))
-        return inverted_index
-
-    def idf(self, term):
-        if term in self.idf_cache:
-            return self.idf_cache[term]
-        doc_freq = len(self.inverted_index.get(term, []))
-        if doc_freq == 0:
-            self.idf_cache[term] = 0
-        else:
-            self.idf_cache[term] = math.log((self.doc_count - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0)
-        return self.idf_cache[term]
-
-    def bm25_score(self, query_terms, doc_id):
-        score = 0
-        doc_length = self.doc_lengths[doc_id]
-        for term in query_terms:
-            tf = self.doc_term_freqs[doc_id].get(term, 0)
-            idf = self.idf(term)
-            numerator = tf * (self.k1 + 1)
-            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_length / self.avg_doc_length))
-            score += idf * (numerator / denominator)
-        return score
-
-    def rank_documents(self, query, sort=True, normalize=False):
-        query_terms = list(jieba.cut(query))  # 对查询进行分词
-        scores = [(doc_id, self.bm25_score(query_terms, doc_id)) for doc_id in range(self.doc_count)]
-        if normalize:
-            max_score = max(scores, key=lambda x: x[1])[1]
-            min_score = min(scores, key=lambda x: x[1])[1]
-            if max_score != min_score:
-                scores = [(doc_id, (score - min_score) / (max_score - min_score)) for doc_id, score in scores]
-
-        return sorted(scores, key=lambda x: x[1], reverse=True) if sort else scores
-
-
-class LRUCache:
-    def __init__(self, capacity: int):
-        self.stack = OrderedDict()
-        self.capacity = capacity
-
-    def get(self, key):
-        if key in self.stack:
-            self.stack.move_to_end(key)
-            return self.stack[key]
-        else:
-            return None
-
-    def put(self, key, value) -> None:
-        if key in self.stack:
-            self.stack[key] = value
-            self.stack.move_to_end(key)
-        else:
-            self.stack[key] = value
-        if len(self.stack) > self.capacity:
-            self.stack.popitem(last=False)
-
-    def change_capacity(self, capacity):
-        self.capacity = capacity
-        for i in range(len(self.stack) - capacity):
-            self.stack.popitem(last=False)
-
-    def delete(self, key):
-        if key in self.stack:
-            del self.stack[key]
-
-    def keys(self):
-        return self.stack.keys()
-
-    def __len__(self):
-        return len(self.stack)
-
-    def __contains__(self, key):
-        return key in self.stack
-
-
-# class BM25:
-#     def __init__(self, corpus, k1=1.5, b=0.75):
-#         self.k1 = k1
-#         self.b = b
-#         self.corpus = [list(jieba.cut(doc)) for doc in corpus]  # doc.split()
-#         self.N = len(self.corpus)  # 语料库中文档总数
-#         self.avgdl = sum(len(doc) for doc in self.corpus) / self.N  # 文档的平均长度
-#         self.df = self._calculate_df()  # 每个词项的文档频率
-#         self.idf = self._calculate_idf()  # 每个词项的逆文档频率
-#
-#     def _calculate_df(self):
-#         """计算词项的文档频率"""
-#         df = {}
-#         for doc in self.corpus:
-#             unique_words = set(doc)
-#             for word in unique_words:
-#                 df[word] = df.get(word, 0) + 1
-#         return df
-#
-#     def _calculate_idf(self):
-#         """计算词项的逆文档频率"""
-#         idf = {}
-#         for word, freq in self.df.items():
-#             idf[word] = math.log((self.N - freq + 0.5) / (freq + 0.5) + 1)
-#         return idf
-#
-#     def _score(self, query, doc):
-#         """计算单个文档对查询的 BM25 得分"""
-#         score = 0.0
-#         doc_len = len(doc)
-#         term_frequencies = Counter(doc)
-#         for word in query:
-#             if word in term_frequencies:
-#                 freq = term_frequencies[word]
-#                 numerator = self.idf.get(word, 0) * freq * (self.k1 + 1)
-#                 denominator = freq + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl)
-#                 score += numerator / denominator
-#         return score
-#
-#     def get_scores(self, query):
-#         """计算语料库中每个文档对查询的 BM25 得分"""
-#         query = list(jieba.cut(query))  # 使用 jieba 对查询进行分词
-#         scores = []
-#         for doc in self.corpus:
-#             scores.append(self._score(query, doc))
-#         return scores
-
 if __name__ == "__main__":
-    # from rank_bm25 import BM25Okapi
-    jieba.initialize()
-    # jieba.load_userdict('data/patent_thesaurus.txt')
-    corpus = [
-        "快速的棕色狐狸跳过了懒狗",
-        "懒狗躺下了",
-        "狐狸很快速并且跳得很高",
-        "快速的棕色狐狸",
-        "猫跳过了狗"
-    ]
-    query = "快速的狐狸"
-    bm25 = BM25(corpus)
-    scores = bm25.rank_documents(query)
-    print(scores, bm25.corpus)
-    # print(BM25(corpus).rank_documents(query))
-
     with open("utils.py", 'r', encoding='utf-8') as file:
         code = file.read()
-    functions = extract_function_metadata(code, r=None)
+    functions = extract_function_metadatas(code)
     for func in functions:
         print(func)
