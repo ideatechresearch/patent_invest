@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>通用填数器</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>通用填数器</h1>
+        <p>请选择要填充数据的表：</p>
+
+        <div class="table-list">
+            {% for table in tables %}
+            <div class="table-card">
+                <a href="{{ prefix }}/{{ table }}">{{ table }}</a>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>

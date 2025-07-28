@@ -1,41 +1,28 @@
 from sqlalchemy import create_engine, select, JSON, Column, ForeignKey, String, Integer, BigInteger, Boolean, Float, \
     DateTime, Index, TEXT
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy import func, or_, and_, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import sessionmaker, declarative_base, mapped_column, Mapped, Session
 # from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.pool import NullPool, QueuePool
 import pymysql, aiomysql
 import hashlib, secrets, uuid
 import copy
 import json
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Union, ClassVar
+from typing import List, Dict, Optional, Union, ClassVar, AsyncIterator
 from collections import defaultdict
+from pydantic import BaseModel
 from utils import cut_chat_history
 from config import Config, parse_database_uri
 
 Base = declarative_base()  # ORM 模型继承基类
 
-# echo=True 仅用于调试 poolclass=NullPool,每次请求都新建连接，用完就断，不缓存
-# async_engine = create_async_engine(Config.ASYNC_SQLALCHEMY_DATABASE_URI)
-# AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=async_engine,
-#                                  class_=AsyncSession)
-# poolclass=QueuePool,多线程安全的连接池，复用连接
 engine = create_engine(Config.SQLALCHEMY_DATABASE_URI, pool_recycle=14400, pool_size=8, max_overflow=20,
                        pool_pre_ping=True)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)  # isolation_level='SERIALIZABLE'
-
-
-# async def get_async_session() -> AsyncSession:
-#     # 异步依赖
-#     async with AsyncSessionLocal() as session:
-#         yield session  # 自动 await 生成器
-#     # finally:
-#     #   await session.close()
 
 
 def get_db():
@@ -50,12 +37,12 @@ def get_db():
         db.close()
 
 
-def get_db_connection(db_config: dict):
+def get_db_connection(db_config: dict, dictionary=True):
     """
     获取 MySQL 数据库连接对象。
-
     示例：
-        conn = get_db_connection()
+        db_config = parse_database_uri(Config.SQLALCHEMY_DATABASE_URI)
+        conn = get_db_connection(db_config)
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT * FROM table")
 
@@ -69,7 +56,7 @@ def get_db_connection(db_config: dict):
     """
     try:
         import mysql.connector
-        return mysql.connector.connect(**db_config)  # connection
+        return mysql.connector.connect(**db_config, dictionary=dictionary)  # connection
     except Exception as e:
         print(f"Error connecting to MySQL: {e}")
         return None
@@ -77,11 +64,11 @@ def get_db_connection(db_config: dict):
 
 class OperationMysql:
     """
-    with OperationMysql(host, user, password, db) as dbop:
-        result = dbop.run("SELECT * FROM users WHERE id=%s", (...,))
+    with OperationMysql(host, user, password, db) as db:
+        result = db.run("SELECT * FROM users WHERE id=%s", (...,))
 
-    async with OperationMysql(...) as db:
-        await db.async_run(...)
+    async with OperationMysql(...) as dbop:
+        await dbop.async_run(...)
     """
 
     def __init__(self, host, user, password, db_name, port=3306, charset="utf8mb4"):
@@ -207,43 +194,57 @@ class OperationMysql:
             print(f"[Sync] 数据库执行出错: {e}")
         return None
 
-    async def async_run(self, sql: str, params: tuple | dict | list = None):
-        if self.pool is None:
-            await self.init_pool()
+    async def async_run(self, sql: str, params: tuple | dict | list = None, conn=None):
+        async def _run(c):
+            sql_type = (sql or "").strip().split()[0].lower()
 
-        sql_type = (sql or "").strip().split()[0].lower()
-        result = None
-        try:
-            async with self.pool.acquire() as conn:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    if isinstance(params, list):
-                        await cur.executemany(sql, params)
+            async with c.cursor(aiomysql.DictCursor) as cur:
+                if isinstance(params, list):
+                    await cur.executemany(sql, params)
+                else:
+                    await cur.execute(sql, params or ())
+
+                if sql_type == "select":
+                    return await cur.fetchall()
+                elif sql_type in {"insert", "update", "delete", "replace"}:
+                    await c.commit()  # 显式保险,autocommit=True
+                    if sql_type == "insert":
+                        return cur.lastrowid or int(c.insert_id())
                     else:
-                        await cur.execute(sql, params or ())
+                        return True
 
-                    if sql_type == "select":
-                        result = await cur.fetchall()
-                    elif sql_type in {"insert", "update", "delete", "replace"}:
-                        await conn.commit()  # 显式保险,autocommit=True
-                        if sql_type == "insert":
-                            result = cur.lastrowid or int(conn.insert_id())
-                        else:
-                            result = True
+                return None
+
+        try:
+            if conn:
+                return await _run(conn)
+
+            if self.pool is None:
+                await self.init_pool()
+            async with self.pool.acquire() as conn:
+                return await _run(conn)
 
         except Exception as e:
             print(f"[Async] SQL执行错误: {e}, SQL={sql}")
 
-        return result
+        return None
 
-    async def async_execute(self, sql_list: list[tuple[str, tuple | dict | list]]):
+    async def async_execute(self, sql_list: list[tuple[str, tuple | dict | list | None]], conn=None):
         """
         批量执行多条 SQL 并自动提交或回滚（同一个事务）
         :param sql_list: 形如 [(sql1, params1), (sql2, params2), ...]
+        :param conn
         """
-        if self.pool is None:
-            await self.init_pool()
 
-        conn = await self.pool.acquire()
+        if conn:
+            should_release = False
+        else:
+            if self.pool is None:
+                await self.init_pool()
+
+            conn = await self.pool.acquire()
+            should_release = True
+
         try:
             async with conn.cursor() as cur:
                 for sql, params in sql_list:
@@ -255,6 +256,7 @@ class OperationMysql:
                         await cur.execute(sql, params or ())
                 await conn.commit()
                 return True
+
         except Exception as e:
             print(f"[Async] 批量 SQL 执行失败: {e}")
             try:
@@ -262,67 +264,163 @@ class OperationMysql:
             except Exception as rollback_err:
                 print(f"[Async] 回滚失败: {rollback_err}")
             return False
-        finally:
-            self.pool.release(conn)
 
-    async def async_query(self, query_list: list[tuple[str, tuple | dict]], fetch_all: bool = True) -> list:
+        finally:
+            if should_release:
+                self.pool.release(conn)
+
+    async def async_query(self, query_list: list[tuple[str, tuple | dict]], fetch_all: bool = True,
+                          cursor=None) -> list:
         """
         执行多个查询，分别返回结果列表
         :param query_list: [(sql1, params1), (sql2, params2), ...]
-        :param fetch_all: 'one' 或 'all'
+        :param fetch_all: True 表示 fetchall，False 表示 fetchone
+        :param cursor: 可选外部 cursor
         :return: [result1, result2, ...]
         """
+
+        async def _run(c) -> list:
+            results = []
+            for sql, params in query_list:
+                await c.execute(sql, params or ())
+                result = await c.fetchall() if fetch_all else await c.fetchone()
+                results.append(result)
+            return results
+
+        if cursor:
+            return await _run(cursor)
+
         if self.pool is None:
             await self.init_pool()
 
-        results = []
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                for sql, params in query_list:
-                    await cur.execute(sql, params)
-                    result = await cur.fetchall() if fetch_all else await cur.fetchone()
-                    results.append(result)
-        return results
+                return await _run(cur)
 
-    async def async_insert(self, table_name: str, params_data: dict):
-        if not params_data:
-            raise ValueError("参数数据不能为空")
-        fields = tuple(params_data.keys())
-        values = tuple(params_data.values())
-        field_str = ', '.join(f"`{field}`" for field in fields)
-        placeholder_str = ', '.join(['%s'] * len(fields))
-        sql = f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str})"
-        return await self.async_run(sql, values)
+    async def query_one(self, sql: str, params: tuple | dict = (), cursor=None) -> dict | None:
+        results = await self.async_query([(sql, params)], fetch_all=False, cursor=cursor)
+        return results[0] if results else None
 
-    async def async_merge(self, table_name: str, params_data: dict, update_fields: list[str] = None):
+    async def async_merge(self, table_name: str, params_data: dict, update_fields: list[str] = None, conn=None):
         """
         插入或更新数据（根据主键或唯一键自动合并）
 
         Args:
             table_name (str): 表名
-            params_data (dict): 要插入的数据（必须包含主键/唯一索引字段）
-            update_fields (list): 需要更新的字段列表，默认为除了主键以外的字段,在发生冲突时被更新的字段列表
+            params_data (dict): 要插入的数据（更新必须包含主键/唯一索引字段）
+            update_fields (list): 需要更新的字段列表，默认为除了主键以外的字段,在发生冲突时被更新的字段列表,[]为插入
+            conn:可选外部传入连接
         """
         if not params_data:
             raise ValueError("参数数据不能为空")
 
-        fields = list(params_data.keys())
+        fields = list(params_data.keys())  # [k for k in params_data if params_data[k] is not None]
         values = tuple(params_data.values())
         field_str = ', '.join(f"`{field}`" for field in fields)
         placeholder_str = ', '.join(['%s'] * len(fields))
+        sql = f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str})"
         if update_fields is None:
             update_fields = [f for f in fields if f.lower() not in ("id", "created_at", "created_time")]
-        update_str = ', '.join(f"`{field}` = VALUES(`{field}`)" for field in update_fields)
-        sql = (
-            f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str}) "
-            f"ON DUPLICATE KEY UPDATE {update_str}"
-        )
-        return await self.async_run(sql, values)
+        if update_fields:
+            sql += " AS new"
+            update_str = ', '.join(f"`{field}` = new.`{field}`" for field in update_fields)
+            if "updated_at" in fields and "updated_at" not in update_fields:
+                update_str += ", `updated_at` = CURRENT_TIMESTAMP"
+            sql += f" ON DUPLICATE KEY UPDATE {update_str}"
+        return await self.async_run(sql, values, conn=conn)
+
+    async def async_insert(self, table_name: str, params_data: dict, conn=None):
+        return await self.async_merge(table_name, params_data, update_fields=[], conn=conn)
+
+    async def async_update(self, table_name: str, params_data: dict, row_id, id_field: str = "id", conn=None):
+        """
+        根据主键字段更新指定行数据。
+
+        Args:
+            table_name (str): 表名
+            row_id: 主键值（通常是 id）
+            params_data (dict): 要更新的字段及新值
+            id_field (str): 主键字段名，默认是 'id'
+            conn:可选外部传入连接
+        """
+        if not params_data:
+            raise ValueError("更新数据不能为空")
+
+        if not row_id:
+            raise ValueError("row_id 不能为空")
+
+        update_fields = ', '.join(f"`{k}` = %s" for k in params_data.keys())  # 构建更新字段列表
+        values = tuple(params_data.values()) + (row_id,)
+
+        sql = f"UPDATE `{table_name}` SET {update_fields} WHERE `{id_field}` = %s"
+        return await self.async_run(sql, values, conn=conn)
 
     async def get_conn(self):
         if self.pool is None:
             await self.init_pool()
         return await self.pool.acquire()
+
+    def release(self, conn):
+        if self.pool is not None:
+            self.pool.release(conn)
+
+    @asynccontextmanager
+    async def get_cursor(self, conn=None) -> AsyncIterator[aiomysql.Cursor]:
+        """获取游标（支持自动释放）
+        释放 await cursor.close()
+        Args:
+            conn: 外部传入的连接对象。如果为None，则自动创建新连接
+
+        Yields:
+            aiomysql.Cursor: 数据库游标
+
+        注意：
+            - 当conn为None时，会自动创建并最终释放连接
+            - 当conn由外部传入时，不会自动释放连接
+        """
+        should_release = False
+        if conn is None:
+            conn = await self.get_conn()
+            should_release = True
+
+        try:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                yield cursor
+        finally:
+            if should_release:
+                self.release(conn)
+
+    async def get_table_columns(self, table_name: str, cursor=None) -> List[dict]:
+        async def _run(c) -> list:
+            await c.execute(f"DESCRIBE {table_name}")
+            columns = await c.fetchall()
+            # 转换列信息为更友好的格式
+            formatted_columns = [{
+                "name": col["Field"],
+                "type": col["Type"],
+                "nullable": col["Null"] == "YES",
+                "key": col["Key"],
+                "default": col["Default"],
+                "extra": col["Extra"]
+            } for col in columns]
+            return formatted_columns
+
+        if cursor:
+            return await _run(cursor)
+
+        if self.pool is None:
+            await self.init_pool()
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                return await _run(cur)
+
+    async def get_primary_key(self, table_name: str, cursor=None) -> Optional[str]:
+        columns = await self.get_table_columns(table_name, cursor=cursor)
+        for col in columns:
+            if col["key"] == "PRI":  # Primary Key,"UNI","MUL"
+                return col["name"]
+        return None
 
     def search(self, sql, params: tuple | dict = None):
         if not sql.lower().startswith("select"):
@@ -367,6 +465,72 @@ class OperationMysql:
         #     self.conn.close()
         return -1
 
+    def query_batches(self, ids: list | tuple, index_key: str, table_name: str, fields: list = None, chunk_size=10000):
+        """
+        await asyncio.to_thread
+        大批量 IN 查询，分批执行，避免 SQL 参数溢出。
+        Args:
+            ids (list | tuple): 要查找的 ID 列表
+            index_key (str): 作为筛选条件的字段
+            table_name (str): 表名
+            fields (list): 返回的字段
+            chunk_size (int): 每次 IN 的最大数量<65535
+        Returns:
+            list[dict]: 查询结果列表
+        """
+        if not ids:
+            return []
+        field_str = ', '.join(f"`{field}`" for field in fields) if fields else '*'
+
+        def chunks(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        result_rows = []
+        for batch in chunks(ids, chunk_size):
+            placeholders = ', '.join(['%s'] * len(batch))
+            sql = f"SELECT {field_str} FROM `{table_name}` WHERE `{index_key}` IN ({placeholders})"
+            self.cur.execute(sql, tuple(batch))
+            result_rows.extend(self.cur.fetchall())
+            # filtered_chunk = pd.read_sql_query(text(sql+'`{index_key}` in :ids'), conn, params={'ids': batch})
+            # df_chunk.to_sql(table_name, con=engine,chunksize=chunk_size, if_exists='append', index=False)
+        return result_rows
+
+    def query_batches_process(self, query: str, process_chunk, params: tuple | dict = None, chunk_size: int = 100000):
+        """
+        通用大表分页查询并处理每块数据。
+
+        Args:
+            query (str): 原始 SQL 查询语句（不含 LIMIT 和 OFFSET）
+            process_chunk (Callable): 对每个批次的进行处理的函数
+            chunk_size (int): 每批次读取的记录数
+            params:
+
+        Returns:
+            Optional[list]: 返回所有处理结果的列表
+        """
+        import pandas as pd
+
+        offset = 0
+        results = []
+
+        while True:
+            chunk_query = f"{query} LIMIT {chunk_size} OFFSET {offset}"
+            self.cur.execute(chunk_query, params or ())
+            rows = self.cur.fetchall()
+            if not rows:
+                break
+
+            df = pd.DataFrame(rows)
+
+            if not df.empty:
+                result = process_chunk(df)
+                results.append(result)
+
+            offset += chunk_size
+
+        return results
+
     def table_schema(self, table_name: str) -> list:
         """
         获取指定表的结构信息，用于自然语言描述
@@ -394,6 +558,35 @@ class OperationMysql:
             print(f"[Schema] 获取表结构失败: {str(e)}")
         return []
 
+    @staticmethod
+    def format_value(value) -> Union[str, int, float, bool, None]:
+        """
+        准备数据库写入值，根据不同类型进行转换：
+        - dict → JSON 字符串
+        - list/tuple（全字符串）→ \n\n 连接字符串
+        - set（全字符串）→ 分号连接字符串
+        - 其他类型 → 原样返回（如 int、float、str、bool、None）
+        """
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)  # 处理字典类型 → JSON序列化, indent=2
+
+        if isinstance(value, (tuple, list)):
+            if all(isinstance(item, str) for item in value):
+                return "\n\n".join(value)
+
+            return json.dumps(value, ensure_ascii=False)  # 非全字符串元素则JSON序列化
+
+        if isinstance(value, set):
+            if all(isinstance(item, str) for item in value):
+                return ";".join(sorted(value))
+            return json.dumps(list(value), ensure_ascii=False)
+
+        # 其他类型保持原样 (None等)
+        return str(value)
+
 
 class MysqlData(OperationMysql):
     db_config = parse_database_uri(Config.SQLALCHEMY_DATABASE_URI)
@@ -408,18 +601,24 @@ class MysqlData(OperationMysql):
         result = await dbop.async_run("SELECT ...")
     """
 
-    def __init__(self, persistent: bool = False, async_mode=False):
+    def __init__(self, persistent: bool = False, async_mode: bool = False, db_config: dict = None):
         """
         persistent: 是否立即连接数据库以便长期持久化使用（不需要用 with），...close()，连接不线程安全，不同线程应用不同实例
         """
-        super().__init__(**type(self).db_config)
+        super().__init__(**(db_config or type(self).db_config))
         self.persistent = persistent
-        if self.persistent and not not async_mode:
+        if self.persistent and not async_mode:
             self.ensure_connection()
+            print('[MysqlData] Sync connected.')
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if not self.persistent:
             await self.close_pool()
+
+    @classmethod
+    async def get_async_conn(cls, **kwargs):
+        async with cls(async_mode=True, **kwargs) as dbop:
+            yield dbop
 
 
 async def search_from_database(session, sql: str, **kwargs):
@@ -942,7 +1141,7 @@ class ChatHistory(BaseChatHistory):
 
         return user_history
 
-    def build(self, user_request: str, user_messages: List[dict] = None, use_hist=False,
+    def build(self, user_request: str, user_messages: List[dict | BaseModel] = None, use_hist=False,
               filter_limit: int = -500, filter_time: float = 0, db: Session = None):
         history = []
         if not user_messages:
@@ -958,7 +1157,10 @@ class ChatHistory(BaseChatHistory):
                 self.user_request = user_request
                 history.append({'role': 'user', 'content': user_request, 'name': self.name})
         else:
-            self.user_history = user_messages.copy()
+            if isinstance(user_messages[0], BaseModel):  # from structs import ChatMessage
+                self.user_history = [msg.model_dump() for msg in user_messages]
+            else:
+                self.user_history = user_messages.copy()
             message_records = cut_chat_history(self.user_history, max_size=filter_limit, max_pairs=-filter_limit,
                                                model_name=Config.DEFAULT_MODEL_ENCODING)
             history.extend(message_records)
@@ -1034,8 +1236,11 @@ class ChatHistory(BaseChatHistory):
 
     def save_cache(self):
         """保存缓存到数据库"""
-        with SessionLocal() as session:
+        session = SessionLocal()
+        try:
             self.sequential_insert(session, user=self.user, robot_id=self.robot_id)
+        finally:
+            session.close()
 
 
 class BaseReBot(Base):
@@ -1064,14 +1269,15 @@ class BaseReBot(Base):
 
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.utc_timestamp(),
+                                                 default=func.utc_timestamp())
 
     __table_args__ = (
         Index('idx_name_time', 'name', 'user', 'robot_id', 'timestamp'),
     )
 
     def __init__(self, user_content=None, assistant_content=None, system_content=None, agent='chat',
-                 name: str = None, user: str = None, robot_id: str = None, model: str = None, msg_id=0,
-                 summary=None, reference=None, transform=None, timestamp: int = 0):
+                 name: str = None, user: str = None, robot_id: str = None, model: str = None, **kwargs):
         self.user_content = user_content
         self.assistant_content = assistant_content
         self.system_content = system_content
@@ -1081,24 +1287,41 @@ class BaseReBot(Base):
         self.user = user
         self.robot_id = robot_id
         self.model = model
-        self.msg_id = msg_id
+        self.msg_id = kwargs.get('msg_id', 0)
 
-        self.summary = summary  # 背景信息
-        self.reference = reference  # 参考信息,rag,tolls
-        self.transform = transform
+        self.summary = kwargs.get('summary', None)  # 背景信息
+        self.reference = kwargs.get('reference', None)  # 参考信息,rag,tolls
+        self.transform = kwargs.get('transform', None)
 
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.timestamp = timestamp or int(time.time())
-        self.created_at = datetime.now(timezone.utc)
+        self.prompt_tokens = kwargs.get('prompt_tokens', 0)
+        self.completion_tokens = kwargs.get('completion_tokens', 0)
+        self.timestamp = kwargs.get('timestamp', int(time.time()))
+        self.created_at = kwargs.get('created_at', datetime.now(timezone.utc))
+        self.updated_at = kwargs.get('updated_at', datetime.now(timezone.utc))
         # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
 
     def asdict(self) -> dict:
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
-    def setdata(self, data: dict):
+    def set_data(self, data: dict):
         for k, v in data.items():
             setattr(self, k, v)
+
+    @classmethod
+    def copy(cls, data: dict, instance: Optional["BaseReBot"] = None):
+        """
+           从数据字典和可选的类实例中构造或更新一个类对象。
+           data 合并用户提交的字典数据,此处优先覆盖
+           instance: 已有实例，用于合并数据或在其上更新
+        """
+        if isinstance(instance, cls):
+            data = {**{k: v for k, v in instance.asdict().items() if v}, **data}
+        final_data = {k: v for k, v in data.items() if v is not None}
+        if isinstance(instance, cls):
+            instance.set_data(final_data)
+            return instance
+
+        return cls(**final_data)  # 否则创建一个新实例返回
 
     def display(self):
         print(f"User: {self.user_content}, Assistant: {self.assistant_content}, Timestamp: {self.timestamp}")
@@ -1110,6 +1333,7 @@ class BaseReBot(Base):
             return True
         except Exception as e:
             db.rollback()
+            print(f"[Insert Error]: {e}")
             return False
 
     @classmethod
@@ -1144,33 +1368,41 @@ class BaseReBot(Base):
         return history
 
     @classmethod
-    def save(cls, user, robot_id, model=None, agent=None, instance=None, messages: list[dict] = None,
-             model_response: dict = None, summary=None, reference=None, transform=None):
-        """自动从 instance 或 messages/model_response 中提取并保存数据库"""
-        data = cls(user=user, robot_id=robot_id, model=model, agent=agent,
-                   summary=summary, reference=reference, transform=transform).asdict()
+    def build(cls, user: str = None, robot_id: str = None, messages: list[dict | BaseModel] = None,
+              model_response: dict | BaseModel = None, **kwargs) -> dict:
+        """自动从 messages/model_response 中提取,排除空值"""
+        if user and ':' in user:
+            parts = user.split(':', 1)
+            user, robot_id = parts[0], robot_id or parts[1]
 
-        if isinstance(instance, cls):
-            data.update({k: v for k, v in instance.asdict().items() if v})
-
+        data = cls(user=user, robot_id=robot_id, **kwargs).asdict()
         if messages and isinstance(messages, list):
+            if isinstance(messages[0], BaseModel):
+                messages = [msg.model_dump() for msg in messages]
+
             last_user_msg = next((msg for msg in reversed(messages) if msg.get("role") == "user"), None)
             data['msg_id'] = len(messages)
             if last_user_msg:
-                data["name"] = data["name"] or last_user_msg.get("name")
-                data["user_content"] = data["user_content"] or last_user_msg.get("content")
+                data["name"] = last_user_msg.get("name")
+                data["user_content"] = last_user_msg.get("content")
             if not data["robot_id"]:
                 data["robot_id"] = next(
-                    (msg.get("name") for msg in reversed(messages) if msg.get("role") == "assistant"),
-                    None)
-            if not data["system_content"]:
+                    (msg.get("name") for msg in reversed(messages) if msg.get("role") == "assistant"), None)
+            if not data.get("system_content"):
                 data["system_content"] = next((msg.get("content") for msg in messages if msg.get("role") == "system"),
                                               None)
 
         if model_response:
+            if isinstance(model_response, BaseModel):
+                model_response = model_response.model_dump()
+
             data["assistant_content"] = model_response.get('choices', [{}])[0].get('message', {}).get('content') or \
-                                        model_response.get('choices', [{}])[0].get('text') or \
-                                        data["assistant_content"]
+                                        model_response.get('choices', [{}])[0].get('text') or data["assistant_content"]
+            if not data["assistant_content"]:
+                tool_calls = model_response.get('choices', [{}])[0].get('message', {}).get('tool_calls', [])
+                if tool_calls:
+                    data["assistant_content"] = json.dumps(tool_calls, ensure_ascii=False)
+
             data["model"] = model_response.get('model', data["model"])
             data["timestamp"] = model_response.get("created", data["timestamp"])
 
@@ -1178,24 +1410,43 @@ class BaseReBot(Base):
             data["completion_tokens"] = model_response.get('usage', {}).get('completion_tokens', 0)
 
         final_data = {k: v for k, v in data.items() if v is not None}
-        if isinstance(instance, cls):
-            instance.setdata(final_data)
-
-        with MysqlData() as session:
-            session.insert(table_name=cls.__tablename__, params=final_data)
-
-        return instance or cls
-
-    # @classmethod
-    # async def save(cls, data: dict = None, dbpool: OperationMysql = None):
-    #     if not data:
-    #         data = cls.asdict()
-    #
-    #     return await dbpool.async_insert(cls.__tablename__, data)
+        return final_data
 
     @classmethod
-    def history(cls, user, robot_id, name, system_content=None, user_content=None, agent='chat', filter_day=None,
-                limit: int = 10):
+    def save(cls, user=None, robot_id=None, instance=None, messages: list[dict] = None, model_response: dict = None,
+             db: SessionLocal = None, **kwargs):
+        """自动从 instance 或 messages/model_response 中提取并保存数据库"""
+
+        data = cls.build(user=user, robot_id=robot_id, messages=messages, model_response=model_response, **kwargs)
+        instance = cls.copy(data, instance)
+        if db:
+            instance.insert(db)
+        else:
+            with SessionLocal() as session:
+                instance.insert(session)
+        return instance
+
+    @classmethod
+    async def async_save(cls, data: dict = None, dbpool: OperationMysql = None, update_fields: list[str] = None,
+                         row_id: int = None, **kwargs):
+        if not data:
+            data = cls.build(**kwargs)
+        else:
+            data = {**kwargs, **data}  # 如果 kwargs 和 data 有重复字段，以 data 为准
+
+        if dbpool:
+            if row_id and row_id > 0:
+                return await dbpool.async_update(table_name=cls.__tablename__, params_data=data, row_id=row_id)
+            return await dbpool.async_merge(table_name=cls.__tablename__, params_data=data,
+                                            update_fields=update_fields or [])  # 默认 insert,lastrowid
+        else:
+            # async with MysqlData(async_mode=True) as dbop:
+            with MysqlData() as session:
+                return session.insert(table_name=cls.__tablename__, params=data)
+
+    @classmethod
+    async def history(cls, user, robot_id, name, system_content=None, user_content=None, agent='chat', filter_day=None,
+                      limit: int = 10, dbpool: OperationMysql = None):
         """组装hsistory"""
         if not filter_day:
             filter_day = datetime.today().strftime('%Y-%m-%d')
@@ -1210,8 +1461,13 @@ class BaseReBot(Base):
              ORDER BY timestamp ASC LIMIT {limit}
          """
         params = (filter_day, agent, user, robot_id, name)
-        with MysqlData() as session:
-            result = session.search(sql, params)
+        result = []
+        if dbpool:
+            result = await dbpool.async_run(sql, params)
+        else:
+            with MysqlData() as session:
+                result = session.search(sql, params)
+
         history = []
 
         for item in result:

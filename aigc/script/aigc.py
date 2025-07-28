@@ -564,9 +564,9 @@ def request_aigc(history, question, system, model_name, agent='0', stream=False,
         "top_p": 0.8,
 
         "name": None,
-        "uuid": None,
         "user": USER_ID,
         "robot_id": None,
+        "request_id": None,
 
         "filter_time": 0,
         "filter_limit": -500,
@@ -585,6 +585,57 @@ def request_aigc(history, question, system, model_name, agent='0', stream=False,
     if get_content:
         return data.get('transform') or data.get('answer') or data
     return data
+
+
+async def request_aigc_sterm(history, question, system, model_name, assistant_response=None, host=AIGC_HOST,
+                             **kwargs):
+    url = f"http://{host}:7000/message"
+    headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
+
+    payload = {
+        "agent": "0",
+        "extract": "json",
+        "filter_time": 0,
+        "max_tokens": 1024,
+        "messages": history,
+        "model_id": 0,
+        "keywords": [],
+        "model_name": model_name,
+        "prompt": system,
+        "question": question,
+        "stream": True,
+        "temperature": 0.4,
+        "top_p": 0.8,
+        "use_hist": False,
+        "user": USER_ID,
+        "robot_id": None,
+        "request_id": None,
+    }
+
+    payload.update(kwargs)
+    async with httpx.AsyncClient() as client:
+        async with client.stream('POST', url, json=payload, headers=headers) as response:
+            async for chunk in response.iter_lines(decode_unicode=True):  # .aiter_text()
+                if not chunk:
+                    continue
+                if chunk.startswith("data: "):
+                    if assistant_response is None:
+                        yield f"{chunk}\n\n"
+                    else:
+                        line_data = chunk.lstrip("data: ")
+                        if line_data == "[DONE]":
+                            break
+                        try:
+                            parsed_content = json.loads(line_data)
+                            yield f'data: {json.dumps(parsed_content, ensure_ascii=False)}\n\n'
+                            # if isinstance(parsed_content, dict) and parsed_content.get("content", ""):
+                            #     if parsed_content.get('role') == 'assistant':
+                            #         assistant_response = [parsed_content.get('content')]
+                        except json.JSONDecodeError:
+                            yield f'data: {line_data}\n\n'
+                            assistant_response.append(line_data)
+
+                await asyncio.sleep(0.01)
 
 
 async def request_aigc_async(history: list, question, system, model_name, agent='0', stream=False, host=AIGC_HOST,

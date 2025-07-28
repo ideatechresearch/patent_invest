@@ -10,7 +10,7 @@ pipeline {
                 cd docker/
                 docker build -t aigc/fastapi .
                 docker rm -f ${JOB_BASE_NAME} || true
-                docker run -d --name ${JOB_BASE_NAME} --network qdrant_net --log-opt max-size=1m --log-opt max-file=3 -p 7000:7000 -v ${JENKINS_HOME}/workspace/${JOB_NAME}:/usr/src/app  -w /usr/src/app -e TZ=Asia/Shanghai aigc/fastapi
+                docker run -d --name ${JOB_BASE_NAME} --network qdrant_net --log-opt max-size=1m --log-opt max-file=3 -p 7000:7000 -v ${JENKINS_HOME}/workspace/${JOB_NAME}:/usr/src/app -w /usr/src/app -e TZ=Asia/Shanghai -e AIGC_DEBUG=false aigc/fastapi
                 '''
 
             }

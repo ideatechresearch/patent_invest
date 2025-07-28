@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>提交成功 - {{ table_name }}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>数据提交成功</h1>
+        <p>您已成功向表 <strong>{{ table_name }}</strong> 提交了以下数据：</p>
+
+        <ul>
+            {% for key, value in data.items() %}
+            <li><strong>{{ key }}:</strong> {{ value }}</li>
+            {% endfor %}
+        </ul>
+
+        <h2>最近10条记录</h2>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    {% for key in recent_data[0].keys() %}
+                    <th>{{ key }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in recent_data %}
+                <tr>
+                    {% for value in row.values() %}
+                    <td>{{ value }}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <p><a href="{{ prefix }}/table/{{ table_name }}">继续填写数据</a> | <a href="/">返回首页</a></p>
+    </div>
+</body>
+</html>

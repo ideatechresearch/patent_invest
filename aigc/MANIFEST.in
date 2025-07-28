@@ -1,12 +1,16 @@
 # 包含源代码文件
 include *.py
 include deoloy.bat
+include run.sh
 include requirements.txt
 include CI
 
 # 包含目录及其所有内容
 recursive-include agents *
 recursive-include script *
+recursive-include static *
+recursive-include router *
+recursive-include templates *
 recursive-include docker *
 # 排除不需要的目录和文件
 prune .venv
@@ -16,9 +20,9 @@ prune docker_build
 prune script/data
 exclude script/nlp.py
 include data/*.yaml
-include data/*.pkl
 
 # 排除所有 __pycache__ 目录及其内容
 global-exclude __pycache__/*
 global-exclude *.py[cod]
 global-exclude *.log
+global-exclude data/*.pkl

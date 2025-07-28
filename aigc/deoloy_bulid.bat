@@ -1,6 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
+REM 清理旧的 dist 目录，生成最新的源码包 ===
+REM rd /s /q dist
+REM python setup.py sdist
+
 REM 清空旧构建目录
 rd /s /q docker_build
 mkdir docker_build

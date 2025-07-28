@@ -1,77 +1,27 @@
 import igraph as ig
-import json, time, random
+import json, time, random, os, pickle
+from datetime import datetime
+import threading
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from queue import Empty, Queue
+from functools import partial, wraps
 from redis.asyncio import Redis, StrictRedis, ConnectionPool
-from typing import Dict, List, Tuple, Union, Iterable, Callable, Optional, Any
-from enum import IntEnum, Enum
+from typing import Dict, List, Tuple, Union, Iterable, Callable, Optional, Any, Type, Awaitable
+from enum import IntEnum, Enum, IntFlag
 from collections import defaultdict
-from dataclasses import asdict, dataclass, is_dataclass, field
-from threading import Thread
+from dataclasses import asdict, dataclass, is_dataclass, field, fields, replace
 import uuid
+import logging
 import zmq, zmq.asyncio
 from neo4j import GraphDatabase, AsyncGraphDatabase
+from dask.distributed import Client as DaskClient, LocalCluster
+from dask import delayed
 
-from config import Config
 from structs import dataclass2dict
-
-# Config.debug()
-
-_graph_driver: Optional[GraphDatabase] = None
-# _graph_driver_lock = asyncio.Lock()  # 防止并发初始化
-_redis_client: Optional[Redis] = None  # StrictRedis(host='localhost', port=6379, db=0)
-_redis_pool: Optional[ConnectionPool] = None
-
-
-def get_redis() -> Optional[Redis]:
-    global _redis_client, _redis_pool
-    if _redis_client is None:
-        _redis_pool = ConnectionPool(host=Config.REDIS_HOST, port=Config.REDIS_PORT, db=0,
-                                     decode_responses=True,  # 自动解码为字符串
-                                     max_connections=50
-                                     # connection_pool=pool
-                                     )
-        _redis_client = Redis(connection_pool=_redis_pool)
-
-    return _redis_client
-
-
-async def shutdown_redis():
-    global _redis_client, _redis_pool
-    if _redis_client:
-        await _redis_client.close()
-        _redis_client = None
-
-    if _redis_pool:
-        await _redis_pool.disconnect()
-        _redis_pool = None
-
-
-async def check_redis_connection(redis):
-    try:
-        await redis.ping()
-        print("Redis connected.")
-        return True
-    except ConnectionError as e:
-        print(f"❌ Redis connection failed: {e}")
-    return False
-
-
-async def get_redis_connection():
-    redis = get_redis()
-    if not await check_redis_connection(redis):
-        return None
-    return redis
-
-
-def get_neo_driver():
-    global _graph_driver
-    if _graph_driver is None:
-        _graph_driver = AsyncGraphDatabase.driver(uri=Config.NEO_URI, auth=(Config.NEO_Username, Config.NEO_Password),
-                                                  max_connection_lifetime=3600,  # 单连接生命周期
-                                                  max_connection_pool_size=50,  # 最大连接池数量
-                                                  connection_timeout=30  # 超时
-                                                  )
-    return _graph_driver
+from config import Config
+from service import get_redis, get_neo_driver, get_dask_client
+from utils import pickle_deserialize
 
 
 async def get_neo_nodes(cypher):
@@ -137,76 +87,9 @@ async def merge_neo_relationship(tx, src_id, tgt_id, props: dict = None, rel_typ
         await tx.run(query, src_id=src_id, tgt_id=tgt_id)
 
 
-async def scan_from_redis(redis, key: str = "funcmeta", user: str = None, batch_count: int = 0):
-    """
-    从 Redis 中获取匹配的所有元数据记录，支持 scan 或 keys 方式。
-
-    Args:
-        redis: Redis 实例。
-        key: Redis key 前缀（如 "funcmeta"）。
-        user: 用户 ID（可选），若指定则拼接为 funcmeta:{user}:*
-        batch_count: 每批 scan 的数量（大于 0 使用 scan，否则用 keys）。
-
-    Returns:
-        List[dict]: 匹配到的 JSON 数据列表。
-    """
-    if user:
-        match_pattern = f"{key}:{user}:*"
-    else:
-        match_pattern = f"{key}:*"
-
-    data = []
-    if batch_count > 0:
-        cursor = b'0'
-        while cursor:
-            cursor, keys = await redis.scan(cursor=cursor, match=match_pattern, count=batch_count)
-            if keys:
-                values = await redis.mget(*keys)
-                data.extend(json.loads(v) for v in values if v)
-    else:
-        keys = await redis.keys(match_pattern)
-        if keys:
-            cached_values = await redis.mget(*keys)
-            data = [json.loads(v) for v in cached_values if v]  # set(cached_values
-    return data
-
-
-async def do_job_by_lock(func_call: Callable, redis_key: str = None, lock_timeout: int = 600, **kwargs):
-    redis = get_redis()
-    if not redis:
-        await func_call(**kwargs)
-        return
-
-    if not redis_key:
-        redis_key = f'lock:{func_call.__name__}'
-    lock_value = str(uuid.uuid4())  # str(time.time())，每个worker使用唯一的lock_value
-    lock_acquired = await redis.set(redis_key, lock_value, nx=True, ex=lock_timeout)
-    if not lock_acquired:
-        print(f"⚠️ 分布式锁已被占用，跳过任务: {func_call.__name__}")
-        return
-
-    try:
-        print(f"🔒 获取锁成功，开始执行任务: {func_call.__name__}")
-        await func_call(**kwargs)
-    except Exception as e:
-        print(f"⚠️ 任务执行出错: {func_call.__name__} -> {e}")
-    finally:
-        # current_lock_value = await redis.get(redis_key)
-        # if current_lock_value and current_lock_value == lock_value:
-        #     await redis.delete(redis_key)
-        # 使用 Lua 脚本保证原子性，确保只有锁持有者能释放，只有最初获取锁的那个worker才能成功删除锁
-        lua_script = """
-           if redis.call("get", KEYS[1]) == ARGV[1] then
-               return redis.call("del", KEYS[1])
-           else
-               return 0
-           end
-           """
-        await redis.eval(lua_script, 1, redis_key, lock_value)
-
 
 async def consumer_worker(queue: asyncio.Queue[tuple[Any, int]], process_task: Callable, max_retries: int = 0,
-                          delay: float = 1.0, **kwargs):
+                          delay: float = 1.0, logger_name: Optional[str] = None, **kwargs):
     """
     启动 worker:
         workers_task_background = [asyncio.create_task(consumer_worker(queue, process_task)) for _ in range(4)],
@@ -217,12 +100,14 @@ async def consumer_worker(queue: asyncio.Queue[tuple[Any, int]], process_task: C
     :param process_task:注入处理函数 async def f(task: tuple, **kwargs),返回值 true,false,失败可以选择 await queue.put(...retry+1):会等待队列有空间再放入 /.put_nowait(x)
     :param max_retries,0不重试
     :param delay: 重试前延迟时间（秒）
+    :param logger_name: 自定义logger，默认使用模块logger
     :return:
     """
+    logger = logging.getLogger(logger_name)
     while True:
         task = await queue.get()
         if task is None:
-            print("[Info] Received shutdown signal")
+            logger.info("[Info] Received shutdown signal")
             queue.task_done()
             break
         try:
@@ -235,29 +120,30 @@ async def consumer_worker(queue: asyncio.Queue[tuple[Any, int]], process_task: C
                         await asyncio.sleep(delay)
                         new_task = (*task_data, retry_count + 1)  # 重建任务，重试次数+1
                         await queue.put(new_task)
-                        print(f"[Task Retry] {task_data} (attempt {retry_count + 1})")
+                        logger.info(f"[Task Retry] {task_data} (attempt {retry_count + 1})")
                     else:
-                        print(f"[Task Failed] {task_data}")
+                        logger.error(f"[Task Failed] {task_data}")
 
         except asyncio.CancelledError:
-            print("[Cancel] Worker shutting down...")
+            logger.info("[Cancel] Worker shutting down...")
             break
         except Exception as e:
-            print(f"[Error] Unexpected error processing task: {e}")
+            logger.error(f"[Error] Unexpected error processing task: {e}")
         finally:
             queue.task_done()  # 必须调用，标记任务完成
 
 
-async def stop_worker(queue: asyncio.Queue, worker_tasks: list):
+async def stop_worker(queue: asyncio.Queue, worker_tasks: list, logger_name: Optional[str] = None):
     '''优雅停止所有 worker'''
+    logger = logging.getLogger(logger_name)
     try:
         await queue.join()  # 等待队列清空
 
-        print("All tasks processed. Stopping consumers...")
+        logger.info("All tasks processed. Stopping consumers...")
         for _ in worker_tasks:
             await queue.put(None)  # 发送停止信号
     except Exception as e:
-        print(f"[Tasks Error] {e}, attempting to cancel workers...")
+        logger.error(f"[Tasks Error] {e}, attempting to cancel workers...")
         for c in worker_tasks:
             c.cancel()
 
@@ -370,68 +256,61 @@ async def consumer_redis(process_task: Callable, queue_key: str | list[str] = "m
     print("[Exit] Consumer loop ended.")
 
 
-# asyncio.create_task(
-
-class AsyncAbortController:
-    def __init__(self):
-        self._abort_event = asyncio.Event()  # 线程安全 threading.Event()
-
-    def should_abort(self) -> bool:
-        """查询是否已触发终止信号,实时检查是否终止"""
-        return self._abort_event.is_set()
-
-    async def wait_abort(self):
-        """等待终止信号（可用于并发 await）,可 await 等待中断"""
-        await self._abort_event.wait()
-
-    def abort(self):
-        """外部触发终止信号,触发终止,是否提前终止,可供外部触发"""
-        self._abort_event.set()
-
-    def reset(self):
-        """清除终止信号，为下一轮任务做准备,重新启动前复位,可多轮复用"""
-        self._abort_event.clear()
-
-
 class TaskStatus(Enum):
     # "pending" | "ready" | "running" | "done" | "failed"
-    PENDING = "pending"  # 等待条件满足
-    READY = "ready"  # 条件满足，可以执行
-    IN_PROGRESS = "running"  # processing
+    PENDING = "pending"  # 等待条件满足，（包含 created、inited、waiting）
 
-    COMPLETED = "done"
-    FAILED = "failed"
-    RECEIVED = "received"
+    READY = "ready"  # 条件满足，可以执行
+    IN_PROGRESS = "running"  # processing，retrying
+
+    COMPLETED = "done"  # completed
+    FAILED = "failed"  # error，timeout，这里不做细分
+
+    RECEIVED = "received"  # 客户接收数据，等待延时释放
+    CANCELLED = "cancelled"  # 手动取消
+
+
+class TaskCommand(Enum):
+    GOTO = "goto"  # 跳转到指定节点
+    CALL = "call"  # 调用子工作流
+    RETURN = "return"  # 返回上级工作流
+    BREAK = "break"  # 跳出循环
+    CONTINUE = "continue"  # 继续下一轮循环
+    EXIT = "exit"  # 终止工作流
 
 
 @dataclass
 class TaskNode:
     name: str  # task_id 任务名或别名
-    description: Optional[str] = None
+    description: Optional[str] = None  # 任务描述
     # type: Optional[str] = None  # 'api', 'llm', 'script'
-    action: Optional[str] = None  # execute 任务的执行逻辑（可调用对象函数、脚本或引用的操作类型),可执行动作（如脚本、注册名、函数名）
-    event: Any = None  # 触发标志（不处理依赖逻辑）事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据
+    action: Optional[str] = None  # 可执行动作,任务用途(如脚本、注册名、函数名、脚本或引用的操作类型)
+    function: Optional[Callable] = field(default=None)  # execute 激活函数任务的执行逻辑（可调用对象函数,绑定后的 partial(func, args)）
+    event: Optional[Dict[str, Any]] = None  # 触发标志（不处理依赖逻辑）事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据,外部触发信号
+    command: Dict[str, Any] = field(default_factory=dict)  # cmd 任务控制逻辑,节点执行函数动态跳转,goto,静态边走 TaskEdge，内部控制
 
     status: TaskStatus = TaskStatus.PENDING
-    progress: int = 0  # 执行进度，适合长任务、流任务场景
-    priority: int = 10  # 执行顺序控制
-    command: Any = field(default_factory=dict)  # 节点执行函数动态跳转,goto,静态边走 TaskEdge
-    tags: List[str] = field(default_factory=list)  # 分类/搜索，索引、分组、过滤
+    progress: int = 0  # 执行进度，适合长任务、流任务场景（0-100）
+    priority: int = 10  # bias 执行顺序控制，优先级
+    tags: List[str] = field(default_factory=list)  # 辅助标签，分类/搜索，索引、分组、过滤
 
-    start_time: float = field(default_factory=time.time)
-    end_time: float = 0
+    start_time: float = field(default_factory=time.time)  # created_at
+    end_time: float = 0  # updated_at
 
-    data: Any = field(default_factory=dict)  # 执行输入
-    result: Any = field(default_factory=list)
-    count: int = 0  # 结果数量
+    data: Any = field(default_factory=dict)  # metadata,动态更新参数，自由定义不用明确结构，此处不限制，保持灵活性，Dict[str, Any]
+    params: Any = field(default_factory=list)  # input payload,执行输入参数,dict/list[dict]
+    result: Any = field(default_factory=list)  # output 输出结果，允许 reason，error，此处不限制，不约束类型保持灵活性
+    count: int = 0  # 结果条目数量，自定义 result_count,event_count
 
     @staticmethod
-    def default_node_attrs(attributes: dict):
+    def default_node_attrs(task_id: str, **attributes):
         default_attrs = {
-            "status": "pending",
-            "start_time": lambda: time.time(),
+            "name": task_id,
+            "status": TaskStatus.PENDING,
+            "start_time": time.time,
             "event": None,
             "action": None,
+            "function": None,
             **attributes
         }
         return {k: v() if callable(v) else v for k, v in default_attrs.items()}
@@ -443,25 +322,57 @@ class TaskNode:
     async def to_redis(self, redis_client, ex=3600, key_prefix='task'):
         key = f"{key_prefix}:{self.name}"
         payload = dataclass2dict(self)
-        payload.pop("data", None)
+        # payload.pop("data", None) # pickle.dumps(payload["data"])
         await redis_client.setex(key, ex, json.dumps(payload, ensure_ascii=False))
 
     @classmethod
     async def from_redis(cls, redis_client, task_id: str, ex: int = 0, key_prefix='task'):
         key = f"{key_prefix}:{task_id}"
         value = await redis_client.get(key)
-        if value:
-            if ex > 0:
-                await redis_client.expire(key, ex)
-            data = json.loads(value)
-            if "status" in data and data["status"] is not None:
-                data["status"] = TaskStatus[data["status"]]
-            return cls(**data)
-        return None
+        if not value:
+            return None
+
+        if ex > 0:
+            await redis_client.expire(key, ex)
+        data = json.loads(value)
+        return cls.set_data(data)
+
+    @classmethod
+    def set_data(cls, data: dict):
+        if "status" in data and data["status"] is not None:
+            data["status"] = TaskStatus(data["status"])
+        if "params" in data:
+            data["params"] = pickle_deserialize(data["params"])
+        if "data" in data:
+            data["data"] = pickle_deserialize(data["data"])  # pickle.loads(data["data"])
+        if "function" in data:
+            data["function"] = pickle_deserialize(data["function"])
+
+        return cls(**data)
+
+    def copy_and_update(self, *args, **kwargs):
+        """
+        Copy the object and update it with the given Info
+        instance and/or other keyword arguments.
+        """
+        new_info = asdict(self)
+
+        for si in args:
+            if isinstance(si, TaskNode):
+                new_info.update({k: v for k, v in asdict(si).items() if v is not None})
+            elif isinstance(si, dict):
+                new_info.update({k: v for k, v in si.items() if v is not None})
+
+        if kwargs:
+            new_info.update(kwargs)
+
+        # for k, v in new_info.items():
+        #     setattr(self, k, v)
+        return replace(self, **new_info)  # 返回一个新的 TaskNode 实例
 
 
 class TaskManager:
-    Task_queue: dict[str, TaskNode] = {}  # queue.Queue(maxsize=Config.MAX_TASKS)
+    Task_queue: dict[str, TaskNode] = {}  # task_map queue.Queue(maxsize=Config.MAX_TASKS)
     Task_lock = asyncio.Lock()
     key_prefix = 'task'
 
@@ -472,6 +383,15 @@ class TaskManager:
 
         async with cls.Task_lock:
             cls.Task_queue[task_id or task.name] = task
+
+    @classmethod
+    async def add(cls, redis=None, **kwargs) -> tuple[str, TaskNode]:
+        task_id = kwargs.pop('name', str(uuid.uuid4()))
+        redis = redis or get_redis()
+        task_fields = TaskNode.default_node_attrs(task_id, **kwargs)
+        task = TaskNode(**task_fields)
+        await cls.add_task(task_id, task, redis_client=redis, ex=3600)
+        return task_id, task
 
     @classmethod
     async def remove_task(cls, task_id: str):
@@ -554,31 +474,34 @@ class TaskManager:
                     cls.Task_queue.pop(_id, None)
 
 
+class ConditionFlag(IntFlag):
+    NONE = 0
+    STATUS_MATCH = 1 << 0
+    TIME_OK = 1 << 1
+    CUSTOM_OK = 1 << 2
+
+
 @dataclass
 class TaskEdge:
     """定义任务依赖关系的有向边"""
-    source: str  # 依赖的起始任务ID
-    target: str  # 被触发的任务ID
+    relation: tuple[str, str]  # (source,target),依赖的起始任务ID,被触发的任务ID
     # 边上的触发条件（与源任务的状态相关),["done",{"deadline": time.time() + 60}]
-    condition: Union[str, Dict[str, Any]]  # 触发条件，如 "done" 或 {"deadline": timestamp}
+    condition: Union[str, Dict[str, Any]]  # 触发条件，如 "done" 或 {"deadline": timestamp}，dependencies
 
     # 使用field提供默认值以避免可变默认值问题,absolute,relative,[None, {"relative": 5}]
     trigger_time: Optional[Dict[str, Union[int, float]]] = field(
         default=None,
-        metadata={
-            "description": "时间触发配置，如 {'relative': 5}(秒) 或 {'absolute': 1680000000}(时间戳)"
-        }
+        metadata={"description": "时间触发配置，如 {'relative': 5}(秒) 或 {'absolute': 1680000000}(时间戳)"}
     )
     # 任务触发事件,None无依赖
-    trigger_event: Optional[str] = field(
-        default=None,
-        metadata={"description": "事件名称，如 'file_uploaded'"}
-    )
+    trigger_event: Optional[str] = field(default=None, metadata={"description": "事件名称，如 'file_uploaded'"})
     # 复杂条件,函数或复杂的逻辑判断
-    rule: Optional[Callable[..., bool]] = field(
-        default=None,
-        metadata={"description": "自定义条件函数，接受上下文返回布尔值"}
-    )
+    rule: Optional[Callable[..., bool]] = field(default=None,
+                                                metadata={"description": "自定义条件函数，接受上下文返回布尔值"})
+    map: Optional[dict] = field(default_factory=dict,
+                                metadata={"description": "挂载函数，对上游结果处理映射,参数变换逻辑"})
+
+    weight: float = 1.0  # 适用于图遍历/调度优先级；-1,0,1
 
     def __post_init__(self):
         """数据校验和转换"""
@@ -589,11 +512,16 @@ class TaskEdge:
         return dataclass2dict(self)
 
     @classmethod
-    def from_dict(cls, data: dict, rule_function: Callable = None):
-        if rule_function:
-            if "rule" in data and isinstance(data["rule"], str):
-                data["rule"] = rule_function(data["rule"])  # 从注册表或动态导入恢复函数
-        return cls(**data)
+    def set_data(cls, data: dict, rule_function: Optional[Callable] = None):
+        if "rule" in data:
+            rule_obj = pickle_deserialize(data["rule"])  # pickle.loads()
+            if rule_function and isinstance(rule_obj, str):
+                rule_obj = rule_function(rule_obj)  # 从注册表或动态导入恢复函数,用于从函数名等恢复为函数对象
+            data["rule"] = rule_obj
+
+        field_names = {f.name for f in fields(cls) if f.init}
+        attrs = {k: v for k, v in data.items() if k in field_names}  # cls.__annotations__
+        return cls(**attrs)
 
     @classmethod
     def get(cls, key):
@@ -601,7 +529,10 @@ class TaskEdge:
 
     def _validate_condition(self):
         """验证condition字段格式"""
-        if isinstance(self.condition, str):
+        condition = self.condition  # STR
+        if isinstance(condition, TaskStatus):
+            condition = condition.value
+        if isinstance(condition, str):
             if self.condition not in ("done", "failed", "running"):
                 raise ValueError(f"Invalid condition string: {self.condition}")
         elif isinstance(self.condition, dict):
@@ -616,6 +547,19 @@ class TaskEdge:
                 "absolute": time.time() + self.trigger_time["relative"]
             }
 
+    def _check_status_condition(self, source: dict) -> bool:
+        if self.condition is None:
+            return False
+
+        condition = self.condition  # STR
+        if isinstance(condition, TaskStatus):
+            condition = condition.value
+        source_status = source.get("status")
+        if isinstance(source_status, TaskStatus):
+            source_status = source_status.value
+
+        return source_status == condition
+
     def should_trigger(self, context: Dict[str, Any]) -> bool:
         """判断是否满足触发条件"""
         # 1. 检查时间条件
@@ -625,7 +569,7 @@ class TaskEdge:
 
         # 2. 检查基础条件
         if isinstance(self.condition, str):
-            if context.get("status") != self.condition:
+            if not self._check_status_condition(context):
                 return False
         elif isinstance(self.condition, dict):
             if "deadline" in self.condition:
@@ -638,21 +582,58 @@ class TaskEdge:
 
         return True
 
+    @staticmethod
+    def _evaluate_rule(rule, context: Dict[str, Any], conditions=[]):
+        """评估复杂规则对象"""
+        rule_type = rule.get("type", "and")
 
-class TaskScheduler:
+        if rule_type == "and":
+            return all(c.should_trigger(context) for c in conditions)
+        elif rule_type == "or":
+            return any(c.should_trigger(context) for c in conditions)
+        elif rule_type == "not":
+            return not conditions[0].should_trigger(context)
+        elif rule_type == "compare":
+            left = context.get("left")
+            right = context.get("right")
+            op = rule["operator"]
+
+            if op == "==": return left == right
+            if op == "!=": return left != right
+            if op == ">": return left > right
+            if op == "<": return left < right
+            if op == ">=": return left >= right
+            if op == "<=": return left <= right
+            if op == "in": return left in right
+            if op == "not_in": return left not in right
+
+        return False
+
+
+class TaskGraphManager:
     Task_graph = ig.Graph(directed=True)  # 创建有向图
+    Dask_client = None
 
-    def __init__(self, graph: Optional[ig.Graph] = None, driver: Optional[GraphDatabase] = None):
+    def __init__(self, graph: Optional[ig.Graph] = None, driver: Optional[GraphDatabase] = None,
+                 cluster: Optional[LocalCluster | str] = None):
         self.graph = self.__class__.Task_graph.copy() if graph is None else graph  # 局部副本
-        for attr in ["name", "status", "action", "start_time", "event", "priority"]:
+        for attr in ["name", "status", "action", "function", "start_time", "event", "priority"]:
             if attr not in self.graph.vs.attributes():  # "name" in Task_graph.vs.attributes()
                 self.graph.vs[attr] = [None] * self.graph.vcount()
 
-        self.driver = driver or get_neo_driver()
+        self.driver = driver  # get_neo_driver()
+        if not self.__class__.Dask_client:
+            if cluster:
+                self.__class__.Dask_client = get_dask_client(cluster)
 
-    def set_task_node(self, task_id: str, attributes: Dict[str, Any]) -> None:
-        """添加或更新任务节点,添加节点到图中"""
+        self.client = self.__class__.Dask_client
+        self.context = None  # history,global,update,relevant,extract,reflect,optimize,analyze,generate,decision
+
+    def set_task_node(self, task_id: str, attributes: Dict[str, Any]) -> ig.Vertex:
+        """添加或更新任务节点,添加节点到图中,对name去重"""
         # nodes = self.graph.vs["name"]
+        if not task_id:
+            task_id = str(uuid.uuid4())
         try:
             node = self.graph.vs.find(name=task_id)
             node.update_attributes(**attributes)
@@ -661,10 +642,14 @@ class TaskScheduler:
             # for k, v in attributes.items():
             #     node[k] = v
         except ValueError:
-            default_attrs = TaskNode.default_node_attrs(attributes)
-            self.graph.add_vertex(name=task_id, **default_attrs)
+            default_attrs = TaskNode.default_node_attrs(task_id, **attributes)
+            node = self.graph.add_vertex(**default_attrs)
+        return node
 
-    async def set_node(self, task_node: TaskNode, **kwargs):
+    def task_to_vertex(self) -> dict[str, int]:
+        return {name: idx for idx, name in enumerate(self.graph.vs["name"])}
+
+    async def set_node(self, task_node: TaskNode, **kwargs) -> ig.Vertex:
         """添加或更新任务节点，使用 TaskNode 对象,向 Neo4j 添加或更新一个任务节点"""
         task_id = task_node.name
         attributes = dataclass2dict(task_node)  # asdict(task_node)
@@ -674,11 +659,11 @@ class TaskScheduler:
             node = self.graph.vs.find(name=task_id)
             node.update_attributes(**attributes)
         except ValueError:
-            self.graph.add_vertex(name=task_id, **attributes)
-
-        async with self.driver.session() as session:
-            await session.execute_write(merge_neo_node, task_id, attributes, 'Task')
-        return task_id
+            node = self.graph.add_vertex(**attributes)
+        if self.driver:
+            async with self.driver.session() as session:
+                await session.execute_write(merge_neo_node, task_id, attributes, 'Task')
+        return node
 
     def update_task_status(self, task_id: str, new_status: TaskStatus | str) -> None:
         """更新任务状态"""
@@ -715,21 +700,24 @@ class TaskScheduler:
             await session.execute_write(_update, task_id, new_status, start_time)
 
     def set_task_dependency(self, edge: TaskEdge | dict, **kwargs):
-        """添加任务依赖关系"""
+        """添加任务依赖关系，对连接去重，source，target对应 name:task_id"""
         if isinstance(edge, dict):
-            edge = TaskEdge.from_dict(edge)  # TaskEdge(**edge)
-        if edge.source not in self.graph.vs["name"] or edge.target not in self.graph.vs["name"]:
+            edge = TaskEdge.set_data(edge)  # TaskEdge(**edge)
+        if edge.relation[0] not in self.graph.vs["name"] or edge.relation[1] not in self.graph.vs["name"]:
             raise ValueError("Source or target task does not exist")
 
+        source_id = self.graph.vs.find(name=edge.relation[0]).index
+        target_id = self.graph.vs.find(name=edge.relation[1]).index
         rel_props = {**edge.__dict__, **kwargs}
+
         rel_props.pop("source", None)
         rel_props.pop("target", None)
 
-        if self.graph.are_adjacent(edge.source, edge.target):  # 是否直接相连（有无一条边）
-            eid = self.graph.get_eid(edge.source, edge.target)
+        if self.graph.are_adjacent(source_id, target_id):  # 是否直接相连（有无一条边）
+            eid = self.graph.get_eid(source_id, target_id)
             self.graph.es[eid].update_attributes(**rel_props)
         else:
-            self.graph.add_edge(edge.source, edge.target, **rel_props)
+            self.graph.add_edge(source_id, target_id, **rel_props)
         return rel_props
 
     async def set_edge(self, task_edge: TaskEdge, **kwargs):
@@ -741,41 +729,110 @@ class TaskScheduler:
             kwargs: 可选附加属性（将合并进 edge 属性中）
         """
         rel_props = self.set_task_dependency(task_edge, **kwargs)
-        async with self.driver.session() as session:
-            await session.execute_write(merge_neo_relationship, task_edge.source, task_edge.target, rel_props,
-                                        'DEPENDS_ON', 'Task', 'Task')
+        if self.driver:
+            async with self.driver.session() as session:
+                await session.execute_write(merge_neo_relationship, task_edge.relation[0], task_edge.relation[1],
+                                            rel_props, 'DEPENDS_ON', 'Task', 'Task')
 
-    def graph_edge_to_task(self, edge: ig.Edge) -> TaskEdge:
-        edge_dict = edge.attributes()
-        # edge_dict.pop("source", None)
-        # edge_dict.pop("target", None)
-        return TaskEdge(source=self.graph.vs[edge.source]["name"], target=self.graph.vs[edge.target]["name"],
-                        **edge_dict)
+    async def build_subgraph(self, graph_def: dict) -> None:
+        """
+        批量添加任务节点与依赖边
+        """
+        nodes: list[TaskNode] = [TaskNode(**nd) for nd in graph_def.get("nodes", [])]
+        edges: list[TaskEdge] = [TaskEdge(**ed) for ed in graph_def.get("edges", [])]
+
+        for node in nodes:
+            await self.set_node(task_node=node)
+
+        for edge in edges:
+            await self.set_edge(task_edge=edge)
+
+    @staticmethod
+    def detect_cycles(g: ig.Graph) -> List[tuple[str]]:
+        """检测图中的环"""
+        cycles = g.feedback_arc_set(method="exact")
+        if not cycles:
+            return []
+        # 将边索引转换为任务ID
+        cycle_tasks = []
+        for eid in cycles:
+            edge: ig.Edge = g.es[eid]
+            source = g.vs[edge.source]["name"]
+            target = g.vs[edge.target]["name"]  # edge.target_vertex["name"]
+            cycle_tasks.append((source, target))
+        return cycle_tasks
+
+    @staticmethod
+    def graph_edge_to_task(edge: ig.Edge) -> TaskEdge:
+        attrs = edge.attributes()
+        if not attrs.get('relation'):
+            attrs['relation'] = (edge.source_vertex["name"], edge.target_vertex["name"])
+        return TaskEdge.set_data(attrs)
+
+    @staticmethod
+    def reroute_edges(g: ig.Graph, source_name: str, new_target_name: str):
+        """
+        将 source_node 的所有出边重新定向到 new_target。
+        注意：只处理 name 属性标识的顶点。
+        """
+        source_id = g.vs.find(name=source_name).index
+        new_target_id = g.vs.find(name=new_target_name).index
+
+        # 收集所有出边
+        out_edges = g.incident(source_id, mode="OUT")
+
+        for eid in out_edges:
+            edge = g.es[eid]
+            old_target = edge.target
+            g.delete_edges([(source_id, old_target)])  # 移除旧边
+            g.add_edge(source_id, new_target_id, **edge.attributes())  # 添加新边（保留 edge 属性）
+
+    @staticmethod
+    def insert_between(g: ig.Graph, source_name: str, target_name: str, new_name: str, new_node_attrs=None):
+        """
+        在 source 和 target 之间插入一个新节点。
+        - new_node_attrs: 可选，用于设置新节点的属性（字典）
+        """
+        source_id = g.vs.find(name=source_name).index
+        target_id = g.vs.find(name=target_name).index
+
+        g.delete_edges([(source_id, target_id)])  # 删除原边
+
+        new_node_id = g.vcount()  # 添加新节点
+        g.add_vertex(name=new_name, **(new_node_attrs or {}))
+
+        # 添加两条新边
+        g.add_edge(source_id, new_node_id)
+        g.add_edge(new_node_id, target_id)
 
     def set_task_edges(self, edges: List[tuple], attributes: List[Dict[str, Any]]):
         # 批量设置边结构（源+目标+属性）
+        assert len(edges) == len(attributes), "Edges and attributes must have the same length."
         for (source, target), attr in zip(edges, attributes):
             attrs = {k: v for k, v in attr.items() if k in TaskEdge.__annotations__}
             other_attrs = {k: v for k, v in attr.items() if k not in TaskEdge.__annotations__}
-            edge = TaskEdge(source=source, target=target, **attrs)  # from_dict()
+            edge = TaskEdge(relation=(source, target), **attrs)
             self.set_task_dependency(edge, **other_attrs)
 
-    def export_adjacency_list(self) -> dict:
+    def export_adjacency_list(self, field_alignment=False) -> dict:
         adjacency_list = defaultdict(list)
-
+        edge_attrs = self.graph.es.attributes()
         for edge in self.graph.es:
             source = self.graph.vs[edge.source]["name"]
             target = self.graph.vs[edge.target]["name"]
 
             adjacency_list[source].append({
                 "name": target,
-                "attrs": edge.attributes()
+                "attrs": {attr: edge[attr] for attr in edge_attrs} if field_alignment
+                else edge.attributes()  # 所有节点字段齐全
             })
 
         return dict(adjacency_list)
 
-    def export_nodes(self) -> dict:
-        return {v["name"]: v.attributes() for v in self.graph.vs}
+    def export_nodes(self, field_alignment=False) -> dict:
+        node_attrs = self.graph.vs.attributes()
+        return {v["name"]: {attr: v[attr] for attr in node_attrs} if field_alignment else v.attributes()
+                for v in self.graph.vs}
         # [self.graph.vs[n]["name"] for n in self.graph.successors(v.index)]
 
     def _check_condition(self, edge: TaskEdge | ig.Edge | Dict[str, Any]) -> int:
@@ -783,10 +840,10 @@ class TaskScheduler:
         if isinstance(edge, ig.Edge):
             edge = self.graph_edge_to_task(edge)
         elif isinstance(edge, dict):
-            edge = TaskEdge.from_dict(edge)  # TaskEdge(**edge)
+            edge = TaskEdge.set_data(edge)  # TaskEdge(**edge)
 
-        source = self.graph.vs.find(name=edge.source)
-        target = self.graph.vs.find(name=edge.target)
+        source = self.graph.vs.find(name=edge.relation[0])
+        target = self.graph.vs.find(name=edge.relation[1])
 
         # 基础状态检查
         if target["status"] != TaskStatus.PENDING:
@@ -795,17 +852,17 @@ class TaskScheduler:
         # 条件类型处理,状态条件
         condition = edge.condition
         if condition is None:
-            return 0
+            return 0  # return True
 
-        if isinstance(condition, str):
-            try:
-                condition = TaskStatus(condition)
-            except:
-                print(condition)
-
-        event_ready = 0
         if isinstance(condition, TaskStatus):
-            if source["status"] != condition:
+            condition = condition.value
+
+        event_ready = ConditionFlag.NONE  # 0
+        if isinstance(condition, str):
+            source_status = source["status"]
+            if isinstance(source_status, TaskStatus):
+                source_status = source_status.value
+            if source_status != condition:
                 return 0
             # 任务状态变化后触发事件驱动的任务边或者任务A完成时触发多个事件
             if edge.trigger_event and source.get("event") != edge.trigger_event:
@@ -817,16 +874,16 @@ class TaskScheduler:
                 if "relative" in edge.trigger_time and time.time() < source["start_time"] + edge.trigger_time[
                     "relative"]:
                     return 0
-            event_ready = 1
+            event_ready = ConditionFlag.STATUS_MATCH
 
         elif isinstance(condition, dict) and "deadline" in condition:
             if time.time() > condition["deadline"]:
                 return 0
-            event_ready = 1 << 1  # 时间条件<
+            event_ready = ConditionFlag.TIME_OK  # 时间条件<
         elif callable(condition):
             if not condition():
                 return 0
-            event_ready = 1 << 2  # 自定义条件
+            event_ready = ConditionFlag.CUSTOM_OK  # 自定义条件
         # 自定义规则
         if edge.rule:
             if not edge.rule():
@@ -834,28 +891,104 @@ class TaskScheduler:
 
         return event_ready
 
-    def check_and_trigger_tasks(self) -> List[str]:
+    def check_trigger_tasks(self) -> List[str]:
         """检查并触发符合条件的任务"""
         triggered = []
         for edge in self.graph.es:  # 遍历全部边
-            if self._check_condition(edge) > 0:
-                target = self.graph.vs.find(name=edge.target)
-                target["status"] = TaskStatus.READY
-                triggered.append(target["name"])
-                print(f"Task {target['name']} triggered by {edge.source}->{edge.target}")
+            if self._check_condition(edge) <= 0:
+                continue
+            target = edge.target_vertex  # self.graph.vs[edge.target]
+            target["status"] = TaskStatus.READY
+            triggered.append(target["name"])
+            print(f"Task {target['name']} triggered by {edge.source_vertex['name']} -> {target['name']}")
+
         return triggered
 
     @staticmethod
-    def _simulate_task_execution(task):
-        # 模拟任务执行
+    def execute_task(task: ig.Vertex, action_registry: Optional[Dict[str, Callable]] = None):
+        """执行单个任务（Dask延迟函数）"""
         attrs = task.attributes()
+        exec_func = attrs.get('function', None)  # execute 预定义函数
+        params = attrs.get("params", {}) or attrs.get("data", {})
+        if callable(exec_func):
+            return exec_func(**params)
+
+        name = task["name"]
         action = attrs.get("action")
         if isinstance(action, str):
-            print(f"Simulating execution for {task['name']}:{action}")
-        elif callable(action):
-            return action()
-        time.sleep(1)
+            if action_registry:
+                exec_func = action_registry.get(action)
+                if callable(exec_func):
+                    return exec_func(**params)
+
+            # 使用AI解析任务输入输出类型 tool_call
+            parameters_prompt = """
+                  根据任务描述确定输入和输出数据类型,根据以下信息生成方法参数
+                  方法: {action} 任务: "{description}"
+
+                  输出格式: 输入类型|输出类型
+                  可用类型: {input_type} {output_type}
+                  可用上下文: {parent_results}
+                  """
+
+            # ai_generate/generate_code Smart...learning strategy 动态调整 context global action expression
+            decision_prompt = """
+                    根据以下信息做出决策：
+                    目标: {global}，当前状态: {state}
+                    action:{action}，task desc:{description}
+                    父节点结果: {parent_results}
+                    决策选项: {options}
+
+                    请分析并选择最佳选项，说明理由。
+                    """
+            decision_prompt = decision_prompt.format(action=action, description=attrs.get('description'))
+            print(f"Simulating execution for {name}:{decision_prompt}")
+            # context=...
+            time.sleep(1)
+        else:
+            # reflect,optimize,analyze 反思优化任务，隐藏节点 or human interaction,调整工作流结构,知识整合
+            reflection_prompt = """
+                   你是一个高级AI工作流优化专家。请分析以下工作流执行情况：
+
+                   工作流目标: {global}
+                   执行历史摘要: {summarize_history} 
+                   分析报告: {analyze}
+
+                   请指出：
+                   1. 工作流设计中的潜在问题
+                   2. 可以优化的执行策略
+                   3. 未来类似工作流的改进建议
+                   4. 需要添加到知识库的关键洞察
+                   """
+            print(f"[SKIP] Task {name} has no executable logic.")
+            return {"status": "skipped", "task": name}
+
         return True
+
+    def build_dask_graph(self, action_registry: Optional[Dict[str, Callable]] = None) -> Dict[str, delayed]:
+        """将 igraph 中的任务节点转换为 Dask 延迟任务图"""
+        delayed_tasks = {}
+
+        for v in self.graph.vs:
+            task_id = v["name"]
+            func = v["function"] or v["action"]
+            if isinstance(func, str) and action_registry:
+                func = action_registry.get(func)  # 从注册表中解析函数
+
+            if not callable(func):
+                continue  # 或 raise Error
+
+            # 找到前置依赖任务名
+            predecessors = self.graph.predecessors(v.index)
+            dep_names = [self.graph.vs[p]["name"] for p in predecessors if self.graph.vs[p]["name"] in delayed_tasks]
+            params = v.attributes().get("params", {}) or v.attributes().get("data", {})  # 静态+动态参数
+            # 构建 delayed task，注入上游参数
+            if dep_names:
+                delayed_tasks[task_id] = delayed(func)(*[delayed_tasks[dep] for dep in dep_names], **params)
+            else:
+                delayed_tasks[task_id] = delayed(func)(**params)
+
+        return delayed_tasks
 
     def execute_ready_tasks(self, executor: Callable[[Any], bool] = None) -> bool:
         """执行所有就绪任务"""
@@ -864,13 +997,14 @@ class TaskScheduler:
         if not ready_tasks:
             return False  # 无可执行任务时退出
 
+        exec_func = executor or self.execute_task
         for task in ready_tasks:
             print(f"Executing Ready task {task['name']}...")
             task["status"] = TaskStatus.IN_PROGRESS  # "running"
             try:
-                exec_func = executor or self._simulate_task_execution
                 result = exec_func(task)
                 # 任务执行成功
+                task['result'] = result  # 将结果映射回任务
                 task["status"] = TaskStatus.COMPLETED if result else TaskStatus.FAILED  # "done"'completed'
             except Exception as e:
                 task["status"] = TaskStatus.FAILED
@@ -878,23 +1012,26 @@ class TaskScheduler:
 
         return True
 
-    def step(self, executor: Callable[[Any], bool] = None) -> bool:
-        triggered = self.check_and_trigger_tasks()  # 检查并触发新的任务
-        executed = self.execute_ready_tasks(executor)
-        return triggered or executed
-
-    def run_scheduler(self, max_cycles: int = 100) -> None:
+    def run_scheduler(self, max_cycles: int = 100, executor: Callable[[Any], bool] = None) -> None:
         if not self.graph.is_dag():
-            raise ValueError("任务图存在循环依赖，无法调度")
+            cycles = self.detect_cycles(self.graph)
+            raise ValueError(f"任务图存在循环依赖，无法调度，图中存在环 {cycles}")
+
+        def step() -> bool:
+            triggered = self.check_trigger_tasks()  # 检查并触发新的任务
+            executed = self.execute_ready_tasks(executor)
+            return triggered or executed
+
         """运行任务调度主循环"""
         if max_cycles:
-            for _ in range(max_cycles):
-                if not self.step():
+            for cycle_num in range(max_cycles):
+                if not step():
+                    print(f"Scheduler finished after {cycle_num} cycles with no more tasks.")
                     break
                 time.sleep(1)
         else:
             while True:
-                if not self.step():
+                if not step():
                     break
                 time.sleep(1)
 
@@ -902,16 +1039,82 @@ class TaskScheduler:
 
         # 检查依赖并触发任务
 
+    def run_dask_schedule(self):
+        """执行任务图"""
+        graph_delayed_tasks = self.build_dask_graph()
+        if not graph_delayed_tasks:
+            return []
+        results = self.client.compute(*graph_delayed_tasks.values(), sync=True)  # 同步等待执行完毕
 
-def get_children(g, node):
-    # g.successors(node.index)
-    return [g.vs[neighbor]["name"] for neighbor in g.neighbors(node, mode="OUT")]
+        for task_id, result in zip(graph_delayed_tasks.keys(), results):
+            try:
+                vertex = self.graph.vs.find(name=task_id)
+                vertex["result"] = result
+                vertex["status"] = TaskStatus.COMPLETED  # 可选：设置任务状态
+            except Exception as e:
+                print(f"[Error] Failed to update result for task {task_id}: {e}")
+
+        return results
 
 
-def get_parent(g, node):
-    # g.predecessors(node.index)
-    neighbors = g.neighbors(node, mode="IN")
-    return g.vs[neighbors[0]]["name"] if neighbors else None
+def get_neighbors(g: ig.Graph, node: int | str | ig.Vertex, mode="ALL"):
+    '''
+    mode:
+    - "OUT": 获取子任务（后继）g.successors(node.index),OUT:children
+    - "IN": 获取父任务（前驱） g.predecessors(node.index),IN:parent
+    - "ALL": 所有邻居
+    '''
+    if isinstance(node, str):
+        node = g.vs.find(name=node)
+    elif isinstance(node, int):
+        node = g.vs[node]
+
+    neighbors = g.neighbors(node.index, mode=mode)
+    return [g.vs[n]["name"] for n in neighbors]
+
+
+def find_root_nodes(g: ig.Graph) -> list[str]:
+    """找到所有根节点（入度为0的节点）"""
+    in_degrees = g.indegree()
+    return [g.vs[i]["name"] for i, deg in enumerate(in_degrees) if deg == 0]
+
+
+def calculate_depths(g: ig.Graph) -> Dict[str, int]:
+    """计算每个节点的深度（拓扑深度），使用 BFS"""
+    in_degrees = g.indegree()
+    root_nodes = [(i, g.vs[i]["name"]) for i, deg in enumerate(in_degrees) if deg == 0]  # 返回[(index, name)]
+    queue = [(v, 0) for v, root in root_nodes]  # deque
+    depths = {}
+    for v, depth in queue:
+        task_id = g.vs[v]["name"]
+        if task_id in depths and depths[task_id] >= depth:
+            continue  # 已处理，且更深或一样深，不更新
+        depths[task_id] = depth
+
+        for succ in g.successors(v):  # 获取后继节点，略去局部判断
+            queue.append((succ, depth + 1))
+
+    return depths
+
+
+def calculate_dependencies(g: ig.Graph) -> Dict[str, List[str]]:
+    """计算每个节点的所有依赖（反向遍历所有节点祖先），使用 DFS"""
+    dependencies = {}
+
+    for v in range(g.vcount()):
+        task_id = g.vs[v]["name"]
+        visited = set()
+        stack = list(g.predecessors(v))
+
+        while stack:
+            pred = stack.pop()
+            if pred not in visited:
+                visited.add(pred)
+                stack.extend(g.predecessors(pred))
+
+        dependencies[task_id] = [g.vs[u]["name"] for u in visited]
+
+    return dependencies
 
 
 def load_graph_from_dict(nodes: dict, adjacency_list: dict) -> ig.Graph:
@@ -1001,18 +1204,21 @@ async def export_graph_to_neo4j(nodes: dict, adjacency_list: dict, driver, g: ig
                     await session.execute_write(merge_neo_relationship, src, tgt, rel_props, rel_type, label, label)
 
 
-def export_to_json_from_graph(graph, filename):
+def export_to_json_from_graph(graph: ig.Graph, filename):
     data = {"nodes": [{"id": v.index, **v.attributes()} for v in graph.vs],
-            "edges": [{"source": e.source, "target": e.target, **e.attributes()} for e in graph.es], }
+            "edges": [{"source": e.source, "target": e.target, **e.attributes()} for e in graph.es],
+            }
     with open(filename, "w") as f:
-        json.dump(data, f, indent=4)
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
     # graph.write_pickle("graph.pkl")
 
 
-def import_to_graph_from_json(filename):
+def import_to_graph_from_json(filename) -> ig.Graph:
     with open(filename, "r") as f:
         data = json.load(f)
+    if "nodes" not in data or "edges" not in data:
+        raise ValueError("Invalid graph JSON format")
 
     g = ig.Graph(directed=True)  # ig.Graph.TupleList(
     g.add_vertices(len(data["nodes"]))
@@ -1034,13 +1240,11 @@ def import_to_graph_from_json(filename):
 
 class WebSearchGraph:
     def __init__(self):
-        import queue
-
         # 初始化节点内容字典
         self.nodes: Dict[str, Dict[str, str]] = {}
         # 初始化邻接表
         self.adjacency_list: Dict[str, List[dict]] = defaultdict(list)
-        self.task_queue = queue.Queue()
+        self.task_queue = Queue()
         self.n_active_tasks = 0
 
     async def add_root_node(self, node_content: str, node_name: str = 'root'):
@@ -1206,16 +1410,18 @@ def list_or_args_keys(keys: Union[_StringLikeT, Iterable[_StringLikeT]],
 
 class MessageZeroMQ:
 
-    def __init__(self, pull_port="7556", push_port="7557", req_port="7555", process_callback=None):
+    def __init__(self, pull_port="7556", push_port="7557", req_port="7555", process_callback: Callable = None):
         self.context = zmq.asyncio.Context(io_threads=2)  # zmq.Context()
 
         # 设置接收消息的 socket
         self.pull_socket = self.context.socket(zmq.PULL)
-        self.pull_socket.bind(f"tcp://*:{pull_port}")  # 绑定接收端口
+        if pull_port:
+            self.pull_socket.bind(f"tcp://*:{pull_port}")  # 绑定接收端口
 
         # 设置发送消息的 socket
         self.push_socket = self.context.socket(zmq.PUSH)
-        self.push_socket.connect(f"tcp://localhost:{push_port}")  # 连接到 Java 的接收端口
+        if push_port:
+            self.push_socket.connect(f"tcp://localhost:{push_port}")  # 连接到 Java 的接收端口
 
         # 设置 REQ socket 用于请求-响应模式
         self.req_socket = self.context.socket(zmq.REQ)  # zmq.DEALER
@@ -1226,7 +1432,17 @@ class MessageZeroMQ:
         # self.push_socket.send_string('topic1 Hello, world!')
 
     def __del__(self):
-        self.context.destroy(linger=0)
+        self.close()
+
+    def close(self):
+        try:
+            self.pull_socket.close(linger=0)
+            self.push_socket.close(linger=0)
+            self.req_socket.close(linger=0)
+            self.context.destroy(linger=0)
+            # self.context.term()  # or destroy()
+        except Exception as e:
+            print(f"Error closing sockets: {e}")
 
     @staticmethod
     def default_process_message(message):
@@ -1242,7 +1458,7 @@ class MessageZeroMQ:
         await self.req_socket.send_string(f'{topic} {message}')
         print(f"Sent request: {message} under topic: {topic}")
         response = await self.req_socket.recv_string()
-        print(f"Received response: {response}")
+        print(f"Received reply: {response}")
         return response
 
     async def call_service(self, data):
@@ -1291,6 +1507,227 @@ class MessageZeroMQ:
             # 将处理后的消息发送
             await self.push_socket.send_string(processed_msg)
             print(f"Sent processed message back.")
+
+
+class TimeWheel:
+    def __init__(self, slots: int, tick_duration: int | float, name: str):
+        self.slots = slots
+        self.tick_duration = tick_duration
+        self.name = name
+        self.current_pos: int = 0
+        self.wheel = [[] for _ in range(slots)]
+        self.next_wheel = None
+        self.timer = None
+
+    def set_next_wheel(self, next_wheel):
+        self.next_wheel = next_wheel
+
+    def add_task(self, delay: float | int, task):
+        ticks = delay // self.tick_duration
+        if ticks < self.slots:
+            rounds = 0  # ticks // self.slots
+            pos = int((self.current_pos + ticks) % self.slots)
+            self.wheel[pos].append((rounds, task))
+        else:
+            # 需要传递到上层时间轮
+            if self.next_wheel:
+                remaining_delay = delay - (self.slots - self.current_pos) * self.tick_duration
+                self.next_wheel.add_task(remaining_delay, task)
+            else:
+                # 如果没有上层时间轮，使用rounds机制, threading.Timer(delay, task).start()
+                rounds = ticks // self.slots
+                pos = int((self.current_pos + ticks) % self.slots)
+                self.wheel[pos].append((rounds, task))
+
+    def start(self):
+        def tick():
+            # 执行当前槽的任务
+            tasks = self.wheel[self.current_pos]
+            remaining_tasks = []
+
+            for rounds, task in tasks:
+                if rounds <= 0:
+                    try:
+                        task()
+                    except Exception as e:
+                        print(f"[{self.name}] Task execution failed: {e}")
+                else:
+                    remaining_tasks.append((rounds - 1, task))
+
+            self.wheel[self.current_pos] = remaining_tasks
+            self.current_pos = int((self.current_pos + 1) % self.slots)  # 移动指针
+
+            # 如果转完一圈，通知上层时间轮
+            if self.current_pos == 0 and self.next_wheel:
+                # 将上层时间轮的任务降级到本层
+                self.cascade_tasks()
+
+            # 继续下一次tick
+            self.timer = threading.Timer(self.tick_duration, tick)
+            self.timer.start()
+
+        tick()
+
+    def cascade_tasks(self):
+        if not self.next_wheel:
+            return
+
+        # 获取上层时间轮下一槽的所有任务
+        next_pos = int((self.next_wheel.current_pos + 1) % self.next_wheel.slots)
+        tasks = self.next_wheel.wheel[next_pos]
+
+        # 将这些任务重新添加到本层时间轮
+        for rounds, task in tasks:
+            new_rounds = int(rounds * (self.next_wheel.slots // self.slots))  # 计算在新层的rounds
+            self.add_task(new_rounds * self.tick_duration, task)
+
+        self.next_wheel.wheel[next_pos] = []  # 清空上层时间轮的这些任务
+
+    def stop(self):
+        if self.timer:
+            self.timer.cancel()
+
+
+class HierarchicalTimeWheel:
+    def __init__(self):
+        # 初始化各层时间轮
+        self.second_wheel = TimeWheel(60, 1, "second")  # 60 slots, 1s per tick
+        self.minute_wheel = TimeWheel(60, 60, "minute")  # 60 slots, 60s per tick
+        self.hour_wheel = TimeWheel(24, 3600, "hour")  # 24 slots, 3600s per tick
+        self.day_wheel = TimeWheel(30, 86400, "day")  # 30 slots, 86400s per tick
+        self.month_wheel = TimeWheel(12, 2592000, "month")  # 12 slots, ~30 days per tick
+
+        # 连接各层时间轮
+        self.second_wheel.set_next_wheel(self.minute_wheel)
+        self.minute_wheel.set_next_wheel(self.hour_wheel)
+        self.hour_wheel.set_next_wheel(self.day_wheel)
+        self.day_wheel.set_next_wheel(self.month_wheel)
+
+        self.running = False
+
+    def add_task(self, execute_time: datetime | float, task):
+        """添加定时任务
+        :param execute_time: 执行时间(datetime对象或时间戳)
+        :param task: 要执行的任务(函数)
+        """
+        if isinstance(execute_time, datetime):
+            execute_time = execute_time.timestamp()
+
+        now = time.time()
+        delay: float = max(0, execute_time - now)
+
+        if delay == 0:
+            threading.Thread(target=task).start()  # 立即执行
+        else:
+            # 根据延迟时间选择合适的时间轮
+            if delay <= 60:
+                self.second_wheel.add_task(delay, task)
+            elif delay <= 3600:
+                self.minute_wheel.add_task(delay, task)
+            elif delay <= 86400:
+                self.hour_wheel.add_task(delay, task)
+            elif delay <= 2592000:  # ~30 days
+                self.day_wheel.add_task(delay, task)
+            else:
+                self.month_wheel.add_task(delay, task)
+
+    def start(self):
+        self.running = True
+        self.second_wheel.start()
+
+    def stop(self):
+        self.running = False
+        self.second_wheel.stop()
+
+
+class AsyncCaller:
+    """
+    通过后台线程和队列将同步函数调用（如日志记录、网络请求）转换为异步执行,适合不关心返回值的场景
+    通过将耗时操作转移到后台线程，主线程可以继续执行核心逻辑，提高程序响应速度。
+    This AsyncCaller tries to make it easier to async call
+
+    Currently, it is used in MLflowRecorder to make functions like `log_params` async
+
+    NOTE:
+    - This caller didn't consider the return value
+    """
+
+    STOP_MARK = "__STOP"
+
+    def __init__(self) -> None:
+        self._q = Queue()
+        self._stop = False
+        self._t = threading.Thread(target=self.run)
+        self._t.start()
+
+    def close(self):
+        self._q.put(self.STOP_MARK)
+
+    def run(self):
+        while True:
+            # NOTE:
+            # atexit will only trigger when all the threads ended. So it may results in deadlock.
+            # So the child-threading should actively watch the status of main threading to stop itself.
+            main_thread = threading.main_thread()
+            if not main_thread.is_alive():  # 检测主线程状态，避免程序退出时死锁
+                break
+            try:
+                data = self._q.get(timeout=1)
+            except Empty:
+                # NOTE: avoid deadlock. make checking main thread possible
+                continue
+            if data == self.STOP_MARK:
+                break
+            data()
+
+    def __call__(self, func, *args, **kwargs):
+        self._q.put(partial(func, *args, **kwargs))
+
+    def wait(self, close=True):
+        if close:  # 资源释放,等待线程结束（可选是否自动关闭）必须显式调用 wait() 或 close()，否则线程可能无法退出
+            self.close()
+        self._t.join()
+
+    @staticmethod
+    def async_dec(ac_attr):
+        def decorator_func(func):
+            def wrapper(self, *args, **kwargs):
+                if isinstance(getattr(self, ac_attr, None), Callable):
+                    return getattr(self, ac_attr)(func, self, *args, **kwargs)
+                else:
+                    return func(self, *args, **kwargs)
+
+            return wrapper
+
+        return decorator_func
+
+
+class ThreadPoolTask:
+    def __init__(self, max_thread_num, **pool_kwargs):
+        self.max_thread_num = max_thread_num
+        self.pool_kwargs = pool_kwargs  # thread_name_prefix
+
+    def run(self, function, args_list, **kwargs):
+        """执行线程池任务
+       :param function: 被调用的函数
+       :param args_list: iterable 可迭代的参数列表（如 [1, 2, 3]）
+       :param kwargs: 传递给每个任务的 func_kwargs
+        """
+        bound_func = partial(function, **kwargs) if kwargs else function
+        with ThreadPoolExecutor(max_workers=self.max_thread_num, **self.pool_kwargs) as executor:
+            return list(executor.map(bound_func, args_list))
+
+
+def run_thread_pool(max_thread_num=10, **pool_kwargs):
+    # 自动用线程池处理每个item
+    def wrapper(func):
+        def inner(args_list, **kwargs):
+            thread_pool = ThreadPoolTask(max_thread_num, **pool_kwargs)
+            return thread_pool.run(func, args_list, **kwargs)  # 返回结果
+
+        return inner
+
+    return wrapper
 
 
 #
@@ -1344,7 +1781,7 @@ if __name__ == "__main__":
 
     def test():
         import pprint
-        scheduler = TaskScheduler()
+        scheduler = TaskGraphManager(cluster=Config.DASK_Cluster)
 
         # 添加任务节点
         scheduler.set_task_node("task1", {"priority": 1})
@@ -1352,19 +1789,15 @@ if __name__ == "__main__":
         scheduler.set_task_node("task3", {"priority": 3})
 
         # 添加依赖关系
-        scheduler.set_task_dependency(TaskEdge(
-            source="task1",
-            target="task2",
-            condition="done",
-            trigger_time={"relative": 1}
-        ))
+        scheduler.set_task_dependency(TaskEdge(relation=('task1', 'task2'),
+                                               condition="done",
+                                               trigger_time={"relative": 1}
+                                               ))
 
-        scheduler.set_task_dependency(TaskEdge(
-            source="task2",
-            target="task3",
-            condition="done",  # 自定义条件
-            rule=lambda: time.localtime().tm_hour < 23  # 晚上11点前才触发
-        ))
+        scheduler.set_task_dependency(TaskEdge(relation=('task2', 'task3'),
+                                               condition="done",  # 自定义条件
+                                               rule=lambda: time.localtime().tm_hour < 23  # 晚上11点前才触发
+                                               ))
 
         # 启动任务
         scheduler.update_task_status("task1", TaskStatus.COMPLETED)  # "done"
@@ -1373,7 +1806,8 @@ if __name__ == "__main__":
         scheduler.set_task_node("taskX", {"action": 'X'})
         scheduler.set_task_node("taskY", {"action": 'y'})
 
-        scheduler.set_task_dependency(TaskEdge("taskX", "taskY", condition="done", trigger_time={"absolute": abs_time}))
+        scheduler.set_task_dependency(
+            TaskEdge(relation=('taskX', 'taskY'), condition="done", trigger_time={"absolute": abs_time}))
         scheduler.update_task_status("taskX", TaskStatus.READY)
 
         # scheduler.set_task_node("A", {})
@@ -1394,14 +1828,61 @@ if __name__ == "__main__":
 
         print(scheduler.export_nodes())
         print(scheduler.export_adjacency_list())
+        print(find_root_nodes(scheduler.graph), calculate_depths(scheduler.graph))
+
+        print(get_neighbors(scheduler.graph, 0))
+
+        print(scheduler.run_dask_schedule())
 
         async def test_save():
             await scheduler.set_node(task_node=TaskNode(name='taskX', action='X'))
             await scheduler.set_node(task_node=TaskNode(name='taskY', action='Y'))
-            await scheduler.set_edge(task_edge=TaskEdge(source='taskX', target='taskY', condition='done',
+            await scheduler.set_edge(task_edge=TaskEdge(relation=('taskX', 'taskY'), condition='done',
                                                         trigger_time={"absolute": abs_time}))
 
         asyncio.run(test_save())
 
 
     test()
+
+    from datetime import timedelta
+
+
+    def print_time(msg):
+        time.sleep(1)  # 模拟耗时操作
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+    caller = AsyncCaller()
+
+    # 异步调用（立即返回）
+    caller(print_time, "test1")
+    caller(print_time, "test2")
+
+    # 等待所有任务完成
+    caller.wait()
+
+    tw = TimeWheel(60, 1, "second")
+    tw.add_task(5, lambda: print_time("5秒后执行"))  # 5秒后执行
+    tw.add_task(65, lambda: print_time("65秒后执行"))
+    tw.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        tw.stop()
+        print_time("时间轮停止")
+
+    tw = HierarchicalTimeWheel()
+    now = datetime.now()
+
+    tw.add_task(now + timedelta(seconds=10), lambda: print_time("10秒后执行"))
+    tw.add_task(now + timedelta(minutes=2), lambda: print_time("2分钟后执行"))
+    tw.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        tw.stop()

@@ -1,13 +1,13 @@
 import httpx, requests, asyncio
 from http import HTTPStatus
-import io
-from config import *
 from PIL import Image
 import dashscope
 # import qianfan
 from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription, RecognitionCallback
-from agents.ai_search import get_httpx_client
+
+from service import get_httpx_client
+from config import *
 
 
 # from lagent import tool_api

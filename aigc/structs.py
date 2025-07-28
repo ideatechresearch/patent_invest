@@ -1,10 +1,16 @@
 from pydantic import BaseModel, Field, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from abc import ABC, abstractmethod
+from collections.abc import Callable as IsCallable
 from enum import IntEnum, Enum
 from dataclasses import asdict, dataclass, is_dataclass, field
 from datetime import datetime
 import random, time, asyncio, json
+
+from utils import pickle_serialize
+from service import ModelListExtract
+
+MODEL_LIST = ModelListExtract()
 
 _KB = 1 << 10
 _MB = 1 << 20
@@ -47,6 +53,8 @@ def dataclass2dict(data):
     """
 
     def convert(obj):
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
         if isinstance(obj, Enum):
             return obj.value
         elif isinstance(obj, datetime):
@@ -59,14 +67,16 @@ def dataclass2dict(data):
             return {k: convert(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple, set, frozenset)):
             return [convert(v) for v in obj]  # list(obj)
-        elif hasattr(obj, "__dict__"):
-            return {k: convert(v) for k, v in vars(obj).items() if not k.startswith("_")}
+        elif isinstance(obj, IsCallable):  # 用于运行时判断
+            return pickle_serialize(obj)
         elif hasattr(obj, "model_dump") and callable(obj.model_dump):  # 兼容 Pydantic v2 的 BaseMode
             return obj.model_dump()
         elif hasattr(obj, "dict") and callable(obj.dict):  # 兼容 Pydantic v1 或其他自定义对象实现的 .dict() 方法
-            return obj.dict()
+            return obj.dict()  # convert(obj.dict())
+        elif hasattr(obj, "__dict__"):  # 通用对象（包含 __dict__）
+            return {k: convert(v) for k, v in vars(obj).items() if not k.startswith("_")}
         else:
-            return obj
+            return pickle_serialize(obj)
 
     return convert(data)
 
@@ -114,6 +124,19 @@ class GenerationParams(BaseModel):
     agent_cfg: Dict = Field(default_factory=dict)
 
 
+class SearchQueryList(BaseModel):
+    query: List[str] = Field(description="A list of search queries to be used for web research.")
+    rationale: str = Field(description="A brief explanation of why these queries are relevant to the research topic.")
+
+
+class Reflection(BaseModel):
+    is_sufficient: bool = Field(
+        description="Whether the provided summaries are sufficient to answer the user's question."
+    )
+    knowledge_gap: str = Field(description="A description of what information is missing or needs clarification.")
+    follow_up_queries: List[str] = Field(description="A list of follow-up queries to address the knowledge gap.")
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "developer", "tool"]
     content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]
@@ -122,12 +145,14 @@ class ChatMessage(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_default_name(cls, values):
-        values["name"] = values.get("name", "") or ""
         role = values.get("role")
         content = values.get("content")
         if role != "user" and isinstance(content, list):
             raise ValueError(f"Role '{role}' must not have list content (only 'user' can have list).")
 
+        name = values.get("name", "")
+        if not name or not str(name).strip():
+            values.pop("name", None)
         return values
 
     # @field_validator("name")
@@ -195,11 +220,6 @@ class IMessage(ChatMessage):
             for call in tool_calls
         ]
         return cls(role="assistant", content=content, tool_calls=formatted_calls, **kwargs)
-
-
-from generates import ModelListExtract
-
-MODEL_LIST = ModelListExtract()
 
 
 class OpenAIRequest(BaseModel):
@@ -274,7 +294,7 @@ class OpenAIRequestMessage(BaseModel):
     stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
     extra_body: Optional[dict] = None
     extra_query: Optional[Dict[str, Any]] = None
-    metadata: Optional[Dict[str, str]] = None
+    metadata: Optional[Dict[str, str]] = None  # 可选，附加的元数据
 
     # file =
     # modalities= ["text", "audio"]
@@ -340,32 +360,30 @@ class OpenAIEmbeddingRequest(BaseModel):
     model: str  # 模型名称
     input: Union[str, List[str]]  # 输入的文本数组
     encoding_format: str = "float"  # 默认设置为 "float"，表示返回浮点数嵌入
+    dimensions: Optional[int] = None  # 指定向量维度（text-embedding-v3及 text-embedding-v4）
 
     user: Optional[str] = None  # 可选，标识用户
-    metadata: Optional[Dict[str, str]] = None  # 可选，附加的元数据
 
     @model_validator(mode="before")
     def set_default_value(cls, values):
         if isinstance(values.get("input"), str):
             values["input"] = [values["input"]]
-        if "user" not in values or values["user"] is None:
-            values["user"] = ""
         values["input"] = [x.replace("\n", " ") for x in values["input"]]
+        user = values.get("user", "")
+        if not user or not str(user).strip():
+            values.pop("user", None)
         return values
 
     class Config:
         json_schema_extra = {
             "example": {
-                "model": "qwen",
+                "model": "qwen:text-embedding-v4",
                 "input": [
                     "role", "user",
-                    "content", "你好,有问题要问你"
+                    "content", "你好,有问题要问你", "第二条文本\n带换行"
                 ],
                 "encoding_format": "float",
-                "metadata": {
-                    "source": "chatbot",
-                    "timestamp": "2025-01-01T00:00:00Z"
-                }
+                "dimensions": 1024
             }
         }
 
@@ -378,6 +396,7 @@ class AuthRequest(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     public_key: Optional[str] = None
+    code: Optional[str] = None
 
     class Config:
         json_schema_extra = {
@@ -385,9 +404,10 @@ class AuthRequest(BaseModel):
                 "username": "test",
                 "password": "123456",
                 "public_key": "0x123456789ABCDEF",
-                "eth_address": "0x123456789ABCDEF",
+                "eth_address": None,
                 "signed_message": None,
-                "original_message": None
+                "original_message": None,
+                "code": None,  # "NUM"
             }
         }
 
@@ -406,7 +426,8 @@ class Registration(AuthRequest):
                 "public_key": "0x123456789ABCDEF",
                 "eth_address": "0x123456789ABCDEF",
                 "signed_message": "signed_message_here",
-                "original_message": "original_message_here"
+                "original_message": "original_message_here",
+                "code": '123456',  # "NUM"
             }
         }
 
@@ -472,7 +493,7 @@ class FuzzyMatchRequest(BaseModel):
     terms: List[str]
     top_n: int = 3
     cutoff: float = 0.6
-    method: str = 'levenshtein'
+    method: Literal['levenshtein', 'bm25', 'reranker', 'embeddings'] = 'levenshtein'
 
 
 class PlatformEnum(str, Enum):
@@ -482,8 +503,8 @@ class PlatformEnum(str, Enum):
 
 
 class ToolRequest(BaseModel):
-    messages: Optional[List[ChatMessage]] = Field(None)
-    tools: Optional[List[Any]] = Field(None)
+    messages: Optional[List[ChatMessage]] = Field(default_factory=list)
+    tools: Optional[List[Any]] = Field(default_factory=list)
     user: Optional[str] = Field(default=None)
     prompt: Optional[str] = Field(default=None)
     model_name: Optional[str] = 'qwen:qwen-max'
@@ -564,6 +585,9 @@ class CallbackUrl(BaseModel):
             data["url"] = None
         return data
 
+    class Config:
+        json_schema_extra = {"example": {'url': 'http://127.0.0.1:7000/callback', 'format': 'json'}}
+
 
 class MetadataRequest(BaseModel):
     function_code: str = Field(..., description="函数源码")
@@ -574,6 +598,16 @@ class MetadataRequest(BaseModel):
     callback: Optional[CallbackUrl] = Field(default=None, description="外部函数调用信息")
     code_type: Optional[str] = Field(default="Python", description="代码类型")
     cache_sec: Optional[int] = Field(default=0, description="缓存秒数，0 表示使用默认")
+
+    class Config:
+        protected_namespaces = ()
+
+
+class AgentRequest(BaseModel):
+    messages: Optional[List[ChatMessage]] = Field(default_factory=list)
+    user: Optional[str] = Field(default=None)
+    model: Optional[str] = 'deepseek-chat'
+    callback: Optional[CallbackUrl] = Field(default=None, description="外部函数调用信息")
 
     class Config:
         protected_namespaces = ()
@@ -710,7 +744,7 @@ class SubmitMessagesRequest(BaseModel):
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
     filter_time: Optional[int] = Field(0, description="The timestamp to filter historical messages.")
 
-    messages: Optional[List[ChatMessage]] = Field(None,
+    messages: Optional[List[ChatMessage]] = Field(default_factory=list,
                                                   description="A list of message objects representing the current conversation. "
                                                               "If no messages are provided and `use_hist` is set to `True`, "
                                                               "the system will filter existing chat history using the fields "
@@ -736,23 +770,41 @@ class SubmitMessagesRequest(BaseModel):
                         "name": 'test',
                     }
                 ],
-                "params": [{
-                    "name": None,
-                    "stream": False,
-                    "temperature": 0.8,
-                    "top_p": 0.8,
-                    "max_tokens": 1024,
-                    "prompt": "",
-                    "question": "",
-                    "keywords": [],
-                    "tools": [],
-                    'images': [],
-                    "agent": "0",
-                    "extract": "json",
-                    "callback": {'url': 'http://127.0.0.1:7000/callback'},
-                    "model_name": "moonshot",
-                    "model_id": 0,
-                }]
+                "params": [
+                    {
+                        "name": None,
+                        "stream": False,
+                        "temperature": 0.8,
+                        "top_p": 0.8,
+                        "max_tokens": 1024,
+                        "prompt": "",
+                        "question": "中国今年多少新生儿",
+                        "keywords": ["中国2024新生儿人口"],
+                        "tools": [],
+                        'images': [],
+                        "agent": "0",
+                        "extract": "json",
+                        "callback": {'url': 'http://127.0.0.1:7000/callback'},
+                        "model_name": "moonshot",
+                        "model_id": 0,
+                    },
+                    {
+                        "agent": "0",
+                        "callback": {"url": "http://127.0.0.1:7000/callback"},
+                        "extract": "wechat",
+                        "images": [],
+                        "keywords": [('web_search', "感冒灵")],
+                        "max_tokens": 1024,
+                        "model_id": 0,
+                        "model_name": "qwen",
+                        "prompt": "",
+                        "question": "感冒灵颗粒好用吗",
+                        "stream": False,
+                        "temperature": 0.8,
+                        "tools": [],
+                        "top_p": 0.8
+                    }
+                ]
             }
         }
 
@@ -767,7 +819,7 @@ class ChatCompletionRequest(CompletionParams):
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
     filter_time: float = Field(default=0, description="The timestamp to filter historical messages.")
 
-    messages: Optional[List[ChatMessage]] = Field(None,
+    messages: Optional[List[ChatMessage]] = Field(default_factory=list,
                                                   description="A list of message objects representing the current conversation. "
                                                               "If no messages are provided and `use_hist` is set to `True`, "
                                                               "the system will filter existing chat history using the fields "
@@ -809,6 +861,15 @@ class ChatCompletionRequest(CompletionParams):
                 # "top_n": 10,
             }
         }
+
+
+class SummaryRequest(BaseModel):
+    text: Union[str, List[str]]
+    extract_prompt: Optional[str] = None
+    summary_prompt: Optional[str] = None
+    model: str = 'qwen:qwen-max'
+    max_tokens: int = 4096
+    max_segment_length: int = 1024
 
 
 class ClassifyRequest(BaseModel):

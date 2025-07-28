@@ -1,39 +1,14 @@
 import asyncio
 import httpx, requests
 import random
-from typing import List, Dict, Tuple, Any, Union, Iterator, Sequence, Literal
+from typing import List, Dict, Literal
 from utils import convert_to_pinyin
-
+from service import get_httpx_client
 from config import *
 
 # Config.load('../config.yaml')
 # Config.debug()
 # from selectolax.parser import HTMLParser
-_httpx_clients: dict[str, httpx.AsyncClient] = {}
-
-
-def get_httpx_client(time_out: float = Config.HTTP_TIMEOUT_SEC, proxy: str = None) -> httpx.AsyncClient:
-    # @asynccontextmanager
-    key = proxy or "default"
-    global _httpx_clients
-    if key not in _httpx_clients or _httpx_clients[key].is_closed:
-        transport = httpx.AsyncHTTPTransport(proxy=proxy or None)
-        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-        timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
-        _httpx_clients[key] = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
-    # try:
-    #     yield _httpx_clients[key] #Depends(get_httpx_client)
-    # finally:
-    #     # 注意：不要在这里关闭客户端，因为它是单例，全局用的
-    #     pass
-
-    return _httpx_clients[key]
-
-
-async def shutdown_httpx():
-    for key, _client in _httpx_clients.items():
-        if _client and not _client.is_closed:
-            await _client.aclose()
 
 
 async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **kwargs) -> List[Dict]:

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% if is_edit %}编辑{% else %}添加{% endif %}数据 - {{ table_name }}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>{% if is_edit %}编辑{% else %}添加{% endif %}数据 - {{ table_name }}</h1>
+
+        <form method="post" action="{{ prefix }}/submit/{{ table_name }}">
+            {% if is_edit %}
+                <input type="hidden" name="edit_id" value="{{ data[primary_key] }}">
+            {% endif %}
+
+            {% for column in columns %}
+            <div class="form-group">
+                <label for="{{ column.name }}">{{ column.name }} ({{ column.type }})</label>
+                {% if column.type.startswith('varchar') or column.type.startswith('text') %}
+                    <input type="text" id="{{ column.name }}" name="{{ column.name }}"
+                           value="{{ data[column.name] if data and column.name in data else '' }}"
+                           {% if not column.nullable and column.extra != 'auto_increment' %}required{% endif %}>
+                {% elif column.type.startswith('int') %}
+                    <input type="number" id="{{ column.name }}" name="{{ column.name }}"
+                           value="{{ data[column.name] if data and column.name in data else '' }}"
+                           {% if not column.nullable and column.extra != 'auto_increment' %}required{% endif %}>
+                {% elif column.type.startswith('decimal') or column.type.startswith('float') %}
+                    <input type="number" step="0.01" id="{{ column.name }}" name="{{ column.name }}"
+                           value="{{ data[column.name] if data and column.name in data else '' }}"
+                           {% if not column.nullable and column.extra != 'auto_increment' %}required{% endif %}>
+                {% elif column.type.startswith('date') %}
+                    <input type="date" id="{{ column.name }}" name="{{ column.name }}"
+                           value="{{ data[column.name].strftime('%Y-%m-%d') if data and column.name in data and data[column.name] else '' }}"
+                           {% if not column.nullable %}required{% endif %}>
+                {% elif column.type.startswith('datetime') or column.type.startswith('timestamp') %}
+                    <input type="datetime-local" id="{{ column.name }}" name="{{ column.name }}"
+                           value="{{ data[column.name].strftime('%Y-%m-%dT%H:%M') if data and column.name in data and data[column.name] else '' }}"
+                           {% if not column.nullable %}required{% endif %}>
+                {% else %}
+                    <input type="text" id="{{ column.name }}" name="{{ column.name }}"
+                           value="{{ data[column.name] if data and column.name in data else '' }}"
+                           {% if not column.nullable and column.extra != 'auto_increment' %}required{% endif %}>
+                {% endif %}
+            </div>
+            {% endfor %}
+
+            <div class="form-actions">
+                <button type="submit" class="btn">{% if is_edit %}更新{% else %}提交{% endif %}数据</button>
+                <a href="{{ prefix }}/view/{{ table_name }}" class="btn cancel-btn">取消</a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>

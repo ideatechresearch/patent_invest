@@ -1,19 +1,19 @@
-import re, json, io, os, sys, threading, platform, time, pickle, struct
-import httpx, aiohttp, aiofiles, asyncio, joblib
+import re, json, io, os, sys, random, threading, time, struct
+import httpx, aiohttp, aiofiles, asyncio, joblib, requests
 from urllib.parse import urlencode, urlparse
-import inspect, importlib, ast, requests
+import inspect, importlib, ast
 from itertools import groupby
 import yaml
 from pathlib import Path
-from contextlib import redirect_stdout
 import xml.etree.ElementTree as ET
 from difflib import get_close_matches, SequenceMatcher
 from functools import partial, wraps  # cache, lru_cache, partial, wraps
 import numpy as np
 from enum import Enum
-import base64
+import base64, hashlib
+import platform, pickle
 from typing import Union, get_origin, get_args
-
+from collections import Counter, deque, defaultdict
 from pypinyin import lazy_pinyin
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
@@ -75,57 +75,7 @@ def convert_keys_to_lower_case(d):
         return d
 
 
-def serialize(obj):
-    '''将复杂对象（包括自定义类、Pydantic模型、Enum等）递归转换为 可序列化的Python原生数据结构（dict/list/primitive types）'''
-    if isinstance(obj, Enum):  # 处理 Enum 类型
-        return obj.value
-    elif hasattr(obj, "dict"):  # 处理 Pydantic 模型
-        return obj.dict()
-    elif hasattr(obj, "__dict__"):  # 递归转换对象
-        return {key: serialize(value) for key, value in obj.__dict__.items()}
-    elif isinstance(obj, list):  # 处理列表
-        return [serialize(item) for item in obj]
-    elif isinstance(obj, dict):  # 处理字典
-        return {key: serialize(value) for key, value in obj.items()}
-    else:
-        return obj  # asdict
-
-
-def map_fields(data: dict, mapping: dict) -> dict:
-    '''递归遍历字典，根据提供的映射规则修改键名'''
-
-    def translate_key(prefix, key):
-        full_key = f"{prefix}.{key}" if prefix else key
-        return mapping.get(full_key, mapping.get(key, key))
-
-    def recursive_map(obj, prefix=""):
-        if isinstance(obj, dict):
-            return {translate_key(prefix, k): recursive_map(v, f"{prefix}.{k}" if prefix else k)
-                    for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [recursive_map(item, prefix) for item in obj]
-        else:
-            return obj
-
-    return recursive_map(data)
-
-
-def slice_json(data, prefix=''):
-    '''将嵌套结构完全展开为扁平字典（键变为路径字符串）'''
-    slices = {}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            slices.update(slice_json(value, f"{prefix}{key}."))
-    elif isinstance(data, list):
-        for i, item in enumerate(data):
-            slices.update(slice_json(item, f"{prefix}{i}."))
-    else:
-        slices[prefix[:-1]] = data
-
-    return slices
-
-
-def extract_json_str(json_code: str) -> str:
+def extract_json_str_md(json_code: str) -> str:
     """
     模型返回的内容，其中 JSON 数据通常被包裹在 Markdown 的代码块标记中（即以 json 开始，以 结束）
     如果未找到起始或结束标记，尝试直接解析整个字符串为 JSON
@@ -145,8 +95,41 @@ def extract_json_str(json_code: str) -> str:
     return json_code[start + 7:end]
 
 
+def extract_json_str(text: str) -> str:
+    """
+    尝试从输入字符串中提取 JSON 数组或对象字符串。
+    - 支持去除 markdown 的 ```json 代码块包装
+    - 优先提取 JSON 数组（[...]），其次为对象（{...}）
+    - 若无明确结构，则尝试解析整体内容是否为合法 JSON
+    """
+
+    # 去除 markdown 包裹
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+
+    # 查找 JSON 数组
+    start_index = text.find('[')
+    end_index = text.rfind(']')
+    if start_index != -1 and end_index != -1 and end_index > start_index:
+        return text[start_index:end_index + 1]
+
+    # 查找 JSON 对象
+    start_index = text.find('{')
+    end_index = text.rfind('}')
+    if start_index != -1 and end_index != -1 and end_index > start_index:
+        return text[start_index:end_index + 1]
+
+    # 尝试整体是否为合法 JSON
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError as e:
+        print(f"提取失败，输入非合法 JSON: {e}")
+        return ""
+
+
 def parse_json(inputs: dict | str) -> dict:
-    # 支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
+    #  Markdown 中完整包裹的 JSON 块，支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
     if not isinstance(inputs, dict):
         try:
             match = re.search(r'^\s*(```json\n)?(.*)\n```\s*$', inputs, re.S)
@@ -181,9 +164,10 @@ def execute_code_results(text):
     执行给定文本中的所有Python代码块，并返回每个代码块的输出、命名空间和错误信息。需要包含Python代码块的文本。
     仅用于已知安全的本地代码块执行。不要用于下载、安装或系统级操作。
     仅限本地已经有的或明确指出的，仅限本地环境、只读、无外部依赖的代码块。不支持 pip 安装、系统命令（如 cd、git、curl 等）。仅当已知代码可信且执行环境支持时调用。
-    :param text:包含一个或多个 Python 代码块的纯文本内容。支持 Markdown 风格的 ```python ``` 格式。
+    :param text:包含一个或多个 Python 代码块的纯文本内容。支持 Markdown 代码块风格的格式。
     :return:运行结果
     """
+    from contextlib import redirect_stdout
     code_blocks = extract_python_code(text)
     results = []
     global_namespace = globals()  # 引用全局命名空间 {"__builtins__": dict(__builtins__)}
@@ -520,31 +504,200 @@ def load_datasets(path):
     return samples
 
 
-async def call_http_request(url: str, headers=None, time_out=100.0, **kwargs):
+def pickle_serialize(obj):
+    try:
+        json.dumps(obj)  # 测试是否可JSON序列化
+        return obj
+    except (TypeError, ValueError):  # 将不可JSON序列化的部分转为pickle的base64字符串
+        try:
+            data = pickle.dumps(obj)  # 返回 bytes 类型
+            return {'__pickle__': base64.b64encode(data).decode('utf-8')}  # 转为 ASCII-safe 字节串
+        except Exception as e:
+            print(f"Object cannot be pickled: {e}")
+            return obj
+
+
+def pickle_deserialize(obj):
+    if isinstance(obj, dict):
+        if '__pickle__' in obj:
+            try:
+                return pickle.loads(base64.b64decode(obj['__pickle__'].encode('utf-8')))  # encoding='bytes' 避免自动导入模块
+            except Exception as e:
+                raise ValueError(f"Failed to decode pickle: {e}")
+    return obj
+
+
+def serialize(obj):
+    '''将复杂对象（包括自定义类、Pydantic模型、Enum等）递归转换为 可序列化的Python原生数据结构（dict/list/primitive types）'''
+    if isinstance(obj, (str, int, float, bool)):  # 优先处理简单类型
+        return obj
+    if isinstance(obj, Enum):  # 处理 Enum 类型
+        return obj.value
+    elif isinstance(obj, (list, tuple, set, frozenset)):  # 处理列表
+        return [serialize(item) for item in obj]
+    elif isinstance(obj, dict):  # 处理字典
+        return {key: serialize(value) for key, value in obj.items()}
+    elif hasattr(obj, "dict") and callable(obj.dict):  # 处理 Pydantic 模型
+        return obj.dict()
+    elif hasattr(obj, "model_dump") and callable(obj.model_dump):  # 兼容 Pydantic v2 的 BaseMode
+        return obj.model_dump()
+    elif hasattr(obj, "__dict__"):  # 递归转换对象
+        return {key: serialize(value) for key, value in obj.__dict__.items()}
+    else:
+        return obj  # asdict
+
+
+def map_fields(data: dict, field_mapping: dict) -> dict:
+    """
+    递归遍历字典，根据提供的映射规则修改键名，支持对指定字段的值进行映射替换。
+
+    :param data: 原始数据
+    :param field_mapping: 键名映射（支持扁平路径）
+    :return: 映射后的字典
+    """
+
+    def translate_key(prefix, key):
+        full_key = f"{prefix}.{key}" if prefix else key
+        return field_mapping.get(full_key, field_mapping.get(key, key))
+
+    def recursive_map(obj, prefix=""):
+        if isinstance(obj, dict):
+            return {translate_key(prefix, k): recursive_map(v, f"{prefix}.{k}" if prefix else k)
+                    for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [recursive_map(item, prefix) for item in obj]
+        else:
+            return obj
+
+    return recursive_map(data)
+
+
+def extract_interface_map(data: dict, field_path: list, mapping: dict):
+    """
+    从 data 中按 field_path 提取字段，并用 mapping 映射字段。
+    支持 field_path 为 str 或 list。
+    """
+
+    def get_nested_value(d, path):
+        if isinstance(path, str):
+            path = [path]
+        for key in path:
+            if isinstance(d, dict):
+                d = d.get(key, {})
+            else:
+                return {}
+        return d  # data.get("data", data.get("result", data))
+
+    extracted = get_nested_value(data, field_path) if field_path else data
+    if not mapping:
+        return extracted
+
+    if isinstance(extracted, list):
+        return [map_fields(item, mapping) for item in extracted]
+    elif isinstance(extracted, dict):
+        return map_fields(extracted, mapping)
+
+    return extracted  # 兜底处理
+
+
+def slice_json(data, prefix=''):
+    '''将嵌套结构完全展开为扁平字典（键变为路径字符串）'''
+    slices = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            slices.update(slice_json(value, f"{prefix}{key}."))
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            slices.update(slice_json(item, f"{prefix}{i}."))
+    else:
+        slices[prefix[:-1]] = data
+
+    return slices
+
+
+def get_origin_fild(index: int, data: dict[str, list | str] | list[tuple[str, list | str]]):
+    items = data.items() if isinstance(data, dict) else data
+    count = 0
+    for k, v in items:
+        count += len(v)
+        if index < count:
+            return k
+    return None
+
+
+def make_hashable(obj):
+    if isinstance(obj, dict):
+        return frozenset((k, make_hashable(v)) for k, v in obj.items())
+    elif isinstance(obj, list):
+        return tuple(make_hashable(i) for i in obj)
+    return obj
+
+
+def generate_hash_key(*args, **kwargs):
+    """
+    根据任意输入参数生成唯一的缓存键。
+    :param args: 任意位置参数（如模型名称、模型 ID 等）
+    :param kwargs: 任意关键字参数（如其他描述性信息）
+    :return: 哈希键
+    """
+    # (id(_func), tuple(args), make_hashable(kwargs))frozenset(kwargs.items())
+    # 将位置参数和关键字参数统一拼接成一个字符串
+    inputs = []
+    for arg in args:
+        if isinstance(arg, (list, tuple)):
+            inputs.extend(map(str, arg))  # 如果是列表，逐个转换为字符串
+        elif isinstance(arg, (float, int, str, bool)):
+            inputs.append(str(arg))
+        else:
+            inputs.append(json.dumps(arg, sort_keys=True, ensure_ascii=True, default=str))
+
+    for key, value in kwargs.items():
+        if isinstance(value, (list, dict, tuple)):
+            value_str = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
+        else:
+            value_str = str(value)
+        inputs.append(f"{key}:{value_str}")  # 格式化关键字参数为 key:value
+
+    joined_key = "|".join(inputs)[:5000]
+    # 返回 MD5 哈希
+    return hashlib.md5(joined_key.encode()).hexdigest()
+
+
+def generate_random_hash(length=16):
+    import string
+    chars = string.ascii_letters + string.digits  # 字母 + 数字
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
+async def call_http_request(url: str, headers=None, timeout=100.0, httpx_client: httpx.AsyncClient = None, **kwargs):
     """
     异步调用HTTP请求并返回JSON响应，如果响应不是JSON格式则返回文本内容
     国内，无代理，可能内容无解析
     :param url: 请求地址
     :param headers: 请求头
-    :param time_out: 请求超时时间
+    :param timeout: 请求超时时间
+    :param httpx_client: 外部传入的 AsyncClient 实例（可复用连接）
     :param kwargs: 其他传递给 httpx 的参数
     :return: dict 或 None
     """
-    async with httpx.AsyncClient() as cx:
-        try:
-            response = await cx.get(url, headers=headers, timeout=time_out, **kwargs)  # 请求级别的超时优先级更高
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if "application/json" in content_type or not content_type:
-                try:
-                    return response.json()
-                except json.JSONDecodeError:
-                    pass
 
-            return {'text': response.text}
-        except Exception as e:
-            print(e)
-            return None
+    async def fetch_url(cx: httpx.AsyncClient, **kwargs):
+        response = await cx.get(url, headers=headers, timeout=timeout, **kwargs)  # 请求级别的超时优先级更高
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type or not content_type:
+            try:
+                return response.json()
+            except json.JSONDecodeError:
+                pass
+
+        return {'text': response.text}
+
+    if httpx_client:
+        return await fetch_url(httpx_client, **kwargs)
+
+    async with httpx.AsyncClient() as cx:
+        return await fetch_url(cx, **kwargs)
 
 
 async def follow_http_html(url, time_out=100.0, **kwargs):
@@ -671,12 +824,35 @@ async def embed_images_as_base64(md_content, image_dir):
     return '\n'.join(new_lines)
 
 
-# 调整缩进,修复代码缩进，确保最小的缩进被移除，以避免缩进错误
-def fix_indentation(code):
-    lines = code.splitlines()
+def fix_unbalanced_brackets(name):
+    left_count = name.count('(')
+    right_count = name.count(')')
+
+    # 如果左括号比右括号多，补齐右括号
+    if left_count > right_count:
+        name += ')' * (left_count - right_count)
+    # 如果右括号比左括号多，补齐左括号
+    elif right_count > left_count:
+        name = '(' * (right_count - left_count) + name
+
+    return name
+
+
+def fix_indentation(code: str) -> str:
+    """
+    调整缩进,修复代码缩进，确保最小的缩进被移除，以避免缩进错误
+    忽略空行，提取每行左侧空格数；
+    找出所有非空行中的 最小缩进量（min_indent）；
+    对每行去掉这个缩进量（保持相对缩进结构）；
+    最后拼接为新的代码字符串。
+    """
+    lines = code.replace("\t", "    ").splitlines()
+    non_empty_lines = [line for line in lines if line.strip()]
+    if not non_empty_lines:
+        return code
 
     min_indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
-    fixed_lines = [line[min_indent:] if len(line) >= min_indent else line for line in lines]
+    fixed_lines = [(line[min_indent:] if len(line) >= min_indent else line).rstrip() for line in lines]
     return "\n".join(fixed_lines)
 
 
@@ -688,7 +864,7 @@ def fix_invalid_backslashes(match):
         return '\\\\' + char  # 非法的补成 \\ + 字符
 
 
-def extract_python_code(text):
+def extract_python_code(text) -> list[str]:
     """
     提取 Markdown 代码块中的 Python 代码，同时支持缩进代码块
     """
@@ -714,7 +890,7 @@ def extract_any_code(markdown_string: str):
     return code_blocks
 
 
-def remove_function_decorators(func):
+def remove_function_decorators(func) -> str:
     """
     获取函数源码，去掉所有装饰器
     """
@@ -823,6 +999,72 @@ def extract_function_metadata(func) -> dict:
     return metadata
 
 
+def filter_directory(base_path: str, config: dict) -> list:
+    """
+    根据配置过滤目录，返回匹配的文件路径列表（相对于 base_path）
+
+    config 字段说明：
+      - include: list of glob patterns to include at root level
+      - recursive_include: dict of {dir_name: [patterns]}，表示在指定子目录下递归匹配模式
+      - prune: list of directory names to完全跳过
+      - exclude: list of glob patterns to排除的文件或路径（相对于 base）
+      - global_exclude: list of glob patterns to 排除的文件或目录（相对于 base, 作用于任意层级）
+    """
+    import fnmatch
+    base = Path(base_path)
+    matched = set()
+
+    include = config.get("include", [])
+    recursive_include = config.get("recursive_include", {})
+    prune = set(config.get("prune", []))
+    exclude = config.get("exclude", [])
+    global_exclude = config.get("global_exclude", [])
+
+    # Helper to check global exclude
+    def is_glob_excluded(rel_path: Path) -> bool:
+        for pattern in global_exclude:
+            if fnmatch.fnmatch(str(rel_path), pattern):
+                return True
+        return False
+
+    # 1. Root include: only files in base directory matching include patterns
+    for pattern in include:
+        for p in base.glob(pattern):
+            rel = p.relative_to(base)
+            if p.is_file() and not is_glob_excluded(rel):
+                matched.add(str(rel))
+
+    # 2. Recursive include: for each specified directory, walk under it
+    for dir_name, patterns in recursive_include.items():
+        dir_path = base / dir_name
+        if not dir_path.exists() or not dir_path.is_dir():
+            continue
+        for root, dirs, files in os.walk(dir_path):
+            # Prune dirs in-place
+            dirs[:] = [d for d in dirs if d not in prune]
+            for fname in files:
+                rel = Path(root).relative_to(base) / fname
+                # Check global exclude
+                if is_glob_excluded(rel):
+                    continue
+                # Check exclude list
+                skip = False
+                for ex in exclude:
+                    if fnmatch.fnmatch(str(rel), ex):
+                        skip = True
+                        break
+                if skip:
+                    continue
+                # Check patterns
+                for pat in patterns:
+                    if fnmatch.fnmatch(fname, pat):
+                        matched.add(str(rel))
+                        break
+
+    # Convert to sorted list
+    return sorted(matched)
+
+
 def extract_sql_code(text):
     sql_blocks = re.findall(r'```(?:sql)?(.*?)```', text, re.DOTALL)
     if not sql_blocks:
@@ -850,6 +1092,14 @@ def extract_java_code(text):
 def extract_bash_code(text):
     bash_blocks = re.findall(r'```(?:bash|sh)?(.*?)```', text, re.DOTALL)
     return [block.strip() for block in bash_blocks]
+
+
+def extract_markdown_blocks(text: str) -> list[str]:
+    """
+    返回内容块列表，去除包裹的 markdown 标记
+    """
+    blocks = re.findall(r"```markdown\n(.*?)```", text, flags=re.DOTALL)
+    return [block.strip() for block in blocks]
 
 
 def extract_table_code(text):
@@ -975,14 +1225,14 @@ def extract_yaml_data(text):
     return parsed_data
 
 
-def extract_list_data(text):
+def extract_list_data(text) -> list[str]:
     list_blocks = re.findall(r'```(?:list)?(.*?)```', text, re.DOTALL)
     if not list_blocks:
         list_blocks = re.findall(r'(\n\s*[-*].*?(\n\s{2,}.*?)*\n)', text)  # 纯文本列表
     return [block.strip() for block in list_blocks]
 
 
-def extract_json_data(text):
+def extract_json_data(text) -> list[str]:
     # 提取 JSON 格式的代码块
     json_blocks = re.findall(r'```(?:json)?(.*?)```', text, re.DOTALL)
     return [block.strip() for block in json_blocks]
@@ -1000,6 +1250,7 @@ def extract_code_blocks(text, lag='python', **kwargs):
         "code": extract_any_code,
         "method": extract_method_calls,
 
+        "md": extract_markdown_blocks,
         "table": extract_table_code,
         "yaml": extract_yaml_data,
         "list": extract_list_data,
@@ -1023,36 +1274,37 @@ def extract_code_blocks(text, lag='python', **kwargs):
     return {k: f(text) for k, f in funcs.items()}
 
 
-def clean_json_string(json_str):
-    # 1. 去除 // 注释
-    json_str = re.sub(r'//.*', '', json_str)
-    # 2. 修复非法反斜杠：把非法的 \x 转为 x
-    json_str = re.sub(r'\\(.)', fix_invalid_backslashes, json_str)
-    # 3. 替换 HTML 标签、伪标签、非法换行符
-    json_str = json_str.replace('<br>', '\n')
-    json_str = json_str.replace('\\"', '"')
-    json_str = json_str.replace('<', '《').replace('>', '》')  # 修复 <ucam.xxx> 造成的错误
-    return json_str
+def extract_json_struct(input_data: str | dict) -> dict | None:
+    """
+    从输入中提取结构化 JSON 对象，兼容以下格式：
+    支持多种格式（Markdown JSON 块、普通 JSON 字符串、字典等）,支持已经是字典的输入
+    - 直接为 dict 类型
+    - 标准 JSON 字符串
+    - Markdown JSON 块（```json ... ```)
+    - 字符串中嵌入 JSON 部分（提取第一个 {...} 段）
+    """
+
+    if isinstance(input_data, dict):
+        return input_data
+
+    # Markdown JSON 格式：```json\n{...}\n```
+    md_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", input_data, re.DOTALL)
+    if md_match:
+        json_str = md_match.group(1)
+    else:
+        # 尝试提取最外层 JSON：匹配最先出现的大括号包裹段，但可能不处理嵌套的 JSON
+        brace_match = re.search(r"\{.*\}", input_data, re.DOTALL)
+        json_str = brace_match.group(0) if brace_match else input_data
+        # 输入可能是标准 JSON 字符串（无包裹）,extract_json_str
+
+    try:
+        return json.loads(json_str.strip())
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}\n invalid json format: {input_data}")
+    return None
 
 
-def extract_json_from_string(input_str):
-    # 从一个普通字符串中提取 JSON 结构，但可能不处理嵌套的 JSON
-    match = re.search(r'\{.*}', input_str, re.DOTALL)
-    if match:
-        json_str = match.group(0)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e1:
-            json_str = clean_json_string(json_str)
-            try:
-                return json.loads(json_str)
-            except json.JSONDecodeError as e2:
-                print(f"Error decoding JSON: {e2},{input_str}")
-
-    return extract_json_array(input_str)
-
-
-def extract_jsons(input_str):
+def extract_jsons(input_str) -> list[dict]:
     """
     处理包含多个 JSON 对象的文本数据,成功解析了 JSON 对象，返回一个包含所有解析结果的列表
     :param input_str:
@@ -1072,25 +1324,89 @@ def extract_jsons(input_str):
     return json_objects
 
 
-def extract_json_array(input_str) -> list | None:
+def extract_json_array(input_data: str | list) -> list | None:
     """
     提取并解析 markdown 包裹的 JSON 数组（尤其是 ```json ... ``` 格式）
     """
+    if isinstance(input_data, list):
+        return input_data
     # 提取 ```json ... ``` 块中内容
-    match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', input_str, re.DOTALL)
-    if match:
-        json_str = match.group(1)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error: {e}")
+    md_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', input_data, re.DOTALL)
+    if md_match:
+        json_str = md_match.group(1)
+    else:
+        # 查找字符串中最外层 JSON 数组（首次出现）
+        array_match = re.search(r"\[[\s\S]*?\]", input_data)
+        if array_match:
+            json_str = array_match.group(0)
+        else:
+            json_str = input_data.strip()  # 若本身就是 JSON 字符串（无包裹）
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}")
     return None
 
 
-def extract_headers(text):
-    # 提取 ## 或 ### 等标题
-    headers = re.findall(r'^(#{1,6})\s+(.*)', text, re.MULTILINE)
-    return [{'level': len(header[0]), 'text': header[1]} for header in headers]
+def clean_any_string(raw_text):
+    """
+    文本清洗函数，支持多种文本格式预处理，包括邮件、URL、时间、日期、异常空格等。
+    """
+    pure_text = raw_text.replace('\n', " ")
+    # 替换不可见字符（如 \xa0）为普通空格
+    pure_text = pure_text.replace('\xa0', ' ').strip()
+    pure_text = re.sub(r'[-–—]', ' ', pure_text)
+
+    pure_text = re.sub(r"\d+/\d+/\d+", "", pure_text)  # 剔除日期
+    pure_text = re.sub(r"[0-2]?[0-9]:[0-6][0-9]", "", pure_text)  # 剔除时间
+    pure_text = re.sub(r"\S+@\S+", "", pure_text)  # 去除电子邮件
+    # #URL，为了防止对中文的过滤，所以使用[a-zA-Z0-9]而不是\w
+    url_regex = re.compile(r"""
+        (https?://)?             # 协议部分可选
+        ([a-zA-Z0-9-]+\.)+       # 域名部分
+        [a-zA-Z]{2,}             # 顶级域名
+        (/[a-zA-Z0-9-]*)*        # 路径部分可选
+    """, re.VERBOSE | re.IGNORECASE)
+    pure_text = url_regex.sub(r"", pure_text)
+    # pure_text = re.sub("[^\u4e00-\u9fa5]","",pure_text)  #  去除所有非汉字内容（英文数字）
+    # pure_text = re.sub(r"\s+", " ", pure_text).strip()  # 多余空格合并
+    # 去掉多余空格和连续空格
+    pure_text = re.sub(r'[^\S\r\n]+', ' ', pure_text)  # r'\s+'
+    return pure_text.strip()
+
+
+def clean_json_string(json_str):
+    # 1. 去除 // 注释
+    json_str = re.sub(r'//.*', '', json_str)
+    # 2. 修复非法反斜杠：把非法的 \x 转为 x
+    json_str = re.sub(r'\\(.)', fix_invalid_backslashes, json_str)
+    # 3. 替换 HTML 标签、伪标签、非法换行符
+    json_str = json_str.replace('<br>', '\n')  # 替换 HTML 标签或伪标签
+    json_str = json_str.replace('<', '《').replace('>', '》')  # 修复 <ucam.xxx> 造成的错误
+    json_str = json_str.replace('\\"', '"')  # 修复被转义的双引号（如 \\"）
+
+    json_str = re.sub(r'"(reason|suggest)":\s*"([^"]+?)(?=\n\s*")', lambda m: f'"{m.group(1)}": "{m.group(2).strip()}"',
+                      json_str)  # 尝试补全 "reason": "... \n  "suggest"
+
+    return json_str
+
+
+def extract_json_from_string(input_str):
+    # 从一个普通字符串中提取 JSON 结构，但可能不处理嵌套的 JSON
+    parsed = extract_json_struct(input_str)
+    if parsed:
+        return parsed
+
+    match = re.search(r'\{.*}', input_str, re.DOTALL)
+    if match:
+        json_str = clean_json_string(match.group(0))
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e},{input_str}")
+
+    return extract_json_array(input_str)
 
 
 def is_url(url: str) -> bool:
@@ -1132,6 +1448,12 @@ def extract_text_urls(text):
     # 提取所有 http(s) URL
     urls = re.findall(r'https?://[^\s)]+', text)
     return list(set(urls))
+
+
+def extract_headers(text):
+    # 提取 ## 或 ### 等标题
+    headers = re.findall(r'^(#{1,6})\s+(.*)', text, re.MULTILINE)
+    return [{'level': len(header[0]), 'text': header[1]} for header in headers]
 
 
 def extract_bold(text):
@@ -1243,6 +1565,17 @@ def ordinal_generator():
         yield ordinal
 
 
+def remove_markdown_block(text: str) -> str:
+    """
+    如果文本以 ```markdown 开头并以 ``` 结尾，则移除这两个标记，返回中间内容。
+    否则返回原始文本。
+    """
+    match = re.match(r"^```markdown\s*\n(.*?)\n?```$", text.strip(), re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
 def remove_markdown(text):
     # 去除 Markdown 的常见标记
     """
@@ -1257,19 +1590,21 @@ def remove_markdown(text):
     ~~删除线文本~~
     __下划线文本__
     """
-    text = re.sub(r'(`{1,3})(.*?)\1', r'\2', text)  # 去除反引号代码块
+    text = remove_markdown_block(text)
+    text = re.sub(r'(`{1,3})(.*?)\1', r'\2', text, flags=re.DOTALL)  # 去除反引号代码块
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # 去除粗体
     text = re.sub(r'\*(.*?)\*', r'\1', text)  # 去除斜体
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)  # 去除图片
-    text = re.sub(r'\[.*?\]\((.*?)\)', r'\1', text)  # 去除链接，但保留 URL
-    text = re.sub(r'#{1,6}\s*(.*)', r'\1', text)  # 去除标题
-    text = re.sub(r'>\s*(.*)', r'\1', text)  # 去除引用块
+    # text = re.sub(r'\[.*?\]\((.*?)\)', r'\1', text)  # 去除链接，但保留 URL
+    text = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1', text)  # 去除链接和 URL
+    text = re.sub(r'#{1,6}\s*(.*)', r'\1', text, flags=re.MULTILINE)  # 去除标题
+    text = re.sub(r'>\s*(.*)', r'\1', text, flags=re.MULTILINE)  # 去除引用块
     text = re.sub(r'(\*|-|\+)\s+(.*)', r'\2', text)  # 去除无序列表符号
     text = re.sub(r'\d+\.\s+(.*)', r'\1', text)  # 去除有序列表符号
     text = re.sub(r'~~(.*?)~~', r'\1', text)  # 去除删除线
     text = re.sub(r'_{2}(.*?)_{2}', r'\1', text)  # 去除下划线标记
-    text = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1', text)  # 去除链接和 URL
-    text = re.sub(r'\n{2,}', '\n', text)  # 将多余的空行替换为单个换行符
+
+    text = re.sub(r'\n{2,}', '\n', text)  # 将多余的空行替换为单个换行符,压缩空行
     return text.strip()
 
 
@@ -1311,21 +1646,91 @@ def df_to_markdown(df, index=False):
     return md if index else md.replace("| Index |", "|")  # 可选移除索引列
 
 
+def format_table(data: list[dict]) -> str:
+    headers = list(data[0].keys())
+    lines = ["| " + " | ".join(headers) + " |",  # header_line
+             "| " + " | ".join(["---"] * len(headers)) + " |"]  # divider_line
+    for row in data:  # rows
+        lines.append("| " + " | ".join(str(row.get(h, "")) for h in headers) + " |")
+    return "\n".join(lines)
+
+
+def format_content_str(content, level=0, exclude_null=True) -> str:
+    if exclude_null and content is None:
+        return ""  # "*（空内容）*"
+
+    if isinstance(content, (tuple, list)):
+        if exclude_null and not content:
+            return ""  # "*（空列表）*"
+        if all(isinstance(x, dict) for x in content):
+            heading_prefix = "\n" if level > 0 else ''
+            return heading_prefix + format_table(content)
+        elif all(isinstance(x, str) for x in content):
+            return "\n".join(content)
+        else:
+            return json.dumps(content, ensure_ascii=False, indent=2)
+    if isinstance(content, dict):
+        if exclude_null and not content:
+            return ""
+        if all(isinstance(x, str) for x in content.keys()):
+            heading_prefix = ("\n" + " " * level) if level > 0 else ''  # "#" * (level + 2)
+            lines = [f"{heading_prefix}**{key}**:{format_content_str(val, level + 1)}" for key, val in content.items()
+                     if not exclude_null or val]
+            return "\n".join(lines)
+        else:
+            return json.dumps(content, ensure_ascii=False, indent=2)
+    if isinstance(content, (int, float, bool)):
+        return str(content)
+    return str(content).strip()
+
+
 def format_for_html(text):
     # Markdown 格式的文本转换为 HTML 的字符串,渲染 Markdown 文章
-    import markdown
-    return markdown.markdown(text)
+    # markdown.markdown(text, extensions=['tables', 'codehilite'])
     # from IPython.display import Markdown, display
     # display(Markdown(f"`{export_command}`"))
+    style = """
+    <style>
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            border: 1px solid #999;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+    </style>
+    """
+    import markdown2
+    html_content = markdown2.markdown(text, extras=["tables", "fenced-code-blocks", "break-on-newline"])
+    return f"<html><head>{style}</head><body>{html_content}</body></html>"
+
+
+def safe_convert_html(text):
+    '''过滤危险标签：防止 XSS 攻击'''
+    from markdown import Markdown
+    from bs4 import BeautifulSoup
+    html = Markdown(extensions=['tables']).convert(text)
+    soup = BeautifulSoup(html, 'html.parser')
+    # 移除 script 等危险标签
+    for tag in soup.find_all(['script', 'iframe']):
+        tag.decompose()
+    return str(soup)
 
 
 def extract_string(text, extract: str | list, **kwargs):
     if not extract:
         return None
     funcs = {
-        "json": extract_json_from_string,
         "jsons": extract_jsons,
+        "json": extract_json_struct,
         "json_array": extract_json_array,
+        "json_any": extract_json_from_string,
+
         "header": extract_headers,
         "links": extract_links,
         'urls': extract_text_urls,
@@ -1337,8 +1742,10 @@ def extract_string(text, extract: str | list, **kwargs):
         "answer": extract_tagged_content,
         "think": partial(extract_tagged_split, tag="think"),
         "reasoning": partial(extract_tagged_split, tag="reasoning"),
+        'clean_any': clean_any_string,
         'sentence': split_sentences,
         'sentences_clean': split_sentences_clean,
+        'split_chunks': split_summary_chunks,
         "wechat": format_for_wechat,
         'remark': remove_markdown,
         "html": format_for_html,
@@ -1414,7 +1821,6 @@ def list_to_xml(tag, lst):
 
 
 def defaultdict_to_dict(d):
-    from collections import defaultdict
     if isinstance(d, defaultdict):
         d = {k: defaultdict_to_dict(v) for k, v in d.items()}
     elif isinstance(d, dict):
@@ -1531,10 +1937,10 @@ def get_max_items_from_list(data: list, max_tokens: int = 4000, tokenizer=None):
     return result
 
 
-def find_similar_word(target_keyword, tokens):
+def find_similar_word(target_keyword, template_list: list[str]) -> int:
     max_ratio = 0
     similar_word_index = -1
-    for i, token in enumerate(tokens):
+    for i, token in enumerate(template_list):
         ratio = SequenceMatcher(None, target_keyword, token).ratio()
         if ratio > max_ratio:
             max_ratio = ratio
@@ -1542,18 +1948,24 @@ def find_similar_word(target_keyword, tokens):
     return similar_word_index
 
 
-def find_similar_words(query, tokens, top_n=3):
-    matches = get_close_matches(query, tokens, n=top_n)
+def find_best_matches(query: str, template_list: list[str], top_n=3, cutoff=0.8, best=True) -> list[tuple]:
+    # 获取满足 cutoff 的匹配
+    matches = get_close_matches(query, template_list, n=top_n, cutoff=cutoff)
     # 计算每个匹配项与查询词的相似度
-    results = []
-    for match in matches:
-        matcher = SequenceMatcher(None, query, match)
-        results.append((match, matcher.ratio(), tokens.index(match)))
+    if matches:
+        return [(match, SequenceMatcher(None, query, match).ratio(), template_list.index(match))
+                for match in matches]
+    # 如果没有匹配，则强制返回最相似的 1 个
+    if best and template_list:
+        scores = [(text, SequenceMatcher(None, query, text).ratio(), i)
+                  for i, text in enumerate(template_list)]
+        return [max(scores, key=lambda x: x[1])]
+        # sorted( [item for item in scores if item[1] >= cutoff], key=lambda x: -x[1])[:top_n]
 
-    return results
+    return []  # text, score, idx [(匹配文本, 相似度, 对应原始idx)]
 
 
-def fuzzy_match_template(query, template_list, threshold=0.8):
+def fuzzy_match_template(query, template_list: list[str], threshold=0.8):
     if not isinstance(query, str):
         return None
 
@@ -1593,7 +2005,7 @@ def lang_detect_to_trans(text):
     return t
 
 
-def lang_token_size(text, tokenizer=None, model_name="gpt-3.5-turbo"):
+def lang_token_size(text: str, tokenizer=None, model_name="gpt-3.5-turbo"):
     """
     计算文本的大致 token 数。
     - 优先使用提供的 tokenizer 或根据 model_name 获取的 tokenizer。
@@ -1616,7 +2028,7 @@ def lang_token_size(text, tokenizer=None, model_name="gpt-3.5-turbo"):
     lang = detect(text[:100])
     if lang in ('en', 'fr', 'es', 'de'):
         return len(text.split())  # 对于英文、法语、西班牙语、德语等，使用空格分词,基于空格分词的近似 token 数
-        # len(text) // 3
+        # len(text.encode('utf-8')) // 3
 
     # 'zh-cn','zh-hk','zh-tw','ja','ar',简体中文,日语,阿拉伯语，返回字符数
     return len(text)
@@ -1641,12 +2053,14 @@ def build_prompt(messages: list, use_role=False) -> str:
     Each message is expected to be a dictionary with 'role' and 'content' keys.
     This function concatenates all message contents, preserving the training format.
     """
+    if all(isinstance(msg, str) for msg in messages):
+        return '\n\n'.join(msg.strip() for msg in messages if msg.strip())
     if use_role:
         # OpenAI-style messages are transformed to a structured conversation format for Ollama.
         return "\n".join(
             f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content'].strip()}"
-            for msg in messages)
-    return "\n".join([msg["content"].strip() for msg in messages])
+            for msg in messages if msg.get('role', 'user') != 'system')
+    return "\n\n".join(msg["content"].strip() for msg in messages)
 
 
 def alternate_chat_history(messages: list):
@@ -1787,12 +2201,28 @@ def get_string_no_punctuation_or_emoji(s):
     return ''.join(chars[start:end + 1])
 
 
-try:
-    from agents.ai_tasks import AsyncAbortController
+class AsyncAbortController:
+    def __init__(self):
+        self._abort_event = asyncio.Event()  # 线程安全 threading.Event()
 
-    LLM_Controller = AsyncAbortController()
-except ImportError:
-    LLM_Controller = None
+    def should_abort(self) -> bool:
+        """查询是否已触发终止信号,实时检查是否终止"""
+        return self._abort_event.is_set()
+
+    async def wait_abort(self):
+        """等待终止信号（可用于并发 await）,可 await 等待中断"""
+        await self._abort_event.wait()
+
+    def abort(self):
+        """外部触发终止信号,触发终止,是否提前终止,可供外部触发"""
+        self._abort_event.set()
+
+    def reset(self):
+        """清除终止信号，为下一轮任务做准备,重新启动前复位,可多轮复用"""
+        self._abort_event.clear()
+
+
+LLM_Controller = AsyncAbortController()
 
 
 async def process_llm_stream(llm_responses_stream, token_size=20, model_name="gpt-3.5-turbo"):
@@ -1864,6 +2294,69 @@ def split_text_into_sentences(raw_text):
     return sentences
 
 
+def render_summary_text(summary_data: dict | list[dict], title_map: dict = None) -> str:
+    """
+    字段中文标题映射
+    将结构化 summary_data 转为分节展示文本（markdown 风格）
+    - 渲染顺序以 summary_data 本身为准
+    """
+
+    def render_one(data, index: int = None):
+        num_iter = iter("一二三四五六七八九十")
+        sections = []
+        for i, (key, content) in enumerate(data.items()):
+            if not content:
+                continue
+            if title_map and key not in title_map:
+                continue
+            # 自动转为字符串（支持字典或表格结构）
+            num = next(num_iter, str(i + 1))
+            prefix = f"#### {num}、{title_map.get(key, key)}"
+            content_str = remove_markdown_block(format_content_str(content))
+            sections.append(f"{prefix}\n\n{content_str}\n")
+
+        md_text = "\n\n---\n\n".join(sections)
+        return f"### 第 {index + 1} 条\n\n" + md_text if index is not None else md_text
+
+    if isinstance(summary_data, list):
+        return "\n\n---\n\n".join(render_one(item, i) for i, item in enumerate(summary_data))
+    return render_one(summary_data)
+
+
+def split_summary_chunks(text: str) -> list[str]:
+    """
+     清洗大模型输出的文本，分成自然段 + 清除 bullet/markdown/符号前缀
+    """
+
+    def clean_lines(line: str) -> str:
+        return re.sub(r"^[-–•\d\)\.\s]+", "", line).strip()  # 清除 bullet/数字/多余符号
+
+    normalized = re.sub(r'\n{2,}', '\n\n', text.strip())
+    return [clean_lines(chunk.replace("\n", " ")) for chunk in normalized.split("\n\n") if chunk.strip()]
+
+
+def remove_parentheses(entity):
+    keys = {'［', '(', '[', '（'}
+    symbol = {'］': '［', ')': '(', ']': '[', '）': '（'}
+    stack = []
+    remove = []
+    for index, s in enumerate(entity):
+        if s in keys:
+            stack.append((s, index))
+        if s in symbol:
+            if not stack: continue
+            temp_v, temp_index = stack.pop()
+            if entity[index - 1] == '\\':
+                t = entity[temp_index - 1:index + 1]
+                remove.append(t)
+            else:
+                remove.append(entity[temp_index:index + 1])
+
+    for r in remove:
+        entity = entity.replace(r, '')
+    return entity
+
+
 def split_sentences(text,
                     pattern=(r'[^一二三四五六七八九十\d\r\n]*\b[一二三四五六七八九十]+\、'  # 中文序号 "一、二、"
                              r'|[^（(）)]*\b[（(][一二三四五六七八九十]+[）)]'  # 括号内的中文序号 "(一)(二)"
@@ -1899,7 +2392,7 @@ def split_sentences_clean(text, h_symbols=True, h_tables=True):
     """
     # 1. 统一换行符
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-
+    text = re.sub(r'\n{2,}', '\n\n', text.strip())
     if h_symbols:
         # 2. 在各种序号后面加空格，避免与正文粘连
         # （1）中国式条款：第X条
@@ -1927,16 +2420,18 @@ def split_sentences_clean(text, h_symbols=True, h_tables=True):
     return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 1]
 
 
-def cross_sentence_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max_length=512, tokenizer=None):
+def cross_sentence_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max_length=512,
+                         model_name="gpt-3.5-turbo"):
     """
     滑动窗口分块 + 最大长度截断（只测长度，不用 tokenizer.decode）
     :param sentences: 分句后的句子列表
     :param chunk_size: 每块包含几个句子
     :param overlap_size: 相邻块重叠几个句子
     :param max_length: 最大长度（token数或字符数）
-    :param tokenizer: 用于计算 token 长度的分词器（可选）
+    :param  model_name: 用于计算 token 长度的分词器
     :return: List[str] 每块一个字符串
     """
+    tokenizer = get_tokenizer(model_name)
     chunks = []
     step = max(chunk_size - overlap_size, 1)
 
@@ -1948,7 +2443,7 @@ def cross_sentence_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max
         if tokenizer:
             token_count = len(tokenizer.encode(text))
             if token_count > max_length:
-                # 直接按字符截断
+                # 直接按字符截断，可能句子割裂
                 text = text[: max_length]
         else:
             # 用字符长度作为 fallback
@@ -1960,15 +2455,15 @@ def cross_sentence_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max
     return chunks
 
 
-def organize_segments_chunk(sentences: list[str], chunk_size=5, overlap_size=2, max_length=512, tokenizer=None) -> list[
-    list[str]]:
+def organize_segments_chunk(sentences: list[str], chunk_size=7, overlap_size=2, max_length=1024,
+                            tokenizer=None) -> list[list[str]]:
     """
     交叉分块函数，将句子列表按块划分，并在块之间保持一定重叠，并根据max_length控制每个段落的最大长度。
     :param sentences: 分句后的句子列表
     :param chunk_size: 每个块的句子数量
     :param overlap_size: 块之间的重叠句子数
     :param max_length: 每个块的最大长度（token数）
-    :param tokenizer: 用于计算token长度的分词器（Tokenizer）
+    :param tokenizer: 用于计算token长度的分词器模型（Tokenizer）
     :return: 交叉分块后的句子块列表
     """
     chunks = []
@@ -1979,36 +2474,40 @@ def organize_segments_chunk(sentences: list[str], chunk_size=5, overlap_size=2, 
     for i in range(total_sentences):
         sentence = sentences[i]
         current_chunk.append(sentence)
-        current_chunk_text = ' '.join(current_chunk)
 
         # 如果当前块长度超过 max_length，则分割块并重置
-        if lang_token_size(current_chunk_text, tokenizer=tokenizer) > max_length:
-            current_chunk.pop()  # 删除最后一个句子
-            chunks.append(current_chunk)  # 添加当前块
-            current_chunk = [sentence]  # 从当前句子开始新的块
+        if lang_token_size(' '.join(current_chunk), tokenizer=tokenizer) > max_length:
+            last_sentence = current_chunk.pop()  # 删除最后一个句子
+            if lang_token_size(last_sentence, tokenizer=tokenizer) > max_length:  # 单句也超长，强制成块
+                chunks.append([last_sentence])
+                current_chunk = []
+            else:
+                chunks.append(current_chunk)  # 添加当前块
+                current_chunk = [sentence]  # 从当前句子开始新的块
 
         # 如果是最后一个句子，将当前块添加到结果中
         if i == total_sentences - 1:
             chunks.append(current_chunk)
 
-    # 处理滑动窗口重叠
+    # 处理滑动窗口重叠，组织大片段
     overlapped_chunks = []
     for i in range(0, len(chunks), chunk_size - overlap_size):
-        chunk = []
+        merged = []
         for j in range(i, min(i + chunk_size, len(chunks))):
-            chunk.extend(chunks[j])
+            merged.extend(chunks[j])
 
-        while lang_token_size(' '.join(chunk), tokenizer=tokenizer) > max_length:
-            overlapped_chunks.append(chunk[:chunk_size])  # 分割保留前面的块
-            chunk = chunk[chunk_size:]  # 剩下的部分继续处理
+        while lang_token_size(' '.join(merged), tokenizer=tokenizer) > max_length:
+            overlapped_chunks.append(merged[:chunk_size])  # 分割保留前面的块
+            merged = merged[chunk_size:]  # 剩下的部分继续处理
 
-        overlapped_chunks.append(chunk[:max_length])  # 确保块的长度在 max_length 之内,添加不超长的部分
+        overlapped_chunks.append(merged[:max_length])  # 确保块的长度在 max_length 之内,添加不超长的部分
 
     return overlapped_chunks
 
 
 # 实现小到大分块逻辑
-def organize_segments(tokens, small_chunk_size: int = 175, large_chunk_size: int = 512, overlap: int = 20):
+def organize_segments(tokens: list[int | str], small_chunk_size: int = 175, large_chunk_size: int = 512,
+                      overlap: int = 20):
     '''
     小块适合用于查询匹配，提高查询的精准度。
     大块划分，将包含上下文信息的多个小块合并为较大的片段。
@@ -2184,7 +2683,7 @@ def format_date_type(date=None):
 
 def get_date_time(date=None):
     """
-    :param date: 指定的日期（默认为当前日期）。
+    :param date: 指定的日期（默认为当前日期）。"%B %d, %Y“
     :return: 日期，时间
     """
     date = format_date_type(date)
@@ -2608,8 +3107,10 @@ def get_memory_info():
             for line in f:
                 if line.startswith("VmRSS:"):
                     mem_kb = int(line.split()[1])
-                    return mem_kb / 1024  # 转为 MB
+                    break
+            return mem_kb / 1024  # 转为 MB
     except Exception:
+        # psutil.virtual_memory().total / (1024 ** 3)
         return -1
 
 
@@ -2650,6 +3151,38 @@ def count_http_connections(port=8000):
     return count
 
 
+async def get_logs(log_path: str | Path = "app.log", lines: int = 100):
+    log_file = Path(log_path)
+    if not log_file.exists():
+        return {"error": f"日志文件不存在: {log_file}"}
+
+    try:
+        lines_list = deque(maxlen=lines)
+        async with aiofiles.open(log_file, "r") as f:
+            # f.readlines(),await f.read()
+            async for line in f:
+                lines_list.append(line.strip())
+
+        return {"logs": list(lines_list), "count": len(lines_list)}
+
+    except Exception as e:
+        return {"error": f"读取日志失败: {str(e)}"}
+
+
+def get_job_list(scheduler):  # AsyncIOScheduler
+    job_list = [
+        {'id': job.id,
+         'name': job.name,
+         'func': str(job.func),
+         # 'args': job.args,
+         # 'kwargs': job.kwargs,
+         'next_run_time': job.next_run_time.isoformat() if job.next_run_time else None,
+         'trigger': str(job.trigger)
+         } for job in scheduler.get_jobs()
+    ]
+    return job_list
+
+
 def configure_event_loop():
     if platform.system() != "Windows":
         try:
@@ -2684,6 +3217,40 @@ def is_empty_lambda(func):
     return False
 
 
+def async_to_sync(func, *args, **kwargs):
+    # 异步代码转换为同步代码
+    return asyncio.run(func(*args, **kwargs))
+
+
+async def wrap_sync(func, *args, **kwargs):
+    # 同步代码转换为异步执行,在后台独立线程中运行,以避免阻塞主事件循环,使用 await 来执行
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def run_with_async(func, *args, **kwargs):
+    """
+    通用方法：根据函数是否为协程自动选择 await 或直接调用
+    支持在异步上下文中统一处理同步/异步函数调用
+
+    :param func: 待执行函数（同步或异步）
+    :param args: 位置参数
+    :param kwargs: 关键字参数
+    :return: 函数返回结果
+    """
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    else:
+        return await asyncio.to_thread(func, *args, **kwargs)  # 用 asyncio.to_thread 以避免阻塞
+
+
+async def run_with_semaphore(func, *args, semaphore=None, **kwargs):
+    if semaphore:
+        async with semaphore:
+            return await func(*args, **kwargs)
+    else:
+        return await func(*args, **kwargs)
+
+
 def get_module_functions(module_name: str = None):
     module = importlib.import_module(module_name) if module_name else inspect.getmodule(inspect.currentframe())
     module_name = module.__name__
@@ -2694,7 +3261,7 @@ def get_module_functions(module_name: str = None):
     return local_funcs
 
 
-def functions_registry(functions_list: list, safe_path=True, module_name: str = None) -> dict:
+def functions_registry(functions_list: list, safe_path=True, module_name: str | list = None) -> dict:
     """
     根据函数名称列表,创建全局函数注册表,或者指定模块中动态加载
     1. 从当前全局作用域查找函数名；
@@ -2703,13 +3270,32 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
 
     :param functions_list: 需要注册的函数名列表
     :param safe_path: 取消不检查是否可调用。
+    :param module_name: 模块名称或者模块名称列表（字符串形式），适合从一个模块或多个模块中匹配加载多个函数。
+    :return: Dict[str, Callable[..., Any]]
+    """
+    if not safe_path:
+        module = importlib.import_module(module_name) if module_name else None
+        return {name: getattr(module, name) if module else globals().get(name) for name in functions_list}
+
+    if isinstance(module_name, list):
+        return function_registry_dynamic(functions_list, module_name)
+    return functions_registry_safe(functions_list, module_name)
+    # get_function_parameters
+
+
+def functions_registry_safe(functions_list: list, module_name: str = None) -> dict:
+    """
+    根据函数名称列表,创建全局函数注册表,或者指定模块中动态加载,检查是否可调用
+    1. 从当前全局作用域查找函数名；
+    2. 指定 module_name，批量从该模块加载；
+    3. 使用 'module.path:func' 格式，单个动态加载。优先匹配
+
+    :param functions_list: 需要注册的函数名列表
     :param module_name: 模块名称（字符串形式），适合从一个模块中加载多个函数。
     :return: Dict[str, Callable[..., Any]]
     """
-    module = importlib.import_module(module_name) if module_name else None
-    if not safe_path:
-        return {name: getattr(module, name) if module else globals().get(name) for name in functions_list}
-
+    # 如果没有模块名，回退到全局作用域
+    module = importlib.import_module(module_name) if module_name else globals()
     registry = {}
     for name in functions_list:
         try:
@@ -2719,7 +3305,7 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
                 func_obj = getattr(_module, func_name, None)
                 name = func_name
             else:
-                func_obj = getattr(module, name) if module else globals().get(name)
+                func_obj = getattr(module, name, None)
 
             if not callable(func_obj):
                 raise ValueError(f"函数 {name} 不存在或不是可调用对象,未在当前作用域中找到,可能未导入或模块未指定。")
@@ -2736,7 +3322,6 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str = 
             print(f"[⚠️] 加载函数失败: {name} → {type(e).__name__}: {e}")
 
     return registry
-    # get_function_parameters
 
 
 def function_registry_dynamic(functions_list: list, module_names: list):
@@ -2751,10 +3336,11 @@ def function_registry_dynamic(functions_list: list, module_names: list):
         try:
             module = importlib.import_module(module_name)  # 动态加载模块
             for name in functions_list:
-                if name not in registry:  # 避免重复覆盖
-                    func = getattr(module, name, None)
-                    if func is not None:
-                        registry[name] = func
+                if name in registry:  # 避免重复覆盖，只注册第一个找到的
+                    continue
+                func = getattr(module, name, None)
+                if func is not None and callable(func):
+                    registry[name] = func
         except ModuleNotFoundError:
             print(f"Module '{module_name}' not found.")
     return registry
@@ -2797,6 +3383,12 @@ def deduplicate_tools_by_name(tools: list[dict]) -> list[dict]:
     return tools_metadata
 
 
+def description_tools(tools: list[dict]) -> list[dict]:
+    return [{'name': tool.get("function", {}).get("name"),
+             'description': tool.get("function", {}).get("description")}
+            for tool in tools if isinstance(tool, dict)]
+
+
 # import psutil,signal,contextlib
 # def kill_process_tree(pid: int):
 #     """
@@ -2829,3 +3421,17 @@ if __name__ == "__main__":
     functions = extract_function_metadatas(code)
     for func in functions:
         print(func)
+
+    filtered_files = filter_directory(r"E:\Documents\PycharmProjects\aigc", config={
+        "include": ["*.py", "deploy.bat", "requirements.txt", "CI"],
+        "recursive_include": {
+            "agents": ["*"],
+            "script": ["*"],
+            "docker": ["*"],
+            "data": ["*.yaml", "*.pkl"]
+        },
+        "prune": [".venv", ".git", "docker_build", "script/data"],
+        "exclude": ["script/nlp.py", "script/data/*"],
+        "global_exclude": ["__pycache__/*", "*.py[cod]", "*.log"]
+    })
+    print(json.dumps(filtered_files, indent=2, ensure_ascii=False))

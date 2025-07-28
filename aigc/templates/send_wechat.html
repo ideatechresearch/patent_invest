@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>微信发送</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        h2 {
+            color: #4CAF50;
+        }
+        form {
+            max-width: 500px;
+            margin: 0 auto;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        input[type="file"], input[type="text"], input[type="datetime-local"], textarea {
+            margin-bottom: 10px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+        input[type="submit"] {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            cursor: pointer;
+        }
+        input[type="submit"]:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+<h2>微信发送</h2>
+<form action="/send_wechat_scheduler" method="post" enctype="multipart/form-data">
+    <label for="user_name">User Name:</label>
+    <input type="text" name="user_name" required><br><br>
+
+    <label for="context">Context:</label>
+    <textarea name="context" rows="5" placeholder="Enter message"></textarea><br><br>
+
+    <label for="file">File:</label>
+    <input type="file" name="file"><br><br>
+
+    <label for="object_name">Object Name:</label>
+    <input type="text" name="object_name"><br><br>
+
+    <label for="send_time">Send Time:</label>
+    <input type="datetime-local" name="send_time"><br><br>
+
+    <input type="submit" value="Upload">
+</form>
+
+<script>
+    // 获取当前时间并格式化为 YYYY-MM-DDTHH:MM
+    let now = new Date();
+    let year = now.getFullYear();
+    let month = (now.getMonth() + 1).toString().padStart(2, '0');
+    let day = now.getDate().toString().padStart(2, '0');
+    let hours = now.getHours().toString().padStart(2, '0');
+    let minutes = now.getMinutes().toString().padStart(2, '0');
+    let formattedTime = `${year}-${month}-${day}T${hours}:${minutes}`;
+
+    // 设置到 input 的默认值
+    document.getElementById('send_time').value = formattedTime;
+</script>
+</body>
+</html>

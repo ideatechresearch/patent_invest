@@ -147,6 +147,25 @@ class BM25:
         ranked = sorted(scores, key=lambda x: x[1], reverse=True)
         return ranked[:top_k] if top_k else ranked
 
+    def best_match(self, query: str) -> int:
+        scores = self.get_scores(query)
+        if scores:
+            best_match = max(scores, key=lambda x: x[1])  # [(idx,max_score)]
+            return best_match[0]
+        return -1
+
+    def hybrid_scores(self, query: str, search_hit: list[dict], alpha=0.6):
+        dense_scores = [item.get('score', 0.0) for item in search_hit]  # dense embedding 相似度，需要与corpus顺序一致
+        sparse_scores = self.get_scores(query, normalize=True)  # BM25 分数
+        assert len(sparse_scores) == len(dense_scores)
+        hybrid_scores = []
+        for idx, item in enumerate(search_hit):
+            hybrid_score = alpha * dense_scores[idx] + (1 - alpha) * sparse_scores[idx][1]
+            hybrid_scores.append((item, hybrid_score, idx))
+
+        hybrid_scores.sort(key=lambda x: x[1], reverse=True)
+        return hybrid_scores
+
 
 # class BM25:
 #     def __init__(self, corpus, k1=1.5, b=0.75):
@@ -208,5 +227,8 @@ if __name__ == "__main__":
     bm25 = BM25(corpus)
     scores = bm25.get_scores(query, normalize=True)
     scores2 = bm25.rank_documents(query, top_k=3)
-    print(scores, scores2, bm25.corpus)
+    print(scores, scores2)
+    print(bm25.best_match(query))
+    print(bm25.corpus)
+    print(bm25.get_sparse_vectors())
     # print(BM25(corpus).rank_documents(query))

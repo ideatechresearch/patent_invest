@@ -5,13 +5,7 @@ import asyncio
 # from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue,PointStruct,DiscoverQuery,ContextQuery,NearestQuery,RecommendQuery
 import qdrant_client.models as qcm
 from typing import Callable, Any
-from abc import ABC, abstractmethod
-
-
-class DataProcessor(ABC):
-    @abstractmethod
-    def process(self, intermediate: dict) -> dict:
-        raise NotImplementedError("必须实现此方法")
+import uuid
 
 
 def empty_match(field_key):
@@ -68,23 +62,49 @@ def geo_match(field_key="geo", lat: float = 40.7128, lon: float = -74.0060, radi
     #                ),
 
 
+async def select_point_ids(querys: list[str], collection_name, client, match: list = None, field_key: str = 'word',
+                           limit: int = 0, get_dict=True):
+    if limit == 0:
+        limit = len(querys)
+    match = match or []
+    should_list = [qcm.FieldCondition(key=field_key, match=qcm.MatchValue(value=w)) for w in querys]
+    scroll_filter = qcm.Filter(must=match, should=should_list) if match else qcm.Filter(should=should_list)
+    # must_not,min_should
+    all_points = []
+    next_offset = None
+    while limit > 0 and len(all_points) < limit:
+        scroll_result, next_offset = await client.scroll(collection_name=collection_name,
+                                                         scroll_filter=scroll_filter,
+                                                         with_payload=True if get_dict else [field_key],
+                                                         # with_vectors=True,
+                                                         limit=1000,
+                                                         offset=next_offset)
+        all_points.extend(scroll_result)
+        if next_offset is None:
+            break
+
+    def extract_payload(p, keys):
+        if get_dict:
+            return p.model_dump(exclude={'vector', 'version', 'shard_key', 'order_value'}, exclude_none=True)
+        if keys is True:
+            return p.payload, p.id
+        if p.payload and isinstance(keys, str):
+            return p.payload.get(keys, None), p.id
+
+        return p.payload, p.id
+
+    return [extract_payload(i, field_key) for i in all_points[:limit]]
+
+
 async def ids_to_names(ids, collection_name, client, key_name='word'):
     id_record = await client.retrieve(collection_name=collection_name, ids=ids, with_payload=[key_name])
     return {p.id: p.payload[key_name] for p in id_record}
 
 
 async def names_to_ids(names: list, collection_name, client, match=[], key_name='word'):
-    shoulds = [qcm.FieldCondition(key=key_name, match=qcm.MatchValue(value=w)) for w in names]
-    scroll_filter = qcm.Filter(must=match, should=shoulds) if match else qcm.Filter(
-        should=shoulds)  # must_not,min_should,
-    scroll_result, next_offset = await client.scroll(collection_name=collection_name,
-                                                     scroll_filter=scroll_filter,
-                                                     with_payload=[key_name],
-                                                     # with_vectors=True,
-                                                     limit=len(names))
-
-    return {i.payload[key_name]: i.id for i in scroll_result}
-    # [(i.payload[key_name], i.id) for i in scroll_result[0]]
+    result = await select_point_ids(names, collection_name, client, match, field_key=key_name, limit=len(names),
+                                    get_dict=False)
+    return {i[0]: i[1] for i in result}
 
 
 async def create_collection_aliases(collection_name, alias_name, client):
@@ -214,7 +234,8 @@ async def create_payload_index(collection_name, client, field_name, field_schema
     return res.model_dump()
 
 
-async def upsert_points(payloads: list[dict], vectors: list, collection_name: str, client, vector_name: str = None):
+async def upsert_points(payloads: list[dict], vectors: list, collection_name: str, client, vector_name: str = None,
+                        hash_id=False, **kwargs):
     """
     插入单个点到 Qdrant 集合。
 
@@ -223,26 +244,36 @@ async def upsert_points(payloads: list[dict], vectors: list, collection_name: st
     :param collection_name: 集合名称
     :param client: Qdrant 客户端实例
     :param vector_name
+    :param hash_id
     """
     assert len(payloads) == len(vectors), "Payloads and vectors must have the same length."
-    current_count = await client.count(collection_name=collection_name, exact=True)
+
     # dense_doc=qcm.Document(text="bye world", model="sentence-transformers/all-MiniLM-L6-v2")#DENSE
-    points: list[qcm.PointStruct] = [qcm.PointStruct(id=current_count.count + idx, payload=payload,
-                                                     vector={vector_name: vector} if vector_name else vector)
-                                     for idx, (payload, vector) in enumerate(zip(payloads, vectors))]
+    if hash_id:
+        points: list[qcm.PointStruct] = [qcm.PointStruct(id=str(uuid.uuid4()), payload=payload,
+                                                         vector={vector_name: vector} if vector_name else vector)
+                                         for payload, vector in zip(payloads, vectors)]
+    else:
+        current_count = await client.count(collection_name=collection_name, exact=True)
+        points: list[qcm.PointStruct] = [qcm.PointStruct(id=current_count.count + idx, payload=payload,
+                                                         vector={vector_name: vector} if vector_name else vector)
+                                         for idx, (payload, vector) in enumerate(zip(payloads, vectors))]
 
     try:
-        operation_info = await client.upsert(collection_name=collection_name, points=points)
-        assert operation_info.status == qcm.UpdateStatus.COMPLETED
-        return operation_info.operation_id
+        operation_info = await client.upsert(collection_name=collection_name, points=points, **kwargs)
+        assert operation_info.status == qcm.UpdateStatus.COMPLETED, operation_info.model_dump()
+        return operation_info.operation_id, [p.id for p in points]
     except Exception as e:
         # client.upload_points(collection_name=collection_name, points=points, parallel=parallel, wait=True)
+        # client.upload_records(collection_name=collection_name,
+        #                       records=(qcm.Record(id=idx, vector=vec.tolist()) for idx, vec in enumerate(vectors)),
+        #                       parallel=parallel, wait=True)
         print(f"Error upserting points to collection {collection_name}: {e}")
-        return None
+        return None, []
 
 
 async def upsert_points_batch(payloads: list[dict], vectors: list, collection_name: str, client,
-                              vector_name: str = None, batch_size: int = 1000):
+                              vector_name: str = None, batch_size: int = 1000, hash_id=False):
     """
     批量插入数据到 Qdrant 集合。
 
@@ -252,15 +283,18 @@ async def upsert_points_batch(payloads: list[dict], vectors: list, collection_na
     :param client: Qdrant 客户端实例
     :param vector_name:
     :param batch_size: 每次插入的批次大小
+    :param hash_id
     """
     assert len(payloads) == len(vectors), "Payloads and vectors must have the same length."
     current_count = await client.count(collection_name=collection_name)
     index = current_count.count
+    ids = []
     for i in range(0, len(payloads), batch_size):
         batch_payloads = payloads[i:i + batch_size]
         batch_vectors = vectors[i:i + batch_size]
         points_size = len(batch_payloads)
-        batch_ids = list(range(index, index + points_size))
+        batch_ids = [str(uuid.uuid4()) for _ in range(points_size)] if hash_id else list(
+            range(index, index + points_size))
 
         # 创建 Batch 对象
         points = qcm.Batch(ids=batch_ids, payloads=batch_payloads,
@@ -271,13 +305,14 @@ async def upsert_points_batch(payloads: list[dict], vectors: list, collection_na
             operation_info = await client.upsert(collection_name=collection_name, points=points)
             assert operation_info.status == qcm.UpdateStatus.COMPLETED, 'NOT COMPLETED'
             index += points_size
+            ids.extend(batch_ids)
         except StopIteration:
             break
         except Exception as e:
             print(e)
             print(f"Error upserting batch {i // batch_size + 1}: {e}")
             continue
-    return index
+    return index, ids
 
 
 async def update_points_batch(ids: list, vectors: list, collection_name: str, client, vector_name: str = None,
@@ -380,25 +415,58 @@ async def get_vec(name, collection_name, client, _id=-1, match=[], key_name='wor
     return point_result[0].vector
 
 
+async def fix_missing_payload(hits, collection_name, client, with_payload: bool | list[str] = True):
+    missing_hits = [h for h in hits if not getattr(h, 'payload', None)]  # or h.payload is None
+    if missing_hits:
+        id_records = await client.retrieve(collection_name, [h.id for h in missing_hits], with_payload=with_payload)
+        # fallback：用 retrieve 填充 回填对应的 payload
+        id_map = {r.id: r for r in id_records}
+        for h in missing_hits:
+            record = id_map.get(h.id)
+            if record:
+                h.payload = record.payload
+
+    # print([p.model_dump() for p in missing_hits])
+
+
 # Recommend
-async def recommend_by_id(ids, collection_name, client, key_name='word', match=[], not_match=[], not_ids=[], topn=10,
-                          score_threshold: float = 0.0, ret_name=False):
+async def recommend_by_id(ids, collection_name, client, payload_key: str | list = 'word', match=[], not_match=[],
+                          not_ids=[], topn=10, score_threshold: float = 0.0, get_dict=True, **kwargs):
     not_match_ids = [qcm.HasIdCondition(has_id=not_ids)]
     query_filter = qcm.Filter(must=match, must_not=not_match_ids + not_match)
+    with_payload = False
+    if payload_key:
+        if isinstance(payload_key, str):
+            with_payload = [payload_key]
+        if isinstance(payload_key, list):
+            with_payload = payload_key
 
     hit = await client.recommend(collection_name=collection_name,
                                  positive=ids,  # [ID]
                                  query_filter=query_filter,
                                  limit=topn, score_threshold=score_threshold,
-                                 with_payload=[key_name] if (ret_name and key_name) else False,
-                                 )  # ScoredPoint
+                                 with_payload=with_payload,
+                                 **kwargs)  # ScoredPoint
+    if with_payload:
+        await fix_missing_payload(hit, collection_name, client, with_payload=with_payload)
 
-    return [(p.payload[key_name] if (ret_name and key_name) else p.id, p.score) for p in hit]
+    def extract_payload(p, keys):
+        if get_dict:
+            return p.model_dump(exclude={'vector', 'version', 'shard_key', 'order_value'}, exclude_none=True)
+        if keys is True:
+            return p.payload, p.score, p.id
+        if p.payload:
+            if isinstance(keys, str):
+                return p.payload.get(keys, None), p.score, p.id
+            if isinstance(keys, list):
+                return {k: p.payload.get(k) for k in keys}, p.score, p.id
+        return p.payload, p.score, p.id
+
+    return [extract_payload(p, payload_key) for p in hit]
 
 
-async def recommend_by_id_group(ids, collection_name, client, group_key="document_id", match=[], not_match=[],
-                                not_ids=[], topn=10, group_size=3,
-                                score_threshold: float = 0.0):
+async def recommend_by_group(ids: list, collection_name, client, group_key="document_id", match=[], not_match=[],
+                             not_ids=[], topn=10, group_size=3, score_threshold: float = 0.0):
     not_match_ids = [qcm.HasIdCondition(has_id=not_ids)]
     query_filter = qcm.Filter(must=match, must_not=not_match_ids + not_match)
 
@@ -416,8 +484,9 @@ async def recommend_by_id_group(ids, collection_name, client, group_key="documen
     return [(p.payload[group_key] if group_key else p.id, p.score) for p in hit]
 
 
-async def recommend_by_ids(ids: list | tuple, collection_name: str, client, payload_key='word', match=[], not_match=[],
-                           topn=10, score_threshold: float = 0.0):
+async def recommend_by_ids(ids: list | tuple, collection_name: str, client, payload_key: str | list = 'word',
+                           match: list = [], not_match: list = [], topn=10, score_threshold: float = 0.0,
+                           get_dict=True):
     not_match_ids = [qcm.HasIdCondition(has_id=ids)]
     query_filter = qcm.Filter(must=match, must_not=not_match_ids + not_match)  # 缩小查询范围
 
@@ -426,11 +495,8 @@ async def recommend_by_ids(ids: list | tuple, collection_name: str, client, payl
                              with_payload=[payload_key] if payload_key else True)
         for _id in ids]
 
-    recommend_hit = await client.recommend_batch(collection_name=collection_name,
-                                                 requests=recommend_queries)  # ScoredPoint
-
-    return [(_id, [(p.payload[payload_key] if payload_key else p.payload, p.id, p.score) for p in hit]) for _id, hit
-            in zip(ids, recommend_hit)]
+    # ScoredPoint
+    return await client.recommend_batch(collection_name=collection_name, requests=recommend_queries)
 
 
 # Search
@@ -463,7 +529,7 @@ async def search_by_id(name, collection_name, client, _id=-1, key_name='word', m
 async def search_by_vecs(query_vectors: list[list[float]], collection_name: str, client,
                          payload_key: str = 'title', vector_name: str = None,
                          match: list = [], not_match: list = [],
-                         topn: int = 10, score_threshold: float = 0.0, exact: bool = False):
+                         topn: int = 10, score_threshold: float = 0.0, exact: bool = False, **kwargs):
     """
     使用 Qdrant 批量查询查询词的嵌入，返回与查询最相似的标记和得分。
 
@@ -487,7 +553,27 @@ async def search_by_vecs(query_vectors: list[list[float]], collection_name: str,
                           params=qcm.SearchParams(exact=exact), )
         for vec in query_vectors]
 
-    return await client.search_batch(collection_name=collection_name, requests=search_queries)  # ScoredPoint
+    return await client.search_batch(collection_name=collection_name, requests=search_queries, **kwargs)  # ScoredPoint
+
+
+async def search_by_group(query_vector: list[float], collection_name, client, group_key: str = "document_id", match=[],
+                          not_match=[], not_ids=[], topn=10, group_size=3, score_threshold: float = 0.0):
+    not_match_ids = [qcm.HasIdCondition(has_id=not_ids)]
+    query_filter = qcm.Filter(must=match, must_not=not_match_ids + not_match)
+
+    hit = await client.search_groups(
+        collection_name=collection_name,
+        group_by=group_key,
+        query_vector=query_vector,
+        query_filter=query_filter,
+        limit=topn,  # Return closest points
+        group_size=group_size,
+        score_threshold=score_threshold,
+        with_payload=[group_key] if group_key else False,
+        consistency=qcm.ReadConsistencyType.MAJORITY,
+    )
+
+    return [(p.payload[group_key] if group_key else p.id, p.score) for p in hit]
 
 
 # SimilarByIds
@@ -541,16 +627,17 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
     def extract_payload(p, keys):
         if get_dict:
             return p.model_dump(exclude={'vector', 'version', 'shard_key', 'order_value'}, exclude_none=True)
-        if keys is True or keys is None:
+        if keys is True:
             return p.payload, p.score, p.id
-        if isinstance(keys, str):
-            return p.payload.get(keys, None), p.score, p.id
-        if isinstance(keys, list):
-            return {k: p.payload.get(k) for k in keys}, p.score, p.id
+        if p.payload:
+            if isinstance(keys, str):
+                return p.payload.get(keys, None), p.score, p.id
+            if isinstance(keys, list):
+                return {k: p.payload.get(k) for k in keys}, p.score, p.id
         return p.payload, p.score, p.id
 
     if len(querys) == 1:
-        with_payload = True
+        with_payload = False
         if payload_key:
             if isinstance(payload_key, str):
                 with_payload = [payload_key]
@@ -568,16 +655,10 @@ async def search_by_embeddings(querys: list[str] | tuple[str], collection_name: 
                                          # params=qcm.SearchParams(exact=exact),
                                          )
 
-        missing_hits = [h for h in search_hit if not getattr(h, 'payload', None)]  # or h.payload is None
-        if missing_hits:
-            id_records = await client.retrieve(collection_name, [h.id for h in missing_hits], with_payload=with_payload)
-            # fallback：用 retrieve 填充 回填对应的 payload
-            id_map = {r.id: r for r in id_records}
-            for h in missing_hits:
-                record = id_map.get(h.id)
-                if record:
-                    h.payload = record.payload
-
+        # hits = await client.query_points(collection_name=collection_name, query=query_vector,
+        #                                  limit=topn,score_threshold=score_threshold)
+        if with_payload:
+            await fix_missing_payload(search_hit, collection_name, client, with_payload=with_payload)
         # {k: p.payload.get(k) for k in payload_key}
         return [extract_payload(p, payload_key) for p in search_hit]
 
@@ -718,12 +799,13 @@ async def search_batch_by_ids(ids, collection_name, client, key_name='word', mat
 # Relation
 async def node_relations(collection_name, client, width, depth, _id, ids_depth: dict = {}, match=[], not_match=[],
                          key_name='word', exclude_all=True, score_threshold=0.0):
-    relationships = []
     try:
+        relationships = []
         not_ids = list(ids_depth) if exclude_all else [k for k in ids_depth if ids_depth[k] <= depth]
-        similar_next = await recommend_by_id([_id], collection_name, client, key_name=key_name, match=match,
+        similar_next = await recommend_by_id([_id], collection_name, client, payload_key=key_name, match=match,
                                              not_match=not_match, not_ids=not_ids, topn=width,
-                                             score_threshold=score_threshold, ret_name=False)
+                                             score_threshold=score_threshold, get_dict=False)
+
         ids = [y[0] for y in similar_next]  # p.payload[self.key_name] if use_name else p.id
         if len(ids) == 0:
             return ids_depth, relationships  # 返回递归
@@ -735,13 +817,13 @@ async def node_relations(collection_name, client, width, depth, _id, ids_depth: 
         relationships = [
             {'source': _id, 'target': y[0], 'relation': str(round(y[1], 5)), 'value': 1.0 - y[1], 'rank': i}
             for i, y in enumerate(similar_next)]
+        return new_depth, relationships
 
     except KeyError:
         id_first = [k for k, v in ids_depth.items() if v == 0]
         print(f"Data '{id_first, _id}' not in vocabulary.")
         # new_depth = {}
-
-    return new_depth, relationships
+    return {}, []
 
 
 # Relations
@@ -1075,7 +1157,8 @@ if __name__ == "__main__":
 
         # await upsert_points(payloads, vectors=embeddings,collection_name=collection_name, client=qc)
 
-        r = await  upsert_points_batch(payloads, text_embeddings.tolist(), collection_name, client=qc, batch_size=1000)
+        r, ids = await  upsert_points_batch(payloads, text_embeddings.tolist(), collection_name, client=qc,
+                                            batch_size=1000)
         print(r)  # 18952
 
         ret = await qc.get_collection(collection_name=collection_name)

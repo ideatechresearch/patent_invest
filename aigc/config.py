@@ -4,7 +4,6 @@ from jose import JWTError, jwt
 import requests, json
 from urllib.parse import quote_plus, urlencode, urlparse, quote, unquote, parse_qs, unquote_plus
 from datetime import datetime, timedelta, timezone
-from wsgiref.handlers import format_date_time
 import time
 import uuid
 import os
@@ -18,14 +17,15 @@ class Config(object):
     """
     # {{!IGNORE_START!}} (请忽略以下内容)
     DATABASE_PWD = "***"
-    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://technet:{quote_plus(DATABASE_PWD)}@***.mysql.rds.aliyuncs.com:3306/technet?charset=utf8'
-    ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://ideatech:{quote_plus(DATABASE_PWD)}@rm-***.mysql.rds.aliyuncs.com:3306/h3yun?charset=utf8'
+    SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://technet:{quote_plus(DATABASE_PWD)}@***.mysql.rds.aliyuncs.com:3306/technet?charset=utf8mb4'
+    ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://ideatech:{quote_plus(DATABASE_PWD)}@***.mysql.rds.aliyuncs.com:3306/h3yun?charset=utf8'
     SQLALCHEMY_COMMIT_ON_TEARDOWN = False
     SQLALCHEMY_TACK_MODIFICATIONS = True
     SQLALCHEMY_ECHO = True
     SECRET_KEY = '***'
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 60
+    VERIFY_TIMEOUT_SEC = 300
     HTTP_TIMEOUT_SEC = 100.0
     MAX_TASKS = 1024
     MAX_CACHE = 1024
@@ -35,10 +35,10 @@ class Config(object):
     DEVICE_ID = '***'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
-    Version = 'v1.2.3'
+    Version = 'v1.2.5'
     _config_path = 'config.yaml'
-    __config_data = {}  # 动态加载的数据
-    __config_dynamic = {}  # 其他默认配置项
+    __config_data = {}  # 动态加载的数据，用于还原
+    __config_dynamic = {}  # 其他默认配置项，用于运行时
     WEBUI_NAME = 'aigc'
     WEBUI_URL = 'http://***:7000'
     # https://api.qdrant.tech/api-reference
@@ -46,13 +46,15 @@ class Config(object):
     NEO_URI = "bolt://neo4j:7687"
     NEO_Username = "neo4j"
     NEO_Password = '***'
-    QDRANT_HOST = 'qdrant'  
+    DASK_Cluster = 'tcp://10.10.10.20:8786'
+    QDRANT_HOST = 'qdrant'  # "47.110.156.41"
     QDRANT_GRPC_PORT = 6334
     QDRANT_URL = "http://***:6333"  # ":memory:"
     WECHAT_URL = 'http://idea_ai_robot:28089'
     REDIS_HOST = "redis_aigc"
     REDIS_PORT = 6379  # 7007
     REDIS_CACHE_SEC = 99999  # 86400
+    REDIS_MAX_CONCURRENT = 50
 
     VALID_API_KEYS = {"token-abc123", "token-def456"}
     DEFAULT_LANGUAGE = 'Chinese'
@@ -120,7 +122,7 @@ class Config(object):
     XF_API_Key = '***'
     XF_Secret_Key = '***'
     Spark_Service_Key = '***'  # AK:SK,{XF_API_Key}:{XF_Secret_Key} ws协议的apikey和apisecret 按照ak:sk格式拼接
-    XF_API_Password = ['**', '***',]  # http协议的APIpassword
+    XF_API_Password = ['***','***']  # http协议的APIpassword
     # https://aistudio.google.com/apikey
     GEMINI_Service_Key = '***'
     # https://console.anthropic.com/settings/keys
@@ -173,8 +175,8 @@ class Config(object):
     # https://console.volcengine.com/iam/keymanage
     VOLC_AK_ID = '***'
     VOLC_Secret_Key = '***'
-    VOLC_AK_ID_admin = '***' 
-    VOLC_Secret_Key_admin = '***'  
+    VOLC_AK_ID_admin = '***'  
+    VOLC_Secret_Key_admin = '***'
     # https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D
     ARK_Service_Key = '***'
 
@@ -220,13 +222,16 @@ class Config(object):
     # https://console.deepgram.com/project/fb261c77-9eb1-4c7a-bf47-1eef8297bafc/keys
     Deepgram_Service_Key = '***'
 
+    # https://app.roboflow.com/main-36irj/settings/api
+    Roboflow_Api_Key = '***'
+
     # https://gitee.com/personal_access_tokens
     GITEE_Access_Tokens = '***'
     # 'https://matrix.ideatech.info'
     Ideatech_API_Key = '***'
+    Ideatech_Host = '***.info'
 
-    HTTP_Proxy = 'http://dooven:***7@***:7930'
-    # 'socks5://dooven:***@10.10.10.3:7891',9793
+    HTTP_Proxy = 'http://***@***:7930'
     HTTP_Proxies = {
         'http': HTTP_Proxy,
         'https': HTTP_Proxy,
@@ -234,36 +239,21 @@ class Config(object):
 
     # {{!IGNORE_END!}}
 
-    def copy_and_update(self, *args, **kwargs):
-        """
-        Copy the object and update it with the given Info
-        instance and/or other keyword arguments.
-        """
-        new_info = asdict(self)
-
-        for si in args:
-            if isinstance(si, Config):
-                new_info.update({k: v for k, v in asdict(si).items() if v is not None})
-            elif isinstance(si, dict):
-                new_info.update({k: v for k, v in si.items() if v is not None})
-
-        if len(kwargs) > 0:
-            new_info.update(kwargs)
-
-        return Config(**new_info)
-
     @classmethod
     def debug(cls):
-        cls.SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://dooven:***@10.10.10.5:3306/kettle?charset=utf8mb4'
-        cls.ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://dooven:***@10.10.10.5:3306/kettle?charset=utf8'
+        if cls.__config_dynamic.get('IS_DEBUG'):
+            return
+        cls.SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://***:***@10.10.10.5:3306/kettle?charset=utf8mb4'
+        cls.ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://***:***@10.10.10.5:3306/kettle?charset=utf8'
         cls.WEBUI_URL = 'http://127.0.0.1:7000'
         # https://api.qdrant.tech/api-reference
         cls.QDRANT_GRPC_PORT = None
-        cls.WECHAT_URL = 'http://47.110.156.41:28089'
+        cls.WECHAT_URL = 'http://***:28089'
         cls.REDIS_HOST = '10.10.10.5'  # "localhost"
         cls.NEO_URI = "bolt://localhost:7687"
+        cls.NEO_Password = '***'
 
-        cls.HTTP_Proxy = 'http://dooven:***@10.10.10.3:7890'
+        cls.HTTP_Proxy = 'http://***:***@10.10.10.3:7890'
         # cls.HTTP_Proxies = {'http': cls.HTTP_Proxy,'https': cls.HTTP_Proxy}
         os.environ['HTTP_PROXY'] = cls.HTTP_Proxies['http']
         os.environ['HTTPS_PROXY'] = cls.HTTP_Proxies['https']
@@ -271,7 +261,7 @@ class Config(object):
         cls.Moonshot_Service_Key = "sk-***"
         cls.DeepSeek_Service_Key = 'sk-***'
         cls.DashScope_Service_Key = 'sk-***'
-
+        cls.__config_dynamic['IS_DEBUG'] = True
         print(cls.get_config_data())
 
     @classmethod
@@ -308,13 +298,13 @@ class Config(object):
     def load(cls, filepath=None):
         """从YAML文件加载配置项"""
         if cls.__config_data:  # is_loaded
-            return
+            return cls.__config_dynamic
 
         import yaml
         path = filepath or getattr(cls, '_config_path', 'data/.config.yaml')
         if not os.path.exists(path):
             print(f"配置文件 {path} 不存在，使用默认配置")
-            return
+            return {}
 
         with open(path, "r", encoding='utf-8') as f:
             cls.__config_data = yaml.safe_load(f)
@@ -334,24 +324,32 @@ class Config(object):
                 # 添加到动态配置
                 cls.__config_dynamic[key] = value
 
-        print("配置已加载并更新")
+        cls.__config_dynamic['IS_LOADED'] = True
+        print(f"配置已加载并更新,文件: {path}")
         return cls.__config_dynamic
 
     @classmethod
-    def __getattr__(cls, name):
-        # 访问不存在的属性时被调用,第一次访问属性时触发
-        if not cls.__config_data:
-            cls.load()
-            if name in cls.__config_data:
-                return cls.__config_data[name]
-        raise AttributeError(f"Config has no attribute '{name}'")
+    def get(cls, key, default=None):
+        """
+        获取配置值，优先级顺序：
+        1. 类属性（静态字段）
+        2. __config_dynamic 动态字段
+        若字段值为 ***遮蔽，尝试从 __config_data 中还原真实值,访问不存在的属性时被调用,第一次访问属性时触发
+        """
+        if hasattr(cls, key):
+            value = getattr(cls, key, default)
+        else:
+            value = cls.__config_dynamic.get(key, default)
+
+        if isinstance(value, str) and all(c == '*' for c in value):
+            if not getattr(cls, "__config_data", None):
+                cls.load()
+            return cls.__config_data.get(key, default)
+        return value
 
     @classmethod
-    def get(cls, key):
-        value = getattr(cls, key, None)
-        if isinstance(value, str) and all(c == '*' for c in value):
-            return getattr(cls, "__config_data", {}).get(key)
-        return value
+    def update(cls, **kwargs):
+        cls.__config_data.update(**kwargs)
 
     @classmethod
     def get_config_data(cls):
@@ -454,7 +452,8 @@ AI_Models = [
      # "qwen-math-plus",'baichuan2-7b-chat-v1','baichuan2-turbo'
      "generation": ["qwen-coder-turbo", "qwen2.5-coder-7b-instruct", "qwen2.5-coder-14b-instruct",
                     "qwen2.5-coder-32b-instruct", "qwen-coder-turbo-latest"],
-     'embedding': ["text-embedding-v2", "text-embedding-v1", "text-embedding-v2", "text-embedding-v3"],
+     'embedding': ["text-embedding-v2", "multimodal-embedding-v1", "text-embedding-v1", "text-embedding-v2",
+                   "text-embedding-v3", "text-embedding-v4"],
      'speech': ['paraformer-v1', 'paraformer-8k-v1', 'paraformer-mtl-v1'],
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
      'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -684,7 +683,8 @@ AI_Models = [
      'supported_openai': True, 'supported_list': True, 'proxy': True},
     # https://docs.x.ai/docs/overview
     {'name': 'grok', 'type': 'default', 'api_key': '',
-     'model': ["grok-2-latest", "grok-2-vision-1212", "grok-3-mini", "grok-3-mini-fast", "grok-3", "grok-3-fast"],
+     'model': ["grok-2-latest", "grok-2-vision-1212", "grok-3-mini", "grok-3-mini-fast", "grok-3", "grok-3-fast",
+               "grok-4-0709"],
      'url': 'https://api.x.ai/v1/chat/completions',
      'base_url': "https://api.x.ai/v1",
      'supported_openai': True, 'supported_list': True, 'proxy': True, "timeout": 200},
@@ -739,10 +739,10 @@ AI_Models = [
     # https://docs.tokenflux.ai/quickstart
     # https://tokenflux.ai/models
     {'name': 'tokenflux', 'type': 'default', 'api_key': '',
-     'model': ['gemini-pro', 'gemini-2.5-pro', 'gemma-3-12b', 'gemma-3-27b-it', 'gemma-3-27b',
+     'model': ['gemini-pro', 'gemini-2.5-pro', 'gemma-3-12b', 'gemma-3-27b',
                'claude-3.5-haiku', 'claude-3-7-sonnet', 'claude-sonnet-4', 'grok-3-mini-beta',
                'deepseek-r1', 'deepseek-v3', 'doubao-1.5-pro-32k', 'glm-4-9b-chat',
-               'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4.1', 'o3'],
+               'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4.1'],
      'embedding': ["BAAI bge-m3", 'text-embedding-3-large'],
      'url': 'https://aihubmix.com/v1/chat/completions',
      'embedding_url': 'https://aihubmix.com/v1/embeddings',
@@ -750,6 +750,18 @@ AI_Models = [
      'mcp_url': 'https:/tokenflux.ai/v1/mcps',
      'base_url': "https://tokenflux.ai/v1",
      'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 200},
+    # https://docs.anthropic.com/zh-CN/api/overview#python
+    # https://docs.anthropic.com/zh-CN/docs/about-claude/models/overview
+    {'name': 'claude', 'type': 'anthropic', 'api_key': '',
+     'model': ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219",
+               "claude-sonnet-4-20250514", "claude-opus-4-20250514",
+               "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest"],
+     'embedding': ["BAAI bge-m3", 'text-embedding-3-large'],
+     'generation': ['claude-2'],
+     'url': 'https://api.anthropic.com/v1/messages',
+     'generation_url': 'https://api.anthropic.com/v1/complete',
+     'base_url': 'https://api.anthropic.com/v1',
+     'supported_openai': False, 'supported_list': False, 'proxy': True, "timeout": 200},
     # https://platform.openai.com/docs/overview
     {'name': 'gpt', 'type': 'default', 'api_key': '',
      'model': ["o3-mini", "o3-mini-2025-01-31", "o1", "o1-2024-12-17", "o1-preview", "o1-preview-2024-09-12", "o1-mini",
@@ -775,8 +787,8 @@ AI_Models = [
 
 
 # moonshot,glm,qwen,ernie,hunyuan,doubao,silicon,spark,baichuan,deepseek
-def model_api_keys():
-    return {
+def model_api_keys(name: str = None):
+    api_keys = {
         'moonshot': Config.Moonshot_Service_Key,
         'glm': Config.GLM_Service_Key,
         'qwen': Config.DashScope_Service_Key,
@@ -792,12 +804,19 @@ def model_api_keys():
         'jina': Config.JINA_Service_Key,
         'gemini': Config.GEMINI_Service_Key,
         'grok': Config.Grok_Service_Key,
+        'claude': Config.Anthropic_Service_Key,
         # 'gpt': Config.OPENAI_Service_Key
         'silicon': Config.Silicon_Service_Key,
         'modelscope': Config.ModelScope_Service_Key,
         'aihubmix': Config.AiHubMix_Service_Key,
         'tokenflux': Config.TokenFlux_Service_Key,
     }
+    if not name:
+        return api_keys
+    api_key = api_keys.get(name, None)
+    if isinstance(api_key, str) and set(api_key) == {"*"}:
+        return None
+    return api_key
 
 
 # SUPPORTED_OPENAI_MODELS = {'moonshot', 'glm', 'qwen', 'hunyuan', 'silicon', 'doubao', 'baichuan', 'deepseek', 'minimax',
@@ -868,44 +887,6 @@ def sha256base64(data):
     sha256.update(data)
     digest = base64.b64encode(sha256.digest()).decode(encoding='utf-8')
     return digest
-
-
-def make_hashable(obj):
-    if isinstance(obj, dict):
-        return frozenset((k, make_hashable(v)) for k, v in obj.items())
-    elif isinstance(obj, list):
-        return tuple(make_hashable(i) for i in obj)
-    return obj
-
-
-def generate_hash_key(*args, **kwargs):
-    """
-    根据任意输入参数生成唯一的缓存键。
-    :param args: 任意位置参数（如模型名称、模型 ID 等）
-    :param kwargs: 任意关键字参数（如其他描述性信息）
-    :return: 哈希键
-    """
-    # (id(_func), tuple(args), make_hashable(kwargs))frozenset(kwargs.items())
-    # 将位置参数和关键字参数统一拼接成一个字符串
-    inputs = []
-    for arg in args:
-        if isinstance(arg, (list, tuple)):
-            inputs.extend(map(str, arg))  # 如果是列表，逐个转换为字符串
-        elif isinstance(arg, (float, int, str, bool)):
-            inputs.append(str(arg))
-        else:
-            inputs.append(json.dumps(arg, sort_keys=True, ensure_ascii=True, default=str))
-
-    for key, value in kwargs.items():
-        if isinstance(value, (list, dict, tuple)):
-            value_str = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
-        else:
-            value_str = str(value)
-        inputs.append(f"{key}:{value_str}")  # 格式化关键字参数为 key:value
-
-    joined_key = "|".join(inputs)[:5000]
-    # 返回 MD5 哈希
-    return hashlib.md5(joined_key.encode()).hexdigest()
 
 
 def construct_sorted_query(params: dict):
@@ -1038,6 +1019,7 @@ def get_xfyun_authorization(api_key=Config.XF_API_Key, api_secret=Config.XF_Secr
     # "itrans.xf-yun.com",/v1/its
     # Step 1: 生成当前日期
     cur_time = datetime.now()
+    from wsgiref.handlers import format_date_time
     date = format_date_time(time.mktime(cur_time.timetuple()))  # RFC1123格式
     # datetime.now(pytz.timezone('Asia/Shanghai')).strftime("%a, %d %b %Y %H:%M:%S GMT")
     # Step 2: 拼接鉴权字符串tmp
