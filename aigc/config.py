@@ -47,7 +47,7 @@ class Config(object):
     NEO_Username = "neo4j"
     NEO_Password = '***'
     DASK_Cluster = 'tcp://10.10.10.20:8786'
-    QDRANT_HOST = 'qdrant'  # "47.110.156.41"
+    QDRANT_HOST = 'qdrant' 
     QDRANT_GRPC_PORT = 6334
     QDRANT_URL = "http://***:6333"  # ":memory:"
     WECHAT_URL = 'http://idea_ai_robot:28089'
@@ -190,7 +190,7 @@ class Config(object):
     OPIK_Api_Key = '***'
     OPIK_Workspace = 'dooven-prime'
     # https://www.searchapi.io/
-    SearchApi_Key = '***'  # TLvdjLW2QAgdotQyYMpcXeqx
+    SearchApi_Key = '***'  
     # https://api-dashboard.search.brave.com/app/keys
     # https://api-dashboard.search.brave.com/app/dashboard
     Brave_Api_Key = "***"
@@ -205,7 +205,7 @@ class Config(object):
     # https://www.alphavantage.co/support/#api-key
     AlphaVantage_Api_Key = '***'
     # https://app.tavily.com/home
-    TAVILY_Api_Key = '***'  # 88YHAKX5YS9EMHGW6EGZN871
+    TAVILY_Api_Key = '***' 
     # https://dashboard.exa.ai/api-keys
     Exa_Api_Key = '***'
     # https://github.com/settings/personal-access-tokens
