@@ -8,15 +8,33 @@ from datetime import datetime
 import random, time, asyncio, json
 
 from utils import pickle_serialize
-from service import ModelListExtract
+from service import ModelList
 
-MODEL_LIST = ModelListExtract()
+MODEL_LIST = ModelList()
 
 _KB = 1 << 10
 _MB = 1 << 20
 _GB = 1 << 30
 _T = 1e12
 SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
+
+from typing import Protocol, runtime_checkable
+
+
+class DataProcessor(ABC):
+    @abstractmethod
+    def process(self, intermediate: dict) -> dict:
+        raise NotImplementedError("必须实现此方法")
+
+    @abstractmethod
+    def operation(self, data):
+        """必须被子类实现的方法"""
+        pass
+
+    @abstractmethod
+    async def execute(self, **kwargs) -> Any:
+        """Execute the tool with given parameters."""
+        raise NotImplementedError("子类必须实现方法")
 
 
 class BaseTool(ABC, BaseModel):
@@ -62,7 +80,7 @@ def dataclass2dict(data):
         elif isinstance(obj, BaseModel):
             return obj.model_dump()
         elif is_dataclass(obj):
-            return {k: convert(v) for k, v in asdict(obj).items()}
+            return {k: convert(getattr(obj, k)) for k in obj.__dataclass_fields__}  # asdict(obj)
         elif isinstance(obj, dict):
             return {k: convert(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple, set, frozenset)):
@@ -104,6 +122,17 @@ def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -
     if isinstance(variables, dict):
         return variables
     raise ValueError('Unsupported variables type.')
+
+
+def transform_fields(data: dict | BaseModel, eng_mapping: dict, reverse=False) -> dict:
+    """
+    当 reverse 为 False 时，将输入数据中的英文字段名转换为对应的中文字段名；
+    当 reverse 为 True 时，则将中文字段名转换为对应的英文字段名。
+    """
+    if isinstance(data, BaseModel):
+        data = data.model_dump()
+    mapping = {v: k for k, v in eng_mapping.items()} if reverse else eng_mapping
+    return {mapping.get(k, k): v for k, v in data.items()}
 
 
 class GeneratorWithReturn:
@@ -262,8 +291,8 @@ class OpenAIRequest(BaseModel):
             }
         }
 
-    @classmethod
     @field_validator("model")
+    @classmethod
     def validate_model(cls, value):
         if not MODEL_LIST.contains(value):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
@@ -311,6 +340,10 @@ class OpenAIRequestMessage(BaseModel):
                 "model": "qwen-turbo",
                 "messages": [
                     {
+                        "role": "system",
+                        "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+                    },
+                    {
                         "role": "user",
                         "content": "你好,有问题要问你",
                         "name": 'test'
@@ -319,25 +352,36 @@ class OpenAIRequestMessage(BaseModel):
                 "temperature": 1,
                 "user": 'test:test',
                 "top_p": 1,
-                "max_tokens": 512,
+                "max_tokens": 1024,
                 "stream": False,
-                "extra_body": {"enable_thinking": False}
+                "extra_body": {"enable_thinking": False},
+                "tools": [{
+                    "type": "baidu_search",
+                    "baidu_search": {'query': '大象像什么'}
+                }]
             }
         }
 
-    @classmethod
     @field_validator("model")
+    @classmethod
     def validate_model(cls, value):
         if not MODEL_LIST.contains(value):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
         return value
 
-    @classmethod
     @field_validator("messages")
+    @classmethod
     def check_messages(cls, values):
         if not values:
             raise ValueError('Messages are required')
         return values
+
+    @field_validator("tools")
+    @classmethod
+    def clean_tools(cls, values):
+        if not values:
+            return []
+        return [t for t in values if isinstance(t, dict) and t]
 
 
 class OpenAIResponse(BaseModel):
@@ -365,6 +409,7 @@ class OpenAIEmbeddingRequest(BaseModel):
     user: Optional[str] = None  # 可选，标识用户
 
     @model_validator(mode="before")
+    @classmethod
     def set_default_value(cls, values):
         if isinstance(values.get("input"), str):
             values["input"] = [values["input"]]
@@ -377,7 +422,7 @@ class OpenAIEmbeddingRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "model": "qwen:text-embedding-v4",
+                "model": "qwen:text-embedding-v3",
                 "input": [
                     "role", "user",
                     "content", "你好,有问题要问你", "第二条文本\n带换行"
@@ -538,8 +583,8 @@ class ToolRequest(BaseModel):
             }
         }
 
-        @classmethod
         @field_validator("tools")
+        @classmethod
         def clean_tools(cls, values):
             if not values:
                 return []
@@ -563,7 +608,7 @@ class AssistantRequest(BaseModel):
         protected_namespaces = ()
 
 
-class KeywordItem(BaseModel):
+class FunctionCallItem(BaseModel):
     function: Optional[str] = None
     args: Optional[List[Any]] = None
     kwargs: Optional[Dict[str, Any]] = None
@@ -712,26 +757,72 @@ class CompletionParams(BaseModel):
             ]
         }
 
-    @classmethod
     @field_validator("model_name")
+    @classmethod
     def validate_model(cls, value):
         if not MODEL_LIST.contains(value):
             raise ValueError(f"Model '{value}' is not in the supported models list {MODEL_LIST.models}")
         return value
 
-    @classmethod
     @field_validator("tools")
+    @classmethod
+    def _clean_tools(cls, values):
+        return cls.clean_tools(values)
+
+    @field_validator("keywords")
+    @classmethod
+    def _clean_keywords(cls, values):
+        return cls.clean_keywords(values)
+
+    @classmethod
     def clean_tools(cls, values):
         if not values:
             return []
         return [t for t in values if isinstance(t, dict) and t]
 
+    @classmethod
+    def clean_keywords(cls, values):
+        if not values:
+            return []
+        keywords_str = [k.strip() for k in values if isinstance(k, str) and k.strip()]
+        return keywords_str + cls.get_keywords_func(values)
+
+    @staticmethod
+    def get_keywords_func(keywords: list[str | tuple]) -> list[tuple]:
+        keywords_func: list[tuple[str, list[Any], dict]] = []
+        for item in keywords:
+            if not isinstance(item, (tuple, list)) or not item:
+                continue
+            # (函数名,无参,单个参数,多个位置参数列表,关键字参数字典)
+            tool_name = item[0]
+            func_args = []
+            func_kwargs = {}
+            for _arg in item[1:]:
+                if isinstance(_arg, dict):  # 处理关键字参数
+                    if "params" in _arg:
+                        func_kwargs.update(_arg["params"])
+                    else:
+                        func_kwargs.update(_arg)  # 将 dict 转换为可哈希类型frozenset(_arg.items())
+                elif isinstance(_arg, (list, tuple)):  # 处理多个位置参数
+                    func_args.extend(_arg)
+                else:  # (函数名, 单个参数)
+                    func_args.append(_arg)  # 剩下的参数[_arg]
+            keywords_func.append((tool_name, func_args, func_kwargs))  # f'{func_name}(**{func_kwargs})'
+
+        return keywords_func
+
     def asdict(self):
-        return self.model_dump()  # .dict()
+        return self.model_dump()
 
     def payload(self):
         return self.model_dump(include={'temperature', 'top_p', 'max_tokens', 'stream'})
         # {k: v for k, v in self.dict().items() if k in ['temperature', 'top_p', 'max_tokens', 'stream']}
+
+    def set_data(self, **kwargs):
+        # from_dict
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
 
 
 class SubmitMessagesRequest(BaseModel):
@@ -751,7 +842,7 @@ class SubmitMessagesRequest(BaseModel):
                                                               "`name`, `user`, and `filter_time`. "
                                                               "If `messages` are provided, the last user message will be used as the question.")
 
-    params: Optional[List[CompletionParams]] = None
+    params: Optional[List[Union[CompletionParams, Dict[str, Any]]]] = None
 
     class Config:
         json_schema_extra = {
@@ -808,6 +899,23 @@ class SubmitMessagesRequest(BaseModel):
             }
         }
 
+    @model_validator(mode='before')
+    @classmethod
+    def clean_params(cls, values):
+        if "params" not in values:
+            return values
+        cleaned = []
+        for item in values["params"]:
+            if isinstance(item, dict):
+                item["tools"] = CompletionParams.clean_tools(item.get("tools"))
+                item["keywords"] = CompletionParams.clean_keywords(item.get("keywords"))
+            elif isinstance(item, BaseModel):
+                item.tools = CompletionParams.clean_tools(item.tools)
+                item.keywords = CompletionParams.clean_keywords(item.keywords)
+            cleaned.append(item)
+        values["params"] = cleaned
+        return values
+
 
 class ChatCompletionRequest(CompletionParams):
     request_id: Optional[str] = None
@@ -843,15 +951,29 @@ class ChatCompletionRequest(CompletionParams):
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
-                "model_name": "moonshot",
+                "model_name": "deepseek",
                 "model_id": 0,
                 "prompt": '',
                 "question": "什么是区块链金融?",
                 "messages": [],
-                "keywords": [],
-                "tools": [],
+                "keywords": ["区块链"],
+                "tools": [
+                    {
+                        "type": "intent_search",
+                        "intent_search": {
+                            "text": "什么是区块链金融",
+                            "engine": "search_std",
+                            "recency_filter": "noLimit",
+                            "search_intent": True,
+                            "count": "10"
+                        }
+                    },
+                    {
+                        "type": "web_search"
+                    }
+                ],
                 'images': [],
-                "extract": 'json',
+                "extract": 'wechat',
                 "callback": None,
                 "stream": False,
                 "temperature": 0.4,
@@ -864,12 +986,13 @@ class ChatCompletionRequest(CompletionParams):
 
 
 class SummaryRequest(BaseModel):
-    text: Union[str, List[str]]
+    text: Union[List[str],str]
     extract_prompt: Optional[str] = None
     summary_prompt: Optional[str] = None
-    model: str = 'qwen:qwen-max'
+    extract_model: str = 'qwen:qwen-long'
+    summary_model: str = 'qwen:qwen-plus'
     max_tokens: int = 4096
-    max_segment_length: int = 1024
+    max_segment_length: int = 100000
 
 
 class ClassifyRequest(BaseModel):

@@ -1,6 +1,6 @@
 import requests, httpx, json
-from utils import call_http_request, map_fields
-from service import get_httpx_client, async_error_logger
+from utils import map_fields
+from service import get_httpx_client, call_http_request, async_error_logger
 from config import Config
 
 

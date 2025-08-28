@@ -23,6 +23,90 @@ def cut_text(text, tokenizer=None, model_name="gpt-3.5-turbo"):
     return tokens  # ' '.join(tokens)
 
 
+def levenshtein_distance(s: str, t: str) -> int:
+    """
+    计算两个字符串之间的 Levenshtein 编辑距离
+    :param s: 第一个字符串
+    :param t: 第二个字符串
+    :return: 编辑距离（操作次数）
+    """
+    # 处理空字符串情况
+    if len(s) == 0:
+        return len(t)
+    if len(t) == 0:
+        return len(s)
+
+    # 初始化矩阵
+    rows = len(s) + 1
+    cols = len(t) + 1
+    dist_matrix = [[0] * cols for _ in range(rows)]
+
+    # 初始化第一列
+    for i in range(rows):
+        dist_matrix[i][0] = i
+
+    # 初始化第一行
+    for j in range(cols):
+        dist_matrix[0][j] = j
+
+    # 计算编辑距离
+    for i in range(1, rows):
+        for j in range(1, cols):
+            # 计算替换成本
+            cost = 0 if s[i - 1] == t[j - 1] else 1
+
+            # 计算三种操作的代价
+            deletion = dist_matrix[i - 1][j] + 1
+            insertion = dist_matrix[i][j - 1] + 1
+            substitution = dist_matrix[i - 1][j - 1] + cost
+
+            # 取最小值
+            dist_matrix[i][j] = min(deletion, insertion, substitution)
+
+    return dist_matrix[len(s)][len(t)]
+
+
+def levenshtein_similarity(s, t):
+    # 编辑距离转相似度（1 越相似，0 越不同）
+    dist = levenshtein_distance(s, t)
+    return 1 - dist / max(len(s), len(t))  # 转成相似度
+
+
+def find_candidates(query, fragments, top_k=10):
+    """
+    简单粗筛：按关键词出现次数选前 top_k 个片段
+    """
+    query_words = set(jieba.cut(query))
+    scored = []
+    for frag in fragments:
+        frag_words = set(jieba.cut(frag))
+        overlap = len(query_words & frag_words)
+        scored.append((overlap, frag))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [frag for _, frag in scored[:top_k]]
+
+
+def hybrid_match(query, long_text):
+    sentences = re.split(r'[。！？\n]', long_text)
+    fragments = [s.strip() for s in sentences if s.strip()]
+    candidates = find_candidates(query, fragments)
+
+    scores = []
+    for cand in candidates:
+        ld_score = levenshtein_similarity(query, cand)
+
+        # 中文分词计算词重合率
+        query_words = set(jieba.cut(query))
+        cand_words = set(jieba.cut(cand))
+        word_overlap = len(query_words & cand_words) / len(query_words) if query_words else 0
+
+        # 综合加权（词重合权重大于字符相似度）
+        score = 0.3 * ld_score + 0.7 * word_overlap
+        scores.append(score)
+
+    return candidates[scores.index(max(scores))] if scores else None
+
+
 def load_jieba(dict_path=None, stop_path=None):
     # 初始化（可选，提前加载）
     jieba.initialize()

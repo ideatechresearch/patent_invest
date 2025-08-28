@@ -5,7 +5,6 @@ import asyncio
 import PyPDF2
 import re
 
-
 def parse_toc(pdf_path, toc_pages=(0, 0)):
     """
     提取 PDF 的目录信息。

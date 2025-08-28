@@ -1,15 +1,17 @@
 import asyncio
-import httpx, requests
-import random
+import httpx, requests, logging
+import random, json, os, time
+import uuid, base64
 from typing import List, Dict, Literal
-from utils import convert_to_pinyin
-from service import get_httpx_client
-from config import *
 
+from utils import convert_to_pinyin
+from config import Config, md5_sign, get_baidu_access_token, get_xfyun_authorization, get_tencent_signature
+from service import get_httpx_client, async_error_logger
+
+
+# if os.getenv('AIGC_DEBUG', '0').lower() in ('1', 'true', 'yes'):
 # Config.load('../config.yaml')
 # Config.debug()
-# from selectolax.parser import HTMLParser
-
 
 async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **kwargs) -> List[Dict]:
     """
@@ -55,10 +57,50 @@ async def web_search_async(text: str, api_key: str = Config.GLM_Service_Key, **k
         return [{'error': f"HTTP error: {exc.response.status_code} -{exc}"}]
     except Exception as exc:
         return [{'error': str(exc), 'text': text, 'data': data}]
-
         # https://portal.azure.com/#home
 
 
+@async_error_logger(max_retries=1, delay=5, exceptions=(Exception, httpx.HTTPError, httpx.HTTPStatusError))
+async def web_search_intent(text: str, engine: Literal[
+    "search_std", "search_pro", "search-pro-sogou", "search-pro-quark"] = "search_std",
+                            recency_filter: Literal['oneDay', 'oneWeek', 'oneMonth', 'oneYear', 'noLimit'] = 'noLimit',
+                            api_key: str = Config.GLM_Service_Key, **kwargs) -> Dict:
+    # https://docs.bigmodel.cn/api-reference/%E5%B7%A5%E5%85%B7-api/%E7%BD%91%E7%BB%9C%E6%90%9C%E7%B4%A2
+    """
+    该函数通过调用外部大模型服务（GLM 大模型 API），基于输入的搜索请求 `text` 自动解析用户意图，智能生成多个查询语句，并检索多引擎网页搜索结果。
+    返回的内容包括：
+    - **search_intent**：结构化的意图识别结果；
+    - **search_result**：每个意图对应的多条网页摘要结果，具备时效性和多角度洞察。
+
+    该接口适用于构建 **AI问答、智能搜索推荐、信息聚合分析** 等场景。
+
+    :param text:要搜索的文本内容
+    :param api_key:用于授权API请求的密钥,不需要提供
+    :param kwargs:其他可选的关键字参数，将被合并到请求数据中
+    :param engine:搜索引擎版本,多引擎协作显著降低空结果率，召回率和准确率大幅提升,搜狗：覆盖腾讯生态（新闻/企鹅号）和知乎内容，在百科、医疗等垂直领域权威性强,夸克：精准触达垂直内容
+    :param recency_filter:搜索指定时间范围内的网页。
+    :return:"search_result" "search_intent"
+    """
+    url = "https://open.bigmodel.cn/api/paas/v4/web_search"
+    payload = {
+        "search_query": text,
+        "search_engine": engine,
+        "search_intent": True,  # 执行搜索意图识别，有搜索意图后执行搜索
+        "search_recency_filter": recency_filter,
+        "count": 10
+    }
+    if kwargs:
+        payload.update(kwargs)
+
+    headers = {"Authorization": f'Bearer {api_key}', "Content-Type": "application/json"}
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, json=payload, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    return {k: data.get(k) for k in ("search_intent", "search_result")}  # title,content,link,media,refer,publish_date
+
+
+@async_error_logger(1)
 async def tokenize_with_zhipu(content: str, model: str = "glm-4-plus", api_key: str = Config.GLM_Service_Key):
     url = "https://open.bigmodel.cn/api/paas/v4/tokenizer"
     headers = {
@@ -71,10 +113,12 @@ async def tokenize_with_zhipu(content: str, model: str = "glm-4-plus", api_key: 
     }
     cx = get_httpx_client()
     response = await cx.post(url, headers=headers, json=payload)
+    response.raise_for_status()
     data = response.json()
     return data["usage"]  # ["prompt_tokens"]
 
 
+@async_error_logger(1)
 async def web_search_tavily(text: str, topic: Literal["general", "news"] = "general",
                             time_range: Literal['day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'] = 'month',
                             search_depth: Literal["basic", "advanced"] = "basic", days: int = 7,
@@ -123,10 +167,11 @@ async def web_search_tavily(text: str, topic: Literal["general", "news"] = "gene
         # print(json.dumps(data, indent=4))  # 打印响应数据
         return data['results']  # "url,title,score,published_date,content
     else:
-        print(f"Error: {response.status_code}")
+        logging.error(f"Error: {response.status_code}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def web_extract_tavily(urls: str | list[str], extract_depth: Literal["basic", "advanced"] = "basic",
                              api_key: str = Config.TAVILY_Api_Key):
     """
@@ -155,10 +200,11 @@ async def web_extract_tavily(urls: str | list[str], extract_depth: Literal["basi
         # print(json.dumps(data, indent=4))  # 打印响应数据
         return data.get("failed_results") or data['results']
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def web_search_jina(text: str, api_key: str = Config.JINA_Service_Key, **kwargs):
     """
     搜索网络并获取 SERP,搜索网络并将结果转换为大模型友好文本，返回 url,title,description,content
@@ -185,10 +231,11 @@ async def web_search_jina(text: str, api_key: str = Config.JINA_Service_Key, **k
         data = response.json()
         return data["data"]
     else:
-        print(f"Error: {response.status_code}")
+        logging.error(f"Error: {response.status_code}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def web_extract_jina(url: str, api_key: str = Config.JINA_Service_Key):
     """
     读取 URL 并获取其内容，20-500 RPM，Reader API 可免费使用，并提供灵活的速率限制和定价。可以提取GitHub项目等页面的文本信息
@@ -209,10 +256,11 @@ async def web_extract_jina(url: str, api_key: str = Config.JINA_Service_Key):
         # print(json.dumps(data, indent=4))  # 打印响应数据
         return data["data"]
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def segment_with_jina(content: str, tokenizer: str = "o200k_base", api_key: str = Config.JINA_Service_Key):
     # 对长文本进行分词分句，20-200 RPM
     url = 'https://api.jina.ai/v1/segment'
@@ -233,6 +281,7 @@ async def segment_with_jina(content: str, tokenizer: str = "o200k_base", api_key
     return response.json()  # "chunk_positions","chunks"
 
 
+@async_error_logger(1)
 async def search_by_api(query: str, location: str = None,
                         engine: Literal["google", "bing", "baidu", "naver", "yahoo", "youtube",
                         "google_videos", "google_news", "google_images", "amazon_search", "shein_search"] | None = 'google',
@@ -289,10 +338,11 @@ async def search_by_api(query: str, location: str = None,
             data = response.json()
             return data.get("organic_results", data)  # "knowledge_graph,answer_box,top_searches,top_stories
         else:
-            print(f"Error: {response.status_code}")
+            logging.error(f"Error: {response.status_code}")
             return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def brave_search(query: str, api_key=Config.Brave_Api_Key):
     """
     查询 Brave Search 并从 Web 取回搜索结果。以下部分介绍如何将请求（包括参数和标头）整理到 Brave Web Search API 并返回 JSON 响应。
@@ -321,10 +371,11 @@ async def brave_search(query: str, api_key=Config.Brave_Api_Key):
         # print(json.dumps(data, indent=4))  # 打印响应数据
         return data.get('web', {}).get('results', [])
     else:
-        print(f"Error: {response.status_code}")
+        logging.error(f"Error: {response.status_code}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def exa_search(query: str, category: Literal[
     "research paper", "company", "news", "pdf", "github", "tweet", "personal site", "linkedin profile", "financial report"] = "research paper",
                      api_key=Config.Exa_Api_Key):
@@ -349,10 +400,11 @@ async def exa_search(query: str, category: Literal[
         data = response.json()
         return data.get('results', [])
     else:
-        print(f"Error: {response.status_code}")
+        logging.error(f"Error: {response.status_code}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def web_extract_exa(urls: list[str], api_key: str = Config.Exa_Api_Key):
     """
     Get the full page contents, summaries, and metadata for a list of URLs.
@@ -373,10 +425,11 @@ async def web_extract_exa(urls: list[str], api_key: str = Config.Exa_Api_Key):
         data = response.json()
         return data.get('results', [])
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def exa_retrieved(query: str, api_key=Config.Exa_Api_Key):
     """
     https://docs.exa.ai/reference/answer
@@ -404,10 +457,11 @@ async def exa_retrieved(query: str, api_key=Config.Exa_Api_Key):
         data = response.json()
         return {"answer": data.get("answer"), "citations": data.get("citations", [])}
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return {'error': response.text}
 
 
+@async_error_logger(1)
 async def firecrawl_search(query: str, api_key=Config.Firecrawl_Service_Key):
     """
     使用自然语言搜索已爬网数据。
@@ -433,10 +487,11 @@ async def firecrawl_search(query: str, api_key=Config.Firecrawl_Service_Key):
         # print(json.dumps(data, indent=4))  # 打印响应数据
         return data.get('data', [])
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return [{'error': response.text}]
 
 
+@async_error_logger(1)
 async def firecrawl_scrape(url, api_key=Config.Firecrawl_Service_Key):
     #   https://docs.firecrawl.dev/features/scrape
     """
@@ -460,10 +515,11 @@ async def firecrawl_scrape(url, api_key=Config.Firecrawl_Service_Key):
         # print(json.dumps(data, indent=4))  # 打印响应数据
         return data.get('data', {}).get("metadata")
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return {'error': response.text}
 
 
+@async_error_logger(1)
 async def web_extract_firecrawl(prompt: str, urls: list[str], api_key=Config.Firecrawl_Service_Key):
     # https://docs.firecrawl.dev/features/extract
     """
@@ -491,13 +547,13 @@ async def web_extract_firecrawl(prompt: str, urls: list[str], api_key=Config.Fir
     response = await cx.post(api_url, headers=headers, json=payload)
     if response.status_code == 200:
         data = response.json()
-        # print(json.dumps(data, indent=4))  # 打印响应数据
         return data.get('data', {})
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return {'error': response.text}
 
 
+@async_error_logger(1)
 async def serper_search(query, engine: Literal['search', 'news', 'scholar', 'patents'] | None = 'search', page=2,
                         api_key=Config.SERPER_Api_Key):
     if engine:
@@ -522,16 +578,16 @@ async def serper_search(query, engine: Literal['search', 'news', 'scholar', 'pat
     if response.status_code == 200:
         try:
             data = response.json()
-            # print(json.dumps(data, indent=4))  # 打印响应数据
             return data.get("organic") or data.get(engine)
         except json.JSONDecodeError as e:
             return {'text': response.text}
     else:
-        print(f"Error: {response.status_code},{response.text}")
+        logging.error(f"Error: {response.status_code},{response.text}")
         return [{'error': response.text}]
     # response = requests.request("POST", url, headers=headers, data=json.dumps(payload))
 
 
+@async_error_logger(1)
 async def duckduckgo_search(query):
     url = "https://api.duckduckgo.com/"
     params = {
@@ -545,10 +601,9 @@ async def duckduckgo_search(query):
     response = await cx.get(url, params=params)
     if response.status_code == 200:
         data = response.json()
-        # print(json.dumps(data, indent=4))  # 打印响应数据
         return data
     else:
-        print(f"Error: {response.status_code}")
+        logging.error(f"Error: {response.status_code}")
         return [{'error': response.text}]
 
 
@@ -667,6 +722,7 @@ async def wikipedia_search(query: str) -> dict:
         return {"success": False, "msg": f"解析失败: {e}"}
 
 
+@async_error_logger(1, extra_msg='arXiv请求错误', exceptions=(httpx.HTTPError, Exception))
 async def arxiv_search(query: str, arxiv_id: str = None, max_results: int = 10,
                        sort_by: str = 'submittedDate') -> list[dict]:
     """
@@ -681,7 +737,7 @@ async def arxiv_search(query: str, arxiv_id: str = None, max_results: int = 10,
     返回:
         论文信息字典列表
     """
-    base_url = "http://export.arxiv.org/api/query"
+    base_url = "https://export.arxiv.org/api/query"
     headers = {
         'User-Agent': 'Mozilla/5.0'
     }
@@ -737,20 +793,10 @@ async def arxiv_search(query: str, arxiv_id: str = None, max_results: int = 10,
         return entries
 
     cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC, proxy=Config.HTTP_Proxy)
-    try:
-        # import feedparser  # 用于解析arXiv的Atom feed
-        # 异步HTTP请求
-        response = await cx.get(base_url, params=params, headers=headers)
-        response.raise_for_status()
-        # print(response.text)
-
-        return parse_arxiv_xml(response.text)
-    except httpx.HTTPError as e:
-        print(f"arXiv请求错误: {e}")
-        return []
-    except Exception as e:
-        print(f"解析错误: {e}")
-        return []
+    # import feedparser  # 用于解析arXiv的Atom feed
+    response = await cx.get(base_url, params=params, headers=headers, follow_redirects=True)
+    response.raise_for_status()
+    return parse_arxiv_xml(response.text)
 
 
 def is_city(city, region='全国'):
@@ -782,6 +828,7 @@ def get_bmap_location(address, city=''):
 
 
 # https://lbsyun.baidu.com/faq/api?title=webapi/place-suggestion-api
+@async_error_logger(1)
 async def search_bmap_location(query, region='', limit=True):
     url = "http://api.map.baidu.com/place/v2/suggestion"  # 100
     params = {
@@ -800,7 +847,7 @@ async def search_bmap_location(query, region='', limit=True):
             res.append({'lng_lat': (round(result['location']['lng'], 6), round(result['location']['lat'], 6)),
                         'name': result["name"], 'address': result['address']})
     else:
-        print(response.text)
+        logging.info(response.text)
     return res  # baidu_nlp(nlp_type='address', text=region+query+result["name"]+ result['address'])
 
 
@@ -817,12 +864,13 @@ def get_amap_location(address, city=''):
             s1, s2 = js['geocodes'][0]['location'].split(',')
             return float(s1), float(s2)  # js['geocodes'][0]['formatted_address']
     else:
-        print(response.text)
+        logging.info(response.text)
 
     return None, None
 
 
 # https://lbs.amap.com/api/webservice/guide/api-advanced/search
+@async_error_logger(1)
 async def search_amap_location(query, region='', limit=True):
     url = "https://restapi.amap.com/v5/place/text?parameters"  # 100
     params = {
@@ -843,7 +891,7 @@ async def search_amap_location(query, region='', limit=True):
                 res.append({'lng_lat': (float(s1), float(s2)),
                             'name': result["name"], 'address': result['address']})
         else:
-            print(response.text)  # {"count":"0","infocode":"10000","pois":[],"status":"1","info":"OK"}
+            logging.info(response.text)  # {"count":"0","infocode":"10000","pois":[],"status":"1","info":"OK"}
     return res
 
 
@@ -879,6 +927,7 @@ def get_weather(city: str, days: int = 0, date: str = None):
 
 
 # https://console.bce.baidu.com/ai/#/ai/machinetranslation/overview/index
+@async_error_logger(1)
 async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en', trans_type='texttrans'):
     """百度翻译 API"""
     salt = str(random.randint(32768, 65536))  # str(int(time.time() * 1000))
@@ -910,7 +959,7 @@ async def baidu_translate(text: str, from_lang: str = 'zh', to_lang: str = 'en',
     if "trans_result" in data:
         return data["trans_result"][0]["dst"]
 
-    print(response.text)
+    logging.info(response.text)
     # texttrans-with-dict
     url = f"https://aip.baidubce.com/rpc/2.0/mt/{trans_type}/v1?access_token=" + get_baidu_access_token(
         Config.BAIDU_translate_API_Key, Config.BAIDU_translate_Secret_Key)
@@ -951,7 +1000,7 @@ async def tencent_translate(text: str, source: str, target: str):
 
     # 检查响应状态码和内容
     if response.status_code != 200:
-        print(f"Error: Received status code {response.status_code},Response content: {response.text}")
+        logging.error(f"Error: Received status code {response.status_code},Response content: {response.text}")
         return {'error': f'{response.status_code},Request failed'}
 
     try:
@@ -1041,19 +1090,19 @@ def caiyun_translate(source, direction="auto2zh"):
     return json.loads(response.text)["target"]
 
 
+__all__ = ['arxiv_search', 'web_search_intent', 'baidu_search', 'baidu_translate', 'bing_search', 'brave_search',
+           'caiyun_translate', 'duckduckgo_search', 'exa_retrieved', 'exa_search', 'firecrawl_scrape',
+           'firecrawl_search','get_amap_location', 'get_bmap_location', 'get_httpx_client', 'get_weather', 'is_city',
+           'search_amap_location', 'search_bmap_location', 'search_by_api', 'segment_with_jina', 'serper_search',
+           'tencent_translate', 'tokenize_with_zhipu', 'web_extract_exa', 'web_extract_firecrawl',
+           'web_extract_jina', 'web_extract_tavily', 'web_search_async', 'web_search_jina', 'web_search_tavily',
+           'wikipedia_search', 'xunfei_translate']
+
 if __name__ == "__main__":
     from utils import get_module_functions
 
     funcs = get_module_functions('agents.ai_search')
     print([i[0] for i in funcs])
-
-    __all__ = ['arxiv_search', 'baidu_search', 'baidu_translate', 'bing_search', 'brave_search', 'caiyun_translate',
-               'duckduckgo_search', 'exa_retrieved', 'exa_search', 'firecrawl_scrape', 'firecrawl_search',
-               'get_amap_location', 'get_bmap_location', 'get_httpx_client', 'get_weather', 'is_city',
-               'search_amap_location', 'search_bmap_location', 'search_by_api', 'segment_with_jina', 'serper_search',
-               'shutdown_httpx', 'tencent_translate', 'tokenize_with_zhipu', 'web_extract_exa', 'web_extract_firecrawl',
-               'web_extract_jina', 'web_extract_tavily', 'web_search_async', 'web_search_jina', 'web_search_tavily',
-               'wikipedia_search', 'xunfei_translate']
 
 
     async def main():
@@ -1072,6 +1121,9 @@ if __name__ == "__main__":
 
         se = await  segment_with_jina(
             '''{"status": "000000", "message": "查询成功", "data": {"name": "宁波尚缔电器有限公司", "historyName": "宁波久刈网络科技有限公司", "registNo": "330215000140739", "unityCreditCode": "91330201MA281N399X", "type": "有限责任公司(自然人投资或控股)", "legalPerson": "黄发虎", "registFund": "100万人民币", "openDate": "2016年03月21日", "startDate": "2016年03月21日", "endDate": "9999年12月31日", "registOrgan": "宁波市市场监督管理局高新技术产业开发区分局", "licenseDate": "2017年04月26日", "state": "吊销，未注销", "address": "宁波高新区创苑路750号001幢759室", "scope": "电器、日用百货、母婴用品的批发、零售及网上销售；网络技术、电子商务技术开发、技术服务；网络工程设计；网页设计；市场营销推广宣传；国内各类广告设计、制作、发布、代理；图文设计、制作；企业形象设计；摄影服务。（依法须经批准的项目，经相关部门批准后方可开展经营活动）", "revokeDate": "2022年04月29日", "isOnStock": null, "lastUpdateDate": "2024年06月28日", "priIndustry": "批发和零售业", "industryCategoryCode": "F", "subIndustry": "批发业", "industryLargeClassCode": "51", "middleCategory": "纺织、服装及家庭用品批发", "middleCategoryCode": "513", "smallCategory": "", "smallCategoryCode": null, "legalPersonSurname": "黄", "legalPersonName": "发虎", "registCapital": "1,000,000.000", "registCurrency": "CNY", "typeCode": "F", "country": "中国", "province": "浙江省", "city": "宁波市", "area": "市辖区", "partners": [{"name": "黄发虎", "type": "自然人股东", "identifyType": null, "identifyNo": null, "shouldType": "", "shouldCapi": "50.0", "shoudDate": "2016年03月21日", "realType": "", "realCapi": "0.0", "realDate": null}, {"name": "曹颖", "type": "自然人股东", "identifyType": null, "identifyNo": null, "shouldType": "", "shouldCapi": "30.0", "shoudDate": "2016年03月21日", "realType": "", "realCapi": "0.0", "realDate": null}, {"name": "王菊美", "type": "自然人股东", "identifyType": null, "identifyNo": null, "shouldType": "", "shouldCapi": "20.0", "shoudDate": "2016年03月21日", "realType": "", "realCapi": "0.0", "realDate": null}], "employees": [{"name": "黄发虎", "job": "执行董事兼总经理"}, {"name": "曹颖", "job": "监事"}], "branchs": [], "changes": [{"changesType": "行业代码变更", "changesBeforeContent": "6420:互联网信息服务", "changesAfterContent": "5137:家用电器批发", "changesDate": "2017年04月26日"}, {"changesType": "其他事项备案", "changesBeforeContent": "6420:互联网信息服务", "changesAfterContent": "5137:家用电器批发", "changesDate": "2017年04月26日"}, {"changesType": "经营范围变更（含业务范围变更）", "changesBeforeContent": "网络技术、电子商务技术开发、技术服务；网络工程设计；网页设计；市场营销推广宣传；国内各类广告设计、制作、发布、代理；图文设计、制作；企业形象设计；摄影服务；日用百货、母婴用品、电器网上销售及批发、零售。", "changesAfterContent": "电器、日用百货、母婴用品的批发、零售及网上销售；网络技术、电子商务技术开发、技术服务；网络工程设计；网页设计；市场营销推广宣传；国内各类广告设计、制作、发布、代理；图文设计、制作；企业形象设计；摄影服务。（依法须经批准的项目，经相关部门批准后方可开展经营活动）", "changesDate": "2017年04月26日"}, {"changesType": "名称变更（字号名称、集团名称等）", "changesBeforeContent": "宁波久刈网络科技有限公司", "changesAfterContent": "宁波尚缔电器有限公司", "changesDate": "2017年04月26日"}]}}''')
+        print(se)
+
+        se = await web_search_intent("宁波尚缔电器有限公司是什么公司")
         print(se)
 
 

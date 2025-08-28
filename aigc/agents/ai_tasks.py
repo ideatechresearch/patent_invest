@@ -15,13 +15,22 @@ import uuid
 import logging
 import zmq, zmq.asyncio
 from neo4j import GraphDatabase, AsyncGraphDatabase
-from dask.distributed import Client as DaskClient, LocalCluster
+from dask.distributed import Client as DaskClient
 from dask import delayed
 
 from structs import dataclass2dict
 from config import Config
 from service import get_redis, get_neo_driver, get_dask_client
 from utils import pickle_deserialize
+
+
+def store_in_dask(client, obj, key):
+    future = client.scatter(obj)
+    client.futures[key] = future
+
+
+def get_from_dask(client, key):
+    return client.futures[key].result()  # 获取复杂对象
 
 
 async def get_neo_nodes(cypher):
@@ -85,71 +94,6 @@ async def merge_neo_relationship(tx, src_id, tgt_id, props: dict = None, rel_typ
             f"MERGE (a)-[r:{rel_type}]->(b)"
         )
         await tx.run(query, src_id=src_id, tgt_id=tgt_id)
-
-
-
-async def consumer_worker(queue: asyncio.Queue[tuple[Any, int]], process_task: Callable, max_retries: int = 0,
-                          delay: float = 1.0, logger_name: Optional[str] = None, **kwargs):
-    """
-    启动 worker:
-        workers_task_background = [asyncio.create_task(consumer_worker(queue, process_task)) for _ in range(4)],
-        #await asyncio.gather(*tasks)
-
-    asyncio.Queue 是内存对象，只存在于当前进程的事件循环中
-    :param queue:asyncio.Queue()
-    :param process_task:注入处理函数 async def f(task: tuple, **kwargs),返回值 true,false,失败可以选择 await queue.put(...retry+1):会等待队列有空间再放入 /.put_nowait(x)
-    :param max_retries,0不重试
-    :param delay: 重试前延迟时间（秒）
-    :param logger_name: 自定义logger，默认使用模块logger
-    :return:
-    """
-    logger = logging.getLogger(logger_name)
-    while True:
-        task = await queue.get()
-        if task is None:
-            logger.info("[Info] Received shutdown signal")
-            queue.task_done()
-            break
-        try:
-            success = await process_task(task, **kwargs)
-            if not success and max_retries > 0:
-                if isinstance(task, (list, tuple)) and isinstance(task[-1], int):
-                    retry_count = task[-1]
-                    task_data = task[:-1]
-                    if retry_count < max_retries:
-                        await asyncio.sleep(delay)
-                        new_task = (*task_data, retry_count + 1)  # 重建任务，重试次数+1
-                        await queue.put(new_task)
-                        logger.info(f"[Task Retry] {task_data} (attempt {retry_count + 1})")
-                    else:
-                        logger.error(f"[Task Failed] {task_data}")
-
-        except asyncio.CancelledError:
-            logger.info("[Cancel] Worker shutting down...")
-            break
-        except Exception as e:
-            logger.error(f"[Error] Unexpected error processing task: {e}")
-        finally:
-            queue.task_done()  # 必须调用，标记任务完成
-
-
-async def stop_worker(queue: asyncio.Queue, worker_tasks: list, logger_name: Optional[str] = None):
-    '''优雅停止所有 worker'''
-    logger = logging.getLogger(logger_name)
-    try:
-        await queue.join()  # 等待队列清空
-
-        logger.info("All tasks processed. Stopping consumers...")
-        for _ in worker_tasks:
-            await queue.put(None)  # 发送停止信号
-    except Exception as e:
-        logger.error(f"[Tasks Error] {e}, attempting to cancel workers...")
-        for c in worker_tasks:
-            c.cancel()
-
-    finally:
-        # 统一回收所有任务
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
 
 
 # 异步生产者
@@ -282,9 +226,9 @@ class TaskCommand(Enum):
 @dataclass
 class TaskNode:
     name: str  # task_id 任务名或别名
-    description: Optional[str] = None  # 任务描述
+    description: Optional[str] = None  # 任务描述 内容 content
     # type: Optional[str] = None  # 'api', 'llm', 'script'
-    action: Optional[str] = None  # 可执行动作,任务用途(如脚本、注册名、函数名、脚本或引用的操作类型)
+    action: Optional[str] = None  # 可执行动作,任务用途(如脚本、注册名、函数名、脚本或引用的操作类型) strategies
     function: Optional[Callable] = field(default=None)  # execute 激活函数任务的执行逻辑（可调用对象函数,绑定后的 partial(func, args)）
     event: Optional[Dict[str, Any]] = None  # 触发标志（不处理依赖逻辑）事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据,外部触发信号
     command: Dict[str, Any] = field(default_factory=dict)  # cmd 任务控制逻辑,节点执行函数动态跳转,goto,静态边走 TaskEdge，内部控制
@@ -292,18 +236,19 @@ class TaskNode:
     status: TaskStatus = TaskStatus.PENDING
     progress: int = 0  # 执行进度，适合长任务、流任务场景（0-100）
     priority: int = 10  # bias 执行顺序控制，优先级
-    tags: List[str] = field(default_factory=list)  # 辅助标签，分类/搜索，索引、分组、过滤
+    tags: List[str] = field(default_factory=list)  # channel,label 辅助标签，分类/搜索，索引、分组、过滤
 
     start_time: float = field(default_factory=time.time)  # created_at
     end_time: float = 0  # updated_at
 
     data: Any = field(default_factory=dict)  # metadata,动态更新参数，自由定义不用明确结构，此处不限制，保持灵活性，Dict[str, Any]
-    params: Any = field(default_factory=list)  # input payload,执行输入参数,dict/list[dict]
+    params: Any = field(default_factory=list)  # input payload,context,message 执行输入参数,dict/list[dict]
     result: Any = field(default_factory=list)  # output 输出结果，允许 reason，error，此处不限制，不约束类型保持灵活性
     count: int = 0  # 结果条目数量，自定义 result_count,event_count
 
     @staticmethod
     def default_node_attrs(task_id: str, **attributes):
+        auto_call = {"start_time", "end_time", "create_time"}
         default_attrs = {
             "name": task_id,
             "status": TaskStatus.PENDING,
@@ -313,7 +258,8 @@ class TaskNode:
             "function": None,
             **attributes
         }
-        return {k: v() if callable(v) else v for k, v in default_attrs.items()}
+        return {k: v() if callable(v) and k in auto_call else v
+                for k, v in default_attrs.items()}
 
     @property
     def duration(self) -> float:
@@ -322,6 +268,8 @@ class TaskNode:
     async def to_redis(self, redis_client, ex=3600, key_prefix='task'):
         key = f"{key_prefix}:{self.name}"
         payload = dataclass2dict(self)
+        if self.function and (asyncio.iscoroutinefunction(self.function) or asyncio.iscoroutine(self.function)):
+            payload.pop("function", None)
         # payload.pop("data", None) # pickle.dumps(payload["data"])
         await redis_client.setex(key, ex, json.dumps(payload, ensure_ascii=False))
 
@@ -615,16 +563,15 @@ class TaskGraphManager:
     Dask_client = None
 
     def __init__(self, graph: Optional[ig.Graph] = None, driver: Optional[GraphDatabase] = None,
-                 cluster: Optional[LocalCluster | str] = None):
+                 dask_client: Optional[DaskClient] = None):
         self.graph = self.__class__.Task_graph.copy() if graph is None else graph  # 局部副本
         for attr in ["name", "status", "action", "function", "start_time", "event", "priority"]:
             if attr not in self.graph.vs.attributes():  # "name" in Task_graph.vs.attributes()
                 self.graph.vs[attr] = [None] * self.graph.vcount()
 
         self.driver = driver  # get_neo_driver()
-        if not self.__class__.Dask_client:
-            if cluster:
-                self.__class__.Dask_client = get_dask_client(cluster)
+        if not self.__class__.Dask_client and dask_client:
+            self.__class__.Dask_client = dask_client  # get_dask_client(cluster)
 
         self.client = self.__class__.Dask_client
         self.context = None  # history,global,update,relevant,extract,reflect,optimize,analyze,generate,decision
@@ -1333,69 +1280,6 @@ class WebSearchGraph:
 
         return load_graph_from_dict(self.nodes, self.adjacency_list)
 
-
-# class Task(Base):
-#     __tablename__ = 'tasks'
-#
-#     task_id = Column(String, primary_key=True)
-#     status = Column(Enum(TaskStatus), default=TaskStatus.PENDING)
-#
-#     # 创建任务的方法
-#     @classmethod
-#     def create_task(cls, session: Session):
-#         task_id = str(uuid.uuid4())  # 生成唯一 task_id
-#         new_task = cls(task_id=task_id)  # 创建任务实例
-#         session.add(new_task)
-#         session.commit()
-#         return task_id
-#
-#     # 更新任务状态的方法
-#     @classmethod
-#     def update_task_status(cls, session: Session, task_id: str, new_status: TaskStatus):
-#         task = session.query(cls).filter_by(task_id=task_id).first()
-#         if task:
-#             task.status = new_status
-#             session.commit()
-#
-#     # 获取任务状态的方法
-#     @classmethod
-#     def get_task_status(cls, session: Session, task_id: str):
-#         task = session.query(cls).filter_by(task_id=task_id).first()
-#         if task:
-#             return task.status
-#         return None
-#
-#     # 模拟异步任务执行
-#     @classmethod
-#     def async_task(cls, session: Session, task_id: str):
-#         import time
-#         try:
-#             cls.update_task_status(session, task_id, TaskStatus.IN_PROGRESS)
-#             time.sleep(1)
-#             cls.update_task_status(session, task_id, TaskStatus.COMPLETED)
-#         except Exception as e:
-#             cls.update_task_status(session, task_id, TaskStatus.FAILED)
-
-_StringLikeT = Union[bytes, str, memoryview]
-
-
-def list_or_args_keys(keys: Union[_StringLikeT, Iterable[_StringLikeT]],
-                      args: Tuple[_StringLikeT, ...] = None) -> List[_StringLikeT]:
-    # 将 keys 和 args 合并成一个新的列表
-    # returns a single new list combining keys and args
-    try:
-        iter(keys)
-        # a string or bytes instance can be iterated, but indicates
-        # keys wasn't passed as a list
-        if isinstance(keys, (bytes, str)):
-            keys = [keys]
-        else:
-            keys = list(keys)  # itertools.chain.from_iterable(keys)
-    except TypeError:
-        keys = [keys]
-    if args:
-        keys.extend(args)
-    return keys
 
 
 # async def setr(key, value, ex=None):

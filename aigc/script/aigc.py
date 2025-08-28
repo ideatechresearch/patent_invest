@@ -4,6 +4,7 @@ import json
 import httpx
 import re, hashlib, time
 import asyncio
+from enum import Enum
 
 try:
     from openai import OpenAI, AsyncOpenAI
@@ -20,6 +21,22 @@ AI_API_KEYS = {'moonshot': "",
 AIGC_HOST = 'aigc'
 
 USER_ID = 'script'
+
+
+class ModelNameEnum(str, Enum):
+    turbo = "qwen-turbo"  # 1M qwen:qwen2.5-32b-instruct
+    long = "qwen-long"  # 10M
+    plus = "qwen-plus"  # 128K qwen:qwq-plus
+    coder = "qwen-coder-plus"  # 128K
+    max = "qwen-max"  # 128K
+    chat = "deepseek-chat"  # 64K
+    think = "deepseek-reasoner"  # 128K
+    distill = "deepseek-r1-distill-qwen-32b"  # 32K
+    moonshot = "moonshot:moonshot-v1-8k"
+
+
+DEFAULT_MODEL_NAME = ModelNameEnum.plus.value
+ANALYSIS_MODEL_NAME = ModelNameEnum.chat.value  # "deepseek:deepseek-chat"
 
 
 class Res:
@@ -176,66 +193,43 @@ def async_to_sync(coro_func, *args, **kwargs):
     return loop.run_until_complete(coro_func(*args, **kwargs))
 
 
-class Local_Aigc:
-    HOST = 'aigc'  # '47.110.156.41'
-    AI_Models = [
-        # https://platform.moonshot.cn/console/api-keys
-        {'name': 'moonshot', 'type': 'default', 'api_key': '', 'data': None,
-         "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
-         'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1"},
-        # {'name': 'aigc', 'type': 'default', 'api_key': '', 'data': None,
-        #  "model": [],
-        #  'url': f"http://{AIGC_HOST}:7000/v1/chat/completions", 'base_url': f"http://{AIGC_HOST}:7000/v1"}
-    ]
+class OperationHttp:
     _client = None  # httpx.AsyncClient | aiohttp.ClientSession
-    _ai_client = None  # local aigc openai client
-    _is_openai = False
     _is_httpx = False
     _is_sync = False
     _timeout = 100
 
-    def __init__(self, host=AIGC_HOST, use_sync=False, time_out: int | float = 100.0):
-        self.__class__.HOST = host
+    def __init__(self, use_sync=False, time_out: int | float = 100.0):
         try:
-            from openai import OpenAI, AsyncOpenAI
-            self.__class__._is_openai = True
+            import httpx
+            self.__class__._is_httpx = True
         except ImportError:
-            self.__class__._is_openai = False
             try:
-                import httpx
-                self.__class__._is_httpx = True
-            except ImportError:
                 import aiohttp
                 self.__class__._is_httpx = False
+            except ImportError:
+                import requests
+                self.__class__._is_sync = True
 
-        self.__class__._is_sync = use_sync
-        self.__class__._timeout = time_out
+        self.__class__.is_sync = use_sync
+        self.__class__.timeout = time_out
 
     async def __aenter__(self):
-        await self.__class__.init_clients()
+        self.__class__.init_client()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.__class__.close_http_client()
+        await self.__class__.close_async()
 
     def __enter__(self):
-        asyncio.run(self.__class__.init_clients())
+        self.__class__.init_client()
         return self
 
     def __exit__(self, *args):
-        self.__class__.close()
+        self.__class__.close_sync()
 
     @classmethod
-    async def init_clients(cls, api_key=''):
-        """获取每个模型的数据"""
-        base_url = f"http://{cls.HOST}:7000/v1"
-        if cls._ai_client is None:
-            if cls._is_openai:
-                if cls._is_sync:
-                    cls._ai_client = OpenAI(base_url=base_url, timeout=cls._timeout, api_key=api_key or 'empty')
-                else:
-                    cls._ai_client = AsyncOpenAI(base_url=base_url, timeout=cls._timeout, api_key=api_key or 'empty')
-
+    def init_client(cls):
         if cls._client is None:
             if cls._is_sync:
                 if cls._is_httpx:
@@ -249,11 +243,129 @@ class Local_Aigc:
                     cls._client = httpx.AsyncClient(limits=limits, timeout=timeout)
                 else:
                     connector = aiohttp.TCPConnector(limit=100, limit_per_host=20)
-                    timeout = aiohttp.ClientTimeout(total=cls._timeout, sock_read=cls._timeout,
-                                                    sock_connect=5.0)
+                    timeout = aiohttp.ClientTimeout(total=cls._timeout, sock_read=cls._timeout, sock_connect=5.0)
                     cls._client = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
             # self.semaphore = asyncio.Semaphore(30)
+
+    @classmethod
+    async def close_client(cls):
+        if cls._is_sync:
+            cls.close_sync()
+        else:
+            await cls.close_async()
+
+    @classmethod
+    def close_sync(cls):
+        if cls._client:
+            cls._client.close()
+            cls._client = None
+
+    @classmethod
+    async def close_async(cls):
+        if cls._client:
+            if cls._is_httpx:
+                if not cls._client.is_closed:
+                    await cls._client.aclose()
+            else:
+                if not cls._client.closed:
+                    await cls._client.close()
+            cls._client = None
+
+    @classmethod
+    async def get(cls, url, headers=None, **kwargs):
+        if cls._is_sync:
+            if cls._is_httpx:
+                resp = cls._client.get(url, headers=headers, **kwargs)  # params=data
+            else:
+                resp = cls._client.get(url, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        else:
+            if cls._is_httpx:
+                resp = await cls._client.get(url, headers=headers, **kwargs)
+                resp.raise_for_status()  # 如果请求失败，则抛出异常
+                return resp.json()
+            else:
+                async with cls._client.get(url, headers=headers or {}, **kwargs) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()  # await resp.text()
+
+    @classmethod
+    async def post(cls, url, json=None, headers=None, **kwargs):
+        if cls._is_sync:
+            if cls._is_httpx:
+                resp = cls._client.post(url, json=json, headers=headers, **kwargs)
+            else:
+                resp = cls._client.post(url, json=json, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        else:
+            if cls._is_httpx:
+                resp = await cls._client.post(url, json=json, headers=headers, **kwargs)
+                resp.raise_for_status()  # 如果请求失败，则抛出异常
+                return resp.json()
+            else:
+                async with cls._client.post(url, json=json, headers=headers or {}, **kwargs) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+
+    @classmethod
+    def _fallback_post(cls, url, json_payload, headers=None, stream=False):
+        try:
+            resp = requests.post(url, headers=headers, json=json_payload, timeout=(5, cls._timeout), stream=stream)
+            if resp.status_code == 200:
+                return resp.json()  # json.loads(resp.content)
+            else:
+                raise RuntimeError(f"[requests fallback] 返回异常: {resp.status_code}, 内容: {resp.text}")
+        except Exception as e:
+            print(f"[requests fallback] 请求失败: {e}")
+            return None
+
+
+class Local_Aigc(OperationHttp):
+    HOST = 'aigc'  # '47.110.156.41'
+    AI_Models = [
+        # https://platform.moonshot.cn/console/api-keys
+        {'name': 'moonshot', 'type': 'default', 'api_key': '', 'data': None,
+         "model": ["moonshot-v1-32k", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+         'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1"},
+        # {'name': 'aigc', 'type': 'default', 'api_key': '', 'data': None,
+        #  "model": [],
+        #  'url': f"http://{AIGC_HOST}:7000/v1/chat/completions", 'base_url': f"http://{AIGC_HOST}:7000/v1"}
+    ]
+    _ai_client = None  # local aigc openai client
+    _is_openai = False
+
+    def __init__(self, host=AIGC_HOST, use_sync=False, time_out: int | float = 100.0):
+        self.__class__.HOST = host
+        try:
+            from openai import OpenAI, AsyncOpenAI
+            self.__class__._is_openai = True
+        except ImportError:
+            self.__class__._is_openai = False
+
+        super().__init__(use_sync, time_out)
+
+    async def __aenter__(self):
+        await self.__class__.init_clients()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.__class__.close_http_client()
+
+    @classmethod
+    async def init_clients(cls, api_key=''):
+        """获取每个模型的数据"""
+        base_url = f"http://{cls.HOST}:7000/v1"
+        if cls._ai_client is None:
+            if cls._is_openai:
+                if cls._is_sync:
+                    cls._ai_client = OpenAI(base_url=base_url, timeout=cls._timeout, api_key=api_key or 'empty')
+                else:
+                    cls._ai_client = AsyncOpenAI(base_url=base_url, timeout=cls._timeout, api_key=api_key or 'empty')
+
+        super().init_client()
 
         if not any(model['name'] == 'aigc' for model in cls.AI_Models):
             cls.AI_Models.append(
@@ -278,7 +390,7 @@ class Local_Aigc:
 
                 url = model['base_url'] + '/models'
                 try:
-                    models = await cls.get_resp(url)  # await call_http_request(url)
+                    models = await cls._client.get(url)  # await call_http_request(url)
                     models_data = models['data']
                 except Exception as e:
                     models_data = None
@@ -291,74 +403,12 @@ class Local_Aigc:
 
     @classmethod
     async def close_http_client(cls):
-        if cls._client:
-            if cls._is_sync:
-                cls._client.close()
-            elif cls._is_httpx:
-                if not cls._client.is_closed:
-                    await cls._client.aclose()
-            else:
-                if not cls._client.closed:
-                    await cls._client.close()
-
-            cls._client = None
+        await cls.close_client()
         cls._ai_client = None
 
     @classmethod
     def close(cls):
         asyncio.run(cls.close_http_client())
-
-    @classmethod
-    async def get_resp(cls, url, headers=None, **kwargs):
-        if cls._is_sync:
-            if cls._is_httpx:
-                resp = cls._client.get(url, headers=headers, **kwargs)  # params=data
-            else:
-                resp = cls._client.get(url, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
-            resp.raise_for_status()
-            return resp.json()
-        else:
-            if cls._is_httpx:
-                resp = await cls._client.get(url, headers=headers, **kwargs)
-                resp.raise_for_status()  # 如果请求失败，则抛出异常
-                return resp.json()
-            else:
-                async with cls._client.get(url, headers=headers or {}, **kwargs) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()  # await resp.text()
-
-    @classmethod
-    async def post_resp(cls, url, json=None, headers=None, **kwargs):
-        if cls._is_sync:
-            if cls._is_httpx:
-                resp = cls._client.post(url, json=json, headers=headers, **kwargs)
-            else:
-                resp = cls._client.post(url, json=json, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
-            resp.raise_for_status()
-            return resp.json()
-        else:
-            if cls._is_httpx:
-                resp = await cls._client.post(url, json=json, headers=headers, **kwargs)
-                resp.raise_for_status()  # 如果请求失败，则抛出异常
-                return resp.json()
-            else:
-                async with cls._client.post(url, json=json, headers=headers or {}, **kwargs) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-
-    @classmethod
-    def _fallback_post(cls, url, json_payload, headers=None, stream=False):
-        try:
-            resp = requests.post(url, headers=headers, json=json_payload, timeout=(5, cls._timeout), stream=stream)
-            if resp.status_code == 200:
-                data = json.loads(resp.content)
-                return data
-            else:
-                raise RuntimeError(
-                    f"[requests fallback] 返回异常: {resp.status_code}, 内容: {resp.text}")
-        except Exception as e:
-            print(f"[requests fallback] 请求失败: {e}")
-            return None
 
     @classmethod
     def find_model(cls, name: str, model_id: int = 0):
@@ -472,7 +522,7 @@ class Local_Aigc:
         # print(headers, payload, url)
 
         try:
-            data = await cls.post_resp(url, headers=headers, json=payload)
+            data = await cls.post(url, headers=headers, json=payload)
 
             if get_content:
                 result = data.get('choices', [{}])[0].get('message', {}).get('content')
@@ -535,6 +585,40 @@ class Local_Aigc:
 
         semaphore = asyncio.Semaphore(max_concurrent)
         tasks = [limited_run(semaphore, row) for row in rows]
+        return await asyncio.gather(*tasks)
+
+    @classmethod
+    async def model_test(cls, user_request: str, system: str, model_names: list = None, max_concurrent: int = 50,
+                         max_tries: int = 1, **kwargs) -> list:
+
+        async def limited_run(semaphore, model):
+            async with semaphore:
+                for attempt in range(1, max_tries + 1):
+                    result = await cls.ai_chat(model=model, system=system, user_request=user_request,
+                                               **kwargs)
+                    if isinstance(result, dict):
+                        content = result.get('choices', [{}])[0].get('message', {}).get('content')
+                    else:
+                        content = str(result) if result is not None else ''
+                        result = {'model': model, 'content': content}
+
+                    if 'Error code: 429' in content or 'error' in content.lower():
+                        print(f"[重试] 第 {attempt} 次失败，内容: {content}")
+                        await asyncio.sleep(2 * attempt)
+                        continue
+
+                    return result
+
+                print("error: Failed after tries", f"model: {model}")
+                return result
+
+        if not model_names:
+            for model in cls.AI_Models:
+                if model['name'] == "aigc":
+                    model_names = model['model']
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+        tasks = [limited_run(semaphore, model) for model in model_names]
         return await asyncio.gather(*tasks)
 
     @classmethod
@@ -863,9 +947,10 @@ def aigc_chat(user_request: str, system: str, model="moonshot:moonshot-v1-8k", g
         return f"HTTP error occurred: {e}" if get_content else {"error": str(e), "status": "failed"}
 
 
-async def ai_chat_async(messages: list[dict] = None, user_request: str = '', user: str = None, name: str = None,
+async def ai_chat_async(messages: list[dict] = None, user_request: str = '', user: str = USER_ID, name: str = None,
                         system: str = '', temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 1024,
-                        _client=None, model='moonshot', host=AIGC_HOST, get_content: bool = True, api_key: str = None,
+                        tools: list[dict] = None, _client=None, model='moonshot', host=AIGC_HOST,
+                        get_content: bool = True, api_key: str = None,
                         time_out: int | float = 100, **kwargs) -> str | dict:
     if not messages:
         messages = []
@@ -888,6 +973,8 @@ async def ai_chat_async(messages: list[dict] = None, user_request: str = '', use
     )
     if user:
         payload['user'] = user
+    if tools:
+        payload['tools'] = tools  # retrieval、web_search、function\map_search\intent_search\baidu_search
     payload.update(kwargs)
 
     if _client:

@@ -1,12 +1,13 @@
 from fastapi import APIRouter
 from fastapi import File, UploadFile
-from database import MysqlData, engine
 from pydantic import BaseModel, Field
 from typing import Optional, List
+from database import engine
+from service import OperationMysql, DB_Client, get_redis
 from utils import *
 from config import Config
 
-from agents.ai_tasks import TaskManager, TaskStatus, TaskNode, get_redis
+from agents.ai_tasks import TaskManager, TaskStatus, TaskNode
 
 ideatech_router = APIRouter()
 
@@ -71,10 +72,10 @@ async def run_structure_sample(task: TaskNode, redis=None, limit: int = 100, yd_
             for _, row in merged_df.iterrows()
         ]
 
-        # with MysqlData() as session:
+        # with OperationMysql() as session:
         #     session.execute(update_sql, params_list)
-        async with MysqlData() as session:
-            await session.async_execute(update_sql, params_list)
+
+        await DB_Client.async_run(update_sql, params_list)
 
     except Exception as e:
         print(e)
@@ -111,11 +112,10 @@ async def get_sample_batch(request: StructureSampleRequest):
 @ideatech_router.get("/templates/list", response_model=List[dict])
 async def list_templates(only_active: bool = True, yd_type='开户'):
     ''' 查询模板，支持筛选路径、来源、状态。'''
-    with MysqlData() as session:
-        sql = f"SELECT * FROM semantic_template_library  WHERE 来源 = {yd_type}"
-        if only_active:
-            sql += " and 状态 = '启用'"
-        return session.search(sql)
+    sql = f"SELECT * FROM semantic_template_library  WHERE 来源 = {yd_type}"
+    if only_active:
+        sql += " and 状态 = '启用'"
+    return DB_Client.search(sql)
 
 
 class SampleResult(BaseModel):
@@ -131,26 +131,25 @@ class SampleResult(BaseModel):
 @ideatech_router.post("/confirm")
 async def confirm_action(sample: SampleResult, yd_type='开户'):
     ''' 确认分类并更新模板库,人工确认 insert/update 的操作, status True 表示同意，False 表示拒绝'''
-    with MysqlData() as session:
-        # 更新 classify_sentences_clustered
-        update_sql = """
-            UPDATE classify_sentences_clustered
-            SET action=%s, 一级类=%s, 二级类=%s, 三级类=%s, template=%s, 标注状态=%s
-            WHERE id=%s
-        """
-        session.execute(update_sql, (
-            sample.action, sample.一级类, sample.二级类,
-            sample.三级类, sample.template, '已确认' if sample.status else '已弃用', sample.id
-        ))
+    # 更新 classify_sentences_clustered
+    update_sql = """
+        UPDATE classify_sentences_clustered
+        SET action=%s, 一级类=%s, 二级类=%s, 三级类=%s, template=%s, 标注状态=%s
+        WHERE id=%s
+    """
+    DB_Client.async_run(update_sql, (
+        sample.action, sample.一级类, sample.二级类,
+        sample.三级类, sample.template, '已确认' if sample.status else '已弃用', sample.id
+    ))
 
-        # 若为 update/insert 则写入 semantic_template_library
-        if sample.status and sample.action in ['update', 'insert']:
-            insert_sql = """
-                INSERT INTO semantic_template_library
-                (来源, 一级类, 二级类, 三级类, template, sentences_sample_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            session.execute(insert_sql, (
-                yd_type, sample.一级类, sample.二级类,
-                sample.三级类, sample.template, sample.id
-            ))
+    # 若为 update/insert 则写入 semantic_template_library
+    if sample.status and sample.action in ['update', 'insert']:
+        insert_sql = """
+            INSERT INTO semantic_template_library
+            (来源, 一级类, 二级类, 三级类, template, sentences_sample_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        DB_Client.async_run(insert_sql, (
+            yd_type, sample.一级类, sample.二级类,
+            sample.三级类, sample.template, sample.id
+        ))

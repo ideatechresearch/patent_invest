@@ -107,6 +107,28 @@ async def get_analysis_answer(batch_no: str):
     return HTMLResponse(f"<html><body>{html_content}</body></html>", status_code=200)
 
 
+@app.get("/get_question_content/{batch_no}", response_class=HTMLResponse)
+async def get_question_content(batch_no: str, get_content: bool = True):
+    rows = await dbop.run("SELECT origin_question,interface_data,content FROM task_question_content WHERE batch_no=%s",
+                          (batch_no,))
+    if not rows:
+        return HTMLResponse(f"<h3>暂无分析报告内容，请稍后重试或检查任务状态。</h3>", status_code=200)
+
+    def load_data(row):
+        data = row['interface_data']
+        try:
+            data = json.loads(row['interface_data'])
+        except json.JSONDecodeError:
+            pass
+        return data
+
+    analysis_data = {row["origin_question"]: row['content'] if get_content else load_data(row) for row in rows}
+    analysis_text = render_summary_text({}, analysis_data)
+    import markdown2
+    html_content = markdown2.markdown(analysis_text, extras=["tables", "fenced-code-blocks", "break-on-newline"])
+    return HTMLResponse(f"<html><body>{html_content}</body></html>", status_code=200)
+
+
 @app.get("/rebuild_summary/{batch_no}")
 async def rebuild_summary_answer(batch_no: str,
                                  attention_origins: list[str] = Query(default=['严重违法信息', '失信信息', '被执行信息',

@@ -1108,7 +1108,7 @@ if __name__ == "__main__":
         from generates import ai_embeddings, init_ai_clients
         import numpy as np
         import pickle
-        from config import AI_Models, API_KEYS
+        from config import AI_Models
 
         qc = AsyncQdrantClient(host='47.110.156.41')  # , grpc_port=6334, prefer_grpc=True
 
@@ -1127,7 +1127,7 @@ if __name__ == "__main__":
         model_name = 'BAAI/bge-large-zh-v1.5'  # 'BAAI/bge-base-zh-v1.5'  # 'all-MiniLM-L6-v2'
         size = text_embeddings.shape[1]
         print(size)  # 1024
-        await init_ai_clients(AI_Models, API_KEYS, get_data=False)
+        await init_ai_clients(AI_Models)
         embeddings = await ai_embeddings(inputs='测试', model_name=model_name, model_id=0)
         print(embeddings)
         assert embeddings and embeddings[0]

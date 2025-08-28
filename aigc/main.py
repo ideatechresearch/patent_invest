@@ -11,10 +11,9 @@ from fastapi.responses import Response, StreamingResponse, JSONResponse, FileRes
 # from starlette.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer
-
 # from fastmcp import FastMCP
 from starlette.middleware.sessions import SessionMiddleware
-
+from sse_starlette.sse import EventSourceResponse
 # from apscheduler.schedulers.background import BackgroundScheduler
 # from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -23,7 +22,6 @@ from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.jobstores.redis import RedisJobStore
 # from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from passlib.context import CryptContext
 from config import Config
@@ -41,6 +39,8 @@ from utils import configure_event_loop
 
 configure_event_loop()
 
+mcp_app = mcp.http_app(transport="streamable-http", path="/mcp")
+
 
 #  定义一个上下文管理器,初始化任务（如初始化数据库、调度器等） @app.lifespa
 @asynccontextmanager
@@ -51,12 +51,43 @@ async def lifespan(app: FastAPI):
         # if not w3.is_connected():
         #     print("Failed to connect to Ethereum node")
 
-        if not scheduler.get_job("tick_job"):
-            scheduler.add_job(tick, 'interval', id="tick_job", seconds=60, misfire_grace_time=60,
+        app.state.dbpool = DB_Client
+        app.state.redis = await get_redis_connection()
+
+        await app.state.dbpool.init_pool(minsize=1, maxsize=20)
+        app.state.httpx_client = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+
+        worker_id, worker_info = get_worker_identity()
+        app.state.worker_id = worker_id
+        app.state.worker_info = worker_info
+        app.state.worker_num = int(os.environ.get("UVICORN_WORKERS") or os.environ.get("GUNICORN_WORKERS", 1))
+        app.state.is_debug = Config.get('IS_DEBUG', False)
+        if app.state.is_debug:
+            tracemalloc.start()
+
+        await init_ai_clients(AI_Models)
+        await ModelList.set(redis=app.state.redis, worker_id=worker_id, ai_models=AI_Models)
+        # print(len(ModelList.models), json.dumps(AI_Models, indent=4))
+
+        app.state.is_main = await is_main_worker(worker_id, redis=app.state.redis)
+        if app.state.is_main:
+            print("Main worker started. Do once-only init. Total workers:", app.state.worker_num)
+            # app.state.dask_client = get_dask_client()
+            print(Config.get_config_data())
+        else:
+            pass
+            # app.state.dask_client = get_dask_client(Config.DASK_Cluster)
+
+        app.state.ai_scheduler = TaskGraphManager(dask_client=None)
+        tick_task = asyncio.create_task(async_tick())
+        if not scheduler.get_job("hour_job"):
+            scheduler.add_job(handle_hour, 'interval', id="hour_job", seconds=3600, misfire_grace_time=60,
                               jobstore='memory', executor='default')  # , max_instances=3
+
+        app.state.func_manager = get_func_manager()
         if not scheduler.get_job("metadata_job"):
-            func_manager = get_func_manager()
-            scheduler.add_job(func_manager.generate_tools_metadata, 'cron', id="metadata_job", hour=5, minute=20,
+            scheduler.add_job(app.state.func_manager.generate_tools_metadata, 'cron', id="metadata_job", hour=5,
+                              minute=20,
                               misfire_grace_time=300,
                               kwargs={"model_name": Config.DEFAULT_MODEL_METADATA}, jobstore='memory',  # 'redis',
                               max_instances=1, replace_existing=True)
@@ -64,32 +95,45 @@ async def lifespan(app: FastAPI):
         if not scheduler.running:
             scheduler.start()
 
-        redis = await get_redis_connection()
-        await init_ai_clients(AI_Models, get_data=True, redis=redis)
-        await DB_Client.init_pool(minsize=1, maxsize=20)
-
-        # print(json.dumps(AI_Models, indent=4))
+        print(app.state.worker_info, "worker inited.")
         # task1 = asyncio.create_task(message_zero_mq.start())
         # global_function_registry()
-
-        yield
-
+        # if Config.get('WORKERS',0) == 1:
+        #     mcp_task, exit_event = await run_mcp_task(port=7007)
+        # Run both lifespans
+        async with mcp_app.lifespan(app):
+            yield
+        tick_task.cancel()
 
     except asyncio.CancelledError:
         logging.warning("Lifespan 被取消（应用关闭中）")
+        await tick_task
+    except Exception as e:
+        logging.error(f"生命周期异常: {e}")
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     finally:
         print("Shutting down.")
         scheduler.shutdown()
         engine.dispose()
         # await async_engine.dispose()
         # MysqlData().close()
-        await DB_Client.close_pool()
+        await app.state.dbpool.close_pool()
 
         await shutdown_httpx()
         await shutdown_redis()
 
+        close_dask_client()
+        if app.state.is_debug:
+            tracemalloc.stop()
     # task1.cancel()
     # await asyncio.gather(task1, return_exceptions=True)
+
+
+@asynccontextmanager
+async def combined_lifespan(app: FastAPI):
+    async with lifespan(app):
+        async with mcp_app.lifespan(app):
+            yield
 
 
 # executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
@@ -101,14 +145,14 @@ scheduler = AsyncIOScheduler(executors={'default': AsyncIOExecutor()},
                                                                run_times_key='apscheduler.run_times',
                                                                host=Config.REDIS_HOST, port=Config.REDIS_PORT, db=0)},
                              timezone='Asia/Shanghai')  # 异步调度器
+
 # message_zero_mq = MessageZeroMQ()
-app = FastAPI(lifespan=lifespan)
+
+app = FastAPI(title="AIGC API", lifespan=lifespan)  # combined_lifespan
 app.add_middleware(SessionMiddleware, secret_key=Config.SECRET_KEY)
-# mcp = FastMCP("aigc", app=app)  # lifespan=
+# mcp = FastMCP.from_fastapi(app=app,name='aigc MCP')
 logger = logging.getLogger(__name__)
 dashscope.api_key = Config.DashScope_Service_Key
-AliyunBucket = oss2.Bucket(oss2.Auth(Config.ALIYUN_oss_AK_ID, Config.ALIYUN_oss_Secret_Key), Config.ALIYUN_oss_endpoint,
-                           Config.ALIYUN_Bucket_Name)
 # 加密配置,密码哈希上下文
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # OAuth2 密码令牌,设置 tokenUrl
@@ -118,37 +162,38 @@ app.mount("/data", StaticFiles(directory=Config.DATA_FOLDER), name="data")
 # directory=os.path.abspath('.') + "/static")
 # 配置静态文件和模板
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/mcp", mcp_app)
 
 app.include_router(ideatech_router, prefix="/ideatech")
 app.include_router(table_router, prefix="/table")
 
 # model_config['protected_namespaces'] = ()
 
-
 MTick_Time: datetime = None
 
-async def tick():
+
+@async_timer_cron(interval=60)
+async def async_tick():
     global MTick_Time
     tick_now = datetime.now()
-    if not MTick_Time or MTick_Time.minute != tick_now.minute:
+    if not MTick_Time or MTick_Time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
         MTick_Time = tick_now.replace(second=0, microsecond=0)
-        # print(f"Tick new bar! The time is: {MTick_Time.strftime('%Y-%m-%d %H:%M:%S')}")
-
+        # print(f'Async Tick! The time is: {time.time()}, {MTick_Time.strftime("%Y-%m-%d %H:%M:%S")}')
         if len(TaskManager.Task_queue):
-            # print(len(TaskManager.Task_queue), 'Tick! The time is: %s' % tick_now)
-            await TaskManager.clean_old_tasks()
+            await TaskManager.clean_old_tasks(3600)
 
-        if len(BaseChatHistory.Chat_History_Cache):
-            with SessionLocal() as session:
-                ChatHistory.sequential_insert(session)
-
-        cleanup_old_tempfiles(min_age=300, prefix="tmp_")
+        cleanup_old_tempfiles(min_age=600, prefix="tmp_")
 
 
-async def async_cron():
-    while True:
-        print('Async Tick! The time is: %s' % time.time())
-        await asyncio.sleep(60)
+async def handle_hour():
+    if MTick_Time:
+        print(f"Tick new bar! The time is: {MTick_Time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if len(BaseChatHistory.Chat_History_Cache):
+        with SessionLocal() as session:
+            ChatHistory.sequential_insert(session)
+
+    await asyncio.to_thread(memory_monitor, threshold_percent=60, desc=app.state.is_debug)
 
 
 # @app.on_event("startup")
@@ -156,6 +201,8 @@ async def async_cron():
 #     print("Starting up...")
 #     Base.metadata.create_all(bind=engine)
 #     asyncio.create_task(async_cron())
+#     sse_transport = SseServerTransport(app)
+#     mcp.mount_transport(sse_transport)
 #
 # @app.on_event("shutdown")
 # async def shutdown_event():
@@ -170,18 +217,6 @@ async def async_cron():
 #             return func()
 #         return wrapper
 #     return decorator
-
-
-# 用户验证后的数据
-fake_users_db = {
-    "user1": {
-        "username": "user1",
-        "full_name": "John Doe",
-        "hashed_password": "$2b$12$KixF3G.UZ.JYF4Jlk/EoWeVvMb2RJsCJdPtFPBW4wZBQGI3B1ysGm",  # "password"
-        "disabled": False,
-        "public_key": "user1_public_key"
-    }
-}
 
 
 # @app.middleware("http")
@@ -200,11 +235,6 @@ fake_users_db = {
 #     api_key = authorization.replace("Bearer ", "")  # 如果用的是 Bearer Token 格式
 #     if api_key not in Config.VALID_API_KEYS:
 #         raise HTTPException(status_code=401, detail="Invalid API key")
-
-# @app.on_event("startup")
-# async def startup():
-#     sse_transport = SseServerTransport(app)
-#     mcp.mount_transport(sse_transport)
 
 def require_api_key(func):
     @wraps(func)
@@ -445,6 +475,9 @@ async def system_status():
         "machine": platform.machine(),
         "processor": platform.processor(),
         "event_loop_type": str(type(asyncio.get_running_loop())),  # asyncio.get_event_loop()
+        "worker_id": app.state.worker_id,
+        "worker_info": app.state.worker_info,
+        "worker_num": app.state.worker_num,
         "pid": os.getpid(),
         "threads": thread_count,
         "asyncio_task_count": task_count,
@@ -466,7 +499,7 @@ async def system_status():
 
 @app.get("/logs")
 async def get_logs_info(lines: int = 100):
-    return await get_logs("app.log", lines)
+    return await get_log_lines("app.log", lines)
 
 
 @app.get("/admin/")
@@ -474,8 +507,8 @@ async def admin(username: str = Depends(verify_access_token)):
     if username == 'admin':
         return JSONResponse(
             content={'history': BaseChatHistory.Chat_History_Cache, 'task': dataclass2dict(TaskManager.Task_queue),
-                     'task_nodes': TaskGraphManager().export_nodes(),
-                     'task_edges': TaskGraphManager().export_adjacency_list(),
+                     'task_nodes': app.state.ai_scheduler.export_nodes(),
+                     'task_edges': app.state.ai_scheduler.export_adjacency_list(),
                      'job': get_job_list(scheduler)})
     return {"message": "Access denied: Admin privileges required"}
 
@@ -515,27 +548,13 @@ async def push_redis_data(payload: dict):
 async def read_redis_value(key: str = 'funcmeta:*'):
     redis = get_redis()
     try:
-        if "*" in key or "?" in key or "[" in key:
-            keys = await redis.keys(key)
-            if not keys:
-                return {"error": f"No keys match pattern '{key}'"}
-            values = await redis.mget(*keys)
-            result = {
-                k.decode("utf-8") if isinstance(k, bytes) else k:
-                    v.decode("utf-8") if isinstance(v, bytes) else v
-                for k, v in zip(keys, values)
-            }
-            return {"result": result}
-        else:
-            value = await redis.get(key)
-            if isinstance(value, bytes):
-                value = value.decode('utf-8')
-            return {"result": value}
+        result = await get_redis_value(redis, key)
+        if result is None:
+            return {"error": f"Key '{key}' not found"}
+        return {"result": result}
 
-    except (ConnectionError, TimeoutError) as e:
-        return JSONResponse(status_code=503, content={"error": "Redis 连接失败", "detail": str(e)})
-    except Exception as e:  # Connect call failed,redis.exceptions.ConnectionError
-        return {"error": str(e)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
 @app.delete("/delete/{key}")
@@ -579,6 +598,41 @@ def pip_list():
 @app.get("/health")
 async def healthcheck():
     return {"status": True}
+
+
+@app.get("/route_info")
+def list_routes():
+    return [{"path": r.path, "name": r.name} for r in app.routes]
+
+
+@app.get("/mcp_tool")
+async def get_mcp_tool():
+    await app.state.func_manager.register_mcp_tools()
+    mcp_tools = await app.state.func_manager.get_mcp_tools()
+    return JSONResponse(content={k: v.__repr__() for k, v in mcp_tools.items()})
+
+
+@app.get("/mcp_sse")
+async def mcp_sse(request: Request):
+    """SSE 端点用于 MCP 实时通信"""
+
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+            # 发送心跳保持连接
+            yield {
+                "event": "heartbeat",
+                "data": json.dumps({"timestamp": datetime.now().isoformat()})
+            }
+            await asyncio.sleep(30)
+
+    return EventSourceResponse(event_generator())
+
+
+# @app.get("/mcp_openai")
+# async def mount_mcp_openai():
+#     mcp.mount(prefix="openapi", server=create_openai_mcp("http://127.0.0.1:7000"))
 
 
 # @app.get("/opensearch.xml")
@@ -629,13 +683,15 @@ async def retrieval(text: str, platform: Literal[
     elif platform == 'invest':
         results = company_search(text, search_type='invest', limit=10)
     else:
-        results = await retrieved_reference(text, keywords=[text])
+        results = await web_search_intent(text)
 
     return JSONResponse(results)
 
 
 @app.get("/extract/")
 async def extract(text: str = Query(...), extract: str = Query(default='all')):
+    text = clean_escaped_string(text)  # 去除外层成对的引号（单引号或双引号）
+
     if is_url(text):
         if extract == 'jina':
             return await web_extract_jina(text)
@@ -783,12 +839,6 @@ async def classify_text(request: ClassifyRequest):
     return {"class": None, 'match': intents}
 
 
-@app.post("/summary")
-async def summary_extract_text(request: SummaryRequest):
-    return await ai_summary(request.text, request.extract_prompt, request.summary_prompt, request.model,
-                            request.max_tokens, max_segment_length=request.max_segment_length)
-
-
 @app.get("/create_embeddings_collection/")
 async def create_embeddings_collection(collection_name: str, model_name: str = Config.DEFAULT_MODEL_EMBEDDING):
     embeddings = await ai_embeddings(inputs=collection_name, model_name=model_name, model_id=0)
@@ -917,14 +967,13 @@ async def get_tools(request: ToolRequest):
     if not request.messages:
         request.messages = [{"role": "system", "content": System_content.get('31')},
                             {"role": "user", "content": request.prompt}]
-    func_manager = get_func_manager()
     tools_metadata = request.tools
     if not request.tools:
         if request.user:
             redis = get_redis()
             tools_metadata = await scan_from_redis(redis, "registry_meta", user=request.user)
         else:
-            tools_metadata = AI_Tools + await func_manager.get_registered_tools_metadata(
+            tools_metadata = AI_Tools + await app.state.func_manager.get_registered_tools_metadata(
                 model_name=request.model_metadata)
             # print(tools_metadata)
 
@@ -932,7 +981,7 @@ async def get_tools(request: ToolRequest):
         return JSONResponse(tools_metadata)
 
     if not tools_metadata:
-        tools_metadata = await func_manager.get_tools_metadata(func_list=[])
+        tools_metadata = await app.state.func_manager.get_tools_metadata(func_list=[])
 
     tool_messages, _ = await ai_client_completions(messages=request.messages, client=None, model=request.model_name,
                                                    get_content=False, tools=tools_metadata or AI_Tools,
@@ -945,7 +994,7 @@ async def get_tools(request: ToolRequest):
         return JSONResponse(tool_messages)
 
     # 解析响应并调用工具
-    return JSONResponse(await ai_tools_results(tool_messages, func_manager))
+    return JSONResponse(await ai_tools_results(tool_messages, app.state.func_manager))
 
 
 @app.post("/metadata")
@@ -1001,29 +1050,33 @@ async def generate_metadata_from_code(req: MetadataRequest):
 
 @app.post("/agent/")
 async def agent_run(request: AgentRequest):
-    func_manager = get_func_manager()
-    scheduler = TaskGraphManager()
-    metadata = await func_manager.get_tools_metadata()
+    metadata = await app.state.func_manager.get_tools_metadata()
     description = request.messages[-1].content
     messages = [msg.dict() for msg in request.messages]
 
-    smart_task, task_id = await TaskManager.add(action='ai_client_completions', function=ai_client_completions,
+    task_id, smart_task = await TaskManager.add(action='ai_client_completions', function=ai_client_completions,
                                                 description=description,
                                                 params={'messages': messages, 'model': request.model})
 
-    smart_task, task_id = await TaskManager.add(action='extract_json_struct', function=extract_json_struct,
-                                                description='extract_json')
+    task_id, extract_task = await TaskManager.add(action='extract_json_struct', function=extract_json_struct,
+                                                  description='extract_json')
 
-    graph_node = await scheduler.set_node(smart_task)
-    await scheduler.build_subgraph(nodes, edges)
+    graph_node = await app.state.ai_scheduler.set_node(smart_task)
+    # await app.state.ai_scheduler.build_subgraph(nodes, edges)
 
     try:
         # scheduler.update_task_status(task_id, TaskStatus.COMPLETED)  # source status:edge["condition"]
         # 触发依赖任务
-        scheduler.check_trigger_tasks()
-        return {"message": f"Task {task_id} executed successfully.{scheduler.export_nodes()}"}
+        app.state.ai_scheduler.check_trigger_tasks()
+        return {"message": f"Task {task_id} executed successfully.{app.state.ai_scheduler.export_nodes()}"}
     except Exception as e:
         return {"error": str(e)}
+
+
+# @app.api_route("/dask-dashboard/{full_path:path}", methods=["GET", "POST"], operation_id="proxy_dask_dashboard")
+# async def proxy_dask_dashboard(full_path: str, request: Request):
+#     return await proxy_http_html(Config.DASK_DASHBOARD_HOST, full_path, request)
+#     return RedirectResponse(url=f'{Config.DASK_DASHBOARD_HOST}/status')  # edirect
 
 
 @app.post("/assistant/")
@@ -1200,7 +1253,7 @@ async def generate_message(request: ChatCompletionRequest,
                 yield f'data: {first_data}\n\n'
 
             assistant_response = []
-            async for content in ai_chat_stream(model_info, payload):
+            async for content, data in ai_chat_stream(model_info, payload):
                 if content:
                     if content.strip():
                         yield f'data: {content}\n\n'
@@ -1264,7 +1317,7 @@ async def completions(request: OpenAIRequest, db: Session = Depends(get_db)) -> 
         instance = BaseReBot(user_content=request.prompt, model=request.model, agent='generate')
         if request.suffix:
             instance.user_content += request.suffix
-        instance.save(request.user, None, instance=instance, model_response=response, db=db)
+        instance.save(request.user, instance=instance, model_response=response, db=db)
 
         return JSONResponse(content=response)
 
@@ -1276,27 +1329,34 @@ async def chat_completions(request: OpenAIRequestMessage):
     兼容 OpenAI API 的 /v1/chat/completions 路径，返回类似 OpenAI API 的格式
     """
     # print(request.dict())
-    kwargs = request.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream', 'user'})
+    kwargs = request.model_dump(exclude_unset=True, exclude={'messages', 'tools', 'model', 'stream', 'user'})
     messages = [msg.dict() for msg in request.messages]
+    instance = BaseReBot(model=request.model, user=request.user, agent='chat')
     if request.stream:
         async def fake_stream_response():
-            async for chunk in ai_chat_stream(model_info=None, messages=messages, user_request=None, system=None,
-                                              model_name=request.model, model_id=0, get_content=False, **kwargs):
-                # print(chunk.encode("utf-8"))
-                yield f"data: {chunk}\n\n"
-
+            assistant_response = []
+            async for content, data in ai_chat_stream(model_info=None, messages=messages, user_request=None,
+                                                      system=None, model_name=request.model, tools=request.tools,
+                                                      **kwargs):
+                yield f"data: {data}\n\n"
+                if content:
+                    assistant_response.append(content)
                 await asyncio.sleep(0.01)
 
             yield 'data: [DONE]\n\n'
+            row_id = await instance.async_save(user=request.user, messages=messages,
+                                               assistant_content=''.join(assistant_response), model_response=data,
+                                               dbpool=app.state.dbpool, instance=instance)
 
         return StreamingResponse(fake_stream_response(), media_type="text/event-stream")
 
     response = await ai_chat(model_info=None, messages=messages, user_request=None, system=None,
                              # temperature=request.temperature, max_tokens=request.max_tokens,top_p=request.top_p,
-                             model_name=request.model, model_id=0, get_content=False, **kwargs)
+                             tools=request.tools, model_name=request.model, model_id=0, get_content=False, **kwargs)
 
-    await BaseReBot.async_save(user=request.user, model=request.model, agent='chat',
-                               messages=messages, model_response=response, dbpool=DB_Client)
+    row_id = await instance.async_save(user=request.user, messages=messages, model_response=response,
+                                       dbpool=app.state.dbpool, instance=instance)
+
     return JSONResponse(content=response)  # Response(content=json.dumps(data), media_type="application/json")
 
 
@@ -1304,54 +1364,17 @@ async def chat_completions(request: OpenAIRequestMessage):
 async def get_models(model: Optional[str] = Query(None,
                                                   description=f"Retrieves a model instance, providing basic information about the model such as the owner and permissioning. e.g., {','.join(model_api_keys().keys())} or custom models.")):
     if model:
-        try:
-            model_info, model_id = find_ai_model(model, 0, 'model')
-            model_data = next((item for item in model_info.get('data', []) if item['id'] == model_id), {})
-            response_data = {
-                "id": model_id,
-                "object": "model",
-                "created": 0,
-                "owned_by": model_info['name']
-            }
-            for k, v in model_data.items():
-                if k not in {"id", "owned_by"}:
-                    response_data[k] = v
-        except ValueError as e:
-            response_data = {'error': str(e)}
+        response_data = ModelList.get_model_data(model)
     else:
-        extracted_data = extract_ai_model("model")
-        response_data = {
-            "object": "list",
-            "data": [
-                {
-                    "id": f'{owner}:{model_id}',  # 用于指定模型进行请求 fine-tuned-model
-                    "object": "model",
-                    "created": 1740386673,
-                    "owned_by": owner,  # 拥有该模型的组织
-                    "root": model_id,  # 根版本，与 ID 相同
-                    "parent": None,  # 如果没有父模型，则为 None
-                    # "max_model_len": 4096,#GPU内存限制而需要调整模型的最大序列长度
-                    "permission": [
-                        {
-                            "id": f"modelperm-{owner}:{model_id}",
-                            "object": "model_permission",
-                            "created": 1740386673,
-                            # "allow_create_engine": False,
-                            # "allow_sampling": True,
-                            # "allow_logprobs": True,
-                            # "allow_search_indices": False,
-                            # "allow_view": True,
-                            # "allow_fine_tuning": False,
-                            # "organization": "*",
-                            # "group": None,
-                            # "is_blocking": False
-                        }
-                    ],
-                } for i, (owner, models) in enumerate(extracted_data)
-                for j, model_id in enumerate(models)]
-        }
-        # print(len(ModelListExtract.models))
+        response_data = ModelList.get_models(AI_Models)
+        # print(len(ModelList.models))
     return JSONResponse(content=response_data)
+
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page(request: Request):
+    # 渲染 templates/chat.html
+    return templates.TemplateResponse("chat.html", {"request": request})
 
 
 @app.websocket("/ws/chat")
@@ -1399,10 +1422,10 @@ async def websocket_chat(websocket: WebSocket):
                         yield f'data: {first_data}\n\n'
 
                     assistant_response = []
-                    async for content in ai_chat_stream(model_info, payload):
+                    async for content, data in ai_chat_stream(model_info, payload):
                         if content and content.strip():
                             yield f'data: {content}\n\n'
-                        assistant_response.append(content)
+                            assistant_response.append(content)
                         await asyncio.sleep(0.01)
 
                     bot_response = ''.join(assistant_response)
@@ -1510,7 +1533,7 @@ async def submit_messages(request: SubmitMessagesRequest,
 
 async def process_task_ai(task: TaskNode, chat_history: ChatHistory, redis=None):
     if not task:
-        print(f"[process_task_ai] Task not found in Task_queue.")
+        logger.warning("[process_task_ai] Task not found in Task_queue.")
         return
 
     await TaskManager.set_task_status(task, TaskStatus.IN_PROGRESS, 10, redis)
@@ -1519,50 +1542,51 @@ async def process_task_ai(task: TaskNode, chat_history: ChatHistory, redis=None)
     history = task.data.get('messages')
     user_request = chat_history.user_request or task.description
 
-    with SessionLocal() as session:
-        async def single_param(i: int, param: CompletionParams):
-            if not param.question:
-                param.question = user_request
-            # else:
-            #     chat_history.user_request = param.question
-            user_history = chat_history.rebuild(param.question, history) if history else []
-            system_prompt = param.prompt or System_content.get(param.agent, '')
-            model_info, payload, refer = await get_chat_payload(messages=user_history, user_request=param.question,
-                                                                system=system_prompt, temperature=param.temperature,
-                                                                top_p=param.top_p, max_tokens=param.max_tokens,
-                                                                model_name=param.model_name, model_id=param.model_id,
-                                                                agent=param.agent, keywords=param.keywords,
-                                                                images=param.images)
-            # **param.asdict(),payload=param.payload()
-            bot_response = await ai_chat(model_info, payload)
-            transform = extract_string(bot_response, param.extract)
+    @run_togather(max_concurrent=Config.MAX_CONCURRENT, batch_size=-1)
+    async def single_param(data: tuple[int, CompletionParams]):
+        i, param = data
+        if not param.question:
+            param.question = user_request
+        # else:
+        #     chat_history.user_request = param.question
+        user_history = chat_history.rebuild(param.question, history) if history else []
+        system_prompt = param.prompt or System_content.get(param.agent, '')
+        model_info, payload, refer = await get_chat_payload(messages=user_history, user_request=param.question,
+                                                            system=system_prompt, temperature=param.temperature,
+                                                            top_p=param.top_p, max_tokens=param.max_tokens,
+                                                            model_name=param.model_name, model_id=param.model_id,
+                                                            agent=param.agent,
+                                                            tools=param.tools, keywords=param.keywords,
+                                                            images=param.images)
+        # **param.asdict(),payload=param.payload()
+        bot_response = await ai_chat(model_info, payload)
+        transform = extract_string(bot_response, param.extract)
+
+        with SessionLocal() as session:
             chat_history.model = param.model_name
             chat_history.agent = param.agent
-            chat_history.save(bot_response, refer, transform, param.question, model_name=payload['model'],
-                              db=session)
+            chat_history.save(bot_response, refer, transform, param.question, model_name=payload['model'], db=session)
 
-            if param.extract == 'wechat':
-                if chat_history.name and chat_history.robot_id:
-                    await send_to_wechat(chat_history.name, transform or bot_response)
-                    # send_wechat(transform or bot_response, chat_history.name)
-            result = {'question': param.question, 'answer': bot_response, 'reference': refer,
-                      'transform': transform, 'id': i}
-            if param.callback and param.callback.url:
-                await send_callback(param.callback.model_dump(),
-                                    result=transform if isinstance(transform, (dict, list)) else result)
+        if param.extract == 'wechat':
+            if chat_history.name and chat_history.robot_id:
+                await send_to_wechat(chat_history.name, transform or bot_response)
+                # send_wechat(transform or bot_response, chat_history.name)
+        result = {'question': param.question, 'answer': bot_response, 'reference': refer,
+                  'transform': transform, 'id': i}
+        if param.callback and param.callback.url:
+            await send_callback(param.callback.model_dump(),
+                                result=transform if isinstance(transform, (dict, list)) else result)
 
-            return result
+        return result
 
-    semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT)
-    tasks = [run_with_semaphore(single_param, i, p, semaphore=semaphore) for i, p in enumerate(params) if not p.stream]
-    results = await asyncio.gather(*tasks, return_exceptions=True)  # 确保任务取消时不会引发异常
+    results = await single_param(inputs=[(i, p) for i, p in enumerate(params) if not p.stream])
     status = TaskStatus.COMPLETED if all(isinstance(r, dict) for r in results) else TaskStatus.FAILED
     await TaskManager.update_task_result(task_id, result=[r for r in results if isinstance(r, dict)],
                                          status=status, redis_client=redis)
 
     for i, r in enumerate(results):
         if isinstance(r, Exception):
-            print(f"[任务 {i} 异常] {r}")
+            logger.error(f"[任务 {i} 异常] {r}")
 
     return results
 
@@ -1662,7 +1686,7 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
                 yield f'data: {first_data}\n\n'
 
             assistant_response = []
-            async for content in ai_chat_stream(model_info, payload):
+            async for content, data in ai_chat_stream(model_info, payload):
                 if content:
                     if content.strip():
                         yield f'data: {content}\n\n'
@@ -1695,7 +1719,7 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
     return JSONResponse(content=result)
 
 
-def cleanup_old_tempfiles(min_age=300, prefix="tmp_"):
+def cleanup_old_tempfiles(min_age=600, prefix="tmp_"):
     """删除超过 `min_age` 秒的临时文件（前缀匹配）"""
     temp_dir = tempfile.gettempdir()  # 获取系统临时目录
     # pattern = os.path.join(temp_dir, f"{prefix}*")  # 匹配前缀文件
@@ -1710,7 +1734,7 @@ def cleanup_old_tempfiles(min_age=300, prefix="tmp_"):
             file_age = time.time() - os.path.getmtime(file_path)  # 文件最后修改时间
             if file_age > min_age:
                 os.remove(file_path)
-                # print(f"已删除过期文件: {file_path}")
+                print(f"已删除过期文件: {file_path}")
         except FileNotFoundError:
             pass  # 文件已被其他进程删除
         except PermissionError:
@@ -1880,6 +1904,75 @@ async def send_page(request: Request):
 # async def send_msg_zero_mq(message: str, topic: str = 'topic'):
 #     await message_zero_mq.send_message(message, topic)
 #     return {"status": "success", "message": f"Message '{message}' sent to ZeroMQ."}
+
+@app.post("/conversations/extract")
+async def extract_conversations(file: UploadFile = File(...), convo_type: Literal['gpt', 'deepseek'] = 'gpt',
+                                stream: bool = False):
+    from script.conversation import extract_conversations_records_gpt, extract_conversations_records_ds
+    raw_bytes = await file.read()
+    conversations_data = json.loads(raw_bytes)
+    if convo_type == 'gpt':
+        structured_data = extract_conversations_records_gpt(conversations_data)
+    else:
+        structured_data = extract_conversations_records_ds(conversations_data)
+
+    if stream:
+        json_bytes = json.dumps(structured_data, ensure_ascii=False).encode('utf-8')
+        convo_io = io.BytesIO(json_bytes)
+        convo_io.seek(0)
+        return StreamingResponse(convo_io, media_type="application/json")
+
+    tmp = tempfile.NamedTemporaryFile(mode="w+", delete=False, prefix="tmp_", suffix=".json", encoding="utf-8")
+    json.dump(structured_data, tmp, ensure_ascii=False, indent=2)
+    tmp.flush()
+    tmp.close()
+    return FileResponse(tmp.name, media_type="application/json", filename=f"conversations_structured.json")
+
+
+@app.post("/conversations/filter")
+async def filter_conversations(file: UploadFile = File(...), after_date: str = None, stream: bool = False):
+    from script.conversation import filter_messages_after, df_messages_sorted
+    raw_bytes = await file.read()
+    structured_data = json.loads(raw_bytes)
+
+    after_ts = format_date_type(date=after_date).timestamp() if after_date else 0
+    filtered_messages = filter_messages_after(structured_data, after_ts)
+    df_sorted = df_messages_sorted(filtered_messages)
+
+    if stream:
+        json_bytes = json.dumps(df_sorted.to_dict(orient='records'), ensure_ascii=False).encode('utf-8')
+        convo_io = io.BytesIO(json_bytes)
+        convo_io.seek(0)
+        return StreamingResponse(convo_io, media_type="application/json")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="tmp_", suffix=".xlsx")
+    tmp.close()
+    df_sorted.to_excel(tmp.name, index=False)  # C:\Users\Admin\AppData\Local\Temp\tmp_a9c3axrq.xlsx
+    return FileResponse(tmp.name, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        filename=f"conversations_filter_{after_date or 'all'}.xlsx")
+
+
+@app.post("/summary")
+async def summary_extract_text(request: SummaryRequest, file: UploadFile = File(None)):
+    long_text = request.text or []
+    if file:
+        try:
+            raw_bytes = await file.read()
+            structured_data = json.loads(raw_bytes)
+            if isinstance(long_text, str):
+                long_text = [long_text]
+            if isinstance(structured_data, list):
+                long_text += structured_data
+            else:
+                long_text.append(structured_data)
+        except Exception as e:
+            return {"error": f"Failed to process the uploaded file:{e}"}
+
+    if not long_text:
+        raise HTTPException(status_code=400, detail="No text or file provided")
+    return await ai_summary(long_text, request.extract_prompt, request.summary_prompt,
+                            request.extract_model, request.summary_model,
+                            max_tokens=request.max_tokens, max_segment_length=request.max_segment_length)
 
 
 @app.post("/ocr")
@@ -2189,7 +2282,11 @@ if __name__ == "__main__":
     LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(asctime)s-%(levelprefix)s %(message)s"  # uvicorn / FastAPI
 
     # Config.debug()  # 测试环境配置,生产环境注释
-    uvicorn.run(app, host="0.0.0.0", port=7000)
-
+    os.environ['UVICORN_WORKERS'] = '1'  # Config.update(WORKERS=1)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=7000)
+    except KeyboardInterrupt:
+        logging.warning("Server stopped by user（Ctrl+C）")
+        close_dask_client()
     # pip install -r requirements.txt
     # uvicorn main:app --host 0.0.0.0 --port 7000 --workers 4

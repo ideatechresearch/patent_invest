@@ -3,7 +3,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi import Request, Depends, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from typing import Optional, Dict
-from generates import DB_Client
+from service import DB_Client
 
 table_router = APIRouter()
 table_router_prefix = "/table"

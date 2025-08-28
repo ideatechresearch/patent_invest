@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OpenAI — 聊天</title>
+  <style>
+    /* 全屏布局，去除页面左右空白 */
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background: #f3f4f6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial;
+    }
+
+    .app {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 60px 1fr auto;
+      max-width: 100%;
+      margin: 0
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 18px;
+      background: #fff;
+      border-bottom: 1px solid #e6e7eb
+    }
+
+    header h1 {
+      font-size: 16px;
+      margin: 0
+    }
+
+    #top-controls {
+      margin-left: auto;
+      display: flex;
+      gap: 8px
+    }
+
+    main#chat-area {
+      overflow: auto;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      background: linear-gradient(#fbfcff, #fff)
+    }
+
+    .chat-empty {
+      color: #8b8f98;
+      text-align: center;
+      padding: 24px
+    }
+
+    /* 气泡 */
+    .msg-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 7px
+    }
+
+    .msg-row.user {
+      justify-content: flex-end
+    }
+
+    .bubble {
+      max-width: 78%;
+      padding: 8px 10px;
+      border-radius: 12px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      font-size: 13px
+    }
+
+    .bubble.user {
+      background: #d6eefc;
+      border-bottom-right-radius: 6px
+    }
+
+    .bubble.assistant {
+      background: #e9f7e9;
+      border-bottom-left-radius: 6px
+    }
+
+    .meta {
+      font-size: 11px;
+      color: #7b7f86;
+      margin-left: 4px
+    }
+
+    footer {
+      display: flex;
+      gap: 12px;
+      padding: 12px 16px;
+      border-top: 1px solid #e6e7eb;
+      background: #fff
+    }
+
+    .left-compose {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 8px
+    }
+
+    textarea#input {
+      width: 100%;
+      min-height: 72px;
+      resize: vertical;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+      font-size: 14px
+    }
+
+    .compose-row {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .right-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .btn {
+      background: #2563eb;
+      color: #fff;
+      border: 0;
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer
+    }
+
+    .btn.secondary {
+      background: #f3f4f6;
+      color: #111
+    }
+
+    .small {
+      font-size: 13px;
+      padding: 6px 8px
+    }
+
+    select,
+    input[type=file] {
+      padding: 6px;
+      border-radius: 6px;
+      border: 1px solid #ddd
+    }
+
+    .tools-row {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .right-panel {
+      width: 320px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px
+    }
+
+    .tool-title {
+      font-size: 13px;
+      color: #333
+    }
+
+    @media (max-width:900px) {
+      .app {
+        grid-template-rows: 60px 1fr auto
+      }
+
+      .right-panel {
+        width: 200px
+      }
+    }
+
+    /* 设置弹窗 */
+    .modal-backdrop {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.35);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 200
+    }
+
+    .modal {
+      background: #fff;
+      border-radius: 8px;
+      padding: 16px;
+      width: 520px;
+      max-width: 95%;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15)
+    }
+
+    .modal h3 {
+      margin: 0 0 8px 0
+    }
+
+    .modal .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin: 8px 0
+    }
+
+    .modal .row label {
+      min-width: 110px;
+      font-size: 13px;
+      color: #333
+    }
+
+    .modal .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 12px
+    }
+
+    .system-list {
+      max-height: 220px;
+      overflow: auto;
+      border: 1px solid #eee;
+      padding: 8px;
+      border-radius: 6px;
+      background: #fafafa
+    }
+
+    .system-item {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      padding: 6px;
+      border-radius: 6px;
+      margin-bottom: 6px
+    }
+
+    .system-item textarea {
+      flex: 1;
+      min-width: 250px;
+      min-height: 50px;
+      resize: vertical;
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 6px
+    }
+
+    .system-controls {
+      min-width: 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .system-controls button,
+    .system-controls input[type=checkbox] {
+      width: auto;
+      min-width: 30px;
+    }
+
+    /* loading bar */
+    .loading-bar {
+      display: none;
+      position: fixed;
+      left: 0;
+      top: 60px;
+      height: 3px;
+      width: 100%;
+      background: #f3f3f3;
+      z-index: 150
+    }
+
+    .loading-bar .progress {
+      width: 0;
+      height: 100%;
+      background: #0366d6;
+      transition: width 300ms linear
+    }
+
+
+    /* small helpers */
+    .muted {
+      color: #7b7f86;
+      font-size: 12px
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app" role="application" aria-label="Chat App">
+    <header>
+      <h1>OpenAI — 聊天</h1>
+      <div id="top-controls">
+        <button id="clear-chat" class="btn secondary small">清空对话</button>
+        <button id="download-chat" class="btn secondary small">导出对话</button>
+        <button id="open-settings" class="btn secondary small">设置</button>
+        <button id="reload-models" class="btn small">刷新模型</button>
+      </div>
+    </header>
+    <div class="loading-bar" id="loading-bar">
+      <div class="progress" id="loading-progress"></div>
+    </div>
+
+    <main id="chat-area">
+      <div id="chat-empty-note" class="chat-empty">还没有对话，输入内容并发送开始聊天。</div>
+    </main>
+
+
+    <footer>
+      <div class="left-compose" style="flex:1;display:flex;flex-direction:column;gap:8px">
+        <!-- 文本框与发送按钮并排 -->
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <textarea id="input" placeholder="请输入消息，然后按发送（Shift+Enter 换行）"
+            style="flex:1;min-height:72px;resize:vertical;padding:10px;border-radius:8px;border:1px solid #ddd;font-size:14px"></textarea>
+          <div class="right-actions" style="display:flex;flex-direction:column">
+            <button id="send-btn" class="btn small">发送</button>
+          </div>
+        </div>
+
+        <!-- 工具行：流式/网页搜索/文件 与 模型 并排 -->
+        <div style="display:flex;align-items:center;gap:16px;margin-top:4px">
+          <div class="tools-row" style="display:flex;gap:8px;align-items:center">
+            <label><input id="websearch-checkbox" type="checkbox"> 网页搜索</label>
+            <label class="small">文件：<input id="file-input" type="file" multiple></label>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px">
+            <div class="tool-title">模型</div>
+            <select id="model-select" class="model-select"></select>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+
+  <!-- 设置弹窗 -->
+  <div class="modal-backdrop" id="settings-modal">
+    <div class="modal">
+      <h3>参数设置</h3>
+      <div class="row"><label>最大回复长度（max_tokens）</label><input id="cfg-max-tokens" type="number" min="100" max="10000"
+          step="50" value="4000"></div>
+      <div class="row"><label>top_p（nucleus sampling）</label><input id="cfg-topp" type="number" min="0" max="1"
+          step="0.01" value="1.0"></div>
+      <div class="row"><label>温度（temperature）</label><input id="cfg-temp" type="number" min="0" max="1" step="0.01"
+          value="0.4"></div>
+      <div class="row"><label>备用模型（model）</label><select id="cfg-model"
+          style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px"></select></div>
+      <div class="row"><label>流式输出（stream）</label><input id="cfg-stream" type="checkbox" checked></div>
+
+      <hr>
+      <h4> 系统提示（System）</h4>
+      <div class="row"><label>新增</label>
+        <textarea id="new-system-text" placeholder="输入一个 system 提示，按 ‘添加’ 保存"
+          style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;min-height:80px"></textarea>
+        <div style="width:30px;display:flex;align-items:center;justify-content:flex-end">
+          <button id="add-system" class="btn small">添加</button>
+        </div>
+      </div>
+      <div class="row"><label>已保存</label>
+        <div class="system-list" id="system-list"></div>
+      </div>
+
+      <div class="actions">
+        <button id="cfg-cancel" class="btn secondary small">取消</button>
+        <button id="cfg-save" class="btn small">保存</button>
+      </div>
+    </div>
+  </div>
+  <script type="module">
+    // 纯 JavaScript 实现（无 TypeScript）
+    const chatArea = document.getElementById('chat-area');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send-btn');
+    const websearchCheckbox = document.getElementById('websearch-checkbox');
+    const fileInput = document.getElementById('file-input');
+    const modelSelect = document.getElementById('model-select');
+    const clearBtn = document.getElementById('clear-chat');
+    const downloadBtn = document.getElementById('download-chat');
+    const reloadModelsBtn = document.getElementById('reload-models');
+    const chatEmptyNote = document.getElementById('chat-empty-note');
+
+    const settingsModal = document.getElementById('settings-modal');
+    const cfgMaxTokens = document.getElementById('cfg-max-tokens');
+    const cfgTopp = document.getElementById('cfg-topp');
+    const cfgTemp = document.getElementById('cfg-temp');
+    const cfgStream = document.getElementById('cfg-stream');
+    const cfgModel = document.getElementById('cfg-model');
+    const cfgSave = document.getElementById('cfg-save');
+    const cfgCancel = document.getElementById('cfg-cancel');
+    const openSettingsBtn = document.getElementById('open-settings');
+    // system related
+    const systemListEl = document.getElementById('system-list');
+    const newSystemText = document.getElementById('new-system-text');
+    const addSystemBtn = document.getElementById('add-system');
+
+    const loadingBar = document.getElementById('loading-bar');
+    const loadingProgress = document.getElementById('loading-progress');
+    const defaultModel = 'gpt-3.5-turbo';//gpt-4o
+
+    let chatHistory = []; // {role, content, time}
+    let lastAssistantPlaceholder = null;
+    let sseBuffer = '';
+    let settings = {
+      model: defaultModel, // cfg-model fallback default -> gpt-4o as requested
+      temperature: 0.4,
+      top_p: 1.0,
+      max_tokens: 4000,
+      stream: true,
+
+      systemPrompts: [], // {id, content}
+      selectedSystemIds: [] // ids of systemPrompts to prepend
+    };
+    function escapeHtml(text) { const d = document.createElement('div'); d.textContent = text; return d.innerHTML; }
+
+    function renderChat() {
+      // render all messages
+      chatArea.innerHTML = '';
+      if (chatHistory.length === 0) { chatArea.appendChild(chatEmptyNote); return; }
+      for (const m of chatHistory) {
+        const row = document.createElement('div');
+        row.className = 'msg-row ' + (m.role === 'user' ? 'user' : (m.role === 'assistant' ? 'assistant' : ''));
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble ' + (m.role === 'user' ? 'user' : 'assistant');
+        bubble.innerHTML = escapeHtml(m.content);
+        row.appendChild(bubble);
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = `${m.role}${m.time ? ' • ' + new Date(m.time).toLocaleTimeString() : ''}`;
+        row.appendChild(meta);
+        chatArea.appendChild(row);
+      }
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+
+    function addMessage(role, content) { const item = { role, content, time: Date.now() }; chatHistory.push(item); renderChat(); return item; }
+
+    async function fileToBase64(file) {
+      console.log('[chat] fileToBase64 start', file.name, file.size);
+      return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = reject; r.readAsDataURL(file); });
+    }
+
+    async function collectTools() {
+      const tools = [];
+      const files = fileInput.files;
+      console.log('[chat] collectTools files:', files ? files.length : 0);
+      if (files && files.length) { for (const f of files) { try { const dataUrl = await fileToBase64(f); const base64 = dataUrl.split(',')[1]; tools.push({ type: 'file', filename: f.name, size: f.size, content_base64: base64 }); } catch (e) { console.warn('file read fail', f.name, e); } } }
+      return tools;
+    }
+
+    function showLoading() { loadingBar.style.display = 'block'; loadingProgress.style.width = '4%'; let prog = 4; const tick = setInterval(() => { prog = Math.min(95, prog + Math.random() * 8); loadingProgress.style.width = prog + '%'; if (loadingBar.style.display === 'none') { clearInterval(tick); loadingProgress.style.width = '0%'; } }, 300); }
+    function hideLoading() { loadingBar.style.display = 'none'; loadingProgress.style.width = '0%'; }
+    function processSSETextChunk(text) { // append to buffer and process complete data: segments
+      sseBuffer += text;
+      // SSE events are separated by double newlines, but to be robust we look for lines that start with 'data:'
+      // split by newline, but keep incomplete tail
+      const lines = sseBuffer.split('\n');
+      // If last line might be incomplete, keep it in buffer
+      sseBuffer = lines.pop();
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (!line.startsWith('data:')) {
+          // sometimes chunk contains raw JSON without "data:", attempt to parse
+          try { const obj = JSON.parse(line); handleSSEObject(obj); } catch (e) { console.warn('parse raw JSON fail', e, line); }
+          continue;
+        }
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') {
+          // stream finished indicator
+          finalizeAssistant();
+          continue;
+        }
+        try {
+          const obj = JSON.parse(payload);
+          handleSSEObject(obj);
+        } catch (e) {
+          // 非法 JSON，可能是分片，尝试拼接到 buffer（already done)；忽略
+          console.warn('parse sse payload fail', e, payload);
+        }
+      }
+    }
+
+    function handleSSEObject(obj) {
+      // obj 结构示例： { id:..., choices:[{ delta:{ content: "xxx", reasoning_content: "..." }, finish_reason: null, index:0 }], ... }
+      if (!obj || !Array.isArray(obj.choices)) return;
+      for (const ch of obj.choices) {
+        const delta = ch.delta || {};
+        // 优先使用 delta.content，如果没有则尝试 reasoning_content
+        const piece = (delta.content != null && delta.content !== undefined) ? delta.content : (delta.reasoning_content != null ? delta.reasoning_content : null);
+        if (piece !== null) {
+          // append to last assistant placeholder
+          if (lastAssistantPlaceholder) {
+            lastAssistantPlaceholder.content += piece;
+            renderChat();
+          } else {
+            // 没有占位，则新建一条 assistant 并追加
+            lastAssistantPlaceholder = addMessage('assistant', piece);
+          }
+        }
+        // 如果逻辑中 finish_reason === 'stop'，则认为结束
+        if (ch.finish_reason === 'stop') {
+          finalizeAssistant();
+        }
+      }
+    }
+
+    function finalizeAssistant() {
+      // 释放占位
+      lastAssistantPlaceholder = null; sseBuffer = ''; hideLoading();
+    }
+
+    // 决定使用哪个模型：优先 model-select (非空)，其次 cfg-model（settings.model），最后默认 'gpt-3.5-turbo'
+    function resolveModel() { const pick = (modelSelect && modelSelect.value && modelSelect.value.trim()) ? modelSelect.value.trim() : (settings.model && settings.model.trim() ? settings.model.trim() : defaultModel); return pick; }
+
+    async function sendCurrentMessage() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+      console.log('[chat] user input length', text.length);
+      addMessage('user', text);
+      inputEl.value = '';
+      // 构建 messages：若有选中的 system prompts，先把它们作为 system role 插入
+      const systemMessages = (settings.systemPrompts || []).filter(sp => settings.selectedSystemIds.includes(sp.id)).map(sp => ({ role: 'system', content: sp.content }));
+      const userAssistantHistory = chatHistory.map(m => ({ role: m.role, content: m.content }));
+      const msgs = systemMessages.concat(userAssistantHistory);
+
+      const model = resolveModel();
+      const stream = !!settings.stream;
+      const tools = await collectTools();
+      if (websearchCheckbox.checked) { tools.push({ type: 'web_search', query: text }); }
+
+      const body = { model, messages: msgs, temperature: parseFloat(settings.temperature), top_p: parseFloat(settings.top_p), max_tokens: parseInt(settings.max_tokens, 10), user: 'html:demo', stream: stream };
+      // add optional/aux params
+      body['tools'] = tools.length ? tools : undefined;
+
+      // 创建 assistant 占位
+      lastAssistantPlaceholder = addMessage('assistant', '');
+      showLoading();
+      try {
+        const res = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (!res.ok) { const txt = await res.text(); throw new Error('HTTP ' + res.status + ' ' + txt); }
+
+        if (stream) {
+          if (!res.body) { // fallback: not streamed
+            const data = await res.json(); const ai = data.choices?.[0]?.message?.content ?? JSON.stringify(data); lastAssistantPlaceholder.content = ai; finalizeAssistant(); renderChat(); return;
+          }
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let done = false;
+          while (!done) {
+            const { value, done: d } = await reader.read();
+            done = d;
+            if (value) {
+              const chunk = decoder.decode(value, { stream: true });
+              // 解析 SSE 样式的 data: ...
+              processSSETextChunk(chunk);
+            }
+          }
+          // 流结束
+          finalizeAssistant();
+        } else {
+          const data = await res.json();
+          const ai = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
+          if (lastAssistantPlaceholder) { lastAssistantPlaceholder.content = ai; }
+          finalizeAssistant(); renderChat();
+        }
+      } catch (err) {
+        if (lastAssistantPlaceholder) { lastAssistantPlaceholder.content = '生成失败：' + String(err); }
+        finalizeAssistant(); renderChat();
+        console.error(err);
+      }
+    }
+
+    // system prompts management
+    function renderSystemList() {
+      systemListEl.innerHTML = '';
+      const arr = settings.systemPrompts || [];
+      if (!arr.length) { systemListEl.innerHTML = '<div class="muted">尚无已保存的 system 提示，使用上方输入框添加。</div>'; return; }
+      for (const sp of arr) {
+        const wrap = document.createElement('div'); wrap.className = 'system-item';
+        const ta = document.createElement('textarea'); ta.value = sp.content; ta.readOnly = true; ta.title = '双击编辑，失焦保存';
+        ta.addEventListener('dblclick', () => { ta.readOnly = false; ta.focus(); });
+        ta.addEventListener('blur', () => { ta.readOnly = true; sp.content = ta.value; saveSettingsToStorage(); });
+
+
+        const controls = document.createElement('div'); controls.className = 'system-controls';
+        const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = settings.selectedSystemIds.includes(sp.id);
+        chk.addEventListener('change', () => {
+          if (chk.checked) {
+            if (!settings.selectedSystemIds.includes(sp.id)) settings.selectedSystemIds.push(sp.id);
+          } else { settings.selectedSystemIds = settings.selectedSystemIds.filter(x => x !== sp.id); }
+          saveSettingsToStorage();
+        });
+        const del = document.createElement('button'); del.className = 'btn secondary small'; del.textContent = '删除'; del.addEventListener('click', () => { if (!confirm('删除该 system 提示？')) return; settings.systemPrompts = settings.systemPrompts.filter(x => x.id !== sp.id); settings.selectedSystemIds = settings.selectedSystemIds.filter(x => x !== sp.id); renderSystemList(); saveSettingsToStorage(); });
+
+
+        controls.appendChild(chk);
+        controls.appendChild(del);
+        wrap.appendChild(ta);
+        wrap.appendChild(controls);
+        systemListEl.appendChild(wrap);
+      }
+    }
+
+
+    addSystemBtn.addEventListener('click', () => {
+      const txt = (newSystemText.value || '').trim(); if (!txt) { alert('请输入 system 提示文本'); return; }
+      const id = 'sys_' + Date.now(); settings.systemPrompts.push({ id, content: txt }); settings.selectedSystemIds.push(id); newSystemText.value = ''; renderSystemList(); saveSettingsToStorage();
+    });
+    async function loadModels() {
+      modelSelect.innerHTML = '<option value="">（使用默认配置）</option>';
+      cfgModel.innerHTML = '<option value="">（请选择备用模型）</option>';
+      try {
+        const res = await fetch('/v1/models');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const models = Array.isArray(data.data) ? data.data : [];
+        // 如果后端返回对象数组或字符串数组都支持
+        for (const m of models) {
+          const id = (m && (m.id || m)) || m;
+          const opt = document.createElement('option');
+          opt.value = id;
+          opt.textContent = id;
+          modelSelect.appendChild(opt);
+          const opt2 = opt.cloneNode(true);
+          cfgModel.appendChild(opt2);
+        }
+        // 1) 尝试恢复已保存的 settings.model
+        const saved = (settings && settings.model) ? settings.model : localStorage.getItem('chat_model');
+        if (saved) {
+          // 优先把 saved 应用到 cfgModel，如果可选，则选中；同时如果 saved 在 modelSelect 中也选中
+          for (const o of cfgModel.options) { if (o.value === saved) { cfgModel.value = saved; break; } }
+          for (const o of modelSelect.options) { if (o.value === saved) { modelSelect.value = saved; break; } }
+        } else {
+          // 没有保存，尝试默认  （若在列表中）
+          for (const o of cfgModel.options) { if (o.value === defaultModel) { cfgModel.value = defaultModel; settings.model = defaultModel; break; } }
+        }
+      } catch (e) {
+        console.warn('loadModels failed', e);
+        // 保底：确保 cfgModel 中有  选项
+        if (!Array.from(cfgModel.options).some(x => x.value === defaultModel)) {
+          const a = document.createElement('option'); a.value = defaultModel; a.textContent = defaultModel; cfgModel.appendChild(a);
+        }
+      }
+    }
+
+    sendBtn.addEventListener('click', sendCurrentMessage);
+    inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrentMessage(); } });
+
+    clearBtn.addEventListener('click', () => { if (!confirm('确认清空对话？')) return; chatHistory = []; lastAssistantPlaceholder = null; sseBuffer = ''; renderChat(); });
+
+    downloadBtn.addEventListener('click', () => { const blob = new Blob([JSON.stringify(chatHistory, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `chat_${new Date().toISOString()}.json`; a.click(); URL.revokeObjectURL(url); });
+
+    reloadModelsBtn.addEventListener('click', loadModels);
+    // Settings modal handlers
+    openSettingsBtn.addEventListener('click', () => { loadSettingsToForm(); settingsModal.style.display = 'flex'; });
+    cfgCancel.addEventListener('click', () => { settingsModal.style.display = 'none'; });
+    cfgSave.addEventListener('click', () => { saveSettingsFromForm(); settingsModal.style.display = 'none'; });
+
+    function saveSettingsToStorage() { localStorage.setItem('chat_enhanced_settings', JSON.stringify(settings)); }
+    function loadSettingsFromStorage() { try { const s = localStorage.getItem('chat_enhanced_settings'); if (s) { settings = Object.assign(settings, JSON.parse(s)); } } catch (e) { console.warn('load settings fail', e); } }
+
+    function loadSettingsToForm() { loadSettingsFromStorage(); cfgMaxTokens.value = settings.max_tokens; cfgTopp.value = settings.top_p; cfgTemp.value = settings.temperature; cfgStream.checked = !!settings.stream; cfgModel.value = settings.model || defaultModel; }
+
+    function saveSettingsFromForm() { settings.max_tokens = parseInt(cfgMaxTokens.value, 10) || 4000; settings.top_p = parseFloat(cfgTopp.value) || 1.0; settings.temperature = parseFloat(cfgTemp.value) || 0.4; settings.stream = !!cfgStream.checked; settings.model = (cfgModel.value || defaultModel).trim(); saveSettingsToStorage(); }
+
+
+    // 初始
+    loadSettingsFromStorage(); loadModels(); renderSystemList(); renderChat();
+  </script>
+</body>
+
+</html>

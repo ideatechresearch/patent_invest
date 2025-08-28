@@ -1,21 +1,20 @@
-import oss2
+import logging
 from typing import Literal
 from openai import AsyncOpenAI, BadRequestError
 
+from utils import *
 from service import *
-from agents.ai_tools import *
-from agents.ai_prompt import *
-from agents.ai_vectors import *
-from agents.ai_tasks import *
-from agents.ai_search import *
-from agents.ai_multi import *
+from agents import *
+from database import BaseReBot
 
 Function_Registry_Global: Optional[FunctionManager] = None
+
 
 def get_func_manager() -> FunctionManager:
     global Function_Registry_Global
     if Function_Registry_Global is None:
-        Function_Registry_Global = FunctionManager(keywords_registry=default_keywords_registry(), copy=True)
+        Function_Registry_Global = FunctionManager(keywords_registry=default_keywords_registry(), copy=True,
+                                                   mcp_server=mcp)
 
     return Function_Registry_Global
 
@@ -26,12 +25,14 @@ def default_keywords_registry():
         'no_func': lambda *args, **kwargs: f"[❌] Function not loaded",
         'map_search': search_amap_location,
         'web_search': web_search_async,
+        'intent_search': web_search_intent,
         'tavily_search': web_search_tavily,
         'tavily_extract': web_extract_tavily,
         'jina_extract': web_extract_jina,
-        'news_search': lambda x: web_search_tavily(x, topic='news', time_range='w'),
-        'baidu_search': lambda x: search_by_api(x, engine='baidu'),
+        'news_search': named_partial('news_search', web_search_tavily, topic='news', time_range='w'),
+        'baidu_search': named_partial('baidu_search', search_by_api, engine='baidu'),
         'wiki_search': wikipedia_search,
+        'arxiv_search': arxiv_search,
         'translate': auto_translate,
         "execute_code": execute_code_results,
         'auto_calls': ai_auto_calls,  # 名称不同，需指定调用，防止重复 ai_auto_calls
@@ -53,7 +54,6 @@ def global_function_registry(func_name: str = None) -> Union[Callable[..., Any],
     return func_manager.get_function_registered(func_name)
 
 
-
 async def ai_generate_metadata(function_code: str, metadata: dict = None, model_name=Config.DEFAULT_MODEL_METADATA,
                                description: str = None, code_type: str = "Python", **kwargs) -> dict:
     if not model_name:
@@ -72,30 +72,80 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
     content, row_id = await ai_client_completions(messages, client=None, model=model_name, get_content=True,
                                                   max_tokens=1000, temperature=0.3, **kwargs)
     if content:
-        parsed = extract_json_struct(content.strip())
+        parsed = extract_json_struct(content)
         if parsed:
             metadata = parsed
+            await BaseReBot.async_save(
+                data={"reference": BaseMysql.format_value(metadata), "transform": BaseMysql.format_value(parsed)},
+                update_fields=["reference", "transform"], row_id=row_id, dbpool=DB_Client)
         else:
-            print('metadata extract failed:', content)
+            logging.warning(f'metadata extract failed:{content}')
 
     return metadata or {}
 
 
-def agent_func_calls(agent: str, messages: list = None, model: str = None, prompt: str = None) -> List[
-    Callable[..., Any]]:  #
+def agent_func_calls(agent: str = 'default', messages: list = None,
+                     tools: list[dict] = None, keywords: list[str | tuple[str, ...]] = None, prompt: str = None,
+                     model: str = Config.DEFAULT_MODEL_FUNCTION, **kwargs) -> List[Callable[..., Any]]:
     from script.knowledge import ideatech_knowledge
+    """
+    根据 agent 类型和传入的 tools 配置，返回对应的函数调用列表
+    :param agent: 代理编号
+    :param messages: 历史对话消息
+    :param tools: 工具配置列表，每个元素为 dict，包含 'type' 和对应参数
+    :param keywords: 输入关键词列表，用于组合调用参数
+    :param model: 模型信息，可用于部分工具函数
+    :param prompt: 用户请求内容 prompt，用于某些 agent, 单独文本作为 fallback keyword
+    :return: 函数列表，每个函数为 partial 结构，可直接调用
+    """
+    items_to_process = []
+    if keywords:
+        if isinstance(keywords, list):
+            items_to_process = [item for item in keywords if isinstance(item, str)]
+    else:
+        if prompt:
+            items_to_process = [prompt]  # ','.join(keywords)
+
     callable_map_agent = {
         'default': [lambda *args, **kwargs: [], ],  # 默认返回一个空函数列表
-        '2': [named_partial('search_by_baidu', search_by_api, engine='baidu'), web_search_async],
+        '2': [named_partial('baidu_search', search_by_api, engine='baidu'), web_search_async],
         '9': [named_partial('auto_translate_baidu', auto_translate, model_name='baidu')],
         '29': [ideatech_knowledge],
         '31': [named_partial('auto_calls_any', ai_auto_calls, user_messages=messages,
-                             system_prompt=System_content.get('31'), get_messages=False)],
+                             system_prompt=System_content.get('31'), model_name=model, get_messages=False)],
         '32': [ai_auto_calls],
         '37': [web_search_async]
         # 扩展更多的 agent 类型，映射到多个函数
     }
-    return callable_map_agent.get(agent, callable_map_agent['default'])
+
+    func_calls: list[Callable[..., Any]] = callable_map_agent.get(agent, [])
+    # 如果有关键词且 func_calls 全部非空 lambda，添加一个默认函数（如意图识别）append auto func to run. ai_auto_calls
+    if keywords and all(not is_empty_lambda(_func) for _func in func_calls):  # and _func()
+        func_calls.append(web_search_intent)
+
+    tool_calls: list[Callable[..., Any]] = []  # callable_list
+    # 对每个关键词，绑定代理函数,多个 tool_calls to process items,kwargs func参数,agent控制
+    for _func in filter(callable, func_calls):
+        if is_empty_lambda(_func):
+            continue
+        tool_calls.extend([partial(_func, item, **kwargs) for item in items_to_process])
+        # print(bound_func.func.__name__, bound_func.args, bound_func.keywords,bound_func.arguments)
+
+    # 解析 tools 并绑定, 函数绑定特定的配置参数,无参数可调用函数
+    if tools:
+        # retrieval、web_search、function, https://docs.bigmodel.cn/cn/guide/tools/web-search
+        registry = default_keywords_registry()  # tool_calls.extend(convert_to_callable_list())
+        tools_params: list = get_tools_params(tools)
+        for tool_name, params in tools_params:
+            if tool_name not in registry:
+                continue
+            _func = registry[tool_name]
+            if params and isinstance(params, dict):
+                tool_calls.append(partial(_func, **params))  # 有参数的情况，直接 partial
+            else:
+                tool_calls.extend([partial(_func, item) for item in items_to_process])  # 无参数的情况，遍历每个 item
+
+    return tool_calls
 
 
 async def ideatech_visitor_records(prompt: str, customer_name: str | list | tuple, **kwargs):
@@ -318,7 +368,7 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
         print(e)
         return []
 
-    batch_size = 16  # DASHSCOPE_MAX_BATCH_SIZE = 25
+    batch_size = 10  # DASHSCOPE_MAX_BATCH_SIZE = 16,25
     has_error = False
     payload = dict(
         model=name,
@@ -330,13 +380,9 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
     client = AI_Client.get(model_info['name'], None)
     if client:  # openai.Embedding.create
         if isinstance(inputs, (list, tuple)) and len(inputs) > batch_size:
-            semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT)
-            tasks = [run_with_semaphore(client.embeddings.create, input=inputs[i:i + batch_size],
-                                        semaphore=semaphore, **payload)
-                     for i in range(0, len(inputs), batch_size)]
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
+            create_embeddings = run_togather(max_concurrent=Config.MAX_CONCURRENT, batch_size=batch_size,
+                                             input_key="input")(client.embeddings.create)
+            results = await create_embeddings(inputs=inputs, **payload)
             if not get_embedding:
                 results_data = results[0]
                 all_data = []
@@ -393,13 +439,13 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
     }
     payload["input"]: list | str = inputs
     embeddings = []
-    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    cx = get_httpx_client()
     try:
         if isinstance(inputs, (list, tuple)) and len(inputs) > batch_size:
             for i in range(0, len(inputs), batch_size):
                 batch = inputs[i:i + batch_size]
                 payload["input"] = batch  # {"texts":batch}
-                response = await cx.post(url, headers=headers, json=payload)
+                response = await cx.post(url, headers=headers, json=payload, timeout=Config.LLM_TIMEOUT_SEC)
                 response.raise_for_status()
                 data = response.json().get('data')  # "output"
                 if data and len(data) == len(batch):
@@ -430,16 +476,15 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
     return embeddings
 
 
+@async_error_logger(1)
 async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="BAAI/bge-reranker-v2-m3", model_id=0,
                       **kwargs):
     if not model_name:
         return []
-    try:
-        model_info, name = find_ai_model(model_name, model_id, 'reranker')
-    except:
-        return []
+    model_info, name = find_ai_model(model_name, model_id, 'reranker')
+
     url = model_info['reranker_url']
-    api_key = model_info['api_key']
+    api_key = model_info.get('api_key')
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {api_key}'
@@ -458,14 +503,17 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
         response = await cx.post(url, headers=headers, json=payload)
         if response.status_code == 200:
             results = response.json().get('results')
-            matches = [(match["document"]["text"] if match.get("document") else documents[match["index"]],
-                        match["relevance_score"], match["index"]) for match in results]
+            matches = [(match["document"].get("text", match["document"])
+                        if match.get("document") else documents[match["index"]],
+                        match["relevance_score"], match["index"])
+                       for match in results]
             return matches
         else:
             print(response.text)
     return []
 
 
+@async_error_logger(1)
 async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = None, model: str = 'deepseek-chat',
                                 get_content=True, tools: list[dict] = None, max_tokens=4096, top_p: float = 0.95,
                                 temperature: float = 0.1, **kwargs):
@@ -496,9 +544,11 @@ async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = 
     )
     try:
         if chat:
-            if tools and any(tools):
-                payload['tools'] = deduplicate_tools_by_name(tools)
-                # tool_choice="auto",
+            if tools:
+                filter_tools: list[dict] = deduplicate_functions_by_name(tools)
+                if any(filter_tools):  # 一旦你传了 tools 字段，它 必须 至少包含一个合法的 tool
+                    payload['tools'] = filter_tools
+                    # tool_choice="auto",
 
             completion = await client.chat.completions.create(**payload)
             row_id = await BaseReBot.async_save(model=model, messages=messages, model_response=completion.model_dump(),
@@ -524,22 +574,37 @@ async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc
 
     messages = [{"role": "system", "content": system_prompt}, {'role': 'user', 'content': user_request}]
     content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,
-                                             max_tokens=max_tokens,
-                                             temperature=temperature, **kwargs)
-    print(f'</{desc}>: {content}')
+                                             max_tokens=max_tokens, temperature=temperature, **kwargs)
+    logging.info(f'</{desc}>: {content}')
     return content.split("</think>")[-1]
 
 
-async def ai_summary(long_text: str | list[str], extract_prompt: str = None, summary_prompt: str = None,
-                     model='qwen:qwen-max', max_tokens=4096, encoding_model=Config.DEFAULT_MODEL_ENCODING,
-                     max_segment_length=1024):
+async def ai_analyze_prompts(system_prompts: list[str], results: dict | list | str, desc: str = None,
+                             model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2,
+                             max_retries: int = 2, max_concurrent: int = Config.MAX_CONCURRENT, **kwargs):
+    '''多提示词并发分析，对同一数据使用不同提示多角度生成任务,返回分析结果列表 '''
+
+    @run_togather(max_concurrent=max_concurrent, batch_size=-1)
+    async def _run(prompt: str):
+        return await ai_analyze(results, prompt, desc, model, max_tokens, temperature,
+                                max_retries=max_retries, **kwargs)
+
+    results = await _run(inputs=system_prompts)
+    return [r if not isinstance(r, Exception) else None for r in results]
+
+
+async def ai_summary(long_text: str | list[str | dict],
+                     extract_prompt: str = None, summary_prompt: str = None,
+                     extract_model='qwen:qwen-plus', summary_model='qwen:qwen-plus',
+                     encoding_model=Config.DEFAULT_MODEL_ENCODING,
+                     max_tokens=4096, max_segment_length=8192):
     tokenizer = get_tokenizer(encoding_model)
+    segments_chunk: list = []
     if isinstance(long_text, str):
         lang = lang_detect_to_trans(long_text)
         if lang == 'zh':
-            sentences = split_sentences_clean(long_text, h_symbols=True, h_tables=True)
-            segments_chunk = organize_segments_chunk(sentences, chunk_size=7, overlap_size=2,
-                                                     max_length=max_segment_length, tokenizer=tokenizer)
+            # sentences = split_sentences_clean(long_text, h_symbols=True, h_tables=True)
+            segments_chunk: list[str] = structure_aware_chunk(long_text, max_size=max_segment_length)
         else:
             tokens = tokenizer.encode(long_text)
             small_chunks, large_chunks = organize_segments(tokens,
@@ -548,29 +613,42 @@ async def ai_summary(long_text: str | list[str], extract_prompt: str = None, sum
                                                            overlap=max(20, int(max_segment_length * 0.04)))
             segments_chunk = [tokenizer.decode(chunk) for chunk in large_chunks if chunk]
 
-    else:
-        segments_chunk = organize_segments_chunk(long_text, chunk_size=7, overlap_size=2,
-                                                 max_length=max_segment_length, tokenizer=tokenizer)
+    elif isinstance(long_text, list):
+        if all(isinstance(x, str) for x in long_text):
+            segments_chunk: list[list[str]] = organize_segments_chunk(long_text, chunk_size=7, overlap_size=2,
+                                                                      max_length=max_segment_length,
+                                                                      tokenizer=tokenizer)
+        if all(isinstance(x, dict) for x in long_text):
+            segments_chunk: list[list[dict]] = list(
+                df2doc_split(long_text, max_tokens=max_segment_length, tokenizer=tokenizer))
 
-    async def extract_item(segment: list | str, i: int):
-        content = '\n\n'.join(segment) if isinstance(segment, list) else segment
+    if not segments_chunk:
+        raise ValueError("long_text 必须是 str 或 list[str|dict]")
+
+    if not summary_prompt:
+        summary_prompt = '你是总结助手，请根据以下多个信息片段进行归纳总结，提炼主旨、关键事件或共同规律。如片段内容存在重复或上下文重叠，可适当整合。'
+    else:
+        if not extract_prompt:
+            extract_prompt = '你是信息摘要助手，请提炼以下关键信息:\n' + summary_prompt
+
+    @run_togather(max_concurrent=Config.MAX_CONCURRENT, batch_size=-1)
+    async def extract_item(data: tuple[int, list | str]):
+        i, segment = data
+        content = format_content_str(segment, exclude_null=True)
+
         if lang_token_size(content, tokenizer=tokenizer) > max_segment_length // 2:
             messages = [{"role": "system",
                          "content": extract_prompt or '你是信息摘要助手，请提炼以下文本中的关键信息、数据或事件。'},
                         {'role': 'user', 'content': content}]
-            content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,
+            content, _ = await ai_client_completions(messages, client=None, model=extract_model, get_content=True,
                                                      max_tokens=max_segment_length // 2, temperature=0.3)
         print(segment, '>', content)
         return {'seq': i, 'extract': content}
 
-    semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT)
-    tasks = [run_with_semaphore(extract_item, chunk, i, semaphore=semaphore)
-             for i, chunk in enumerate(segments_chunk) if chunk]
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    raw_results = await extract_item(inputs=[(i, chunk) for i, chunk in enumerate(segments_chunk) if chunk])
     results = [r for r in raw_results if isinstance(r, dict)]
-    summary = await ai_analyze(results,
-                               system_prompt=summary_prompt or '你是总结助手，请根据以下多个信息片段进行归纳总结，提炼主旨、关键事件或共同规律。如片段内容存在重复或上下文重叠，可适当整合。',
-                               desc='信息片段', model=model, max_tokens=max_tokens)
+    summary = await ai_analyze(results, system_prompt=summary_prompt, desc='信息片段', model=summary_model,
+                               max_tokens=max_tokens)
 
     return {'chunks': results, 'summary': summary}
 
@@ -682,87 +760,51 @@ async def openai_ollama_chat_completions(messages: list, model_name="qwen3:14b",
 
 
 # retriever
-async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple[str, ...]]] = None,
-                              tool_calls: List[Callable[[...], Any]] = None, **kwargs):
+async def retrieved_reference(keywords: List[Union[str, Tuple[str, ...]]] = None,
+                              tool_calls: List[Callable[[...], Any]] = None):
     """
       根据用户请求和关键字调用多个工具函数，并返回处理结果。
 
-      :param user_request: 用户请求内容。
       :param keywords: 关键字列表，可以是字符串或元组（函数名, 参数）。
       :param tool_calls: 工具函数列表。
-      :param kwargs: 其他关键字参数。
       :return: 处理结果的扁平化列表。
     """
     # docs = retriever(question)
     # Assume this is the document retrieved from RAG
     # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
-    tool_calls = tool_calls or []  # callable_list
-    items_to_process = []
-    callables = {}  # []
-    tasks = []  # asyncio.create_task(),创建任务对象并将其加入任务列表
+    tool_calls = tool_calls or []
+    keywords = keywords or []
+    callables = {}
+    # 多个keywords,用在registry list 的 user_calls,自定义func参数
+    for item in keywords:
+        if isinstance(item, tuple):  # (函数名,无参,单个参数,多个位置参数列表,关键字参数字典)
+            try:
+                tool_name = item[0]
+                _func = global_function_registry(tool_name)  # user_calls 函数
+                if _func:
+                    func_args = item[1] if len(item) > 1 else []
+                    func_kwargs = item[2] if len(item) > 2 else {}
+                    callable_key = generate_hash_key(id(_func), func_args, **func_kwargs)
+                    bound_func = partial(_func, *func_args, **func_kwargs)
+                    callables[callable_key] = bound_func
+                    # callables.append((_func, func_args, func_kwargs)))
+            except TypeError as e:
+                logging.error(f"类型错误: {e},{item}")
+            except Exception as e:
+                logging.error(f"其他错误: {e},{item}")
 
-    if not keywords:
-        if user_request:
-            items_to_process = [user_request]  # ','.join(keywords)
-    else:
-        if all(not is_empty_lambda(_func) for _func in tool_calls):  # and _func()
-            tool_calls.append(web_search_async)  # append auto func to run. ai_auto_calls
-        # 多个keywords,用在registry list 的 user_calls,自定义func参数
-        for item in keywords:
-            if isinstance(item, tuple):  # (函数名,无参,单个参数,多个位置参数列表,关键字参数字典)
-                try:
-                    tool_name = item[0]
-                    _func = global_function_registry(tool_name)  # user_calls 函数
-                    if _func:
-                        # if len(item) == 1:
-                        #     callables.append((_func, [], {}))
-                        func_args = []
-                        func_kwargs = {}
-                        for _arg in item[1:]:
-                            if isinstance(_arg, dict):  # 处理关键字参数
-                                if "params" in _arg:
-                                    func_kwargs.update(_arg["params"])
-                                else:
-                                    func_kwargs.update(_arg)  # 将 dict 转换为可哈希类型frozenset(_arg.items())
-                            elif isinstance(_arg, (list, tuple)):  # 处理多个位置参数
-                                func_args.extend(_arg)
-                            else:  # (函数名, 单个参数)
-                                func_args.append(_arg)  # 剩下的参数[_arg]
-
-                        callable_key = generate_hash_key(id(_func), func_args, **func_kwargs)
-                        bound_func = partial(_func, *func_args, **func_kwargs)
-                        callables[callable_key] = bound_func
-                        # callables.append((_func, func_args, func_kwargs)))
-                    # else:
-                    #     tool_calls.extend(convert_to_callable_list(tools_list))
-                    #     _func = global_function_registry(tool_name)
-                    #     config=item[1]global_function_registry
-                    #     if _func:
-                    #         tool_calls.append(partial(_func, **config))  # 函数绑定特定的配置参数,无参数可调用函数
-                except TypeError as e:
-                    print(f"类型错误: {e},{item}")
-                except Exception as e:
-                    print(f"其他错误: {e},{item}")
-
-            else:  # isinstance(keyword, str)
-                items_to_process.append(item)  # keyword
-
-    # 多个tool_calls to process items,kwargs func参数,agent控制
-    for _func in filter(callable, tool_calls):
-        if _func.__name__ == '<lambda>' and _func() == []:  # empty_lambda
-            continue
-        for item in items_to_process:
-            callable_key = generate_hash_key(id(_func), item, **kwargs)
-            bound_func = partial(_func, item, **kwargs)
+    for bound_func in filter(callable, tool_calls):
+        if isinstance(bound_func, partial):
+            callable_key = generate_hash_key(id(bound_func), bound_func.args, **bound_func.keywords)
             callables[callable_key] = bound_func
-            # print(bound_func.func.__name__, bound_func.args, bound_func.keywords)
-            # if inspect.iscoroutinefunction(_func):
-            #     tasks.append(_func(item, **kwargs))
-            # else:
-            #     tasks.append(wrap_sync(_func, item, **kwargs))
+            logging.info(f"{bound_func.func.__name__} with args: {bound_func.args}, kwargs: {bound_func.keywords}")
+        else:
+            func_name = getattr(bound_func, "__name__", type(bound_func).__name__)
+            logging.warning(f"{func_name}(not partial)")
 
     # print(callables)
+    tasks = []  # asyncio.create_task(),创建任务对象并将其加入任务列表
     for _key, bound_func in callables.items():
         if inspect.iscoroutinefunction(bound_func.func):
             tasks.append(bound_func())  # 添加异步函数任务，同时传递kwargs
@@ -774,13 +816,13 @@ async def retrieved_reference(user_request: str, keywords: List[Union[str, Tuple
     err_count = 0
     for t, r in zip(tasks, refer):
         if isinstance(r, Exception):
-            print(f"Task {t.__name__} failed with error: {r}")
+            logging.error(f"Task {t.__name__} failed with error: {r}")
             err_count += 1
         elif not r:
-            print(f"Task returned empty result: {t}")
+            logging.warning(f"Task returned empty result: {t}")
 
     if err_count:
-        print(callables, refer)
+        logging.error(callables, refer)
     # 展平嵌套结果,(result.items() if isinstance(result, dict) else result)
     return [item for result in refer if not isinstance(result, Exception)
             for item in (result if isinstance(result, list) else [result])]
@@ -839,9 +881,9 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
             messages = [{"role": "system", "content": system}]
         messages.append({'role': 'user', 'content': user_request})
 
-    tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent, messages)  # .extend
+    tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent, messages, tools, keywords, user_request)
 
-    refer = await retrieved_reference(user_request, keywords, tool_callable, **kwargs)
+    refer = await retrieved_reference(keywords, tool_callable)
     if refer:
         # """Answer the users question using only the provided information below:{docs}""".format(docs=formatted_refer)
         if model_type != 'baidu':
@@ -871,16 +913,26 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
         # extra_body = {"prefix": "```python\n", "suffix":"后缀内容"} 希望的前缀内容,基于用户提供的前缀信息来补全其余的内容
         # response_format={"type": "json_object"}
     )
+    payload.update(kwargs)
 
-    if tools and any(tools):  # 一旦你传了 tools 字段，它 必须 至少包含一个合法的 tool
-        payload['tools'] = tools  # retrieval、web_search、function
+    if tools:
+        filter_tools: list[dict] = deduplicate_functions_by_name(tools)
+        if any(filter_tools):  # 一旦你传了 tools 字段，它 必须 至少包含一个合法的 tool
+            payload['tools'] = filter_tools
+
     if model_type == 'baidu':
         payload['system'] = system
-    if model_info['name'] == 'qwen':
-        payload['extra_body'] = {"enable_thinking": False}  # 开启深度思考
+
     if name in ('o3-mini', 'o4-mini'):
         payload['max_completion_tokens'] = payload.pop('max_tokens', max_tokens)
         payload.pop('top_p', None)
+    if name in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b", "qwq-32b", "qwen-turbo", "qwen-plus"):
+        payload['extra_body'] = {"enable_thinking": False}  # 开启深度思考
+    if name in ("qwen-mt-plus", "qwen-mt-turbo"):
+        payload['extra_body'] = {"translation_options": {
+            "source_lang": "auto",
+            "target_lang": "English"}
+        }
 
     # 1. 系统设定（system）
     # 2. 原始提问（user）
@@ -962,9 +1014,9 @@ async def get_generate_payload(prompt: str, user_request: str = '', suffix: str 
                                                             agent=agent, tools=None, keywords=keywords, **kwargs)
 
     else:
-        tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent)
+        tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent, keywords=keywords, prompt=user_request)
         # 检索参考资料
-        refer = await retrieved_reference(user_request, keywords, tool_callable, **kwargs)
+        refer = await retrieved_reference(keywords, tool_callable)
         # 如果检索到内容，就把它拼到 user_request 里
         if refer:
             formatted_refer = "\n".join(map(str, refer))
@@ -1002,8 +1054,8 @@ async def ai_generate(model_info: Optional[Dict[str, Any]], payload: dict = None
     if 'messages' in payload:
         if stream:
             async def stream_data():
-                async for chunk in ai_chat_stream(model_info, payload, get_content):
-                    yield chunk
+                async for content, data in ai_chat_stream(model_info, payload):
+                    yield content if get_content else data
 
             return stream_data()
         else:
@@ -1139,7 +1191,7 @@ async def ai_try(client, payload: dict, e: Exception, get_content: bool = True):
     except Exception:
         error_message = str(e)
 
-    print("[BadRequestError] 捕获错误消息：", error_message)
+    logging.error(f"[BadRequestError] 捕获错误消息：{error_message}")
 
     stream_required_phrases = [
         "only support stream mode",
@@ -1210,7 +1262,7 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
             except:
                 raise
         except Exception as e:
-            print("OpenAI error:", e, payload)
+            logging.error(f"OpenAI error:{e}, {payload}")
             error_message = f"OpenAI error occurred: {e}"
             if get_content:
                 return error_message
@@ -1245,9 +1297,9 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
         # d.get('Choices')[0].get('Message').get('Content')
         'default': lambda d: d.get('choices', [{}])[0].get('message', {}).get('content')
     }
-    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    cx = get_httpx_client(proxy=Config.HTTP_Proxy if model_info.get('proxy') else None)
     try:
-        response = await cx.post(url, headers=headers, json=payload)
+        response = await cx.post(url, headers=headers, json=payload, timeout=Config.LLM_TIMEOUT_SEC)
         response.raise_for_status()  # 如果请求失败，则抛出异常
         data = response.json()
         if get_content:
@@ -1277,18 +1329,25 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
 
     except Exception as e:
         # print(response.text)
-        return f"HTTP error occurred: {e},{response.text}"
+        return f"HTTP error occurred: {e}"
 
 
-async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, get_content=True, **kwargs):
+async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, **kwargs):
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
         # payload=copy(payload)
         payload.update(kwargs)
 
+    fake_response = {
+        "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": payload.get("model", "unknown"),
+        "choices": [{"index": 0, "delta": {"content": 'null'}, "finish_reason": "stop"}],
+    }
     payload["stream"] = True
-    payload["extra_body"] = {"enable_thinking": True}
+    if payload["model"] in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b",
+                            "qwq-32b", "qwen-turbo", "qwen-plus"):
+        payload["extra_body"] = {"enable_thinking": True}
     client = AI_Client.get(model_info['name'], None)
     # print(payload, client)
     if client:
@@ -1299,33 +1358,29 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, get
             if not hasattr(stream, "__aiter__"):
                 raise TypeError("OpenAI API returned a non-streaming response")
             has_content = False
-            async for chunk in stream:  # for chunk in stream
+            async for chunk in stream:
                 if not chunk:
                     continue
+                if not chunk.choices:  # 若 choices 为空但包含 usage，说明是 stream 末尾数据
+                    yield None, chunk.model_dump_json()  # '[DONE]' usage
+                    break
                 has_content = True
-                if get_content:
-                    delta = chunk.choices[0].delta
-                    if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                        yield delta.content
-                    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                        yield delta.reasoning_content
-                else:
-                    yield chunk.model_dump_json()  # 获取字节流数据
+
+                delta = chunk.choices[0].delta
+                content = delta.content  # 以两个换行符 \n\n 结束当前传输的数据块
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                    content = delta.reasoning_content
+
+                yield content, chunk.model_dump_json()  # 获取字节流数据
 
             if not has_content:
                 raise ValueError("OpenAI API returned an empty stream")
         except Exception as e:
-            print("OpenAI error:", e, payload)
+            logging.error(f"OpenAI error:{e}, {payload}")
             error_message = f"OpenAI error occurred: {e}"
-            fake_response = {
-                "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk",
-                "created": int(time.time()), "model": payload.get("model", "unknown"),
-                "choices": [
-                    {"index": 0, "delta": {"content": error_message}, "finish_reason": "stop"}],
-            }
-            yield error_message if get_content else json.dumps(fake_response)
+            fake_response["choices"][0]["delta"]["content"] = error_message
+            yield error_message, json.dumps(fake_response)
 
-            # yield '[DONE]'
             # with client.chat.completions.with_streaming_response.create(**payload) as response:
             #     print(response.headers.get("X-My-Header"))
             #     for line in response.iter_lines():
@@ -1334,74 +1389,45 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, get
         return  # 异步生成器的结束无需返回值
 
     url, headers, payload = get_chat_payload_post(model_info, payload)
-    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
-    try:
-        async with cx.stream("POST", url, headers=headers, json=payload) as response:
-            response.raise_for_status()
-            async for content in process_line_stream(response, model_info['type']):
-                # print(chunk["choices"][0]["delta"].get("content", ""), end="", flush=True)
-                yield content
-    except httpx.RequestError as e:
-        yield str(e)
+    cx = get_httpx_client(proxy=Config.HTTP_Proxy if model_info.get('proxy') else None)
+    model_type = model_info['type']
+    async for item in post_httpx_sse(url, payload, headers, Config.LLM_TIMEOUT_SEC, cx):
+        data_type = item.get("type")
+        if data_type == 'done':
+            break
+
+        data = item.get("data", None)
+        if not data:
+            continue
+
+        if data_type != "data":
+            # text / error 直接返回原始字符串 yield
+            content = f"OpenAI error occurred: {data}" if data_type == "error" else data
+            fake_response["choices"][0]["delta"]["content"] = content
+            yield data, json.dumps(fake_response)
+            print(item)
+            continue
+
+        if model_type == 'baidu':
+            if data.get('is_end') is True:
+                break
+            content = data.get("result") or data.get("error_msg")
+            fake_response["choices"][0]["delta"]["content"] = content
+            yield content, json.dumps(fake_response)
+        elif model_type == 'tencent':
+            reason = data.get('Choices', [{}])[0].get('FinishReason')
+            if reason == "stop":
+                # raise StopIteration(2)
+                break
+            data = convert_keys_to_lower_case(data)
+
+        choices = data.get('choices', [])  # 通用逻辑：处理 choices -> delta -> content
+        if choices:
+            delta = choices[0].get('delta', {})
+            yield delta.get("content", ""), json.dumps(data)
+            # print(delta.get("content", ""), end="", flush=True)
 
     # yield "[DONE]"
-
-
-async def process_line_stream(response, model_type='default'):
-    def process_data_chunk(data):
-        try:
-            chunk = json.loads(data)
-
-            if model_type == 'baidu':  # line.decode("UTF-8")
-                return chunk.get("result") or chunk.get("error_msg")
-            else:
-                if model_type == 'tencent':
-                    chunk = convert_keys_to_lower_case(chunk)
-
-                choices = chunk.get('choices', [])
-                if choices:
-                    delta = choices[0].get('delta', {})
-                    return delta.get("content")
-
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            return str(e)
-        return None
-
-    data = ""
-    async for line in response.aiter_lines():
-        # print(line)
-        line = line.strip()
-        if len(line) == 0:  # 开头的行 not line
-            if data:
-                yield process_data_chunk(data)  # 一个数据块的结束 yield from + '\n'
-                data = ""
-            continue
-        if line.startswith("data: "):
-            line_data = line.lstrip("data: ")
-            if line_data == "[DONE]":
-                # if data:
-                #     yield process_data_chunk(data)
-                # print(data)
-                break
-            if model_type == 'tencent':
-                chunk = json.loads(line_data)
-                reason = chunk.get('Choices', [{}])[0].get('FinishReason')
-                if reason == "stop":
-                    # raise StopIteration(2)
-                    break
-            elif model_type == 'baidu':
-                chunk = json.loads(line_data)
-                if chunk.get('is_end') is True:
-                    break
-
-            content = process_data_chunk(line_data)
-            if content:
-                yield content
-        else:
-            data += "\n" + line
-
-    if data:
-        yield process_data_chunk(data)
 
 
 async def forward_stream(response):
@@ -1791,14 +1817,50 @@ async def siliconflow_generate_image(prompt: str = '', negative_prompt: str = ''
         "Authorization": f"Bearer {Config.Silicon_Service_Key}",
         "Content-Type": "application/json"
     }
-    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
-    response = await cx.post(url, headers=headers, json=payload)
+    cx = get_httpx_client()
+    response = await cx.post(url, headers=headers, json=payload, timeout=Config.LLM_TIMEOUT_SEC)
     response.raise_for_status()
     if response.status_code != 200:
         return None, {'error': f'{response.status_code},Request failed,Response content: {response.text}'}
 
     response_data = response.json()
     return None, {"urls": [i['url'] for i in response_data["images"]], 'id': response_data["seed"]}
+
+
+@mcp.tool
+async def generate_summary(content: str, ctx: MCPContext) -> str:
+    """Generate a summary of the provided content."""
+    prompt = f"Please provide a concise summary of the following content:\n\n{content}"
+
+    response = await ctx.sample(prompt)
+    return response.text
+
+
+@mcp.tool
+async def generate_code_example(concept: str, ctx: MCPContext) -> str:
+    """Generate a Python code example for a given concept."""
+    response = await ctx.sample(
+        messages=f"Write a simple Python code example demonstrating '{concept}'.",
+        system_prompt="You are an expert Python programmer. Provide concise, working code examples without explanations.",
+        temperature=0.7,
+        max_tokens=300
+    )
+
+    code_example = response.text
+    return f"```python\n{code_example}\n```"
+
+
+@mcp.tool
+async def technical_analysis(data: str, ctx: MCPContext) -> str:
+    """Perform technical analysis with a reasoning-focused model."""
+    response = await ctx.sample(
+        messages=f"Analyze this technical data and provide insights: {data}",
+        model_preferences=["claude-3-opus", "gpt-4"],  # Prefer reasoning models
+        temperature=0.2,  # Low randomness for consistency
+        max_tokens=800
+    )
+
+    return response.text
 
 
 async def baidu_nlp(text: str | list[str] = None, nlp_type='ecnet', **kwargs):  # text': text
@@ -1897,79 +1959,8 @@ def dashscope_file_upload(messages, file_path='.pdf', api_key=Config.DashScope_S
         return {"error": str(e)}, None
 
 
-def upload_file_to_oss(bucket, file_obj, object_name, expires: int = 604800):
-    """
-      上传文件到 OSS 支持 `io` 对象。
-      :param bucket: OSS bucket 实例
-      :param file_obj: 文件对象，可以是 `io.BytesIO` 或 `io.BufferedReader`
-      :param object_name: OSS 中的对象名
-      :param expires: 签名有效期，默认一周（秒）
-    """
-    file_obj.seek(0, os.SEEK_END)
-    total_size = file_obj.tell()  # os.path.getsize(file_path)
-    file_obj.seek(0)
-    if total_size > 1024 * 1024 * 16:
-        part_size = oss2.determine_part_size(total_size, preferred_size=128 * 1024)
-        upload_id = bucket.init_multipart_upload(object_name).upload_id
-        parts = []
-        part_number = 1
-        offset = 0
-        while offset < total_size:
-            size_to_upload = min(part_size, total_size - offset)
-            result = bucket.upload_part(object_name, upload_id, part_number,
-                                        oss2.SizedFileAdapter(file_obj, size_to_upload))
-            parts.append(oss2.models.PartInfo(part_number, result.etag, size=size_to_upload, part_crc=result.crc))
-            offset += size_to_upload
-            part_number += 1
-
-        # 完成分片上传
-        bucket.complete_multipart_upload(object_name, upload_id, parts)
-    else:
-        # OSS 上的存储路径, 本地图片路径
-        bucket.put_object(object_name, file_obj)
-        # bucket.put_object_from_file(object_name, str(file_path))
-
-    if 0 < expires <= 604800:  # 如果签名signed_URL
-        url = bucket.sign_url("GET", object_name, expires=expires)
-    else:  # 使用加速域名
-        url = f"{Config.ALIYUN_Bucket_Domain}/{object_name}"
-        # bucket.bucket_name
-    # 获取文件对象
-    # result = bucket.get_object(object_name)
-    # result.read()获取文件的二进制内容,result.headers元数据（头部信息）
-    return url
-
-
-# 获取文件列表
-def oss_list_files(bucket, prefix='upload/', max_keys=100, max_pages=1):
-    """
-    列出 OSS 中的文件。
-    :param bucket: oss2.Bucket 实例
-    :param prefix: 文件名前缀，用于筛选
-    :param max_keys: 每次返回的最大数量
-    :return: 文件名列表
-    """
-    file_list = []
-    if max_pages <= 1:
-        for obj in oss2.ObjectIterator(bucket, prefix=prefix, max_keys=max_keys):
-            file_list.append(obj.key)
-    else:
-        i = 0
-        next_marker = ''
-        while i < max_pages:
-            result = bucket.list_objects(prefix=prefix, max_keys=max_keys, marker=next_marker)
-            for obj in result.object_list:
-                file_list.append(obj.key)
-            if not result.is_truncated:  # 如果没有更多数据，退出循环
-                break
-            next_marker = result.next_marker
-            i += 1
-
-    return file_list
-
-
 async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
-                        in_decode=False, in_session=False, retries=3, delay=3):
+                        in_decode=False, in_session=False, retries=3, delay=3, time_out=Config.HTTP_TIMEOUT_SEC):
     """
     下载URL中的文件到目标文件夹
     :param url: 下载链接
@@ -1979,6 +1970,7 @@ async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
     :param in_session: 是否使用 session（长连接优化）
     :param retries: 下载失败后的重试次数
     :param delay: 重试之间的等待时间（秒）
+    :param time_out: 超时时间（秒）
     """
     # filename = url.split("/")[-1]  # 提取文件名
     file_name = unquote(url.split("/")[-1].split("?")[0])
@@ -1991,18 +1983,22 @@ async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
     while attempt < retries:
         try:
             if in_session:  # aiohttp长连接优化，适合发送多个请求或需要更好的连接复用,维护多个请求之间的连接
-                return await download_by_aiohttp(url, save_path, chunk_size, in_decode), file_name
+                timeout = aiohttp.ClientTimeout(total=time_out) if time_out > 0 else None
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await download_by_aiohttp(url, session, save_path, chunk_size, in_decode), file_name
             else:  # httpx少量请求场景,适合简单的、单个请求场景
-                return await download_by_httpx(url, save_path, chunk_size, in_decode), file_name
+                timeout = httpx.Timeout(time_out) if time_out > 0 else None
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    return await download_by_httpx(url, client, save_path, chunk_size, in_decode), file_name
 
-        except (httpx.RequestError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (httpx.RequestError, aiohttp.ClientError, asyncio.TimeoutError, requests.Timeout) as e:
             print(f"Download attempt {attempt + 1} failed: {e}")
             attempt += 1
             await asyncio.sleep(delay)  # 等待重试
         except httpx.HTTPStatusError as exc:
             print(f"Failed to download {url},HTTP error occurred: {exc.response.status_code} - {exc.response.text}")
         except TypeError:
-            return download_by_requests(url, save_path, chunk_size, in_decode), file_name
+            return download_by_requests(url, save_path, chunk_size, in_decode, time_out), file_name
         except Exception as e:
             print(f"Error: {e}, downloading url: {url} file: {file_name}")
             break
@@ -2021,14 +2017,14 @@ async def send_to_wechat(user_name: str, context: str = None, link: str = None, 
         response = await cx.post(url, json=body, headers=headers)
         response.raise_for_status()
         return response.json()
-        # with httpx.Client(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        #     response = cx.post(url, json=body, headers=headers)
-        #     response.raise_for_status()
-        # return response.json()
 
     except Exception as e:
         print('send_to_wechat', datetime.now(), body)
         print(f"Error occurred while sending message: {e}")
+        # with httpx.Client(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        #     response = cx.post(url, json=body, headers=headers)
+        #     response.raise_for_status()
+        # return response.json()
 
     return None
 
@@ -2062,23 +2058,27 @@ async def send_callback(callback_data: dict, result, **kwargs):
     payload = apply_mapping(payload)
     headers = callback_data.get("headers") or {}
     params = callback_data.get("params")
+    timeout = Config.HTTP_TIMEOUT_SEC
     if params and isinstance(params, dict):
+        timeout = params.pop("timeout", timeout)
         kwargs.update(params)
 
     res = None
     format_type = callback_data.get("format", 'json').lower()  # "query" or "json" form"
-    if format_type == "json":
-        res = await post_http_json(url, json=payload, headers=headers, time_out=Config.HTTP_TIMEOUT_SEC, **kwargs)
-    if format_type == "query":  # query 参数或表单参数
-        query_payload = filter_payload(payload)
-        print(query_payload)
-        res = await get_http_query(url, params=query_payload, headers=headers, time_out=Config.HTTP_TIMEOUT_SEC)
-    if format_type == "form":  # 支持 query 或 form
-        res = await post_http_form(url, data=payload, headers=headers, time_out=Config.HTTP_TIMEOUT_SEC)
 
-    if res and res.get('error'):
-        return await post_http_json(fallback_url, json=payload, headers=headers, **kwargs)
-    return res
+    async with aiohttp.ClientSession() as session:
+        if format_type == "json":  # post_http_json
+            res = await aiohttp_request("POST", url, session, json=payload, headers=headers, timeout=timeout, **kwargs)
+        elif format_type == "query":  # get_http_query query 参数或表单参数
+            query_payload = filter_payload(payload)
+            res = await aiohttp_request("GET", url, session, params=query_payload, headers=headers, timeout=timeout)
+        elif format_type == "form":  # post_http_form 支持 query 或 form
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            res = await aiohttp_request("POST", url, session, data=payload, headers=headers, timeout=timeout)
+
+        if res and res.get('error'):
+            return await aiohttp_request("POST", fallback_url, session, json=payload, headers=headers, **kwargs)
+        return res
 
 
 if __name__ == "__main__":

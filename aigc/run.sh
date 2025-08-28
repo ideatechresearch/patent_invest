@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e  # 脚本中遇到错误就退出
-AIGC_DEBUG=${AIGC_DEBUG:-true}#如果没有设置，默认关闭 debug
+AIGC_DEBUG=${AIGC_DEBUG:-true} # 如果没有设置，默认关闭 debug
 
 echo "Running with AIGC_DEBUG=$AIGC_DEBUG"
 # 拷贝 requirements.txt

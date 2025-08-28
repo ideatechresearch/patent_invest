@@ -1,3 +1,5 @@
+import time
+
 from fastapi import APIRouter
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -9,9 +11,8 @@ search_router = APIRouter()
 @search_router.get('/search_points')
 async def search_embeddings_points(batch_no: str,
                                    querys: Union[str, List[str]] = Query(None, description="查询语句，一个或多个"),
-                                   reranker: Optional[Literal['KeyWord', 'BM25', 'Hybrid', 'LLM']] = None,
-                                   topn: int = 30, score_threshold: float = 0.0,
-                                   payload_key: Optional[str] = None):
+                                   reranker: Optional[Literal['KeyWord', 'BM25', 'Hybrid', 'Hybrid_LLM', 'LLM']] = None,
+                                   topn: int = 30, score_threshold: float = 0.0, model: str = 'qwen-plus'):
     # {'text': chunk, 'chunk_id': i, 'batch_no': batch_no, 'desc': origin_question}
 
     if not querys:
@@ -29,17 +30,18 @@ async def search_embeddings_points(batch_no: str,
     match = field_match(field_key='batch_no', match_values=batch_no)
     not_match = field_match(field_key='desc', match_values='整体风险与运营状况总结')
     search_hit = await search_by_embeddings(tokens, Collection_Name, client=qd_client, emb_client=emb_client,
-                                            model=MODEL_EMBEDDING, payload_key=payload_key,
+                                            model=MODEL_EMBEDDING, payload_key=['text', 'desc'],
                                             match=match, not_match=not_match,
                                             topn=topn, score_threshold=score_threshold, exact=False, get_dict=True)
     if not reranker:
         return {'search_hit': search_hit}
 
+    question_content = await dbop.run(
+        "SELECT origin_question,content FROM task_question_content WHERE batch_no=%s", (batch_no,))
+
     if reranker == 'KeyWord':
-        question_content = await dbop.run(
-            "SELECT id,origin_question,content FROM task_question_content WHERE batch_no=%s", (batch_no,))
         segments = [p.get("content", '') for p in question_content]
-        corpus = [para for doc in segments for para in doc.split('\n\n') if para.strip()]
+        corpus = [para for doc in segments for para in doc.split('\n\n---\n\n') if para.strip()]
         results = []
         bm25 = BM25(corpus)
         for token in tokens:
@@ -84,17 +86,31 @@ async def search_embeddings_points(batch_no: str,
     final_score = α * dense_similarity + (1 - α) * sparse_score
     '''
 
-    system_prompt = SYS_PROMPT.get('search_prompt')
     #  3. 如果某些文本明显无关、重复度过高，或者仅是模板性描述，可直接排除。
+    if reranker == 'Hybrid_LLM':
+        system_prompt = SYS_PROMPT.get('search_prompt')
+        corpus = search_hit
+    else:
+        system_prompt = SYS_PROMPT.get('search_prompt2')
+        corpus = [(p.get('origin_question'), p.get("content", '').split('\n\n---\n\n')) for p in question_content]
+        print(corpus)
+
+        # corpus = corpus * 5
+        # qwen-plus:18862(14390+2476),75448(56188+1758),150896(111896+2078)
+        # qwen-long:113172(84042+4155),188620(139733+1610),943100(696813+1731)
+        # deepseek-chat:75448(47700+2906) 158,94310
+        print(sum([len(y) for x in corpus for y in x[1]]), sum(len(p.get("content", '')) for p in question_content))
 
     desc = (f'请根据以上规则处理，并返回一个 JSON 数组（保留{topn}个相关结果并重排）。数据如下：'
-            f'\nquerys: {tokens}\nsearch_hit')
-    result = await ai_analyze(system_prompt, search_hit, client=ai_client, desc=desc,
-                              model='deepseek-chat', max_tokens=8192, temperature=0.2, top_p=0.85)
-
+            f'\nquery: {tokens}\nsearch_hit')
+    x = time.time()
+    result = await ai_analyze(system_prompt, corpus, client=emb_client, desc=desc,
+                              model=model, max_tokens=8192, temperature=0.2, top_p=0.85)
+    print(time.time() - x)
     parsed = extract_json_array(result)
-    similar_list = [s.strip() for s in parsed if isinstance(s, str) and s.strip()] if isinstance(parsed, list) else []
-    return JSONResponse(content={'similar_list': similar_list, 'search_hit': search_hit})
+    reranker_list = [d.strip() if isinstance(d, str) else d for d in parsed] if isinstance(parsed, list) else []
+
+    return JSONResponse(content={'similar_list': reranker_list, 'search_hit': search_hit})
 
 
 @search_router.get('/get_origin')

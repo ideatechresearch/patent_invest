@@ -1,19 +1,30 @@
 from typing import Callable, Dict, Any, Optional, Union, List, Tuple
-from utils import *
-from service import get_redis, get_redis_retry, scan_from_redis, do_job_by_lock
+from functools import partial, wraps
+import asyncio
+import json
+from utils import fix_indentation, remove_function_decorators, generate_hash_key, extract_function_metadata, \
+    functions_registry, extract_method_calls, safe_eval_call, run_with_async, run_with_semaphore, \
+    description_tools, strip_kwargs_wrapper
+from service import get_redis, get_redis_retry, scan_from_redis, run_with_lock, run_togather, distributed_lock, FastMCP
 from config import Config
 
 
 class FunctionManager:
     _meta_store: Dict[str, dict] = {}  # Function_MetaData_Store cache_func_key:cached_metadata
     global_registry: Dict[str, Callable[..., Any]] = {}  # 全局标准函数注册表（自动加载模块）Function_Registry_Global
+    mcp_server: Optional[FastMCP] = None
     key_meta = "funcmeta"
 
-    def __init__(self, keywords_registry: Dict[str, Callable] = None, copy=True, user='local'):
+    def __init__(self, keywords_registry: Dict[str, Callable] = None, copy=True,
+                 mcp_server: FastMCP = None, user='local'):
         """外部手动注册函数表"""
         self.registry_key = f"registry:{user}"
         self.registry_meta: Dict[str, dict] = {}  # 缓存函数元数据 function_name:metadata
-        self.keywords_registry: Dict[str, Callable[..., Any]] = keywords_registry or {}
+        self.keywords_registry: Dict[str, Callable[..., Any]] = keywords_registry or {}  # handlers
+        if mcp_server:
+            self.__class__.mcp_server = mcp_server
+            print('Mcp_Server:', self.mcp_server)
+
         # 动态性延迟加载,全局注册表初始化,调用可能需要确定某些参数
         if not self.__class__.global_registry:
             for m, f in Registry_Module.items():
@@ -28,14 +39,34 @@ class FunctionManager:
         self.keywords_registry.update(keywords_registry or {})  # 合并 keywords 映射
 
     @classmethod
+    async def get_mcp_tools(cls) -> dict:
+        return await cls.mcp_server.get_tools() if cls.mcp_server else {}
+
+    @classmethod
     def register(cls, func: Callable):
-        cls.global_registry[func.__name__] = func
+        name = func.__name__
+        cls.global_registry[name] = func
+        if cls.mcp_server:
+            cls.mcp_server.tool(func, name=name)
         return func
 
     @classmethod
     def set_registry_global(cls, functions_list: list, module_name: str | list = None):
         cls.global_registry.update(functions_registry(functions_list=functions_list,
                                                       module_name=None if module_name == 'default' else module_name))
+
+    @classmethod
+    async def register_mcp_tools(cls):
+        if cls.mcp_server:
+            tools = await cls.get_mcp_tools()
+            for name, func in cls.global_registry.items():
+                if name in tools:
+                    continue  # Tool already exists
+                func = strip_kwargs_wrapper(func)
+                try:
+                    cls.mcp_server.tool(func, name=name)  # from_function
+                except Exception as e:
+                    print(name, e)
 
     # global_function_registry
     def get_function_registered(self, func_name: str | list = None) -> Union[Callable, Dict[str, Callable]]:
@@ -174,8 +205,7 @@ class FunctionManager:
         return cache_key, {}, function_code
 
     @classmethod
-    async def generate_metadata(cls, func: Callable, model_name: str = None, redis=None, retry=2,
-                                **kwargs) -> dict:
+    async def generate_metadata(cls, func: Callable, model_name: str = None, redis=None, retry=2, **kwargs) -> dict:
         '''
         为单个函数生成元数据（可从 Redis/本地缓存中恢复）
         '''
@@ -212,10 +242,8 @@ class FunctionManager:
                 cls._meta_store.values())
             return tools_metadata
 
-        semaphore = asyncio.Semaphore(Config.REDIS_MAX_CONCURRENT)
-        tasks = [run_with_semaphore(cls.generate_metadata, f, model_name, redis=redis, semaphore=semaphore, **kwargs)
-                 for f in func_list]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        process_func = run_togather(max_concurrent=Config.REDIS_MAX_CONCURRENT)(cls.generate_metadata)
+        results = await process_func(inputs=func_list, model_name=model_name, redis=redis, **kwargs)
         return [metadata for metadata in results if isinstance(metadata, dict)]
 
     async def get_registered_tools_metadata(self, model_name=Config.DEFAULT_MODEL_METADATA, **kwargs) -> list[dict]:
@@ -230,8 +258,8 @@ class FunctionManager:
         '''
         加锁后生成所有注册表函数元数据，用于定时任务等场景
         '''
-        await do_job_by_lock(self.get_registered_tools_metadata, "lock:generate_tools_metadata", lock_timeout,
-                             model_name=model_name)
+        await run_with_lock(self.get_registered_tools_metadata, lock_timeout=lock_timeout,
+                            lock_key="lock:generate_tools_metadata", model_name=model_name)
 
     @classmethod
     def generate_metadata_async(cls, func: Callable):
@@ -276,7 +304,7 @@ Registry_Module = {
     ],
     "utils": ["get_times_shift", "date_range_calculator", 'extract_json_struct', 'extract_json_array',
               "get_day_range", "get_week_range", "get_month_range", "lang_token_size",
-              "get_quarter_range", "get_year_range", "get_half_year_range", 'call_http_request', "math_solver",
+              "get_quarter_range", "get_year_range", "get_half_year_range", "math_solver",
               "extract_links", "extract_web_content", "remove_markdown", "extract_table_segments"],
     "agents.ai_multi": ['xunfei_ppt_create', 'tencent_generate_image'],
     "agents.ai_company": ['annual_report_info', 'base_account_record', 'case_filing', 'company_black_list',
@@ -286,7 +314,8 @@ Registry_Module = {
                           'exact_saic_info', 'final_beneficiary', 'implements_info', 'judgment_doc',
                           'real_time_saic_info',
                           'saic_basic_info', 'shell_company', 'simple_cancellation', 'stock_freeze'],
-    "agents.ai_search": ["web_search_async", "tokenize_with_zhipu", "get_weather", "duckduckgo_search",
+    "agents.ai_search": ["web_search_async", "web_search_intent", "tokenize_with_zhipu",
+                         "get_weather", "duckduckgo_search",
                          "web_search_tavily", "web_extract_tavily",
                          "web_search_jina", "web_extract_jina", "segment_with_jina",
                          "search_by_api", "serper_search", "brave_search",
@@ -446,10 +475,4 @@ API型 (api): 封装外部接口调用。
 查询型 (query): 面向数据检索的操作。
 '''
 if __name__ == 'main':
-    from utils import fix_indentation, remove_function_decorators, generate_hash_key, extract_function_metadata, \
-        run_with_semaphore, functions_registry, extract_method_calls, safe_eval_call, deduplicate_tools_by_name, \
-        description_tools
-    import asyncio
-    import json
-    import inspect
-    from functools import partial
+    pass

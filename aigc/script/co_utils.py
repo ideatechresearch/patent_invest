@@ -11,6 +11,7 @@ from qdrant_client import AsyncQdrantClient
 from openai import AsyncOpenAI
 from typing import Optional, Literal, Dict, List, Tuple, Union, Any, Callable, AsyncIterator, Type, Awaitable
 from functools import wraps
+import inspect
 from collections import defaultdict
 from datetime import datetime
 
@@ -132,6 +133,20 @@ async def ai_analyze(system_prompt: str, results: dict | list | str, client, des
     content = completion.choices[0].message.content
     print(f'</{desc}>: {content}')  # reasoning_content
     return content.split("</think>")[-1]
+
+
+async def ai_analyze_prompts(system_prompts: list[str], results: dict | list | str, client, desc: str = None,
+                             model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2,
+                             max_retries: int = 2, max_concurrent: int = 100, **kwargs):
+    '''多提示词并发分析，对同一数据使用不同提示多角度生成任务,返回分析结果列表 '''
+
+    async def _run(prompt, sem):
+        async with sem:
+            return await ai_analyze(prompt, results, client, desc, model, max_tokens, temperature,
+                                    max_retries=max_retries, **kwargs)
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    return await asyncio.gather(*(_run(prompt, semaphore) for prompt in system_prompts), return_exceptions=True)
 
 
 @async_error_logger(1)
@@ -788,7 +803,7 @@ class OperationMysql:
 
         if isinstance(value, (tuple, list)):
             if all(isinstance(item, str) for item in value):
-                return "\n\n".join(value)
+                return "\n\n---\n\n".join(value)  # "\n\n"
 
             return json.dumps(value, ensure_ascii=False)  # 非全字符串元素则JSON序列化
 
@@ -801,28 +816,57 @@ class OperationMysql:
         return str(value)
 
 
-async def consumer_worker(queue: asyncio.Queue[tuple[Any, int]], process_task: Callable, max_retries: int = 0,
-                          delay: float = 1.0, **kwargs):
-    while True:
-        task = await queue.get()
-        if task is None:
-            queue.task_done()
-            break
+def task_processor_worker(max_retries: int = 0, delay: float = 1.0, backoff: int | float = 2, timeout: int = -1,
+                          logger_name: Optional[str] = None):
+    """
+    任务处理装饰器，封装任务执行、重试和异常处理逻辑
+    """
+    def decorator(func: Callable):
+        async def wrapper(queue: asyncio.Queue, **kwargs):
+            logger = logging.getLogger(logger_name)
+            # 判断 func 是否接收 queue 参数
+            accepts_queue = 'queue' in inspect.signature(func).parameters
 
-        success = await process_task(task, **kwargs)
-        if not success and max_retries > 0:
-            retry_count = task[-1]
-            task_data = task[:-1]
-            if retry_count < max_retries:
-                await asyncio.sleep(delay)
-                new_task = (*task_data, retry_count + 1)  # 重建任务，重试次数+1
-                await queue.put(new_task)
-                print(f"[Task Retry] {task_data} (attempt {retry_count + 1})")
-            else:
-                print(f"[Task Failed] {task_data}")
+            while True:
+                task_data = await queue.get()
+                if task_data is None:
+                    logger.info("[Info] Received shutdown signal")
+                    queue.task_done()
+                    break
 
-        queue.task_done()  # 必须调用，标记任务完成
+                try:
+                    process_func = func
+                    if max_retries > 0:
+                        process_func = async_error_logger(max_retries=max_retries, delay=delay, backoff=backoff,
+                                                          logger_name=logger_name)(func)  # 处理重试逻辑
+                    if timeout > 0:
+                        if accepts_queue:
+                            success = await asyncio.wait_for(process_func(task_data, queue, **kwargs), timeout=timeout)
+                        else:
+                            success = await asyncio.wait_for(process_func(task_data, **kwargs), timeout=timeout)
+                    else:
+                        if accepts_queue:
+                            success = await process_func(task_data, queue, **kwargs)
+                        else:
+                            success = await process_func(task_data, **kwargs)  # 执行实际的任务处理
 
+                    if not success:
+                        logger.error(f"[Task Failed] {task_data}")
+
+                except asyncio.TimeoutError:
+                    logger.error(f"[Timeout] Task {task_data} timed out")
+                    # await queue.put(task),.put_nowait(x)
+                except asyncio.CancelledError:
+                    logger.info("[Cancel] Worker shutting down...")
+                    break
+                except Exception as e:
+                    logger.error(f"[Error] Unexpected error processing task: {e}")
+                finally:
+                    queue.task_done()  # 必须调用，标记任务完成
+
+        return wrapper
+
+    return decorator
 
 async def stop_worker(queue: asyncio.Queue, worker_tasks: list):
     '''优雅停止所有 worker'''
@@ -844,8 +888,8 @@ async def stop_worker(queue: asyncio.Queue, worker_tasks: list):
 
 from fastapi import FastAPI
 
-Ideatech_Host = 'matrix.***.info'
-Local_Base_Url = 'http://**:7000/v1'
+Ideatech_Host = '***'
+Local_Base_Url = 'http://***:7000/v1'
 Ideatech_API_Key = '***'
 DeepSeek_API_Key = '***'
 DashScope_Service_Key = '***'
@@ -942,6 +986,7 @@ async def background_consumer(batch_no: str, queue):
             queue.task_done()  # 必须调用！标记任务完成
 
 
+@task_processor_worker(1)
 async def process_embedding_task(task: tuple, **kwargs):
     system_prompt = SYS_PROMPT.get('chunking')
     batch_no, insert_id, origin_question, interface_data, field_mapping = task
@@ -952,8 +997,7 @@ async def process_embedding_task(task: tuple, **kwargs):
     try:
         await dbop.insert('task_question_content',
                           {'id': insert_id, 'batch_no': batch_no, 'origin_question': origin_question,
-                           'interface_data': dbop.prepare_value(interface_data), 'status': 'running'
-                           })
+                           'interface_data': dbop.prepare_value(interface_data), 'status': 'running'})
 
         desc = f'''请将以下 JSON 数据，生成自然语言段落列表,合理信息切片，每条切片用于后续文本嵌入（embedding）；
         其中相关字段映射为：{field_mapping}（诺含义或标签不明确，可以此辅助推断）；
@@ -1037,6 +1081,25 @@ async def company_stock_deep_relation(company_name, httpx_client, host, api_key,
     return data, results_data
 
 
+async def run_extra_analysis_task(batch_no: str, analyze_prompts: list[str], interface_data, origin_question,
+                                  model='deepseek-chat'):
+    results = await ai_analyze_prompts(analyze_prompts, interface_data, ai_client, origin_question, model=model)
+
+    if not results or not isinstance(results[-1], str):
+        raise RuntimeError(f"LLM 任务未成功返回: {origin_question}")
+    print(batch_no, origin_question)
+    for i, (p, r) in enumerate(zip(analyze_prompts, results)):
+        if not r:
+            continue
+        if isinstance(r, Exception):
+            print(r)
+            continue
+        result_data = extract_json_struct(r)
+        print(i, result_data, p)
+        if int(result_data.get('score')) > 60:
+            print(result_data.get('result'))
+
+
 async def run_enterprise_analysis_task(batch_no: str, company_name: str, host: str, api_key: str, httpx_client) -> str:
     conn = await dbop.get_conn()
     await dbop.insert(
@@ -1111,13 +1174,23 @@ async def run_enterprise_analysis_task(batch_no: str, company_name: str, host: s
 
             if field_mapping:
                 prompt += f'\n相关字段映射为：{field_mapping}，（诺含义或标签不明确，可以此辅助推断）'
-            result = await ai_analyze(analysis_prompt + '\n' + prompt, interface_data or interface_result, ai_client,
+
+            full_prompt = analysis_prompt + '\n' + prompt
+            result = await ai_analyze(full_prompt, interface_data or interface_result, ai_client,
                                       origin_question, model='deepseek-chat')
 
             await dbop.run("""
                         UPDATE task_question SET status='completed', result=%s
                         WHERE batch_no=%s AND question_no=%s
                     """, (result, batch_no, question_no))
+
+            extra_question = task_conf.get("extra_question", None)
+            if extra_question:
+                analyze_prompts: list[str] = [p.strip() for p in extra_question.split('#===#') if p.strip()]
+                if analyze_prompts:
+                    asyncio.create_task(
+                        run_extra_analysis_task(batch_no, analyze_prompts, interface_data or interface_result,
+                                                origin_question, model='deepseek-chat'))
 
             return result
 
@@ -1131,7 +1204,7 @@ async def run_enterprise_analysis_task(batch_no: str, company_name: str, host: s
             print(err_msg)
             return err_msg
 
-    worker_consumers_background = [asyncio.create_task(consumer_worker(queue, process_embedding_task, 0)) for _ in
+    worker_consumers_background = [asyncio.create_task(process_embedding_task(queue=queue)) for _ in
                                    range(len(QUERY_TASKS))]
     all_results = await asyncio.gather(*(run_subtask(i, task_conf) for i, task_conf in enumerate(QUERY_TASKS)))
     try:
@@ -1299,7 +1372,7 @@ async def run_summary_embedding(batch_no, summary_data: dict, summary_text: str,
              (batch_no, 'completed'))
         ])
 
-        sentence = [(r["origin_question"], r.get("content", '').split('\n\n')) for r in question_content_rows]
+        sentence = [(r["origin_question"], r.get("content", '').split("\n\n---\n\n")) for r in question_content_rows]
         segments = [(r["origin_question"], split_summary_chunks(r.get("result", ''))) for r in question_analysis_rows]
         corpus = [line.replace("\n", " ").strip() for chunks in sentence for line in chunks[1]]
         corpus_analyze = [line for chunks in segments for line in chunks[1]]
@@ -1426,11 +1499,11 @@ def split_summary_chunks(text: str) -> list[str]:
 
 
 def format_content_str(content, level=0, exclude_null=True) -> str:
-    def format_table(data: list[dict]) -> str:
-        headers = list(data[0].keys())
+    def format_table(records: list[dict]) -> str:
+        headers = list(records[0].keys())
         lines = ["| " + " | ".join(headers) + " |",  # header_line
                  "| " + " | ".join(["---"] * len(headers)) + " |"]  # divider_line
-        for row in data:  # rows
+        for idx, row in enumerate(records):  # rows
             lines.append("| " + " | ".join(str(row.get(h, "")) for h in headers) + " |")
         return "\n".join(lines)
 
@@ -1452,6 +1525,9 @@ def format_content_str(content, level=0, exclude_null=True) -> str:
             return ""
         if all(isinstance(x, str) for x in content.keys()):
             heading_prefix = ("\n" + " " * level) if level > 0 else ''  # "#" * (level + 2)
+            if all(isinstance(x, (str, int, float, bool, type(None))) for x in content.values()):
+                return '|'.join(f"{heading_prefix}{key}:{val.strip() if isinstance(val, str) else val}" for key, val in
+                                content.items() if not exclude_null or val)
             lines = [f"{heading_prefix}**{key}**:{format_content_str(val, level + 1)}" for key, val in content.items()
                      if not exclude_null or val]
             return "\n".join(lines)
