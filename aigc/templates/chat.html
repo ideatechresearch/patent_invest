@@ -10,6 +10,7 @@
     html,
     body {
       height: 100%;
+      width: 100%;
       margin: 0;
       padding: 0;
       background: #f3f4f6;
@@ -18,6 +19,7 @@
 
     .app {
       height: 100vh;
+      width: 100vw;
       display: grid;
       grid-template-rows: 60px 1fr auto;
       max-width: 100%;
@@ -46,11 +48,14 @@
 
     main#chat-area {
       overflow: auto;
+      overflow-y: auto;
       padding: 18px;
       display: flex;
       flex-direction: column;
       gap: 6px;
-      background: linear-gradient(#fbfcff, #fff)
+      width: 100%;
+      background: linear-gradient(#fbfcff, #fff);
+      box-sizing: border-box;
     }
 
     .chat-empty {
@@ -107,7 +112,15 @@
       flex: 1;
       display: flex;
       flex-direction: column;
+      width: 100%;
       gap: 8px
+    }
+
+    .left-compose textarea#input {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 72px;
+      resize: vertical;
     }
 
     textarea#input {
@@ -176,13 +189,39 @@
       color: #333
     }
 
-    @media (max-width:900px) {
+    .model-select {
+      min-width: 150px;
+      /* max-width: 250px; */
+    }
+
+    @media (max-width:768px) {
       .app {
         grid-template-rows: 60px 1fr auto
       }
 
       .right-panel {
         width: 200px
+      }
+
+      textarea#input {
+        font-size: 16px;
+        min-height: 60px;
+      }
+
+      .bubble {
+        max-width: 90%;
+        font-size: 14px;
+        word-wrap: break-word;
+      }
+
+      footer {
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .right-actions {
+        flex-direction: row;
+        justify-content: flex-end;
       }
     }
 
@@ -310,8 +349,7 @@
       <div id="top-controls">
         <button id="clear-chat" class="btn secondary small">清空对话</button>
         <button id="download-chat" class="btn secondary small">导出对话</button>
-        <button id="open-settings" class="btn secondary small">设置</button>
-        <button id="reload-models" class="btn small">刷新模型</button>
+        <button id="open-settings" class="btn small">设置</button>
       </div>
     </header>
     <div class="loading-bar" id="loading-bar">
@@ -336,14 +374,11 @@
 
         <!-- 工具行：流式/网页搜索/文件 与 模型 并排 -->
         <div style="display:flex;align-items:center;gap:16px;margin-top:4px">
-          <div class="tools-row" style="display:flex;gap:8px;align-items:center">
+          <div class="tools-row">
             <label><input id="websearch-checkbox" type="checkbox"> 网页搜索</label>
+            <label><input id="thinking-checkbox" type="checkbox"> 思考</label>
             <label class="small">文件：<input id="file-input" type="file" multiple></label>
-          </div>
-
-          <div style="display:flex;align-items:center;gap:8px">
-            <div class="tool-title">模型</div>
-            <select id="model-select" class="model-select"></select>
+            <label class="tool-title">模型：<select id="model-select" class="model-select"></select></label>
           </div>
         </div>
       </div>
@@ -355,14 +390,17 @@
   <div class="modal-backdrop" id="settings-modal">
     <div class="modal">
       <h3>参数设置</h3>
+      <div class="row"><label for="topn">上下文数量</label>
+        <input id="cfg-topn" type="number" min="4" max="100" step="2" value="20">
+      </div>
       <div class="row"><label>最大回复长度（max_tokens）</label><input id="cfg-max-tokens" type="number" min="100" max="10000"
           step="50" value="4000"></div>
-      <div class="row"><label>top_p（nucleus sampling）</label><input id="cfg-topp" type="number" min="0" max="1"
-          step="0.01" value="1.0"></div>
-      <div class="row"><label>温度（temperature）</label><input id="cfg-temp" type="number" min="0" max="1" step="0.01"
+      <div class="row"><label>核采用率（top_p）</label><input id="cfg-topp" type="number" min="0" max="1" step="0.01"
+          value="1.0"></div>
+      <div class="row"><label>温度系数（temperature）</label><input id="cfg-temp" type="number" min="0" max="1" step="0.01"
           value="0.4"></div>
-      <div class="row"><label>备用模型（model）</label><select id="cfg-model"
-          style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px"></select></div>
+      <div class="row"><label>备用模型（model）</label><select id="cfg-model" class="model-select"
+          style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px"></select><button id="reload-models" class="btn small">刷新</button></div>   
       <div class="row"><label>流式输出（stream）</label><input id="cfg-stream" type="checkbox" checked></div>
 
       <hr>
@@ -385,34 +423,37 @@
     </div>
   </div>
   <script type="module">
+    const el = id => document.getElementById(id);
     // 纯 JavaScript 实现（无 TypeScript）
-    const chatArea = document.getElementById('chat-area');
-    const inputEl = document.getElementById('input');
-    const sendBtn = document.getElementById('send-btn');
-    const websearchCheckbox = document.getElementById('websearch-checkbox');
-    const fileInput = document.getElementById('file-input');
-    const modelSelect = document.getElementById('model-select');
-    const clearBtn = document.getElementById('clear-chat');
-    const downloadBtn = document.getElementById('download-chat');
-    const reloadModelsBtn = document.getElementById('reload-models');
-    const chatEmptyNote = document.getElementById('chat-empty-note');
+    const chatArea = el('chat-area');
+    const inputEl = el('input');
+    const sendBtn = el('send-btn');
+    const websearchCheckbox = el('websearch-checkbox');
+    const thinkingCheckbox = el('thinking-checkbox');
+    const fileInput = el('file-input');
+    const modelSelect = el('model-select');
+    const clearBtn = el('clear-chat');
+    const downloadBtn = el('download-chat');
+    const chatEmptyNote = el('chat-empty-note');
 
-    const settingsModal = document.getElementById('settings-modal');
-    const cfgMaxTokens = document.getElementById('cfg-max-tokens');
-    const cfgTopp = document.getElementById('cfg-topp');
-    const cfgTemp = document.getElementById('cfg-temp');
-    const cfgStream = document.getElementById('cfg-stream');
-    const cfgModel = document.getElementById('cfg-model');
-    const cfgSave = document.getElementById('cfg-save');
-    const cfgCancel = document.getElementById('cfg-cancel');
-    const openSettingsBtn = document.getElementById('open-settings');
+    const settingsModal = el('settings-modal');
+    const cfgMaxTokens = el('cfg-max-tokens');
+    const cfgTopn = el('cfg-topn');
+    const cfgTopp = el('cfg-topp');
+    const cfgTemp = el('cfg-temp');
+    const cfgStream = el('cfg-stream');
+    const cfgModel = el('cfg-model');
+    const cfgSave = el('cfg-save');
+    const cfgCancel = el('cfg-cancel');
+    const openSettingsBtn = el('open-settings');
+    const reloadModelsBtn = el('reload-models');
     // system related
-    const systemListEl = document.getElementById('system-list');
-    const newSystemText = document.getElementById('new-system-text');
-    const addSystemBtn = document.getElementById('add-system');
+    const systemListEl = el('system-list');
+    const newSystemText = el('new-system-text');
+    const addSystemBtn = el('add-system');
 
-    const loadingBar = document.getElementById('loading-bar');
-    const loadingProgress = document.getElementById('loading-progress');
+    const loadingBar = el('loading-bar');
+    const loadingProgress = el('loading-progress');
     const defaultModel = 'gpt-3.5-turbo';//gpt-4o
 
     let chatHistory = []; // {role, content, time}
@@ -422,6 +463,7 @@
       model: defaultModel, // cfg-model fallback default -> gpt-4o as requested
       temperature: 0.4,
       top_p: 1.0,
+      top_n: 20, // 默认取最后 20 条上下文
       max_tokens: 4000,
       stream: true,
 
@@ -536,9 +578,10 @@
       console.log('[chat] user input length', text.length);
       addMessage('user', text);
       inputEl.value = '';
+      const n = settings.top_n || 20;  // 取最后 n 条上下文
       // 构建 messages：若有选中的 system prompts，先把它们作为 system role 插入
       const systemMessages = (settings.systemPrompts || []).filter(sp => settings.selectedSystemIds.includes(sp.id)).map(sp => ({ role: 'system', content: sp.content }));
-      const userAssistantHistory = chatHistory.map(m => ({ role: m.role, content: m.content }));
+      const userAssistantHistory = chatHistory.slice(-n).map(m => ({ role: m.role, content: m.content }));
       const msgs = systemMessages.concat(userAssistantHistory);
 
       const model = resolveModel();
@@ -549,6 +592,13 @@
       const body = { model, messages: msgs, temperature: parseFloat(settings.temperature), top_p: parseFloat(settings.top_p), max_tokens: parseInt(settings.max_tokens, 10), user: 'html:demo', stream: stream };
       // add optional/aux params
       body['tools'] = tools.length ? tools : undefined;
+      if (thinkingCheckbox.checked) {
+        const thinkingBudget = Math.max(0, Math.min(Math.floor(body.max_tokens / 2), 2048));
+        body.extra_body = {
+          enable_thinking: true,
+          thinking_budget: thinkingBudget,
+        };
+      }
 
       // 创建 assistant 占位
       lastAssistantPlaceholder = addMessage('assistant', '');
@@ -661,6 +711,48 @@
       }
     }
 
+    // function connectMCP(message) {
+    //   const evtSource = new EventSource(`/mcp/stream?message=${encodeURIComponent(message)}`)
+
+    //   evtSource.onmessage = (event) => {
+    //     const data = JSON.parse(event.data)
+    //     console.log("MCP Event:", data)
+
+    //     // 1. 如果是普通响应块
+    //     if (data.type === "message") {
+    //       appendResult("MCP 回复", data)
+    //     }
+
+    //     // 2. 如果返回工具选择
+    //     if (data.type === "tools") {
+    //       showToolOptions(data.tools)
+    //     }
+    //   }
+
+    //   evtSource.onerror = (err) => {
+    //     console.error("MCP error", err)
+    //     evtSource.close()
+    //   }
+    // }
+
+    // function showToolOptions(tools) {
+    //   const container = document.createElement("div")
+    //   container.innerHTML = "<h4>可用工具</h4>"
+    //   tools.forEach(t => {
+    //     const btn = document.createElement("button")
+    //     btn.textContent = `使用 ${t.name}`
+    //     btn.onclick = () => {
+    //       fetch("/mcp/use_tool", {
+    //         method: "POST",
+    //         headers: { "Content-Type": "application/json" },
+    //         body: JSON.stringify({ tool: t.name })
+    //       })
+    //     }
+    //     container.appendChild(btn)
+    //   })
+    //   document.getElementById("results").appendChild(container)
+    // }
+
     sendBtn.addEventListener('click', sendCurrentMessage);
     inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendCurrentMessage(); } });
 
@@ -677,9 +769,9 @@
     function saveSettingsToStorage() { localStorage.setItem('chat_enhanced_settings', JSON.stringify(settings)); }
     function loadSettingsFromStorage() { try { const s = localStorage.getItem('chat_enhanced_settings'); if (s) { settings = Object.assign(settings, JSON.parse(s)); } } catch (e) { console.warn('load settings fail', e); } }
 
-    function loadSettingsToForm() { loadSettingsFromStorage(); cfgMaxTokens.value = settings.max_tokens; cfgTopp.value = settings.top_p; cfgTemp.value = settings.temperature; cfgStream.checked = !!settings.stream; cfgModel.value = settings.model || defaultModel; }
+    function loadSettingsToForm() { loadSettingsFromStorage(); cfgMaxTokens.value = settings.max_tokens; cfgTopp.value = settings.top_p; cfgTemp.value = settings.temperature; cfgStream.checked = !!settings.stream; cfgModel.value = settings.model || defaultModel; cfgTopn.value = settings.top_n; }
 
-    function saveSettingsFromForm() { settings.max_tokens = parseInt(cfgMaxTokens.value, 10) || 4000; settings.top_p = parseFloat(cfgTopp.value) || 1.0; settings.temperature = parseFloat(cfgTemp.value) || 0.4; settings.stream = !!cfgStream.checked; settings.model = (cfgModel.value || defaultModel).trim(); saveSettingsToStorage(); }
+    function saveSettingsFromForm() { settings.max_tokens = parseInt(cfgMaxTokens.value, 10) || 4000; settings.top_p = parseFloat(cfgTopp.value) || 1.0; settings.temperature = parseFloat(cfgTemp.value) || 0.4; settings.stream = !!cfgStream.checked; settings.model = (cfgModel.value || defaultModel).trim(); settings.top_n = parseInt(cfgTopn.value, 10) || 20; saveSettingsToStorage(); }
 
 
     // 初始

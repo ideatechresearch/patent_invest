@@ -1,5 +1,6 @@
-from utils import load_dictjson, save_dictjson, extract_json_struct
+from utils import load_dictjson, save_dictjson, extract_json_struct, ts2datetime, str_to_ts
 from datetime import datetime
+import time
 import pandas as pd
 
 
@@ -19,7 +20,7 @@ def extract_conversations_records_gpt(conversations: list):
 
         stack = list(start_nodes)
         messages = []
-
+        index = 0
         while stack:
             node_id = stack.pop(0)
             node = mapping.get(node_id)
@@ -47,8 +48,10 @@ def extract_conversations_records_gpt(conversations: list):
                 "create_time": create_time,
                 "model": model_slug,
                 "id": _id,
-                "search_results": None
+                "search_results": None,
+                "index": index
             })
+            index += 1
 
             stack.extend(node.get("children", []))
 
@@ -79,7 +82,7 @@ def extract_conversations_records_ds(conversations: list):
 
         stack = list(start_nodes)
         messages = []
-
+        index = 0
         while stack:
             node_id = stack.pop(0)
             node = mapping.get(node_id)
@@ -129,9 +132,10 @@ def extract_conversations_records_ds(conversations: list):
                 "content": content,
                 "create_time": create_time,
                 "model": model,
-                "search_results": search_results
+                "search_results": search_results,
+                "index": index
             })
-
+            index += 1
             stack.extend(node.get("children", []))
 
         # 保留至少一个消息的会话
@@ -151,19 +155,23 @@ def filter_messages_after(structured_data: list, after_timestamp: int | float = 
 
     for convo in structured_data:
         title = convo.get("title")
+        create_time = convo.get("create_time")
         update_time = convo.get("update_time")
 
-        for msg in convo["messages"]:
-            create_time = msg.get("create_time")
-            if create_time and create_time > after_timestamp:
+        for i, msg in enumerate(convo["messages"]):
+            created_timestamp = msg.get("create_time")
+            if created_timestamp and created_timestamp > after_timestamp:
                 result.append({
                     "role": msg["role"],
                     "content": msg["content"],
                     "search_results": msg.get("search_results", None),
-                    "create_time": create_time,
+                    "created_timestamp": created_timestamp,
                     "model": msg.get("model"),
+
                     "title": title,
-                    "update_time": update_time
+                    "create_time": create_time,
+                    "update_time": update_time,
+                    "index": msg.get("index", i),
                 })
 
     return result
@@ -172,20 +180,41 @@ def filter_messages_after(structured_data: list, after_timestamp: int | float = 
 def df_messages_sorted(messages: list[dict]):
     df = pd.DataFrame(messages)
 
-    def ts_to_str(ts):
-        if pd.isna(ts) or ts is None:
-            return None
-        try:
-            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
+    df["create_time_dt"] = df["create_time"].apply(ts2datetime)
+    df["update_time_dt"] = df["update_time"].apply(ts2datetime)
+    df_sorted = df.sort_values(by=["create_time_dt", "title", "update_time_dt", "index", "created_timestamp"])
 
-    df["create_time"] = df["create_time"].apply(ts_to_str)
-    df["update_time"] = df["update_time"].apply(ts_to_str)
+    df_sorted["create_time"] = df_sorted["create_time_dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    df_sorted["update_time"] = df_sorted["update_time_dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    df_sorted = df.sort_values(by=["title", "create_time", "role"])
-    print(df_sorted["content"].str.len().sum())
-    return df_sorted
+    print('messages len sum:', df_sorted["content"].str.len().sum())
+    return df_sorted.drop(columns=["create_time_dt", "update_time_dt"])
+
+
+def messages_to_records_values(df_sorted, user: str, name: str) -> list[dict]:
+    """
+    将外部的消息格式转换为与表列名一致的 dict 列表。
+    假设表字段包含: user, agent, role, timestamp, model, content, search_results, reference
+    create_time/create_at -> timestamp (unix seconds)
+    """
+    if df_sorted is None or df_sorted.empty:
+        return []
+
+    df_filtered = df_sorted.loc[(df_sorted['role'] != 'system') & (df_sorted['content'].str.len() > 0)].copy()
+    if df_filtered.empty:
+        return []
+
+    now_ts = int(time.time())
+    df_filtered['user'] = user
+    df_filtered['name'] = name
+    df_filtered["timestamp"] = df_filtered["created_timestamp"].apply(lambda v: str_to_ts(v, now_ts))
+    df_filtered["created_at"] = df_filtered["timestamp"].apply(ts2datetime)
+    df_filtered.rename(columns={"title": "agent", "search_results": "reference"}, inplace=True)
+    cols = [c for c in
+            ("user", "name", "agent", "role", "timestamp", "model", "content", "reference", "created_at", "index") if
+            c in df_filtered.columns]
+
+    return df_filtered[cols].where(pd.notna(df_filtered[cols]), None).to_dict(orient="records")
 
 
 if __name__ == "__main__":

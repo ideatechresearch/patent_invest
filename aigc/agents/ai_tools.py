@@ -3,9 +3,9 @@ from functools import partial, wraps
 import asyncio
 import json
 from utils import fix_indentation, remove_function_decorators, generate_hash_key, extract_function_metadata, \
-    functions_registry, extract_method_calls, safe_eval_call, run_with_async, run_with_semaphore, \
+    functions_registry, extract_method_calls, safe_eval_call, run_with_async, run_togather, \
     description_tools, strip_kwargs_wrapper
-from service import get_redis, get_redis_retry, scan_from_redis, run_with_lock, run_togather, distributed_lock, FastMCP
+from service import get_redis, get_redis_retry, scan_from_redis, run_with_lock, distributed_lock, FastMCP
 from config import Config
 
 

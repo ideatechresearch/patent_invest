@@ -84,6 +84,63 @@ def unix_timestamp(iso_time_str: str) -> float:
     return dt.timestamp()
 
 
+def ts2datetime(ts):
+    '''datetime'''
+    import pandas as pd
+    if ts is None or pd.isna(ts):
+        return pd.NaT
+    if isinstance(ts, datetime):
+        return ts
+    if isinstance(ts, str):
+        try:
+            return pd.to_datetime(ts)
+        except Exception:
+            return pd.NaT
+    if isinstance(ts, (int, float)):
+        ts_int = int(ts)
+        if ts_int > 1e12:  # 毫秒
+            ts_int = ts_int // 1000
+        return datetime.fromtimestamp(ts_int)
+    return pd.NaT
+
+
+def str_to_ts(s, now: int | float) -> int:
+    """
+    把已格式化字符串或数字转成秒级 int；失败返回 now。
+    支持：
+    - None / NaN -> now
+    - int/float -> 自动识别秒级或毫秒级
+    - str -> 优先解析 '%Y-%m-%d %H:%M:%S'，失败则用 pandas.to_datetime
+    """
+    import pandas as pd
+    # 空值处理
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return now
+
+    # 数字处理
+    if isinstance(s, (int, float)):
+        v = int(s)
+        return v // 1000 if v > 10 ** 12 else v
+
+    # 字符串处理
+    s_str = str(s).strip()
+    if not s_str:
+        return now
+
+    # 优先尝试标准格式
+    try:
+        dt = datetime.strptime(s_str, "%Y-%m-%d %H:%M:%S")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        pass  # 继续尝试 pandas 解析
+
+    # pandas 通用解析
+    ts_pd = pd.to_datetime(s_str, errors="coerce", utc=True)
+    if pd.isna(ts_pd):
+        return now
+    return int(ts_pd.timestamp())
+
+
 def format_date_type(date=None):
     """
     :param date:可以是一个日期字符串或 None（如果传入 None，则使用当前日期）。

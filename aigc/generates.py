@@ -1,5 +1,5 @@
 import logging
-from typing import Literal
+from typing import Literal, AsyncIterable
 from openai import AsyncOpenAI, BadRequestError
 
 from utils import *
@@ -55,7 +55,7 @@ def global_function_registry(func_name: str = None) -> Union[Callable[..., Any],
 
 
 async def ai_generate_metadata(function_code: str, metadata: dict = None, model_name=Config.DEFAULT_MODEL_METADATA,
-                               description: str = None, code_type: str = "Python", **kwargs) -> dict:
+                               description: str = None, code_type: str = "Python", dbpool=None, **kwargs) -> dict:
     if not model_name:
         model_name = Config.DEFAULT_MODEL_METADATA
 
@@ -70,14 +70,14 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
     messages = [{"role": "system", "content": prompt}, {"role": "user", "content": prompt_user}]
 
     content, row_id = await ai_client_completions(messages, client=None, model=model_name, get_content=True,
-                                                  max_tokens=1000, temperature=0.3, **kwargs)
+                                                  max_tokens=1000, temperature=0.3, dbpool=dbpool, **kwargs)
     if content:
         parsed = extract_json_struct(content)
         if parsed:
             metadata = parsed
             await BaseReBot.async_save(
                 data={"reference": BaseMysql.format_value(metadata), "transform": BaseMysql.format_value(parsed)},
-                update_fields=["reference", "transform"], row_id=row_id, dbpool=DB_Client)
+                row_id=row_id, dbpool=dbpool or DB_Client)
         else:
             logging.warning(f'metadata extract failed:{content}')
 
@@ -243,7 +243,7 @@ async def ai_auto_calls(question, user_messages: list = None, system_prompt: str
 
     await BaseReBot.async_save(
         data={"user_content": question, "reference": json.dumps(tool_results, ensure_ascii=False)},
-        update_fields=["reference"], row_id=row_id, dbpool=DB_Client)
+        row_id=row_id, dbpool=DB_Client)
     if not get_messages:
         return [tuple(item.values()) for item in tool_results]  # [{func_name:func_result}
 
@@ -262,13 +262,16 @@ async def ai_auto_calls(question, user_messages: list = None, system_prompt: str
     return result_messages  # [-1]
 
 
-async def ai_files_messages(files: List[str], question: str = None, model_name: str = 'qwen-long', **kwargs):
+async def ai_files_messages(files: List[str], question: str = None, model_name: str = 'qwen-long', max_tokens=4096,
+                            dbpool=None, **kwargs):
     """
     处理文件并生成 AI 模型的对话结果。
 
     :param files: 文件路径列表
     :param question:问题提取
     :param model_name: 模型名称
+    :param max_tokens
+    :param dbpool
     :return: 模型生成的对话结果和文件对象列表
     """
     model_info, name = find_ai_model(model_name, -1)
@@ -293,11 +296,115 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
 
     if question:
         messages.append({"role": "user", "content": question})
-        bot_response, _ = await ai_client_completions(messages, client, model=name, get_content=True, **kwargs)
+        bot_response, _ = await ai_client_completions(messages, client, model=name, get_content=True,
+                                                      max_tokens=max_tokens, dbpool=dbpool, **kwargs)
         messages.append({"role": "assistant", "content": bot_response})
         return messages
 
     return messages
+
+
+async def ai_batch(inputs_list: List[list[dict] | tuple[str, str]], task_id: str, model: str = 'qwen-long',
+                   search_field: str = 'model', **kwargs):
+    model_info, name = find_ai_model(model, -1, search_field)
+    endpoint_map = {  # 选择Embedding文本向量模型进行调用时，url的值需填写"/v1/embeddings",其他模型填写/v1/chat/completions
+        "model": "/v1/chat/completions",
+        "embedding": "/v1/embeddings",
+        "generation": "/v1/completions"
+    }
+    endpoint = endpoint_map.get(search_field, "/v1/chat/completions")
+    input_filename = f'{task_id}_input.jsonl'
+    file_path = Path(Config.DATA_FOLDER) / input_filename
+    async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+        for i, msg in enumerate(inputs_list):
+            messages = [{"role": "system", "content": msg[0]},
+                        {"role": "user", "content": msg[1]}] if isinstance(msg, tuple) else msg
+            body = {"model": name, "messages": messages, **kwargs}
+            request = {"custom_id": i, "method": "POST", "url": endpoint, "body": body}
+            await f.write(json.dumps(request, separators=(',', ':'), ensure_ascii=False) + "\n")
+
+    client = AI_Client.get(model_info['name'], None)
+    # Step 1: 上传包含请求信息的JSONL文件,得到输入文件ID,如果您需要输入OSS文件,可将下行替换为：input_file_id = "实际的OSS文件URL或资源标识符"
+    file_object = await client.files.create(file=file_path, purpose="batch")
+    # Step 2: 基于输入文件ID,创建Batch任务
+    batch = await client.batches.create(input_file_id=file_object.id, endpoint=endpoint, completion_window="24h")
+    return {
+        "input_file_id": file_object.id,
+        "batch_id": batch.id,
+        "input_file": input_filename,
+        "client_name": model_info['name']
+    }
+
+
+async def ai_batch_result(batch_id: str, task_id: str, client_name: str,
+                          interval: int = 10,  # 每次查询间隔秒数
+                          timeout: int = 3600,  # 最长等待时间（秒），默认 1 小时
+                          oss_expires: int = 86400
+                          ):
+    """
+    轮询批处理任务状态，等待完成后下载结果文件。
+    - batch_id: 批处理任务ID
+    - client_name: AI_Client 的 key
+    - task_id: 用来命名输出文件，避免混淆
+    - interval: 轮询间隔秒数，<=0 不轮询
+    - timeout: 超时时间，防止永远等待，<=0 永远等待
+    """
+    client = AI_Client.get(client_name, None)
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
+    while True:
+        batch = await client.batches.retrieve(batch_id=batch_id)
+        status = batch.status
+
+        if status in ["completed", "failed", "expired", "cancelled"]:
+            # 结束状态，停止轮询
+            print(f"[Batch状态] {batch_id}: {status}")
+            break
+
+        if loop.time() - start_time > timeout > 0:
+            logger.warning(f"[Batch超时] {batch_id} 等待超时({timeout}s)")
+            return {"status": "timeout"}
+
+        if interval > 0:
+            await asyncio.sleep(interval)
+        else:
+            print(batch.model_dump())  # 'in_progress'
+            break  # 不轮询，立即查看状态
+
+    # ✅ 任务完成，下载结果文件
+    result = {"status": status, "request_counts": batch.request_counts.model_dump()}
+
+    if status == "failed":
+        result["errors"] = str(batch.errors)
+        return result
+
+    output_filename = f'{task_id}_{batch_id}_result.jsonl'
+    error_filename = f'{task_id}_{batch_id}_error.jsonl'
+    output_file_path = Path(Config.DATA_FOLDER) / output_filename
+    error_file_path = Path(Config.DATA_FOLDER) / error_filename
+    if batch.error_file_id and not error_file_path.exists():
+        content = await client.files.content(batch.error_file_id)
+        logger.error(f"[Batch error] {batch_id} 前1000字符:\n{content.text[:1000]}...\n")
+        content.write_to_file(error_file_path)
+        result["error_file"] = error_filename
+        result["error_file_id"] = batch.error_file_id
+        result["batch_id"] = batch.id or batch_id
+
+    if batch.output_file_id and not output_file_path.exists():
+        content = await client.files.content(batch.output_file_id)
+        print(f"[Batch result] {batch_id} 前1000字符:\n{content.text[:1000]}...\n")
+        content.write_to_file(output_file_path)
+        result["result_file"] = output_filename
+        result["output_file_id"] = batch.output_file_id
+        result["batch_id"] = batch.id or batch_id
+        if oss_expires != 0:
+            object_name = f"upload/{output_filename}"
+            with open(output_file_path, 'rb') as file_obj:
+                result["output_file_url"] = await asyncio.to_thread(upload_file_to_oss, AliyunBucket, file_obj,
+                                                                    object_name, expires=oss_expires)
+            # os.remove(output_file_path)
+
+    return result
 
 
 Embedding_Cache = {}
@@ -516,7 +623,7 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
 @async_error_logger(1)
 async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = None, model: str = 'deepseek-chat',
                                 get_content=True, tools: list[dict] = None, max_tokens=4096, top_p: float = 0.95,
-                                temperature: float = 0.1, **kwargs):
+                                temperature: float = 0.1, dbpool=None, **kwargs):
     """
     return: str or 模型响应的消息对象, lastrowid
     """
@@ -552,14 +659,14 @@ async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = 
 
             completion = await client.chat.completions.create(**payload)
             row_id = await BaseReBot.async_save(model=model, messages=messages, model_response=completion.model_dump(),
-                                                dbpool=DB_Client, user='local', agent='chat')
+                                                dbpool=dbpool or DB_Client, user='local', agent='chat')
             return (completion.choices[0].message.content if get_content else completion.choices[0].message), row_id
         else:
             payload['prompt'] = build_prompt(messages, use_role=False)
             payload.pop('messages', None)
             completion = await client.completions.create(**payload)
             row_id = await BaseReBot.async_save(model=model, messages=messages, model_response=completion.model_dump(),
-                                                dbpool=DB_Client, user='local', agent='generate')
+                                                dbpool=dbpool or DB_Client, user='local', agent='generate')
             return completion.choices[0].text, row_id
     except Exception as e:
         print(f"OpenAI error occurred: {e}")
@@ -567,60 +674,76 @@ async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = 
 
 
 async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc: str = None,
-                     model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2, **kwargs):
+                     model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2, dbpool=None, **kwargs):
     user_request = results if isinstance(results, str) else json.dumps(results, ensure_ascii=False)
     if desc:
         user_request = f"{desc}: {user_request}"
 
     messages = [{"role": "system", "content": system_prompt}, {'role': 'user', 'content': user_request}]
     content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,
-                                             max_tokens=max_tokens, temperature=temperature, **kwargs)
+                                             max_tokens=max_tokens, temperature=temperature, dbpool=dbpool, **kwargs)
     logging.info(f'</{desc}>: {content}')
     return content.split("</think>")[-1]
 
 
-async def ai_analyze_prompts(system_prompts: list[str], results: dict | list | str, desc: str = None,
-                             model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2,
-                             max_retries: int = 2, max_concurrent: int = Config.MAX_CONCURRENT, **kwargs):
-    '''多提示词并发分析，对同一数据使用不同提示多角度生成任务,返回分析结果列表 '''
+async def ai_analyze_together(variable_name: str, variable_values: list,
+                              system_prompt: str = None, user_request: str = None,
+                              model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2,
+                              max_retries: int = 2, max_concurrent: int = Config.MAX_CONCURRENT, dbpool=None, **kwargs):
+    '''
+    多变量并发分析，对同一数据使用不同变量值进行多角度分析,返回分析结果列表
+    顺序与variable_values对应,variable_name: 要变化的变量名(覆盖)
+    '''
+    if variable_name == 'model':
+        client = None
+    else:
+        model_info, name = find_ai_model(model, 0, search_field='model')
+        client = AI_Client.get(model_info['name'], None)
 
-    @run_togather(max_concurrent=max_concurrent, batch_size=-1)
-    async def _run(prompt: str):
-        return await ai_analyze(results, prompt, desc, model, max_tokens, temperature,
-                                max_retries=max_retries, **kwargs)
+    @run_togather(max_concurrent=max_concurrent, batch_size=-1, input_key=variable_name)
+    async def _run(item):
+        payload = {"system_prompt": system_prompt, "user_request": user_request, "model": model,
+                   "max_tokens": max_tokens, "temperature": temperature, **kwargs, variable_name: item}
+        messages = [{"role": "system", "content": payload.pop('system_prompt')},
+                    {'role': 'user', 'content': payload.pop('user_request')}]
+        content, row_id = await ai_client_completions(messages, client=client, get_content=True, dbpool=dbpool,
+                                                      **payload, max_retries=max_retries)
+        return {"content": content, "variable_item": item}  # , "row_id": row_id
 
-    results = await _run(inputs=system_prompts)
-    return [r if not isinstance(r, Exception) else None for r in results]
+    results = await _run(inputs=variable_values)
+    return [{'id': i, **r} for i, r in enumerate(results) if
+            not isinstance(r, Exception)], [{'id': i, 'error': str(r)} for i, r in enumerate(results) if
+                                            isinstance(r, Exception)]
 
 
 async def ai_summary(long_text: str | list[str | dict],
                      extract_prompt: str = None, summary_prompt: str = None,
                      extract_model='qwen:qwen-plus', summary_model='qwen:qwen-plus',
                      encoding_model=Config.DEFAULT_MODEL_ENCODING,
-                     max_tokens=4096, max_segment_length=8192):
+                     extract_max_tokens=4096, summary_max_tokens=8182, segment_max_length=10000, dbpool=None):
     tokenizer = get_tokenizer(encoding_model)
     segments_chunk: list = []
     if isinstance(long_text, str):
         lang = lang_detect_to_trans(long_text)
         if lang == 'zh':
             # sentences = split_sentences_clean(long_text, h_symbols=True, h_tables=True)
-            segments_chunk: list[str] = structure_aware_chunk(long_text, max_size=max_segment_length)
+            segments_chunk: list[str] = structure_aware_chunk(long_text, max_size=segment_max_length)
         else:
             tokens = tokenizer.encode(long_text)
             small_chunks, large_chunks = organize_segments(tokens,
-                                                           small_chunk_size=max(175, int(max_segment_length * 0.34)),
-                                                           large_chunk_size=max_segment_length,
-                                                           overlap=max(20, int(max_segment_length * 0.04)))
+                                                           small_chunk_size=max(175, int(segment_max_length * 0.34)),
+                                                           large_chunk_size=segment_max_length,
+                                                           overlap=max(20, int(segment_max_length * 0.04)))
             segments_chunk = [tokenizer.decode(chunk) for chunk in large_chunks if chunk]
 
     elif isinstance(long_text, list):
         if all(isinstance(x, str) for x in long_text):
             segments_chunk: list[list[str]] = organize_segments_chunk(long_text, chunk_size=7, overlap_size=2,
-                                                                      max_length=max_segment_length,
+                                                                      max_length=segment_max_length,
                                                                       tokenizer=tokenizer)
         if all(isinstance(x, dict) for x in long_text):
             segments_chunk: list[list[dict]] = list(
-                df2doc_split(long_text, max_tokens=max_segment_length, tokenizer=tokenizer))
+                df2doc_split(long_text, max_tokens=segment_max_length, tokenizer=tokenizer))
 
     if not segments_chunk:
         raise ValueError("long_text 必须是 str 或 list[str|dict]")
@@ -631,26 +754,33 @@ async def ai_summary(long_text: str | list[str | dict],
         if not extract_prompt:
             extract_prompt = '你是信息摘要助手，请提炼以下关键信息:\n' + summary_prompt
 
-    @run_togather(max_concurrent=Config.MAX_CONCURRENT, batch_size=-1)
-    async def extract_item(data: tuple[int, list | str]):
-        i, segment = data
+    @run_generator(max_concurrent=Config.MAX_CONCURRENT, return_exceptions=True)
+    async def extract_item(segment: list | str):
+        if not segment:
+            raise ValueError("bad input")
         content = format_content_str(segment, exclude_null=True)
 
-        if lang_token_size(content, tokenizer=tokenizer) > max_segment_length // 2:
+        if lang_token_size(content, tokenizer=tokenizer) > extract_max_tokens:
             messages = [{"role": "system",
                          "content": extract_prompt or '你是信息摘要助手，请提炼以下文本中的关键信息、数据或事件。'},
                         {'role': 'user', 'content': content}]
             content, _ = await ai_client_completions(messages, client=None, model=extract_model, get_content=True,
-                                                     max_tokens=max_segment_length // 2, temperature=0.3)
+                                                     max_tokens=extract_max_tokens, temperature=0.3, dbpool=dbpool)
         print(segment, '>', content)
-        return {'seq': i, 'extract': content}
+        return content
 
-    raw_results = await extract_item(inputs=[(i, chunk) for i, chunk in enumerate(segments_chunk) if chunk])
-    results = [r for r in raw_results if isinstance(r, dict)]
+    raw_results = []
+    async for idx, extract in extract_item(inputs=segments_chunk):
+        if isinstance(extract, Exception):
+            yield {'seq': idx, 'content': None, 'type': 'extract', 'error': str(extract), 'item': segments_chunk[idx]}
+            continue
+        res = {'seq': idx, 'content': extract, 'type': 'extract'}
+        yield res
+        raw_results.append(res)
+    results = sorted(raw_results, key=lambda x: x['seq'], reverse=True)
     summary = await ai_analyze(results, system_prompt=summary_prompt, desc='信息片段', model=summary_model,
-                               max_tokens=max_tokens)
-
-    return {'chunks': results, 'summary': summary}
+                               max_tokens=summary_max_tokens, dbpool=dbpool)
+    yield {'seq': -1, 'content': summary, 'type': 'summary'}  # 'extract': results,
 
 
 async def call_ollama(prompt: str | list[str] = None, messages: list[dict] = None, model_name="mistral",
@@ -769,10 +899,14 @@ async def retrieved_reference(keywords: List[Union[str, Tuple[str, ...]]] = None
       :param tool_calls: 工具函数列表。
       :return: 处理结果的扁平化列表。
     """
+
     # docs = retriever(question)
     # Assume this is the document retrieved from RAG
     # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
     # refer = function_call(user_message, ...)
+    async def wrap_sync(func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+
     tool_calls = tool_calls or []
     keywords = keywords or []
     callables = {}
@@ -833,7 +967,8 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
                            temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 1024,
                            model_name=Config.DEFAULT_MODEL, model_id=0,
                            agent: str = None, tools: List[dict] = None,
-                           keywords: List[Union[str, Tuple[str, ...]]] = None, images: List[str] = None, **kwargs):
+                           keywords: List[Union[str, Tuple[str, ...]]] = None, images: List[str] = None,
+                           thinking: int = 0, **kwargs):
     model_info, name = find_ai_model(model_name, model_id, 'model')
     model_type = model_info['type']
     if messages is None:
@@ -923,16 +1058,45 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
     if model_type == 'baidu':
         payload['system'] = system
 
-    if name in ('o3-mini', 'o4-mini'):
+    if name in ('o3-mini', 'o4-mini', 'openai/o3', "openai/o1", 'openai/o1-mini', 'openai/o1-pro',
+                'openai/o3-mini', 'openai/o3-pro', 'openai/o4-mini'):
         payload['max_completion_tokens'] = payload.pop('max_tokens', max_tokens)
-        payload.pop('top_p', None)
-    if name in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b", "qwq-32b", "qwen-turbo", "qwen-plus"):
-        payload['extra_body'] = {"enable_thinking": False}  # 开启深度思考
+        payload.pop('top_p', None)  # https://www.cnblogs.com/xiaoxi666/p/18827733
+    if name in ('gpt-5', 'gpt-5-mini', 'gpt-5-nano',
+                'openai/gpt-5', 'openai/gpt-5-chat', 'openai/gpt-5-mini', 'openai/gpt-5-nano'):
+        for param in ['top_p', 'presence_penalty', 'frequency_penalty']:
+            payload.pop(param, None)
+
+    extra_body = payload.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    enable_thinking = extra_body.get('enable_thinking', thinking > 0)
+    thinking_budget = max(0, thinking) or extra_body.get('thinking_budget', 0)
+    # https://help.aliyun.com/zh/model-studio/deep-thinking?spm=a2c4g.11186623.0.0.31a44823XJPxi9#e7c0002fe4meu
+    if name in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b", "qwq-32b", "qwen-turbo", "qwen-plus",
+                "qwen-plus-2025-04-28", "deepseek-v3.1"):
+        # 开启深度思考,参数开启思考过程，该参数对 qwen3-30b-a3b-thinking-2507、qwen3-235b-a22b-thinking-2507、QwQ 模型无效
+        extra_body["enable_thinking"] = enable_thinking
+        if thinking_budget > 0:
+            extra_body["thinking_budget"] = thinking_budget
+    if name in ('deepseek-v3-1-terminus', "deepseek-v3-1-250821", "doubao-seed-1-6-250615"):
+        extra_body["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}  # /"auto"
+        if 'max_completion_tokens' in payload:
+            payload.pop('max_tokens', None)  # 不可与 max_tokens 字段同时设置，会直接报错
+        else:
+            payload['max_completion_tokens'] = payload.pop('max_tokens', max_tokens) + thinking_budget  # 最大输出长度
+    if name in ("deepseek-reason",):
+        extra_body["thinking_budget"] = thinking_budget or 2048
     if name in ("qwen-mt-plus", "qwen-mt-turbo"):
-        payload['extra_body'] = {"translation_options": {
-            "source_lang": "auto",
-            "target_lang": "English"}
-        }
+        extra_body["translation_options"] = {"source_lang": "auto", "target_lang": "English"}
+
+    if extra_body:
+        if isinstance(payload.get("extra_body"), dict):
+            payload["extra_body"].update(extra_body)
+        else:
+            payload["extra_body"] = extra_body
+
+    # payload['response_format'] = {"type": "json_object"}
 
     # 1. 系统设定（system）
     # 2. 原始提问（user）
@@ -1011,7 +1175,8 @@ async def get_generate_payload(prompt: str, user_request: str = '', suffix: str 
         model_info, payload, refer = await get_chat_payload(messages=None, user_request=user_request, system=prompt,
                                                             temperature=temperature, top_p=top_p, max_tokens=max_tokens,
                                                             model_name=model_name, model_id=model_id,
-                                                            agent=agent, tools=None, keywords=keywords, **kwargs)
+                                                            agent=agent, tools=None, keywords=keywords, thinking=0,
+                                                            **kwargs)
 
     else:
         tool_callable: List[Callable[[...], Any]] = agent_func_calls(agent, keywords=keywords, prompt=user_request)
@@ -1083,73 +1248,6 @@ async def ai_generate(model_info: Optional[Dict[str, Any]], payload: dict = None
     return response.choices[0].text.strip() if get_content else response.model_dump()
 
 
-async def stream_chat_completion(client, payload: dict) -> tuple[str, dict]:
-    payload["stream"] = True
-    payload["stream_options"] = {"include_usage": True}  # 可选，配置以后会在流式输出的最后一行展示token使用信息
-    payload["extra_body"] = {"enable_thinking": True}  # enable_thinking 参数开启思考过程，该参数对 QwQ 模型无效
-    try:
-        stream = await client.chat.completions.create(**payload)
-
-        if not stream or not hasattr(stream, "__aiter__"):
-            raise TypeError("Returned stream is not async iterable")
-
-        thinking = ''
-        content = ''
-        results_data = None
-
-        async for chunk in stream:
-            if not chunk:
-                continue
-
-            # 若 choices 为空但包含 usage，说明是 stream 末尾数据
-            if not hasattr(chunk, "choices") or not chunk.choices:
-                results_data = chunk
-                # {"id": "chatcmpl-xxx", "choices": [], "created": 1719286190, "model": "qwen-plus",
-                #  "object": "chat.completion.chunk", "system_fingerprint": null,
-                #  "usage": {"completion_tokens": 16, "prompt_tokens": 22, "total_tokens": 38}}
-                # {'id': 'chatcmpl-eba4e423-a1bf-90d6-b296-3e526727a0f0', 'choices': [], 'created': 1744611825,
-                #  'model': 'qwq-plus', 'object': 'chat.completion.chunk', 'service_tier': None,
-                #  'system_fingerprint': None,'usage': {'completion_tokens': 196, 'prompt_tokens': 14, 'total_tokens': 210,
-                #            'completion_tokens_details': None, 'prompt_tokens_details': None}}
-
-                break
-
-            delta = chunk.choices[0].delta
-            if hasattr(delta, "content") and delta.content:
-                content += delta.content
-
-            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                thinking += delta.reasoning_content
-
-        if not content:
-            raise ValueError("OpenAI API returned an empty stream response.")
-        if thinking:
-            print('thinking:', thinking)
-
-        # 构建最终 completion 格式
-        completion = results_data.model_dump() if results_data else {}
-        completion.update({
-            "object": "chat.completion",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": content},  # .split("</think>")[-1]
-                    "finish_reason": "stop",
-                    "metadata": {
-                        "reasoning": thinking
-                    }
-                }
-            ],
-        })
-        await BaseReBot.async_save(model=payload.get('model'), messages=payload.get('messages', []),
-                                   model_response=completion, reference=thinking,
-                                   dbpool=DB_Client, user='local', agent='chat', robot_id='stream_chat')
-        return content, completion
-
-    except Exception as e:
-        raise RuntimeError(f"[stream_chat_completion] Failed to complete streaming call: {e}") from e
-
-
 async def ai_try(client, payload: dict, e: Exception, get_content: bool = True):
     """
         封装 BadRequestError 的错误信息解析和修正处理逻辑。
@@ -1212,7 +1310,21 @@ async def ai_try(client, payload: dict, e: Exception, get_content: bool = True):
     error_msg = error_message.lower()
 
     if any(p in error_msg for p in stream_required_phrases):
-        content, completion = await stream_chat_completion(client, payload)
+        payload["extra_body"] = {"enable_thinking": True}
+        try:
+            last_value = None
+            async for chunk in stream_chat_completion(client, payload):
+                last_value = chunk
+            if last_value is None:
+                raise RuntimeError("[stream_chat_completion] No data received from stream.")
+            _, completion = last_value
+            completion = json.loads(completion)
+            content = completion.get('choices', [{}])[0].get('message', {}).get('content')
+            await BaseReBot.async_save(model=payload.get('model'), messages=payload.get('messages', []),
+                                       assistant_content=content, model_response=completion, dbpool=DB_Client,
+                                       user='local', agent='chat', robot_id='stream_chat')
+        except Exception as e:
+            raise RuntimeError(f"[stream_chat_completion] Failed to complete streaming call: {e}") from e
         return content if get_content else completion
     elif any(p in error_msg for p in length_required_phrases):
         raise ValueError(f"[InputTokenError] 输入超过模型限制或无效：{error_message}")
@@ -1242,18 +1354,42 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
     else:
         payload.update(kwargs)  # 修改更新 payload
 
+    fake_response = {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": payload.get('model', 'unknown'),
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": 'null',
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
     client = AI_Client.get(model_info['name'], None)
     if client:
         try:
             # await asyncio.to_thread(client.chat.completions.create, **payload)
-            # await asyncio.wait_for(client.chat.completions.create
+            # await asyncio.wait_for(client.chat.completions.create, **payload)
             completion = await client.chat.completions.create(**payload)
             if completion is None:
                 raise ValueError("OpenAI API returned None instead of a valid response")
-            if not hasattr(completion, "choices") or not hasattr(completion.choices[0], "message"):
-                raise ValueError(f"Unexpected API response: {completion}")
-
-            return completion.choices[0].message.content if get_content else completion.model_dump()  # 自动序列化为 JSON
+            if not hasattr(completion, "choices") or not completion.choices:
+                raise ValueError(f"Unexpected API response, missing choices: {completion}")
+            first_choice = completion.choices[0]
+            if not hasattr(first_choice, "message") or not hasattr(first_choice.message, "content"):
+                raise ValueError(f"Unexpected API response, missing message: {completion}")
+            return first_choice.message.content if get_content else completion.model_dump()  # 自动序列化为 JSON
+            # content = getattr(first_choice.message, "content", None)
             # json.loads(completion.model_dump_json())
 
         except BadRequestError as e:
@@ -1266,27 +1402,7 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
             error_message = f"OpenAI error occurred: {e}"
             if get_content:
                 return error_message
-            fake_response = {
-                "id": f"chatcmpl-{int(time.time())}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": payload.get('model', 'unknown'),
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": error_message,
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-            }
+            fake_response["choices"][0]["message"]["content"] = error_message
             return fake_response
 
     url, headers, payload = get_chat_payload_post(model_info, payload)
@@ -1329,7 +1445,82 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, ge
 
     except Exception as e:
         # print(response.text)
-        return f"HTTP error occurred: {e}"
+        error_message = f"HTTP error occurred: {e}"
+        if get_content:
+            return error_message
+        fake_response["choices"][0]["message"]["content"] = error_message
+        return fake_response
+
+
+async def stream_chat_completion(client, payload: dict):
+    payload["stream"] = True
+    set_usage = payload.get("stream_options", {}).get("include_usage", False)
+    if not set_usage:
+        if not isinstance(payload.get("stream_options"), dict):
+            payload["stream_options"] = {}
+        payload["stream_options"]["include_usage"] = True  # 可选，配置以后会在流式输出的最后一行展示token使用信息
+
+    # print(payload, client)
+    try:
+        stream = await client.chat.completions.create(**payload)
+        if not stream:
+            raise ValueError("OpenAI API returned an empty response")
+        if not hasattr(stream, "__aiter__"):
+            raise TypeError("OpenAI API returned a non-streaming response")
+
+        reasoning_content = ''
+        assistant_content = []  # answer_content
+        completion_chunk = None
+        async for chunk in stream:
+            if not chunk:
+                continue
+
+            completion_chunk = chunk
+            # 若 choices 为空但包含 usage，说明是 stream 末尾数据,qwen
+            if not chunk.choices:
+                if set_usage:
+                    yield None, chunk.model_dump_json()  # '[DONE]' usage
+                if assistant_content:
+                    break
+                else:
+                    continue
+
+            delta = chunk.choices[0].delta
+            if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
+                assistant_content.append(delta.content)
+                yield delta.content, chunk.model_dump_json()  # 获取字节流数据
+
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                reasoning_content += delta.reasoning_content
+                yield delta.reasoning_content, chunk.model_dump_json()
+
+        if not assistant_content and not reasoning_content:
+            raise ValueError("OpenAI API returned an empty stream response")
+        if completion_chunk:
+            completion = completion_chunk.model_dump()
+            completion.update({
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ''.join(assistant_content),
+                                    "reasoning_content": reasoning_content},
+                        "finish_reason": "stop",
+                        # "metadata": {"reasoning": reasoning}  # .split("</think>")[-1]
+                    }
+                ],
+            })
+            yield None, json.dumps(completion)
+
+    except Exception as e:
+        logging.error(f"OpenAI error:{e}, {payload}")
+        error_message = f"OpenAI error occurred: {e}"
+        fake_response = {
+            "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": payload.get("model", "unknown"),
+            "choices": [{"index": 0, "delta": {"content": error_message}, "finish_reason": "stop"}],
+        }
+        yield error_message, json.dumps(fake_response)
 
 
 async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, **kwargs):
@@ -1339,56 +1530,25 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, **k
         # payload=copy(payload)
         payload.update(kwargs)
 
+    client = AI_Client.get(model_info['name'], None)
+    if client:
+        async for item in stream_chat_completion(client, payload):
+            yield item
+
+        # with client.chat.completions.with_streaming_response.create(**payload) as response:
+        #     print(response.headers.get("X-My-Header"))
+        #     for line in response.iter_lines():
+        #         yield line
+
+        return  # 异步生成器的结束无需返回值
+
     fake_response = {
         "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk",
         "created": int(time.time()), "model": payload.get("model", "unknown"),
         "choices": [{"index": 0, "delta": {"content": 'null'}, "finish_reason": "stop"}],
     }
-    payload["stream"] = True
-    if payload["model"] in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b",
-                            "qwq-32b", "qwen-turbo", "qwen-plus"):
-        payload["extra_body"] = {"enable_thinking": True}
-    client = AI_Client.get(model_info['name'], None)
-    # print(payload, client)
-    if client:
-        try:
-            stream = await client.chat.completions.create(**payload)
-            if not stream:
-                raise ValueError("OpenAI API returned an empty response")
-            if not hasattr(stream, "__aiter__"):
-                raise TypeError("OpenAI API returned a non-streaming response")
-            has_content = False
-            async for chunk in stream:
-                if not chunk:
-                    continue
-                if not chunk.choices:  # 若 choices 为空但包含 usage，说明是 stream 末尾数据
-                    yield None, chunk.model_dump_json()  # '[DONE]' usage
-                    break
-                has_content = True
-
-                delta = chunk.choices[0].delta
-                content = delta.content  # 以两个换行符 \n\n 结束当前传输的数据块
-                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                    content = delta.reasoning_content
-
-                yield content, chunk.model_dump_json()  # 获取字节流数据
-
-            if not has_content:
-                raise ValueError("OpenAI API returned an empty stream")
-        except Exception as e:
-            logging.error(f"OpenAI error:{e}, {payload}")
-            error_message = f"OpenAI error occurred: {e}"
-            fake_response["choices"][0]["delta"]["content"] = error_message
-            yield error_message, json.dumps(fake_response)
-
-            # with client.chat.completions.with_streaming_response.create(**payload) as response:
-            #     print(response.headers.get("X-My-Header"))
-            #     for line in response.iter_lines():
-            #         yield line
-
-        return  # 异步生成器的结束无需返回值
-
     url, headers, payload = get_chat_payload_post(model_info, payload)
+    payload["stream"] = True
     cx = get_httpx_client(proxy=Config.HTTP_Proxy if model_info.get('proxy') else None)
     model_type = model_info['type']
     async for item in post_httpx_sse(url, payload, headers, Config.LLM_TIMEOUT_SEC, cx):
@@ -2004,29 +2164,6 @@ async def download_file(url: str, dest_folder: Path = None, chunk_size=4096,
             break
 
     return None, None
-
-
-async def send_to_wechat(user_name: str, context: str = None, link: str = None, object_name: str = None):
-    url = f"{Config.WECHAT_URL}/sendToChat"
-    headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
-    body = {'user': user_name, 'context': context, 'url': link,
-            'object_name': object_name, 'file_type': get_file_type_wx(object_name)}
-
-    try:
-        cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
-        response = await cx.post(url, json=body, headers=headers)
-        response.raise_for_status()
-        return response.json()
-
-    except Exception as e:
-        print('send_to_wechat', datetime.now(), body)
-        print(f"Error occurred while sending message: {e}")
-        # with httpx.Client(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
-        #     response = cx.post(url, json=body, headers=headers)
-        #     response.raise_for_status()
-        # return response.json()
-
-    return None
 
 
 async def send_callback(callback_data: dict, result, **kwargs):

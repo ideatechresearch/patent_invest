@@ -1,4 +1,5 @@
 import ast, re, json
+import markdown2
 import yaml
 from functools import partial
 from .base import *
@@ -248,37 +249,41 @@ def extract_table_segments(raw_text) -> list[tuple[str, str]]:
 
 def extract_markdown_table(text: str, convert: bool = True) -> list[dict]:
     """
-       从Markdown格式文本中提取表格并转换为字典列表
-       自动将可以转换为数字的字符串转换为int或float
-
-       参数:
-           text: 包含Markdown表格的字符串
-
-       返回:
-           字典列表，每个字典代表表格中的一行数据
-       """
-    # 匹配Markdown表格模式
-    block_match = re.search(r'(?:^\s*\|.*\|\s*$\n?)+', text, re.MULTILINE)
+    从Markdown格式文本中提取表格并转换为字典列表
+    保留原始字符串格式，只做必要的清理
+    """
+    block_match = re.search(r'(?:^\s*\|.*\|\s*$\n?)+', text, re.MULTILINE)  # 匹配Markdown表格模式
     if not block_match:
         return []
+
     lines = block_match.group(0).strip().splitlines()
     if len(lines) < 2:
         return []
 
-    # 提取表头行和数据行部分
-    headers = [col.strip().strip("*") for col in lines[0].strip().strip('|').split('|')]
-    rows = lines[2:]  # 跳过分隔符行（第2行）
+    def clean_cell(content: str) -> str | None:
+        """清理单元格内容，只移除基本的Markdown格式"""
+        if content is None:
+            return None
 
+        content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)  # 移除简单的加粗标记（**text**），但保留内容
+        content = re.sub(r'\*([^*]+)\*', r'\1', content)  # 移除简单的斜体标记（*text*），但保留内容
+        content = re.sub(r'`([^`]*)`', r'\1', content)  # 移除 `code`
+        return content.strip() or None  # 移除行首行尾多余空格
+
+    # 清理和提取表头
+    headers = [clean_cell(col.strip() or f"col{idx}") for idx, col in enumerate(lines[0].strip('|').split('|'))]
+    sep_re = re.compile(r'^\s*\|?[-:\s|]+\|?\s*$')
+    data_lines = [ln for ln in lines[1:] if not sep_re.match(ln)]  # 数据行从第一行之后，跳过所有分隔线
+
+    # 处理数据行
     result = []
-    for row in rows:
-        cells = [col.strip().strip("*") for col in row.strip().strip('|').split('|')]
-        if len(cells) != len(headers):
-            continue  # 跳过列数不一致的行
-        row_item = {
-            headers[i]: convert_num_value(cells[i]) if convert else cells[i]
-            for i in range(len(headers))
-        }
-        result.append(row_item)
+    for ln in data_lines:
+        cells = [clean_cell(col.strip()) for col in ln.strip('|').split('|')]
+        cells += [None] * (len(headers) - len(cells))
+        cells = cells[:len(headers)]  # 截断多余列
+        row = {hdr: convert_num_value(val) if convert and val is not None else val
+               for hdr, val in zip(headers, cells)}  # 创建行数据
+        result.append(row)
 
     return result
 
@@ -410,19 +415,27 @@ def clean_json_string(json_str):
     return json_str
 
 
-def clean_escaped_string(text: str) -> str:
-    # 尝试去除外层引号，并反转义
+def clean_escaped_string(text: str, force_str: bool = True, decode_unicode: bool = False) -> str:
+    """
+    尝试去除外层引号，并反转义，返回字符串。
+    force_str=True 时，非字符串结果也会转成 str。
+    decode_unicode=True 时，尝试把 \\uXXXX 形式解码成真实字符。
+    """
     try:
-        return ast.literal_eval(text)  # 自动处理 \" \\n 等
+        result = ast.literal_eval(text)  # 自动处理 \" \\n 等
+        if force_str and not isinstance(result, str):
+            result = str(result)
+        return result
     except:
         # fallback 处理
         text = text.strip()
         if re.fullmatch(r'''["'].*["']''', text) and text[0] == text[-1]:
             text = text[1:-1]
-        try:
-            return text.encode('utf-8').decode('unicode_escape')
-        except:
-            pass
+        if decode_unicode:
+            try:
+                return text.encode('utf-8').decode('unicode_escape')
+            except:
+                pass
 
     return text
 
@@ -444,44 +457,6 @@ def extract_json_from_string(input_str):
     return extract_json_array(input_str)
 
 
-def format_for_html(text):
-    # Markdown 格式的文本转换为 HTML 的字符串,渲染 Markdown 文章
-    # markdown.markdown(text, extensions=['tables', 'codehilite'])
-    # from IPython.display import Markdown, display
-    # display(Markdown(f"`{export_command}`"))
-    style = """
-    <style>
-        table {
-            border-collapse: collapse;
-            width: 100%;
-        }
-        th, td {
-            border: 1px solid #999;
-            padding: 8px;
-            text-align: left;
-        }
-        th {
-            background-color: #f2f2f2;
-        }
-    </style>
-    """
-    import markdown2
-    html_content = markdown2.markdown(text, extras=["tables", "fenced-code-blocks", "break-on-newline"])
-    return f"<html><head>{style}</head><body>{html_content}</body></html>"
-
-
-def safe_convert_html(text):
-    '''过滤危险标签：防止 XSS 攻击'''
-    from markdown import Markdown
-    from bs4 import BeautifulSoup
-    html = Markdown(extensions=['tables']).convert(text)
-    soup = BeautifulSoup(html, 'html.parser')
-    # 移除 script 等危险标签
-    for tag in soup.find_all(['script', 'iframe']):
-        tag.decompose()
-    return str(soup)
-
-
 def extract_links(text):
     # 提取 Markdown 格式的链接 [链接文字](链接地址)
     pattern = r'\[([^\]]+)\]\((https?://[^\s)]+)\)'
@@ -492,19 +467,14 @@ def extract_links(text):
 def extract_headers(text):
     # 提取 ## 或 ### 等标题
     headers = re.findall(r'^(#{1,6})\s+(.*)', text, re.MULTILINE)
-    return [{'level': len(header[0]), 'text': header[1]} for header in headers]
+    return [{'level': len(header[0]), 'text': header[1].strip()} for header in headers]
 
 
-def extract_bold(text):
-    # 提取 Markdown 格式的 **粗体**
-    bold_texts = re.findall(r'\*\*(.*?)\*\*', text)
-    return bold_texts
-
-
-def extract_italic(text):
-    # 提取 Markdown 格式的 __斜体__ 或 *斜体*
-    italic_texts = re.findall(r'__(.*?)__|\*(.*?)\*', text)
-    return [italic[0] or italic[1] for italic in italic_texts]  # 处理两个捕获组
+def extract_imports(text):
+    bold_texts = re.findall(r'\*\*(.*?)\*\*', text)  # 提取 Markdown 格式的 **粗体**
+    italic_texts = re.findall(r'__(.*?)__|\*(.*?)\*', text)  # 提取 Markdown 格式的 __斜体__ 或 *斜体*
+    italic = [italic[0] or italic[1] for italic in italic_texts]
+    return {"bold": bold_texts, "italic": italic, "header": extract_headers(text)}
 
 
 def extract_tagged_content(text, tag="answer"):
@@ -628,7 +598,107 @@ def format_for_wechat(text):
     return formatted_text.strip()
 
 
-def format_table(records: list[dict]) -> str:
+def format_to_spans(text: str, codes: bool = True, tables: bool = True) -> str:
+    """把自定义标记语法转换为 HTML span"""
+    import html
+    def parse_table(md: str) -> str:
+        lines = [l for l in md.splitlines() if l.strip()]
+        if not lines or "|" not in lines[0]:
+            return md  # 不是表格
+        html_table = ["<table>"]
+        for i, line in enumerate(lines):
+            cols = [c.strip() for c in line.split("|") if c.strip()]
+            if not cols:
+                continue
+            tag = "th" if i == 0 else "td"
+            html_table.append("<tr>" + "".join(f"<{tag}>{html.escape(c)}</{tag}>" for c in cols) + "</tr>")
+        html_table.append("</table>")
+        return "\n".join(html_table)
+
+    def format_text(t: str) -> str:
+        # --- 或 *** 或 ___ 作为水平分割线
+        t = re.sub(r'^\s*(---|\*\*\*|___)\s*$', '<hr>', t, flags=re.M)
+        # #### 或更多的标题 -> small-caps
+        t = re.sub(r'^(#{4,7})\s+(.*?)(\n|$)', r'<span class="bold important small-caps">\2</span>\n',
+                   t, flags=re.M)
+        # ### 标题 -> large-text uppercase
+        t = re.sub(r'###\s(.*?)(\n|$)', r'<span class="bold large-text uppercase">\1</span>\n', t)
+        # 文本标记替换
+        t = re.sub(r'\*\*(.*?)\*\*', r'<span class="bold">\1</span>', t)  # **粗体**
+        t = re.sub(r'!!(.*?)!!', r'<span class="highlight">\1</span>', t)  # !!高亮!!
+        t = re.sub(r'__(.*?)__', r'<span class="italic">\1</span>', t)  # __斜体__
+        t = re.sub(r'~~(.*?)~~', r'<span class="underline">\1</span>', t)  # ~~下划线~~
+        t = re.sub(r'\^\^(.*?)\^\^', r'<span class="important">\1</span>', t)  # ^^重要^^
+
+        # t = re.sub(r'\n+', '\n', t).strip()
+        t = re.sub(r'\n{2,}', '</p><p>', t)  # 处理多余空行 -> 段落
+        t = t.replace("\n", "<br>")  # 把换行转成 <br>（避免浏览器忽略）
+        # # 包裹在 <p> 中，保证 HTML 结构完整
+        # if not t.startswith("<p>"):
+        #     t = f"<p>{t}</p>"
+        return t
+
+    def repl_codeblock(match):
+        code_content = html.escape(match.group(1))
+        return f'<pre><code>{code_content}</code></pre>'
+
+    if codes:
+        # 处理 ```code```，HTML 转义内部
+        text = re.sub(r'```(.*?)```', repl_codeblock, text, flags=re.S)
+    if tables:
+        text = parse_table(text)  # 先处理表格
+
+    return format_text(text)
+
+
+def normalize_markdown(text: str) -> str:
+    # 确保标题后至少有一个空行
+    def repl(m):
+        title = m.group(1)
+        rest = m.group(2)
+        if rest.startswith("\n\n"):
+            return title + rest
+        else:
+            return title + "\n\n" + rest
+
+    text = text.replace("\\n", "\n")
+    pattern = re.compile(r'^(#{1,6} .+?)(\n.*)', re.MULTILINE | re.DOTALL)  # 确保标题后至少有一个空行
+    return pattern.sub(repl, text)
+
+
+def format_for_html(text: str, html: bool = False):
+    # Markdown 格式的文本转换为 HTML 的字符串,渲染 Markdown 文章
+    # markdown.markdown(text, extensions=['tables', 'codehilite'])
+    # from IPython.display import Markdown, display
+    # display(Markdown(f"`{export_command}`"))
+    style = """
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", Arial, sans-serif; }
+        table { border-collapse: collapse; width: 100%; max-width: 100%; overflow-x: auto; display: block; }
+        th, td { border: 1px solid #999; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        pre { background-color: #1e1e1e; color: #d4d4d4; padding: 8px; border-radius: 5px; overflow-x: auto; font-size: 0.9em;}
+        code { font-family: "Courier New", monospace; background-color: #1e1e1e; color: #d4d4d4; padding: 2px 4px; border-radius: 3px;}
+    </style>
+    """
+    text = normalize_markdown(text)
+    html_content = markdown2.markdown(text, extras=["tables", "fenced-code-blocks", "break-on-newline"])
+    return f"<html><head>{style}</head><body>{html_content}</body></html>" if html else html_content
+
+
+def safe_convert_html(text):
+    '''过滤危险标签：防止 XSS 攻击'''
+    from markdown import Markdown
+    from bs4 import BeautifulSoup
+    html = Markdown(extensions=['tables']).convert(text)
+    soup = BeautifulSoup(html, 'html.parser')
+    # 移除 script 等危险标签
+    for tag in soup.find_all(['script', 'iframe']):
+        tag.decompose()
+    return str(soup)
+
+
+def format_table_md(records: list[dict]) -> str:
     seen = []
     for r in records:
         for k in r.keys():
@@ -647,28 +717,21 @@ def format_content_str(content, level=0, exclude_null=True) -> str:
     if exclude_null and content is None:
         return ""  # "*（空内容）*"
 
-    if isinstance(content, (list, tuple)):
-        if exclude_null and not content:
-            return "" # "*（空列表）*"
-        if all(isinstance(x, dict) for x in content):
-            return format_table(content)
-        elif all(isinstance(x, str) for x in content):
-            return "\n".join(content)
-        else:
-            return json.dumps(content, ensure_ascii=False, indent=2)
     if isinstance(content, dict):
         if exclude_null and not content:
             return ""
         if all(isinstance(x, str) for x in content.keys()):
             heading_prefix = ("\n" + " " * level) if level > 0 else ''  # "#" * (level + 2)
-            if all(isinstance(x, (str, int, float, bool, type(None))) for x in content.values()):
-                return '|'.join(f"{heading_prefix}{key}:{val.strip() if isinstance(val, str) else val}" for key, val in
-                                content.items() if not exclude_null or val)
-            lines = [f"{heading_prefix}**{key}**:{format_content_str(val, level + 1)}" for key, val in content.items()
-                     if not exclude_null or val]
+            lines = [f"{heading_prefix}**{key}**:{format_content_str(val, level + 1, exclude_null)}"
+                     for key, val in content.items()
+                     if not exclude_null or val is not None]  # 统一走递归多行输出
             return "\n".join(lines)
-        else:
-            return json.dumps(content, ensure_ascii=False, indent=2)
+        return json.dumps(content, ensure_ascii=False, indent=2)
+
+    if isinstance(content, (list, tuple)):
+        if exclude_null and not content:
+            return ""  # "*（空列表）*"
+        return "\n".join(format_content_str(x, level, exclude_null) for x in content)  # format_table/str/any
 
     if isinstance(content, (int, float, bool)):
         return str(content)
@@ -676,16 +739,22 @@ def format_content_str(content, level=0, exclude_null=True) -> str:
     return str(content).strip()
 
 
-def render_summary_text(summary_data: dict | list[dict], title_map: dict = None) -> str:
+def format_summary_text(summary_data: dict | list[dict], title_map: dict = None, base_level=3) -> str:
     """
     字段中文标题映射
     将结构化 summary_data 转为分节展示文本（markdown 风格）
     - 渲染顺序以 summary_data 本身为准
     """
     title_map = title_map or {}
+    numerals = "一二三四五六七八九十"
 
     def render_one(data: dict, index: int = None):
-        num_iter = iter("一二三四五六七八九十")
+        values = list(data.values())
+        if all(isinstance(v, (int, float, bool)) for v in values) or all(
+                isinstance(v, str) and len(v) < 50 for v in values):
+            return f"```json\n{json.dumps(map_fields(data, title_map), ensure_ascii=False, indent=2)}```"
+
+        num_iter = iter(numerals)
         sections = []
         for i, (key, content) in enumerate(data.items()):
             if not content:
@@ -694,12 +763,17 @@ def render_summary_text(summary_data: dict | list[dict], title_map: dict = None)
                 continue
             # 自动转为字符串（支持字典或表格结构）
             num = next(num_iter, str(i + 1))
-            prefix = f"#### {num}、{title_map.get(key, key)}"
-            content_str = remove_markdown_block(format_content_str(content))
+            prefix = f"{'#' * (base_level + 1)} {num}、{title_map.get(key, key)}"
+            if isinstance(content, list) and all(isinstance(x, dict) for x in content):
+                content_str = format_table_md(content)
+            else:
+                content_str = remove_markdown_block(format_content_str(content))
             sections.append(f"{prefix}\n\n{content_str}\n")
 
         md_text = "\n\n---\n\n".join(sections)
-        return f"### 第 {index + 1} 条\n\n" + md_text if index is not None else md_text
+        if index is not None:
+            return f"{'#' * base_level}  第 {index + 1} 条\n\n" + md_text
+        return md_text
 
     if isinstance(summary_data, list):
         return "\n\n---\n\n".join(render_one(item, i) for i, item in enumerate(summary_data))
@@ -1020,19 +1094,19 @@ def extract_code_blocks(text, lag='python', **kwargs):
 
 
 def extract_string(text, extract: str | list, **kwargs):
-    if not extract:
+    if not extract or extract == 'raw':
         return None
     funcs = {
         "jsons": extract_jsons,
         "json": extract_json_struct,
         "json_array": extract_json_array,
-        "json_any": extract_json_from_string,
+        "json_object": extract_json_from_string,
 
         "header": extract_headers,
+        "imports": extract_imports,
         "links": extract_links,
         'urls': extract_text_urls,
-        "bold": extract_bold,
-        "italic": extract_italic,
+
         "tables": extract_table_blocks,
         "table_segments": extract_table_segments,
         "table_data": extract_markdown_table,
@@ -1046,6 +1120,7 @@ def extract_string(text, extract: str | list, **kwargs):
         "wechat": format_for_wechat,
         'remark': remove_markdown,
         "html": format_for_html,
+        "spans": format_to_spans,
         "web": extract_web_content,
     }
 

@@ -1,15 +1,16 @@
 import httpx, aiohttp, aiofiles, requests
 import asyncio
 import logging
-import json, uuid, os
-from typing import Callable, Optional, Type, Dict, Tuple, Any, Union, Awaitable, AsyncIterator, Coroutine
+import json, uuid, os, time
+from typing import Callable, Optional, Type, Dict, List, Tuple, Any, Union, Awaitable, AsyncIterator, AsyncGenerator, \
+    Coroutine
+
 from contextlib import asynccontextmanager
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 # from starlette.routing import Route, Mount
-
 from logging.handlers import RotatingFileHandler
-from utils import async_to_sync, run_with_semaphore, generate_hash_key, parse_database_uri, is_port_open
+from utils import async_to_sync, generate_hash_key, parse_database_uri, is_port_open, chunks_iterable, get_file_type_wx
 from config import Config, AI_Models, model_api_keys
 
 # Config.load('config.yaml')
@@ -24,8 +25,6 @@ from fastmcp import FastMCP, Context as MCPContext, Client as MCPClient, setting
 import oss2
 # https://gofastmcp.com/servers/context
 from redis.asyncio import Redis, StrictRedis, ConnectionPool
-# from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-# from sqlalchemy.pool import NullPool, QueuePool
 from functools import partial, wraps
 import inspect
 
@@ -36,14 +35,7 @@ _redis_client: Optional[Redis] = None  # StrictRedis(host='localhost', port=6379
 _redis_pool: Optional[ConnectionPool] = None
 _dask_cluster: Optional[LocalCluster | str] = None
 _dask_client: Optional[DaskClient] = None
-
-log_handler = RotatingFileHandler("app.log", maxBytes=1_000_000, backupCount=3, encoding='utf-8')
-# 文件日志logging.FileHandler('errors.log')
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.WARNING, encoding='utf-8',
-                    handlers=[
-                        logging.StreamHandler(),  # 输出到终端,控制台输出
-                        log_handler
-                    ])
+logger = logging.getLogger(__name__)
 AI_Client: Dict[str, Optional[AsyncOpenAI]] = {}  # OpenAI
 QD_Client = AsyncQdrantClient(host=Config.QDRANT_HOST, grpc_port=Config.QDRANT_GRPC_PORT,
                               prefer_grpc=True) if Config.QDRANT_GRPC_PORT else AsyncQdrantClient(url=Config.QDRANT_URL)
@@ -55,21 +47,26 @@ mcp = FastMCP(name="FastMCP Server")  # Create a server instance,main_mcp
 
 # dependencies=["pandas", "matplotlib", "requests"]
 
-# echo=True 仅用于调试 poolclass=NullPool,每次请求都新建连接，用完就断，不缓存
-# async_engine = create_async_engine(Config.ASYNC_SQLALCHEMY_DATABASE_URI)
-# AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=async_engine,
-#                                  class_=AsyncSession)
-# poolclass=QueuePool,多线程安全的连接池，复用连接
+
+def setup_logging(file_name="app.log", level=logging.WARNING):
+    log_handler = RotatingFileHandler(file_name, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
+    # 文件日志logging.FileHandler('errors.log')
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=level, encoding='utf-8',
+                        handlers=[
+                            logging.StreamHandler(),  # 输出到终端,控制台输出
+                            log_handler
+                        ])
 
 
-def get_httpx_client(time_out: float = Config.HTTP_TIMEOUT_SEC, proxy: str = None) -> httpx.AsyncClient:
+def get_httpx_client(time_out: float = None, proxy: str = None) -> httpx.AsyncClient:
     # @asynccontextmanager
     key = proxy or "default"
     global _httpx_clients
     if key not in _httpx_clients or _httpx_clients[key].is_closed:
         transport = httpx.AsyncHTTPTransport(proxy=proxy or None)
-        limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-        timeout = httpx.Timeout(timeout=time_out, read=60.0, write=30.0, connect=5.0)
+        limits = httpx.Limits(max_connections=Config.MAX_HTTP_CONNECTIONS,
+                              max_keepalive_connections=Config.MAX_KEEPALIVE_CONNECTIONS)
+        timeout = httpx.Timeout(timeout=time_out or Config.HTTP_TIMEOUT_SEC, read=60.0, write=30.0, connect=5.0)
         _httpx_clients[key] = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
     # try:
     #     yield _httpx_clients[key] #Depends(get_httpx_client)
@@ -85,13 +82,6 @@ async def shutdown_httpx():
         if _client and not _client.is_closed:
             await _client.aclose()
 
-
-# async def get_async_session() -> AsyncSession:
-#     # 异步依赖
-#     async with AsyncSessionLocal() as session:
-#         yield session  # 自动 await 生成器
-#     # finally:
-#     #   await session.close()
 
 def get_redis(db: int = 0) -> Optional[Redis]:
     global _redis_client, _redis_pool
@@ -234,12 +224,22 @@ async def scan_from_redis(redis, key: str = "funcmeta", user: str = None, batch_
     return data
 
 
+async def stream_to_redis(redis, batch: list, key: str = 'streams'):
+    pipe = redis.pipeline()
+    for stream_id, chunk in batch:
+        stream_name = f"{key}:{stream_id % 3}"  # 选择分片流名
+        pipe.xadd(stream_name, fields=chunk, id="*", maxlen=10000, approximate=True)  # {"data": json.dumps(chunk)}
+    try:
+        await pipe.execute()
+    except Exception as e:
+        raise
+
+
 async def run_with_lock(func_call: Callable, *args, lock_timeout: int = 600, lock_key: str = None, redis=None,
-                        logger_name: Optional[str] = None, **kwargs):
+                        **kwargs):
     redis = redis or get_redis()
     if not redis:
         return await func_call(*args, **kwargs)
-    logger = logging.getLogger(logger_name)
     func_name = getattr(func_call, "__qualname__", getattr(func_call, "__name__", repr(func_call)))
     lock_key = lock_key or f'lock:{func_name}'
     lock_value = str(uuid.uuid4())  # str(time.time())，每个worker使用唯一的lock_value
@@ -271,14 +271,13 @@ async def run_with_lock(func_call: Callable, *args, lock_timeout: int = 600, loc
     return result
 
 
-def distributed_lock(lock_timeout: int = 600, redis_key: Optional[str] = None, logger_name: Optional[str] = None):
+def distributed_lock(lock_timeout: int = 600, redis_key: Optional[str] = None):
     '''
     locked_operation = distributed_lock(lock_timeout=300)(my_task)    手动应用装饰器,临时需要加锁的函数
     await locked_operation(123, {"name": "John"})
     @distributed_lock(300) 长期使用的任务函数
     :param lock_timeout:
     :param redis_key:
-    :param logger_name:
     :return:
     '''
 
@@ -289,8 +288,6 @@ def distributed_lock(lock_timeout: int = 600, redis_key: Optional[str] = None, l
             if not redis:
                 return await func(*args, **kwargs)
 
-            # 配置日志和锁键
-            logger = logging.getLogger(logger_name)  # or func.__module__)
             lock_key = redis_key or f"lock:{func.__qualname__}"
 
             # 尝试获取锁
@@ -413,13 +410,10 @@ def get_w3():
     return None
 
 
-def error_logger(extra_msg=None, logger_name=None):
+def error_logger(extra_msg=None):
     """
     错误日志装饰器 @error_logger()
-    参数:
-        logger_name (str): 日志器名称
     """
-    logger = logging.getLogger(logger_name)
 
     def decorator(func):
         @wraps(func)
@@ -441,7 +435,7 @@ def error_logger(extra_msg=None, logger_name=None):
 
 def async_error_logger(max_retries: int = 0, delay: int | float = 1, backoff: int | float = 2,
                        exceptions: Type[Exception] | tuple[Type[Exception], ...] = Exception,
-                       extra_msg: str = None, logger_name: Optional[str] = None, log_level: int = logging.ERROR):
+                       extra_msg: str = None, log_level: int = logging.ERROR):
     """
     异步函数的错误重试和日志记录装饰器
 
@@ -450,10 +444,8 @@ def async_error_logger(max_retries: int = 0, delay: int | float = 1, backoff: in
         delay (int/float): 初始延迟时间(秒)，默认为1
         backoff (int/float): 延迟时间倍增系数，默认为2
         exceptions (Exception/tuple): 要捕获的异常类型，默认为所有异常
-        logger_name (Logger): 自定义logger，默认使用模块logger  __name__
         log_level (int): 日志级别
     """
-    logger = logging.getLogger(logger_name)
 
     def decorator(func: Callable[..., Awaitable]):
         @wraps(func)
@@ -464,22 +456,22 @@ def async_error_logger(max_retries: int = 0, delay: int | float = 1, backoff: in
             _backoff = kwargs.pop("backoff", backoff)
             _extra_msg = kwargs.pop("extra_msg", extra_msg)
 
-            retry_count = 0
+            attempt = 0
             current_delay = _delay
 
             while True:
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
-                    retry_count += 1
+                    attempt += 1
                     msg = f"Async function {func.__name__} failed with error: {str(e)}."
                     if _extra_msg:
                         msg += f" | Extra: {_extra_msg}"
-                    if retry_count > _max_retries:
+                    if attempt > _max_retries:
                         logger.log(log_level, f"{msg} After {_max_retries} retries", exc_info=True)
                         raise  # 重试次数用尽后重新抛出异常
 
-                    logger.log(log_level, f"{msg} Retrying {retry_count}/{_max_retries} in {current_delay} seconds...")
+                    logger.log(log_level, f"{msg} Retrying {attempt}/{_max_retries} in {current_delay} seconds...")
                     await asyncio.sleep(current_delay)
                     current_delay *= _backoff  # 指数退避
 
@@ -488,8 +480,8 @@ def async_error_logger(max_retries: int = 0, delay: int | float = 1, backoff: in
     return decorator
 
 
-def task_processor_worker(max_retries: int = 0, delay: float = 1.0, backoff: int | float = 2, timeout: int | float = -1,
-                          logger_name: Optional[str] = None):
+def task_processor_worker(max_retries: int = 0, delay: float = 1.0, backoff: int | float = 2,
+                          timeout: int | float = -1):
     """
     任务处理装饰器，封装任务执行、重试和异常处理逻辑
     @task_processor_worker(max_retries=3, delay=0.5,timeout=10)
@@ -524,13 +516,11 @@ def task_processor_worker(max_retries: int = 0, delay: float = 1.0, backoff: int
     :param delay: 重试前延迟时间（秒）
     :param backoff:
     :param timeout: 超时时间（秒）
-    :param logger_name: 自定义logger，默认使用模块logger
     :return:
     """
 
     def decorator(func: Callable):
         async def wrapper(queue: asyncio.Queue, **kwargs):
-            logger = logging.getLogger(logger_name)
             # 判断 func 是否接收 queue 参数
             accepts_queue = 'queue' in inspect.signature(func).parameters
 
@@ -544,8 +534,8 @@ def task_processor_worker(max_retries: int = 0, delay: float = 1.0, backoff: int
                 try:
                     process_func = func
                     if max_retries > 0:
-                        process_func = async_error_logger(max_retries=max_retries, delay=delay, backoff=backoff,
-                                                          logger_name=logger_name)(func)  # 处理重试逻辑
+                        process_func = async_error_logger(max_retries=max_retries, delay=delay, backoff=backoff)(
+                            func)  # 处理重试逻辑
                     if timeout > 0:
                         if accepts_queue:
                             success = await asyncio.wait_for(process_func(task_data, queue, **kwargs), timeout=timeout)
@@ -581,9 +571,8 @@ def start_consumer_workers(queue: asyncio.Queue, worker_func: Callable, num_work
     return [asyncio.create_task(worker_func(queue=queue, **kwargs)) for _ in range(num_workers)]
 
 
-async def stop_worker(queue: asyncio.Queue, worker_tasks: list, logger_name: Optional[str] = None):
+async def stop_worker(queue: asyncio.Queue, worker_tasks: list):
     '''优雅停止所有 worker'''
-    logger = logging.getLogger(logger_name)
     try:
         await queue.join()  # 等待队列清空
 
@@ -598,55 +587,6 @@ async def stop_worker(queue: asyncio.Queue, worker_tasks: list, logger_name: Opt
     finally:
         # 统一回收所有任务
         await asyncio.gather(*worker_tasks, return_exceptions=True)
-
-
-def run_togather(max_concurrent: int = 100, batch_size: int = -1, input_key: str = None):
-    """
-    concurrency 并发限制装饰器，支持批量调用控制并发数量
-    参数：
-        max_concurrent: 最大并发数，默认 100；若 <=0 则不限制。
-        batch_size: 批量大小，默认 -1 表示不分批；若 >0 则按批调用函数。
-        - 第一个参数为单个输入（如 str|list[str],list[tuple]），或用 inputs=... 关键字传入。
-        input_key: 如果不为 None，则以关键字参数方式传递输入值，如 func(**{input_key: x})
-    用法：
-        @run_togather(max_concurrent=10, batch_size=16)
-        async def create_embeddings(input: List[str]|str, ..., model='xxx'):
-            ...
-        process_func = run_togather(max_concurrent=100, input_key="input")(cls.generate_metadata)
-        results = await process_func(inputs=func_list,**kwargs)
-    """
-    semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
-
-    def decorator(func: Callable[..., Any]):
-        @wraps(func)
-        async def wrapper(*args, inputs: list = None, **kwargs):
-            _args = list(args)
-            if inputs is None and _args:
-                inputs = _args.pop(0)  # 允许 positional 方式传 list
-            if not isinstance(inputs, list):
-                inputs = [inputs]
-
-            async def run_semaphore(x):
-                if semaphore:
-                    async with semaphore:
-                        if input_key:
-                            return await func(*_args, **{input_key: x}, **kwargs)
-                        return await func(x, *_args, **kwargs)
-                if input_key:
-                    return await func(*_args, **{input_key: x}, **kwargs)
-                return await func(x, *_args, **kwargs)
-
-            if batch_size <= 0:
-                # 所有 input 独立请求
-                tasks = [run_semaphore(item) for item in inputs]
-            else:
-                tasks = [run_semaphore(inputs[i:i + batch_size]) for i in range(0, len(inputs), batch_size)]
-
-            return await asyncio.gather(*tasks, return_exceptions=True)  # 确保任务取消时不会引发异常
-
-        return wrapper
-
-    return decorator
 
 
 def async_timer_cron(interval: float = 60) -> Callable[
@@ -763,6 +703,18 @@ class BaseMysql:
         """异步实现中关闭连接池；子类实现"""
         raise NotImplementedError
 
+    def table_schema(self, table_name: str) -> tuple[str, tuple]:
+        if not table_name:
+            raise ValueError("[Schema] 表名不能为空")
+        sql = """
+                 SELECT column_name, data_type, is_nullable, column_type, column_comment
+                 FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s
+                 ORDER BY ordinal_position
+             """
+        params = (self.db_name, table_name)
+        return sql, params
+
     @staticmethod
     def format_value(value) -> Union[str, int, float, bool, None]:
         """
@@ -785,6 +737,103 @@ class BaseMysql:
             return json.dumps(list(value), ensure_ascii=False)
 
         return str(value)  # 其他类型保持原样 (None等)
+
+    @staticmethod
+    def build_insert(table_name: str, params_data: dict, update_fields: list[str] | None = None) -> tuple[str, tuple]:
+        """
+        生成插入 SQL（可选 ON DUPLICATE KEY UPDATE）
+
+        Args:
+            table_name: 表名
+            params_data: 数据字典
+            update_fields: 冲突时更新的字段，None 表示默认更新非主键字段
+
+        Returns:
+            tuple: (sql, values)
+        """
+        if not params_data:
+            raise ValueError("params_data 不能为空")
+
+        fields = list(params_data.keys())
+        values = tuple(params_data.values())  # [tuple(row[f] for f in fields) for row in params_data]
+        field_str = ', '.join(f"`{field}`" for field in fields)  # columns_str
+        placeholder_str = ', '.join(['%s'] * len(fields))
+        sql = f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str})"
+
+        if update_fields is None:
+            update_fields = [f for f in fields if f.lower() not in ("id", "created_at", "created_time")]
+
+        if update_fields:
+            sql += " AS new"
+            update_str = ', '.join(f"`{field}` = new.`{field}`" for field in update_fields)
+            if "updated_at" in fields and "updated_at" not in update_fields:
+                update_str += ", `updated_at` = CURRENT_TIMESTAMP"
+            sql += f" ON DUPLICATE KEY UPDATE {update_str}"
+
+        return sql, values
+
+    @staticmethod
+    def get_dataframe(db_config: dict, sql: str, params: tuple | dict = None):
+        import pandas as pd
+        # with create_engine(SQLALCHEMY_DATABASE_URI).connect() as conn:
+        conn = pymysql.connect(**db_config)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params or ())
+                rows = cursor.fetchall()
+                cols = [desc[0] for desc in cursor.description]
+                return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            return pd.read_sql(sql, conn, params=params)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def query_dataframe_process(conn, sql: str, process_chunk: Callable = None, params: tuple | dict = None,
+                                chunk_size: int = 100000, aggregate: bool = False):
+        """
+        通用大表分页查询并处理每块数据。
+
+        Args:
+            conn: 数据库连接对象（需支持 conn.cursor()）
+            sql (str): 原始 SQL 查询语句（不含 LIMIT 和 OFFSET）
+            process_chunk (Callable): 对每个批次的进行处理的函数
+            chunk_size (int): 每批次读取的记录数
+            params(tuple|dict|None): SQL 查询参数
+            aggregate (bool): 是否把所有 DataFrame 合并成一个大 DataFrame
+        Returns:
+            list | pd.DataFrame: 返回所有处理结果的列表
+        """
+        import pandas as pd
+
+        offset = 0
+        results = []
+        chunk_query = f"{sql} LIMIT %s OFFSET %s"
+
+        with conn.cursor() as cur:
+            while True:
+                if isinstance(params, tuple):
+                    query_params = (*params, chunk_size, offset)
+                elif isinstance(params, dict):
+                    query_params = {**params, "limit": chunk_size, "offset": offset}
+                else:
+                    query_params = (chunk_size, offset)
+
+                cur.execute(chunk_query, query_params)
+                rows = cur.fetchall()
+                if not rows:
+                    break
+
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    results.append(process_chunk(df) if process_chunk else df)
+
+                offset += chunk_size
+
+        if aggregate and not process_chunk:
+            return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
+        return results
 
 
 class SyncMysql(BaseMysql):
@@ -933,12 +982,8 @@ class SyncMysql(BaseMysql):
             return []
         field_str = ', '.join(f"`{field}`" for field in fields) if fields else '*'
 
-        def chunks(lst, n):
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-
         result_rows = []
-        for batch in chunks(ids, chunk_size):
+        for batch in chunks_iterable(ids, chunk_size):
             placeholders = ', '.join(['%s'] * len(batch))
             sql = f"SELECT {field_str} FROM `{table_name}` WHERE `{index_key}` IN ({placeholders})"
             self.cur.execute(sql, tuple(batch))
@@ -946,40 +991,6 @@ class SyncMysql(BaseMysql):
             # filtered_chunk = pd.read_sql_query(text(sql+'`{index_key}` in :ids'), conn, params={'ids': batch})
             # df_chunk.to_sql(table_name, con=engine,chunksize=chunk_size, if_exists='append', index=False)
         return result_rows
-
-    def query_batches_process(self, query: str, process_chunk: Callable, params: tuple | dict = None,
-                              chunk_size: int = 100000):
-        """
-        通用大表分页查询并处理每块数据。
-
-        Args:
-            query (str): 原始 SQL 查询语句（不含 LIMIT 和 OFFSET）
-            process_chunk (Callable): 对每个批次的进行处理的函数
-            chunk_size (int): 每批次读取的记录数
-            params:
-
-        Returns:
-            Optional[list]: 返回所有处理结果的列表
-        """
-        import pandas as pd
-
-        offset = 0
-        results = []
-
-        while True:
-            chunk_query = f"{query} LIMIT {chunk_size} OFFSET {offset}"
-            self.cur.execute(chunk_query, params or ())
-            rows = self.cur.fetchall()
-            if not rows:
-                break
-
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                result = process_chunk(df)
-                results.append(result)
-            offset += chunk_size
-
-        return results
 
     def get_table_schema(self, table_name: str) -> list:
         """
@@ -989,18 +1000,9 @@ class SyncMysql(BaseMysql):
         返回:
             表结构列表，每列包含 column_name, data_type, is_nullable, column_type, column_comment
         """
-        if not table_name:
-            print("[Schema] 表名不能为空")
-            return []
         try:
             self.ensure_connection()
-            sql = """
-                SELECT column_name, data_type, is_nullable, column_type, column_comment
-                FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s
-                ORDER BY ordinal_position
-            """
-            params = (self.db_name, table_name)
+            sql, params = self.table_schema(table_name)
             return self.search(sql, params)
         except Exception as e:
             print(f"[Schema] 获取表结构失败: {str(e)}")
@@ -1041,7 +1043,7 @@ class AsyncMysql(BaseMysql):
             self.pool = None
 
     async def close_pool(self):
-        if self.pool:
+        if self.pool is not None:
             self.pool.close()
             await self.pool.wait_closed()
             self.pool = None
@@ -1148,8 +1150,8 @@ class AsyncMysql(BaseMysql):
             return False
 
         finally:
-            if should_release and self.pool is not None:
-                self.pool.release(conn)
+            if should_release:
+                self.release(conn)
 
     async def async_query(self, query_list: list[tuple[str, tuple | dict]], fetch_all: bool = True,
                           cursor=None) -> list:
@@ -1183,38 +1185,28 @@ class AsyncMysql(BaseMysql):
         results = await self.async_query([(sql, params)], fetch_all=False, cursor=cursor)
         return results[0] if results else None
 
-    async def async_merge(self, table_name: str, params_data: dict, update_fields: list[str] = None, conn=None):
+    async def async_insert(self, table_name: str, params_data: dict, conn=None):
         """
-        插入或更新数据（根据主键或唯一键自动合并）
-
+        插入数据
         Args:
             table_name (str): 表名
             params_data (dict): 要插入的数据（更新必须包含主键/唯一索引字段）
-            update_fields (list): 需要更新的字段列表，默认为除了主键以外的字段,在发生冲突时被更新的字段列表,[]为插入
             conn:可选外部传入连接
         """
-        if not params_data:
-            raise ValueError("参数数据不能为空")
-
-        fields = list(params_data.keys())  # [k for k in params_data if params_data[k] is not None]
-        values = tuple(params_data.values())
-        field_str = ', '.join(f"`{field}`" for field in fields)
-        placeholder_str = ', '.join(['%s'] * len(fields))
-        sql = f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str})"
-        if update_fields is None:
-            update_fields = [f for f in fields if f.lower() not in ("id", "created_at", "created_time")]
-        if update_fields:
-            sql += " AS new"
-            update_str = ', '.join(f"`{field}` = new.`{field}`" for field in update_fields)
-            if "updated_at" in fields and "updated_at" not in update_fields:
-                update_str += ", `updated_at` = CURRENT_TIMESTAMP"
-            sql += f" ON DUPLICATE KEY UPDATE {update_str}"
+        sql, values = self.build_insert(table_name, params_data, update_fields=[])
         return await self.async_run(sql, values, conn=conn)
 
-    async def async_insert(self, table_name: str, params_data: dict, conn=None):
-        return await self.async_merge(table_name, params_data, update_fields=[], conn=conn)
+    async def async_merge(self, table_name: str, params_list: list[dict], update_fields: list[str] = None, conn=None):
+        """
+        批量插入/更新数据,返回true（根据主键或唯一键自动合并）
+        update_fields (list): 需要更新的字段列表，默认为除了主键以外的字段,在发生冲突时被更新的字段列表,[]为插入
+        """
+        if not params_list:
+            raise ValueError("参数列表不能为空")
+        sql_list = [self.build_insert(table_name, row, update_fields=update_fields or []) for row in params_list]
+        return await self.async_execute(sql_list, conn=conn)  # list[tuple[str, tuple]]
 
-    async def async_update(self, table_name: str, params_data: dict, row_id, id_field: str = "id", conn=None):
+    async def async_update(self, table_name: str, params_data: dict, row_id: int, primary_key: str = "id", conn=None):
         """
         根据主键字段更新指定行数据。
 
@@ -1222,7 +1214,7 @@ class AsyncMysql(BaseMysql):
             table_name (str): 表名
             row_id: 主键值（通常是 id）
             params_data (dict): 要更新的字段及新值
-            id_field (str): 主键字段名，默认是 'id'
+            primary_key (str): 主键字段名，默认是 'id'
             conn:可选外部传入连接
         """
         if not params_data:
@@ -1232,8 +1224,32 @@ class AsyncMysql(BaseMysql):
 
         update_fields = ', '.join(f"`{k}` = %s" for k in params_data.keys())  # 构建更新字段列表
         values = tuple(params_data.values()) + (row_id,)
-        sql = f"UPDATE `{table_name}` SET {update_fields} WHERE `{id_field}` = %s"
+        sql = f"UPDATE `{table_name}` SET {update_fields} WHERE `{primary_key}` = %s"
         return await self.async_run(sql, values, conn=conn)
+
+    async def get_offset(self, table_name: str, page: int = None, per_page: int = 10, cursor=None,
+                         use_estimate: bool = True):
+        total = 0
+        if use_estimate:
+            row = await self.query_one(
+                "SELECT TABLE_ROWS AS estimate "
+                "FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+                params=(table_name,), cursor=cursor)
+            total = int(row["estimate"]) if row and row.get("estimate") is not None else 0
+        if (not use_estimate) or total <= 0:
+            count_res = await self.query_one(f"SELECT COUNT(*) as count FROM {table_name}", cursor=cursor)
+            total = int(count_res["count"]) if count_res else 0
+
+        total_pages = (total + per_page - 1) // per_page if total > 0 else 1
+        if page is None:  # default to last page when page not provided
+            page = total_pages
+        if page < 1:
+            page = 1
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * per_page
+        return offset, page, total_pages, total
 
     async def get_table_columns(self, table_name: str, cursor=None) -> list[dict]:
         async def _run(c) -> list:
@@ -1269,18 +1285,8 @@ class AsyncMysql(BaseMysql):
 
     async def get_table_schema(self, table_name: str, conn=None) -> list:
         """异步版本获取表结构信息"""
-        if not table_name:
-            print("[Schema] 表名不能为空")
-            return []
-        sql = """
-               SELECT column_name, data_type, is_nullable, column_type, column_comment
-               FROM information_schema.columns
-               WHERE table_schema = %s AND table_name = %s
-               ORDER BY ordinal_position
-           """
-        params = (self.db_name, table_name)
-        results = await self.async_run(sql, params, conn)
-        return results or []
+        sql, params = self.table_schema(table_name)
+        return await self.async_run(sql, params, conn) or []
 
 
 class OperationMysql(AsyncMysql, SyncMysql, BaseMysql):
@@ -1346,6 +1352,329 @@ class OperationMysql(AsyncMysql, SyncMysql, BaseMysql):
 
 
 DB_Client = OperationMysql(persistent=True, async_mode=True)
+
+
+class CollectorMysql(AsyncMysql):
+    def __init__(self, *,
+                 batch_size: int = 1000,
+                 queue_maxsize: int = 10000,
+                 max_wait_seconds: float = 1.0,
+                 worker_count: int = 1,
+                 retry_times: int = 2, retry_backoff: float = 1.0,
+                 instance: AsyncMysql = None):
+        '''
+        collector = CollectorMysql(instance=DB_Client)
+        await collector.start()
+        await collector.enqueue(
+        ok = collector.enqueue_nowait(
+        wait collector.stop(flush=True)# 停机前清理
+        '''
+        if instance is not None:
+            super().__init__(host=instance.host, user=instance.user, password=instance.password,
+                             db_name=instance.db_name, port=instance.port, charset=instance.charset)
+            self.pool = instance.pool
+        else:
+            config = parse_database_uri(Config.SQLALCHEMY_DATABASE_URI)
+            super().__init__(**config)
+
+        self.batch_size = batch_size
+        self.batch_interval = max_wait_seconds
+        self.worker_count = worker_count
+        self.retry_times = retry_times
+        self.retry_backoff = retry_backoff
+
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
+        self._workers: list[asyncio.Task] = []
+        self._stopped = asyncio.Event()
+        self._started = False
+
+    async def start(self):
+        if self._started:
+            return
+        self._stopped.clear()
+        for _ in range(self.worker_count):
+            self._workers.append(asyncio.create_task(self._worker_loop()))
+        self._started = True
+
+    async def stop(self, flush: bool = True, timeout: float = 10.0):
+        """
+        优雅停机：可选先 flush 所有队列再退出
+        """
+        if not self._started:
+            return
+
+        if flush:
+            if timeout > 0:  # 轮询等待队列为空
+                start = time.time()
+                while not self._queue.empty() and (time.time() - start) < timeout:
+                    await asyncio.sleep(0.05)
+
+        self._stopped.set()
+        # cancel workers if they block on queue.get
+        for w in self._workers:
+            w.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()
+        self._started = False
+
+        if flush and self._queue.qsize() > 0:  # flush 队列剩余数据
+            try:
+                await asyncio.wait_for(self.flush_all(), timeout=timeout)
+            except asyncio.TimeoutError:
+                print("[Collector] flush timeout, some data may not be written")
+
+    @asynccontextmanager
+    async def context(self):
+        """上下文管理器，用于安全地初始化和关闭处理器"""
+        await self.start()
+        try:
+            yield self
+        finally:
+            await self.stop()
+
+    async def enqueue(self, table_name: str, params_data: dict, update_fields: list[str] = None):
+        """
+        将一条记录加入队列（默认阻塞直到放入，产生回压），直到队列有空位可以放入
+        """
+        sql, values = self.build_insert(table_name, params_data, update_fields=update_fields or [])
+        await self._queue.put((sql, values))
+
+    def enqueue_nowait(self, table_name: str, params_data: dict, update_fields: list[str] = None) -> bool:
+        """
+        尝试非阻塞入队，失败返回 False（可用于采样/舍弃策略），队列满不等待，直接抛出 QueueFull
+        """
+        try:
+            sql, values = BaseMysql.build_insert(table_name, params_data, update_fields=update_fields or [])
+            self._queue.put_nowait((sql, values))
+            return True
+        except asyncio.QueueFull:
+            return False  # 选择：丢弃、降采样、写入备份文件、或写到 Redis 等持久队列
+
+    async def _worker_loop(self):
+        """
+        消费者主循环：按 batch_size 或 max_wait_seconds 刷盘
+        """
+        while not self._stopped.is_set():
+            try:
+                # 用 batch_interval 等待第一个元素，避免 busy loop
+                item = await asyncio.wait_for(self._queue.get(), timeout=self.batch_interval)
+                # if item is None:
+                #     break # propagate sentinel to stop
+            except asyncio.TimeoutError:
+                continue  # 没有新数据，检查 _stopped 后继续
+            batch = [item]
+            deadline = time.time() + self.batch_interval
+
+            while len(batch) < self.batch_size:  # 尝试在剩余时间内凑满 batch_size
+                timeout = deadline - time.time()
+                if timeout <= 0:
+                    break
+                try:
+                    item = self._queue.get_nowait()
+                    batch.append(item)
+                except asyncio.QueueEmpty:
+                    try:  # 等待直到剩余时间结束或新数据到来
+                        item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                        batch.append(item)
+                    except asyncio.TimeoutError:
+                        break
+
+            if not batch:
+                continue
+
+            conn = await self.get_conn()
+            try:
+                await self._flush_batch(batch, conn)  # 处理 batch（异步执行 DB 写）
+            except Exception as e:
+                # 此处应该记录日志/告警；为防止数据丢失，可考虑把失败的 batch 放到后端持久化或重试队列
+                logger.error(f"[Collector] flush batch failed: {e}")
+                # 这里不 raise，让 loop 继续消费后续 batch
+            finally:
+                for _ in batch:  # 标记任务完成，确保释放连接
+                    self._queue.task_done()
+                self.release(conn)
+
+    async def _flush_batch(self, batch: list, conn=None):
+        # 分组：将字段一致的行合并到一起以便用 executemany
+        groups: dict[str, list] = {}
+        for sql, params in batch:
+            groups.setdefault(sql, []).append(params)
+
+        # prepare sql_list for async_execute: if a group has same fields -> executemany
+        sql_list = [(sql, params_list) for sql, params_list in groups.items()]
+
+        # 执行并带重试逻辑
+        process_execute = async_error_logger(max_retries=self.retry_times, delay=1, backoff=self.retry_backoff,
+                                             extra_msg="InsertCollector flush batch")(self.async_execute)
+        ok = await process_execute(sql_list, conn=conn)
+        if not ok:
+            raise RuntimeError("flush batch failed after retries")
+
+    async def flush_all(self):
+        items = []
+        while not self._queue.empty():
+            items.append(await self._queue.get())
+        if not items:
+            return
+        async with self.pool.acquire() as conn:
+            await self._flush_batch(items, conn)
+
+
+class AsyncBatchAdd:
+    """
+    通用的异步批量处理器，可用于任何 SQLAlchemy ORM 类
+    """
+
+    def __init__(
+            self,
+            model_class: Type,
+            batch_size: int = 100,
+            batch_timeout: float = 5.0,
+            queue_maxsize: int = 10000,
+            get_session_func: Optional[Callable] = None
+    ):
+        """
+        初始化批量处理器
+
+        Args:
+            model_class: SQLAlchemy ORM 类
+            batch_size: 每批处理的记录数量
+            batch_timeout: 批处理超时时间（秒）
+            get_session_func: 获取数据库会话的函数,AsyncSessionLocal
+        """
+        self.model_class = model_class
+        self.batch_size = batch_size
+        self.batch_timeout = batch_timeout
+        self.get_session_func = get_session_func  # coro
+
+        self._queue = asyncio.Queue(maxsize=queue_maxsize)
+        self._task = None
+        self._is_running = False
+
+    async def initialize(self):
+        """初始化处理器，启动后台任务"""
+        if not self._is_running:
+            self._is_running = True
+            self._task = asyncio.create_task(self._worker())
+            logger.info(f"Initialized batch processor for {self.model_class.__name__}")
+
+    async def shutdown(self):
+        """关闭处理器，停止后台任务并处理剩余数据"""
+        if self._is_running:
+            self._is_running = False
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                self._task = None
+            logger.info(f"Shutdown batch processor for {self.model_class.__name__}")
+
+    async def put_nowait(self, data: Dict[str, Any]):
+        """将数据放入队列（非阻塞）"""
+        if not self._is_running:
+            await self.initialize()
+        await self._queue.put(data)
+
+    def put_many_nowait(self, data_list: List[Dict]) -> int:
+        """将多条数据放入队列（非阻塞）"""
+        count = 0
+        for data in data_list:
+            try:
+                self._queue.put_nowait(data)
+                count += 1
+            except asyncio.QueueFull:
+                break
+        return count
+
+    async def _worker(self):
+        """后台批量插入工作器"""
+        batch = []
+        last_insert_time = time.time()
+
+        while self._is_running:
+            try:
+                # 等待新消息或超时
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=self.batch_timeout)
+                    batch.append(item)
+                    self._queue.task_done()
+                except asyncio.TimeoutError:
+                    pass  # 超时，继续处理当前批次
+
+                current_time = time.time()
+                # 如果批次达到指定大小或超时，执行插入
+                if (len(batch) >= self.batch_size or
+                        (batch and current_time - last_insert_time >= self.batch_timeout)):
+                    await self.process_batch(batch)
+                    batch.clear()
+                    last_insert_time = current_time
+
+            except asyncio.CancelledError:
+                if batch:  # 任务被取消，处理剩余批次
+                    await self.process_batch(batch)
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in batch insert worker: {e}")
+
+    async def process_batch(self, batch: List[Dict[str, Any]]):
+        """处理一批数据，插入到数据库"""
+        if not batch:
+            return
+
+        if not self.get_session_func:
+            logger.error("No session function provided for batch processor")
+            return
+
+        try:
+            async with self.get_session_func() as session:
+                session.add_all([self.model_class(**data) for data in batch])
+                await session.commit()
+                logger.info(f"Successfully inserted {len(batch)} records for {self.model_class.__name__}")
+        except Exception as e:
+            logger.error(f"Error inserting batch for {self.model_class.__name__}: {e}")
+            # await session.rollback()
+            # 可以根据需要添加重试逻辑或错误处理
+
+    async def process_one(self, data):
+        """直接插入（不使用队列）"""
+        async with self.get_session_func() as session:
+            try:
+                session.add(self.model_class(**data))
+                await session.commit()
+                return True
+            except Exception as e:
+                await session.rollback()
+                logger.error(f"Error insert for {self.model_class.__name__}: {e}")
+        return False
+
+    async def execute_batch(self, stmt, values_list: List[tuple | dict]):
+        """
+           批量插入或更新历史记录（支持 executemany），使用 MySQL 的 ON DUPLICATE KEY UPDATE。
+        """
+        total = 0
+        try:
+            async with self.get_session_func() as session:
+                for chunk in chunks_iterable(values_list, self.batch_size):
+                    await session.execute(stmt, chunk)
+                    total += len(chunk)
+                await session.commit()
+            logger.info(f"Inserted/Updated {total} records")
+            return total
+
+        except Exception as e:
+            logger.error(f"Error during history upsert: {e}\n{stmt}")
+        return total
+
+    @asynccontextmanager
+    async def context(self):
+        """上下文管理器，用于安全地初始化和关闭处理器"""
+        await self.initialize()
+        try:
+            yield self
+        finally:
+            await self.shutdown()
 
 
 async def aiohttp_request(method: str, url: str, session: aiohttp.ClientSession = None, json=None, data=None,
@@ -1599,6 +1928,29 @@ def upload_by_requests(url: str, file_path, file_key='snapshot'):
     return response.json()
 
 
+async def send_to_wechat(user_name: str, context: str = None, link: str = None, object_name: str = None):
+    url = f"{Config.WECHAT_URL}/sendToChat"
+    headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
+    body = {'user': user_name, 'context': context, 'url': link,
+            'object_name': object_name, 'file_type': get_file_type_wx(object_name)}
+
+    try:
+        cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+        response = await cx.post(url, json=body, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    except Exception as e:
+        logger.error(f'send_to_wechat{body}')
+        logger.error(f"Error occurred while sending message: {e}")
+        # with httpx.Client(timeout=Config.HTTP_TIMEOUT_SEC) as cx:
+        #     response = cx.post(url, json=body, headers=headers)
+        #     response.raise_for_status()
+        # return response.json()
+
+    return None
+
+
 class OperationHttp:
     def __init__(self, use_sync=False, time_out: int | float = 100.0, proxy: str = None):
         self.client = None  # httpx.AsyncClient | aiohttp.ClientSession | requests.Session
@@ -1730,7 +2082,7 @@ class OperationHttp:
 
 
 @async_error_logger(max_retries=1, delay=3, exceptions=(Exception, httpx.HTTPError))
-async def follow_http_html(url, time_out=100.0, **kwargs):
+async def follow_http_html(url, time_out: float = 100.0, **kwargs):
     async with httpx.AsyncClient(timeout=time_out, follow_redirects=True) as cx:
         response = await cx.get(url, **kwargs)
         response.raise_for_status()
@@ -1763,14 +2115,16 @@ async def get_data_for_model(model: dict):
         except Exception as e:
             print(f"OpenAI error occurred:{e},name:{model_name}")
     else:
-        url = model['base_url'] + '/models'
+        url = model.get('model_url') or model['base_url'] + '/models'
         headers = {}
         api_key = model.get('api_key')
         if api_key:
             headers["Authorization"] = f'Bearer {api_key}'
             if model['type'] == 'anthropic':
                 headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
-        models = await call_http_request(url, headers)
+
+        cx = get_httpx_client(proxy=Config.HTTP_Proxy if model.get('proxy') else None)
+        models = await call_http_request(url, headers, httpx_client=cx)
         if models:
             return models.get('data')
 
@@ -1801,7 +2155,6 @@ class ModelList:
     async def set(cls, redis=None, worker_id: str = None, ai_models: list = AI_Models):
         """更新 MODEL_LIST,并保存到 Redis"""
         cls.models = cls.extract(ai_models)
-
         if cls._redis is None:
             cls._redis = redis or get_redis()
         if worker_id:
@@ -1962,7 +2315,8 @@ class ModelList:
 
 
 async def init_ai_clients(ai_models: list = AI_Models):
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
+    limits = httpx.Limits(max_connections=max(Config.MAX_HTTP_CONNECTIONS, Config.MAX_KEEPALIVE_CONNECTIONS),
+                          max_keepalive_connections=Config.MAX_KEEPALIVE_CONNECTIONS)
     transport = httpx.AsyncHTTPTransport(proxy=Config.HTTP_Proxy)
     # proxies = {"http://": Config.HTTP_Proxy, "https://": Config.HTTP_Proxy}
     # http_client = DefaultHttpxClient(proxy="http://my.test.proxy.example.com", transport=httpx.HTTPTransport(local_address="0.0.0.0"))
@@ -1979,9 +2333,11 @@ async def init_ai_clients(ai_models: list = AI_Models):
                     http_client = httpx.AsyncClient(transport=transport, limits=limits, timeout=timeout)
 
                 AI_Client[model_name]: AsyncOpenAI = AsyncOpenAI(api_key=api_key, base_url=model['base_url'],
-                                                                 http_client=http_client)  # OpenAI
+                                                                 http_client=http_client,
+                                                                 max_retries=Config.MAX_RETRY_COUNT)
                 if http_client is None:
-                    AI_Client[model_name] = AI_Client[model_name].with_options(timeout=time_out, max_retries=3)
+                    AI_Client[model_name] = AI_Client[model_name].with_options(timeout=time_out,
+                                                                               max_retries=Config.MAX_RETRY_COUNT)
 
 
 # client = AI_Client['deepseek']
@@ -1991,7 +2347,7 @@ async def init_ai_clients(ai_models: list = AI_Models):
 # print(dir(client.files)) #'content', 'create', 'delete', 'list', 'retrieve', 'retrieve_content', 'wait_for_processing'
 
 
-def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple[dict, str]:
+def find_ai_model(name: str, model_id: int = 0, search_field: str = 'model') -> Tuple[dict, str]:
     """
     在 AI_Models 中查找模型。如果找到名称匹配的模型，返回模型及其类型或具体的子模型名称。
 
@@ -2005,12 +2361,15 @@ def find_ai_model(name, model_id: int = 0, search_field: str = 'model') -> Tuple
     异常:
     - ValueError: 如果未找到模型
     """
+
     if ':' in name:
         parts = name.split(':', 1)
         owner, model_name = parts[0], parts[1]
         model = next((item for item in AI_Models if item['name'] == owner), None)
-        if model and model_name in model.get(search_field, []):
-            return model, model_name
+        if model:
+            model_items = model.get(search_field, [])
+            if model_name in model_items:
+                return model, model_items[model_name] if isinstance(model_items, dict) else model_name
 
     model = next(
         (item for item in AI_Models if item['name'] == name or name in item.get(search_field, [])),
@@ -2204,7 +2563,7 @@ if __name__ == "__main__":
 
     async def test_r():
         redis = get_redis()
-        result = await get_redis_value(redis, 'model_data_list:aihubmix')  # tokenflux
+        result = await get_redis_value(redis, 'model_data_list:zzz')  # tokenflux,aihubmix
         print([item.get('id') for item in result])
         await shutdown_redis()
 

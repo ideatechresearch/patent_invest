@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>多模型辩论模拟器</title>
+  <style>
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      background: #0f172a;
+      color: #e6eef8;
+      margin: 0;
+      padding: 0;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 12px auto;
+      padding: 12px;
+      background: #0b1220;
+      border-radius: 10px;
+      box-shadow: 0 6px 30px rgba(2, 6, 23, 0.6)
+    }
+
+    h1 {
+      font-size: 18px;
+      margin: 0 0 10px
+    }
+
+    .top {
+      display: flex;
+      gap: 10px;
+      align-items: start
+    }
+
+    select,
+    input,
+    textarea,
+    button {
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: transparent;
+      color: inherit;
+      box-sizing: border-box
+    }
+
+    select[multiple] {
+      height: 110px
+    }
+
+    .params {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      width: 100%
+    }
+
+    .params>* {
+      min-width: 0
+    }
+
+    .log {
+      margin-top: 12px;
+      background: #040814;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.02);
+      height: 80vh;
+      overflow: auto
+    }
+
+    .entry {
+      padding: 10px;
+      margin-bottom: 10px;
+      border-left: 4px solid rgba(255, 255, 255, 0.04)
+    }
+
+    .meta {
+      font-size: 12px;
+      opacity: 0.85;
+      margin-bottom: 6px
+    }
+
+    .bubble {
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.45
+    }
+
+    .bottom {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px
+    }
+
+    .bottom textarea {
+      flex: 1;
+      min-height: 80px;
+      resize: vertical
+    }
+
+    .small {
+      font-size: 12px;
+      opacity: 0.85
+    }
+
+    .btn {
+      cursor: pointer
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1>多模型辩论模拟器</h1>
+
+    <!-- Top row: all parameters -->
+    <div class="top">
+      <div style="width:250px">
+        <label class="small">模型（多选，Ctrl/Cmd 多选）</label>
+        <select id="modelSelect" multiple></select>
+      </div>
+      <div style="flex:1">
+        <label class="small">主题（注入每轮 system）</label>
+        <textarea id="topic" placeholder="例如：新能源车是否应全面补贴？" style="height:180px;width:750px"></textarea>
+      </div>
+
+
+      <div style="width:260px">
+        <label class="small">历史轮数（context window）</label>
+        <input id="context_window" type="number" value="5" />
+        <label class="small" style="margin-top:8px">每轮超时(ms)</label>
+        <input id="timeout" type="number" value="15000" />
+        <div style="height:8px"></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="loadModelsBtn" class="btn">加载模型</button>
+          <button id="startBtn" class="btn">开始</button>
+          <button id="stopBtn" class="btn">停止</button>
+        </div>
+        <div style="height:8px"></div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="autoMode" checked />
+          <span class="small">自动模式（开启）</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Center: log (拉满) -->
+    <div id="log" class="log" role="log" aria-live="polite"></div>
+
+    <!-- Bottom: human input -->
+    <div class="bottom">
+      <textarea id="humanInput" placeholder="手动插入的人类发言（下一轮会被注入）"></textarea>
+      <div style="width:190px;display:flex;flex-direction:column;gap:8px">
+        <button id="insertHuman" class="btn">插入并下一轮</button>
+        <button id="nextBtn" class="btn">下一轮（手动）</button>
+        <button id="clearLog" class="btn">清空记录</button>
+        <div id="status" class="small">状态：空</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const apiBase = ''; // 后端基地址
+    const modelSelect = document.getElementById('modelSelect');
+    const loadModelsBtn = document.getElementById('loadModelsBtn');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const insertHumanBtn = document.getElementById('insertHuman');
+    const clearLogBtn = document.getElementById('clearLog');
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+
+    let participants = [];
+    let idx = 0;
+    let history = []; // {role:'user'|'assistant', name, text, time}
+    let running = false;
+    let controller = null;
+    let isRunning = false;
+
+    function updateStatus(s) { statusEl.textContent = '状态：' + s; }
+    function safeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+    // append message entry (model or human)
+    function appendEntry(name, text, role = 'user') {
+      const entry = document.createElement('div');
+      entry.className = 'entry';
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = `${name} • ${new Date().toLocaleTimeString()}`;
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.innerHTML = safeHtml(text);
+      entry.appendChild(meta);
+      entry.appendChild(bubble);
+      logEl.appendChild(entry);
+      logEl.scrollTop = logEl.scrollHeight;
+      history.push({ role: role, name, text, time: Date.now() });
+    }
+
+    // load models from /v1/models
+    async function loadModels() {
+      modelSelect.innerHTML = '';
+      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '（使用默认）'; modelSelect.appendChild(placeholder);
+      try {
+        const res = await fetch(apiBase + '/v1/models');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const models = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+        for (const m of models) {
+          const id = (m && (m.id || m)) || m;
+          if (!id) continue;
+          const opt = document.createElement('option'); opt.value = id; opt.textContent = id;
+          modelSelect.appendChild(opt);
+        }
+        updateStatus('模型列表加载成功');
+      } catch (e) {
+        console.warn('load models failed', e);
+        updateStatus('加载模型失败: ' + (e.message || e));
+      }
+    }
+
+    // start: gather selected models and begin
+    startBtn.onclick = () => {
+      const selected = Array.from(modelSelect.selectedOptions).map(o => o.value).filter(Boolean);
+      if (selected.length === 0) { alert('请在模型列表选择至少一个模型'); return; }
+      participants = selected;
+      running = true;
+      idx = 0;
+      history = [];
+      logEl.innerHTML = '';
+      updateStatus('已开始，参与模型：' + participants.join(', '));
+      runOne(); // start first model immediately
+    };
+
+    stopBtn.onclick = () => {
+      running = false;
+      if (controller) try { controller.abort(); } catch (e) { }
+      updateStatus('已停止');
+    };
+
+    nextBtn.onclick = () => { runOne(); };
+
+    clearLogBtn.onclick = () => { logEl.innerHTML = ''; history = []; updateStatus('记录已清空'); };
+
+    insertHumanBtn.onclick = () => {
+      const txt = document.getElementById('humanInput').value.trim();
+      if (!txt) return alert('请输入内容');
+      appendEntry('Human', txt, 'user');
+      document.getElementById('humanInput').value = '';
+      // 触发下一轮
+      runOne();
+    };
+
+    // extract delta content from parsed chunk (robust)
+    function extractDelta(parsed) {
+      try {
+        const c = parsed.choices && parsed.choices[0];
+        if (!c) return '';
+        if (c.delta && typeof c.delta === 'object') {
+          if (typeof c.delta.content === 'string') return c.delta.content;
+          if (c.delta.message && typeof c.delta.message.content === 'string') return c.delta.message.content;
+        }
+        if (c.message && typeof c.message.content === 'string') return c.message.content;
+        if (typeof c.text === 'string') return c.text;
+      } catch (e) { }
+      return '';
+    }
+
+    // extract full content from non-stream response
+    function extractFullContent(data) {
+      try {
+        if (data.choices && data.choices[0]) {
+          const c = data.choices[0];
+          if (c.message && typeof c.message.content === 'string') return c.message.content;
+          if (typeof c.text === 'string') return c.text;
+          if (c.delta && typeof c.delta.content === 'string') return c.delta.content;
+        }
+        if (data.message && typeof data.message.content === 'string') return data.message.content;
+      } catch (e) { }
+      return '';
+    }
+
+    // run one model (single turn). Auto-advance if autoMode checked.
+    async function runOne() {
+      if (!running) { updateStatus('未运行（请点击开始）'); return; }
+      if (isRunning) { updateStatus('正在运行，请稍候'); return; }
+      if (!participants || participants.length === 0) { updateStatus('无选中模型'); return; }
+
+      isRunning = true;
+      const m = participants[idx % participants.length];
+      idx++;
+      updateStatus('调用模型：' + m);
+
+      // build messages
+      const topic = document.getElementById('topic').value || '';
+      const cw = parseInt(document.getElementById('context_window').value) || 4;
+      const timeout = parseInt(document.getElementById('timeout').value) || 15000;
+      const messages = [
+        { role: 'system', content: '你是参与多人辩论的模型，围绕主题进行发言，可以补充或反驳最近的几条发言。' },
+        { role: 'system', content: '主题: ' + topic }
+      ];
+      const recent = history.slice(-cw);
+      recent.forEach(h => {
+        const role = h.role === 'user' ? 'user' : 'assistant';
+        messages.push({ role, content: (h.name ? (h.name + ': ') : '') + h.text, name: h.name || undefined });
+      });
+
+      // add placeholder entry (will update as stream arrives)
+      const entryDiv = document.createElement('div'); entryDiv.className = 'entry';
+      const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${m} • ${new Date().toLocaleTimeString()}`;
+      const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.innerHTML = '';
+      entryDiv.appendChild(meta); entryDiv.appendChild(bubble);
+      logEl.appendChild(entryDiv);
+      logEl.scrollTop = logEl.scrollHeight;
+
+      controller = new AbortController();
+      let finalText = '';
+
+      try {
+        const res = await fetch(apiBase + '/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: m, messages, stream: true, timeout }),
+          signal: controller.signal
+        });
+
+        if (!res.ok) {
+          const txt = await res.text().catch(() => res.statusText);
+          throw new Error('HTTP ' + res.status + ' ' + txt);
+        }
+
+        // if no body/stream support, fallback to parse JSON
+        if (!res.body || !res.body.getReader) {
+          const data = await res.json();
+          finalText = extractFullContent(data) || JSON.stringify(data);
+          bubble.innerHTML = safeHtml(finalText);
+          history.push({ role: 'assistant', name: m, text: finalText, time: Date.now() });
+          updateStatus('模型完成（非流）: ' + m);
+          isRunning = false;
+          if (running && document.getElementById('autoMode').checked) setTimeout(runOne, 20);
+          return;
+        }
+
+        // stream processing: collect chunks, parse SSE-like data: ... blocks
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let done = false;
+
+        while (!done) {
+          const { value, done: d } = await reader.read();
+          if (d) done = true;
+          if (value) buffer += decoder.decode(value, { stream: true });
+
+          // split events by double newlines (SSE style)
+          const parts = buffer.split(/\r?\n\r?\n/);
+          buffer = parts.pop(); // last may be incomplete
+          for (const part of parts) {
+            const lines = part.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+            for (const line of lines) {
+              if (line === '[DONE]' || line === 'data: [DONE]') { done = true; break; }
+              if (line.startsWith('data:')) {
+                const jsonText = line.slice(5).trim();
+                if (jsonText === '[DONE]') { done = true; break; }
+                try {
+                  const parsed = JSON.parse(jsonText);
+                  const delta = extractDelta(parsed);
+                  if (delta) {
+                    finalText += delta;
+                    bubble.innerHTML = safeHtml(finalText);
+                    logEl.scrollTop = logEl.scrollHeight;
+                  }
+                } catch (err) {
+                  // not JSON -> append raw
+                  finalText += jsonText;
+                  bubble.innerHTML = safeHtml(finalText);
+                  logEl.scrollTop = logEl.scrollHeight;
+                }
+              } else {
+                // some implementations send raw JSON without "data:" prefix
+                try {
+                  const parsed = JSON.parse(line);
+                  const delta = extractDelta(parsed);
+                  if (delta) {
+                    finalText += delta;
+                    bubble.innerHTML = safeHtml(finalText);
+                  }
+                } catch (e) { }
+              }
+            }
+            if (done) break;
+          }
+        }
+
+        // leftover buffer (final event)
+        if (buffer && buffer.trim()) {
+          const maybe = buffer.trim();
+          // try to extract data: lines
+          const lines = maybe.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+          for (const line of lines) {
+            if (line.startsWith('data:')) {
+              const jsonText = line.slice(5).trim();
+              if (jsonText !== '[DONE]') {
+                try {
+                  const parsed = JSON.parse(jsonText);
+                  const delta = extractDelta(parsed);
+                  if (delta) { finalText += delta; }
+                } catch (e) {
+                  finalText += jsonText;
+                }
+              }
+            } else {
+              try {
+                const parsed = JSON.parse(line);
+                const delta = extractDelta(parsed);
+                if (delta) finalText += delta;
+              } catch (e) { }
+            }
+          }
+          bubble.innerHTML = safeHtml(finalText);
+        }
+
+        // finish
+        history.push({ role: 'assistant', name: m, text: finalText, time: Date.now() });
+        updateStatus('模型完成: ' + m);
+
+        // auto-advance immediately if enabled
+        if (running && document.getElementById('autoMode').checked) {
+          isRunning = false;
+          setTimeout(runOne, 20);
+        } else {
+          isRunning = false;
+        }
+
+      } catch (err) {
+        console.error('调用错误', err);
+        updateStatus('调用失败: ' + (err.message || err));
+        isRunning = false;
+      } finally {
+        controller = null;
+      }
+    }
+
+    // auto load models at start
+    window.addEventListener('DOMContentLoaded', () => { loadModels(); });
+
+    // button bindings
+    loadModelsBtn.onclick = loadModels;
+  </script>
+</body>
+
+</html>

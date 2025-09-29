@@ -1,13 +1,11 @@
-from fastapi import APIRouter
-from fastapi.templating import Jinja2Templates
+from router.base import *
 from fastapi import Request, Depends, Query, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from typing import Optional, Dict
 from service import DB_Client
 
 table_router = APIRouter()
 table_router_prefix = "/table"
-templates = Jinja2Templates(directory="templates")
 REGISTERED_TABLES = ['agent_history', 'agent_robot', 'chat_history']  # 注册的表名列表
 
 
@@ -58,25 +56,11 @@ async def submit_data(request: Request, table_name: str,
             primary_key = await DB_Client.get_primary_key(table_name, cur)
             if edit_id and primary_key:
                 # 更新操作
-                set_clause = ", ".join([f"{k} = %s" for k in valid_data.keys()])
-                sql = f"""
-                    UPDATE {table_name} 
-                    SET {set_clause} 
-                    WHERE {primary_key} = %s
-                """
-                params = list(valid_data.values()) + [edit_id]
-                await cur.execute(sql, params)
-                await conn.commit()
-
+                await DB_Client.async_update(table_name, valid_data, edit_id, primary_key, conn)
                 message = "数据更新成功"
             else:
                 # 插入操作
-                columns_str = ", ".join(valid_data.keys())
-                placeholders = ", ".join(["%s"] * len(valid_data))
-                sql = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
-                await cur.execute(sql, list(valid_data.values()))
-                await conn.commit()
-
+                await DB_Client.async_insert(table_name, valid_data, conn)
                 message = "数据添加成功"
 
             # 获取操作后的数据（便于回显）
@@ -103,21 +87,20 @@ async def submit_data(request: Request, table_name: str,
 
 @table_router.get("/view/{table_name}", response_class=HTMLResponse)
 async def view_table_data(request: Request, table_name: str,
-                          page: int = Query(1, ge=1), per_page: int = Query(10, ge=1, le=100)):
+                          page: int = Query(None, ge=1), per_page: int = Query(10, ge=1, le=100)):
     if table_name not in REGISTERED_TABLES:
         return RedirectResponse(f"{table_router_prefix}/list")
 
-    offset = (page - 1) * per_page
     async with DB_Client.get_cursor() as cur:
-        data, count = await DB_Client.async_query(
-            [(f"SELECT * FROM {table_name} LIMIT %s OFFSET %s", (per_page, offset)),
-             (f"SELECT COUNT(*) as count FROM {table_name}", None)],
-            cursor=cur)
-        total = count[0]["count"]  # 获取总数
-        total_pages = (total + per_page - 1) // per_page
-
+        offset, page, total_pages, total = await DB_Client.get_offset(table_name, page=page, per_page=per_page,
+                                                                      cursor=cur)
         columns = await DB_Client.get_table_columns(table_name, cur)
         primary_key = await DB_Client.get_primary_key(table_name, cur)
+
+        order_clause = f"ORDER BY {primary_key} ASC" if primary_key else ""
+        data_query = f"SELECT * FROM {table_name} {order_clause} LIMIT %s OFFSET %s"
+        results = await DB_Client.async_query([(data_query, (per_page, offset))], cursor=cur)
+        data = results[0] if results else None
 
     return templates.TemplateResponse("table_view.html", {
         "request": request,

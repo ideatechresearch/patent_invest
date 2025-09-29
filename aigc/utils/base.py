@@ -198,7 +198,7 @@ def extract_interface_map(data: dict, field_path: list, mapping: dict):
     return extracted  # 兜底处理
 
 
-def slice_json(data, prefix=''):
+def slice_json(data, prefix='') -> dict:
     '''将嵌套结构完全展开为扁平字典（键变为路径字符串）'''
     slices = {}
     if isinstance(data, dict):

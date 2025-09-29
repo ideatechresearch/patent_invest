@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>多模型讨论</title>
+<style>
+  :root{
+    --bg:#0f172a;
+    --card:#0b1220;
+    --muted:rgba(230,238,248,0.7);
+    --accent:#7dd3fc;
+    --panel:#071026;
+    --panel-2:#040814;
+  }
+  body{
+    margin:0;
+    font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    background:var(--bg);
+    color:#e6eef8;
+  }
+  .wrap{max-width:1200px;margin:28px auto;padding:18px;background:var(--card);border-radius:12px;box-shadow:0 6px 30px rgba(2,6,23,0.6)}
+  h1{font-size:20px;margin:0 0 12px}
+  .row{display:flex;gap:12px}
+  input,select,textarea,button{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit;box-sizing:border-box}
+  .controls{display:flex;gap:8px;margin-top:12px;align-items:center}
+  .log{ /* 横跨中间和右列，拉满更大宽度 */ grid-column: 2 / 4; background:var(--panel-2); padding:14px; border-radius:10px; border:1px solid rgba(255,255,255,0.02); height:70vh; overflow:auto; }
+  .entry{padding:10px;margin-bottom:10px;border-left:4px solid rgba(255,255,255,0.04)}
+  .meta{font-size:12px;opacity:0.8;margin-bottom:6px}
+  .panel{background:var(--panel);padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.02)}
+  .small{font-size:12px;opacity:0.85}
+  .chip{display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.03);font-size:12px}
+  .prompt{background:#020617;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);margin-bottom:8px}
+  .main { display:grid; grid-template-columns: 320px 1fr 360px; gap:12px; margin-top:12px; align-items:start; }
+  .left { display:flex; flex-direction:column; gap:12px; }
+  .center { display:flex; flex-direction:column; gap:12px; }
+  .right { display:flex; flex-direction:column; gap:12px; }
+  select[multiple]{height:180px}
+  pre { white-space:pre-wrap; font-family: inherit; }
+  .status { font-size:12px; opacity:0.85; margin-top:6px }
+  .btn-ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px;border-radius:8px;cursor:pointer}
+  select[multiple]{height:180px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>多模型讨论（真实调用 /v1/chat/completions）</h1>
+
+    <div class="row">
+      <div class="col" style="flex:1">
+        <label>主题 / 任务</label>
+        <input id="topic" placeholder="例如：是否应对短途航空实行碳税？" />
+      </div>
+
+      <div style="width:220px">
+        <label>讨论模式</label>
+        <select id="mode">
+          <option value="consensus">达成共识（Consensus）</option>
+          <option value="diversity">鼓励多样性（Encourage Diversity）</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div style="display:flex;gap:8px;align-items:center">
+        <button id="startBtn" class="btn-ghost">开始（真实调用）</button>
+        <button id="stopBtn" class="btn-ghost">停止</button>
+        <button id="loadModelsBtn" class="btn-ghost">刷新模型列表</button>
+      </div>
+      <div style="flex:1"></div>
+      <div class="small">模式说明：<span class="chip" id="modeHint">达成共识</span></div>
+            <!-- 新增 autoMode 控件（默认 checked） -->
+      <label style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="autoMode" checked />
+        <span class="small">自动模式（开启：模型完成后自动切换）</span>
+      </label>
+    </div>
+
+    select[multiple]{height:180px}
+
+    <div class="main">
+      <!-- 左 -->
+      <div class="left">
+        <div class="panel">
+          <div class="small" style="margin-bottom:8px">参与者（从后端 /v1/models 加载）</div>
+          <select id="modelSelect" multiple></select>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button id="selectAllBtn" class="btn-ghost">全选</button>
+            <button id="deselectAllBtn" class="btn-ghost">取消全选</button>
+          </div>
+          <div class="status" id="modelsInfo">加载中...</div>
+        </div>
+
+        <div class="panel">
+          <div class="small" style="margin-bottom:8px">运行设置</div>
+          <label class="small">最大回合数（每模型轮次计入）</label>
+          <input id="max_rounds" type="number" value="6" />
+          <label class="small" style="margin-top:8px">每轮间隔(ms) — 若需节流，可设置</label>
+          <input id="interval_ms" type="number" value="200" />
+          <label class="small" style="margin-top:8px">单次模型超时(ms)</label>
+          <input id="timeout" type="number" value="15000" />
+        </div>
+      </div>
+
+      <!-- 中：日志 -->
+      <div class="center">
+        <div class="panel" style="padding:8px">
+          <div class="small" style="margin-bottom:8px">讨论日志（中心展示）</div>
+          <div id="log" class="log"></div>
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:flex-start">
+          <textarea id="humanInput" placeholder="手动插入的人类发言（下一轮会被注入）" rows="3" style="flex:1"></textarea>
+          <div style="width:160px;display:flex;flex-direction:column;gap:8px">
+            <button id="insertHuman" class="btn-ghost">插入并下一轮</button>
+            <button id="clearLog" class="btn-ghost">清空记录</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右 -->
+      <div class="right">
+        <div class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div class="small">Prompt 模板（按模式切换）</div>
+            <button id="copyAll" class="btn-ghost">复制当前模板</button>
+          </div>
+          <div id="prompts"></div>
+          <hr style="border:none;border-top:1px solid rgba(255,255,255,0.03);margin:10px 0" />
+          <div class="small">使用建议</div>
+          <ul class="small" style="margin-top:6px">
+            <li>历史消息会以 {role, name, content} 形式传给后端（如需兼容可移除 name 字段）。</li>
+            <li>确保后端接受 `stream: true` 且以 SSE/chunked `data: {...}` 返回增量事件。</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+<script>
+/* ---------- UI 元素 ---------- */
+const loadModelsBtn = document.getElementById('loadModelsBtn');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const modelSelect = document.getElementById('modelSelect');
+const modelsInfo = document.getElementById('modelsInfo');
+const selectAllBtn = document.getElementById('selectAllBtn');
+const deselectAllBtn = document.getElementById('deselectAllBtn');
+const logEl = document.getElementById('log');
+const insertHumanBtn = document.getElementById('insertHuman');
+const clearLogBtn = document.getElementById('clearLog');
+const modeEl = document.getElementById('mode');
+const modeHint = document.getElementById('modeHint');
+const promptsEl = document.getElementById('prompts');
+const copyAllBtn = document.getElementById('copyAll');
+
+const apiBase = ''; // 后端基地址（默认同域）
+let history = [];   // {role: 'user'|'assistant', name, text, time}
+let participants = [];
+let running = false;
+let controller = null;
+let roundCount = 0; // 记录完成的 "轮"（可按每模型一次计）
+let participantIndex = 0;
+
+/* ---------- Prompt templates（原样保留） ---------- */
+const templates = {
+  consensus: [
+    { title: 'Moderator（仲裁者）提示', body: `你是讨论的仲裁者。任务：围绕主题组织多模型讨论并判断是否达成共识。\n...` },
+    { title: 'Agent（发言模型）模板（结构化）', body: `...` },
+    { title: 'Aggregation（聚合策略）', body: `...` }
+  ],
+  diversity: [
+    { title: 'Moderator（鼓励多样性）提示', body: `...` },
+    { title: 'Agent 模板（多样性风格）', body: `...` },
+    { title: 'Diversity Aggregation（多样性度量）', body: `...` }
+  ]
+};
+// 填充模板：为了保持回答简洁，我用和上次相同的模板内容，直接复用变量。
+templates.consensus = [
+  {
+    title: 'Moderator（仲裁者）提示',
+    body: `你是讨论的仲裁者。任务：围绕主题组织多模型讨论并判断是否达成共识。\n输入：主题（topic），最近若干条发言（recent），当前回合回答者（agent）。\n输出：当识别到足够支持的候选结论时返回{consensus: <短结论>, support_ratio: <0-1>, rationale: <总结>}，否则返回 {continue: true, suggestion: <引导下轮的提示>}。`
+  },
+  {
+    title: 'Agent（发言模型）模板（结构化）',
+    body: `你是参与讨论的模型。目标：对主题给出简洁立场并提供证据与置信度。\n回复必须使用 JSON 格式（严格）:\n{\n  "claim": "一句话结论，例如：支持/反对/中立/具体建议",\n  "evidence": "2-3 条关键论据或事实，要尽量简短并标注来源类型（如果使用检索）",\n  "confidence": 0.0-1.0,\n  "notes": "可选的短说明或反驳点"\n}\n示例：{\"claim\":\"支持对短途航班征收碳税\",\"evidence\":\"可减少碳排放；替代交通可行\",\"confidence\":0.78}`
+  },
+  {
+    title: 'Aggregation（聚合策略）',
+    body: `每轮结束后，仲裁者收集所有 Agent 的 claim。若某一 claim 的支持比例 >= 0.6 且平均 confidence >= 0.6，则视为候选共识。若该候选在连续 2 轮保持不变，则最终接受并停止。`
+  }
+];
+templates.diversity = [
+  {
+    title: 'Moderator（鼓励多样性）提示',
+    body: `你是讨论的仲裁者，目标不是让模型快速达成一致，而是最大化观点覆盖与辩点多样性。\n要求：在每轮引导下一位模型从新的角度发言，若发现重复，提示其从不同角色/利益方角度回应（例如政府/企业/环保人士/普通乘客）。\n输出格式：{continue:true, suggestion: <引导语>}。`
+  },
+  {
+    title: 'Agent 模板（多样性风格）',
+    body: `请从一个特定视角发言（指定角色），并说明该视角关注的 2 个主要论点与 1 个潜在反驳点。\n使用 JSON：{ "role": "Gov/Industry/Env/Passenger", "points": ["...","..."], "counter": "可能的反驳" }`
+  },
+  {
+    title: 'Diversity Aggregation（多样性度量）',
+    body: `仲裁者在每轮计算观点覆盖度（不同角色/主题词/主要观点的数量）。当覆盖度在连续两轮下降或达到设计上限时可停止。`
+  }
+];
+
+/* ---------- 渲染 prompts ---------- */
+function renderPrompts(){
+  const mode = modeEl.value;
+  modeHint.textContent = mode === 'consensus' ? '达成共识' : '鼓励多样性';
+  promptsEl.innerHTML = '';
+  templates[mode].forEach(t=>{
+    const div = document.createElement('div');
+    div.className = 'prompt';
+    div.innerHTML = `<div style="display:flex;justify-content:space-between"><strong>${t.title}</strong><button class='btn-ghost small copyOne'>复制</button></div><pre style="white-space:pre-wrap;margin-top:8px">${t.body}</pre>`;
+    promptsEl.appendChild(div);
+    div.querySelector('.copyOne').addEventListener('click', ()=>{ navigator.clipboard.writeText(t.body).then(()=> alert('已复制')); });
+  });
+}
+modeEl.addEventListener('change', renderPrompts);
+copyAllBtn.addEventListener('click', ()=>{
+  const mode = modeEl.value;
+  const all = templates[mode].map(t=> `${t.title}\n\n${t.body}`).join('\n\n---\n\n');
+  navigator.clipboard.writeText(all).then(()=> alert('所有模板已复制'));
+});
+renderPrompts();
+
+/* ---------- 日志与辅助 ---------- */
+function appendLog(meta, text){
+  const div = document.createElement('div'); div.className='entry';
+  const time = new Date().toLocaleTimeString();
+  div.innerHTML = `<div class='meta'>${meta} • ${time}</div><div>${String(text).replace(/\n/g,'<br/>')}</div>`;
+  logEl.appendChild(div); logEl.scrollTop = logEl.scrollHeight;
+}
+function safeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ---------- 加载模型列表 ---------- */
+async function loadModels(){
+  modelSelect.innerHTML = '';
+  const placeholder = document.createElement('option'); placeholder.value=''; placeholder.textContent='（使用默认）'; modelSelect.appendChild(placeholder);
+  try{
+    const res = await fetch(apiBase + '/v1/models');
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const models = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : []);
+    let count = 0;
+    for(const m of models){
+      const id = (m && (m.id || m)) || m;
+      if(!id) continue;
+      const opt = document.createElement('option'); opt.value = id; opt.textContent = id;
+      modelSelect.appendChild(opt);
+      count++;
+    }
+    modelsInfo.textContent = `已加载 ${count} 个模型`;
+  }catch(e){
+    console.warn('loadModels failed', e);
+    modelsInfo.textContent = '加载模型失败（检查 /v1/models）';
+  }
+}
+window.addEventListener('DOMContentLoaded', loadModels);
+loadModelsBtn.addEventListener('click', loadModels);
+
+selectAllBtn.addEventListener('click', ()=>{ for(const o of modelSelect.options) o.selected = !!o.value; });
+deselectAllBtn.addEventListener('click', ()=>{ for(const o of modelSelect.options) o.selected = false; });
+
+/* ---------- 关键：构建 messages（包含 name） ---------- */
+function buildMessagesFromHistory(topic, cw){
+  const msgs = [
+    { role:'system', content:'你是参与多人辩论的模型，围绕主题进行发言，可以补充或反驳最近的几条发言。' },
+    { role:'system', content:'主题: ' + (topic || '') }
+  ];
+  const recent = history.slice(-cw);
+  recent.forEach(h=>{
+    const role = h.role === 'user' ? 'user' : 'assistant';
+    // include name if present
+    const msg = { role, content: (h.name ? (h.name + ': ') : '') + h.text };
+    if(h.name) msg.name = h.name;
+    msgs.push(msg);
+  });
+  return msgs;
+}
+
+/* ---------- 流式解析工具 ---------- */
+function extractDeltaFromParsed(parsed){
+  try {
+    const c = parsed.choices && parsed.choices[0];
+    if(!c) return '';
+    if(c.delta && typeof c.delta === 'object'){
+      if(typeof c.delta.content === 'string') return c.delta.content;
+      if(c.delta.message && typeof c.delta.message.content === 'string') return c.delta.message.content;
+    }
+    if(c.message && typeof c.message.content === 'string') return c.message.content;
+    if(typeof c.text === 'string') return c.text;
+  } catch(e){}
+  return '';
+}
+function extractFullContent(data){
+  try {
+    if(data.choices && data.choices[0]){
+      const c = data.choices[0];
+      if(c.message && typeof c.message.content === 'string') return c.message.content;
+      if(typeof c.text === 'string') return c.text;
+      if(c.delta && typeof c.delta.content === 'string') return c.delta.content;
+    }
+    if(data.message && typeof data.message.content === 'string') return data.message.content;
+  } catch(e){}
+  return '';
+}
+
+/* ---------- 运行流程：按选中模型轮换调用 /v1/chat/completions ---------- */
+startBtn.addEventListener('click', async ()=>{
+  if(running) return;
+  participants = Array.from(modelSelect.selectedOptions).map(o=>o.value).filter(Boolean);
+  if(participants.length === 0){ alert('请先选择至少一个模型'); return; }
+  running = true;
+  roundCount = 0;
+  participantIndex = 0;
+  history = []; // 清空历史（或按需保留）
+  logEl.innerHTML = '';
+  appendLog('系统', `开始真实讨论 — 模式=${modeEl.value}，参与者=${participants.join(', ')}`);
+  // 启动循环（按模型逐个调用）
+  scheduleNextRealCall();
+});
+
+stopBtn.addEventListener('click', ()=>{
+  running = false;
+  if(controller) try{ controller.abort(); }catch(e){}
+  appendLog('系统','已停止（手动）');
+});
+
+/* scheduleNextRealCall 控制是否继续下一次调用（考虑 max_rounds、running 标志） */
+async function scheduleNextRealCall(){
+  // stop condition
+  const maxRounds = parseInt(document.getElementById('max_rounds').value) || 10;
+  const intervalMs = parseInt(document.getElementById('interval_ms').value) || 300;
+  // participantIndex increments per model call; we count full rounds by when participantIndex % participants.length === 0
+  while(running){
+    await runOneModelTurn();
+    // after one model finishes:
+    if(!running) break;
+    // check rounds:
+    if(participantIndex % participants.length === 0){
+      roundCount++;
+      if(roundCount >= maxRounds){ appendLog('系统', `达到最大回合数 ${maxRounds}，停止`); running = false; break; }
+    }
+    // if auto mode false, break and wait for manual next
+    const autoEl = document.getElementById('autoMode');
+    const autoOn = autoEl ? autoEl.checked : true;
+    if(!autoOn){
+      appendLog('系统','自动模式关闭，等待手动下一轮');
+      break;
+    }
+    // small delay to avoid tight loop
+    await new Promise(res => setTimeout(res, Math.max(0, intervalMs)));
+  }
+}
+
+/* runOneModelTurn: 调用单个模型并流式显示 */
+async function runOneModelTurn(){
+  if(!running) return;
+  if(participants.length === 0) return;
+  const m = participants[participantIndex % participants.length];
+  participantIndex++;
+  appendLog('系统', `正在调用模型：${m}`);
+  // build messages (include name for history items)
+  const topic = document.getElementById('topic').value || '';
+  const cw = parseInt(document.getElementById('max_rounds').value) ? Math.max(1, Math.min(50, parseInt(document.getElementById('max_rounds').value))) : 4;
+  // Note: we also have a dedicated context_window earlier; if you want that, use that input.
+  const contextWindow = document.getElementById('context_window') ? parseInt(document.getElementById('context_window').value) || 4 : 4;
+  const messages = buildMessagesFromHistory(topic, contextWindow);
+
+  // add placeholder entry to log
+  const entryDiv = document.createElement('div'); entryDiv.className = 'entry';
+  const timeStr = new Date().toLocaleTimeString();
+  entryDiv.innerHTML = `<div class='meta'>${m} • ${timeStr}</div><div class='bubble'></div>`;
+  logEl.appendChild(entryDiv);
+  logEl.scrollTop = logEl.scrollHeight;
+  const bubble = entryDiv.querySelector('.bubble');
+
+  controller = new AbortController();
+  const timeoutMs = parseInt(document.getElementById('timeout').value) || 15000;
+  const timeoutId = setTimeout(()=>{ if(controller) controller.abort(); }, timeoutMs);
+
+  try {
+    const res = await fetch(apiBase + '/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ model: m, messages, stream: true, timeout: timeoutMs }),
+      signal: controller.signal
+    });
+
+    if(!res.ok){
+      const txt = await res.text().catch(()=>res.statusText);
+      throw new Error('HTTP ' + res.status + ' ' + txt);
+    }
+
+    // if no stream supported, fallback parse full JSON
+    if(!res.body || !res.body.getReader){
+      const data = await res.json();
+      const content = extractFullContent(data) || JSON.stringify(data);
+      bubble.innerHTML = safeHtml(content);
+      history.push({ role:'assistant', name: m, text: content, time: Date.now() });
+      appendLog('系统', `模型 ${m} 完成（非流式）`);
+      clearTimeout(timeoutId);
+      return;
+    }
+
+    // stream processing
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalText = '';
+    let done = false;
+
+    while(!done){
+      const { value, done: d } = await reader.read();
+      if(d) done = true;
+      if(value) buffer += decoder.decode(value, { stream: true });
+
+      // SSE-style events separated by double newline
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop(); // keep last incomplete
+      for(const part of parts){
+        const lines = part.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+        for(const line of lines){
+          if(line === '[DONE]' || line === 'data: [DONE]') { done = true; break; }
+          if(line.startsWith('data:')){
+            const jsonText = line.slice(5).trim();
+            if(jsonText === '[DONE]'){ done = true; break; }
+            try{
+              const parsed = JSON.parse(jsonText);
+              const delta = extractDeltaFromParsed(parsed);
+              if(delta){
+                finalText += delta;
+                bubble.innerHTML = safeHtml(finalText);
+                logEl.scrollTop = logEl.scrollHeight;
+              }
+            }catch(err){
+              // 如果解析失败，追加原始文本
+              finalText += jsonText;
+              bubble.innerHTML = safeHtml(finalText);
+            }
+          } else {
+            // 可能是裸 JSON
+            try {
+              const parsed = JSON.parse(line);
+              const delta = extractDeltaFromParsed(parsed);
+              if(delta){
+                finalText += delta;
+                bubble.innerHTML = safeHtml(finalText);
+              }
+            } catch(e){}
+          }
+        }
+        if(done) break;
+      }
+    } // end while
+
+    // leftover buffer
+    if(buffer && buffer.trim()){
+      const maybe = buffer.trim();
+      const lines = maybe.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+      for(const line of lines){
+        if(line.startsWith('data:')){
+          const jsonText = line.slice(5).trim();
+          if(jsonText !== '[DONE]'){
+            try{
+              const parsed = JSON.parse(jsonText);
+              const delta = extractDeltaFromParsed(parsed);
+              if(delta) finalText += delta;
+            }catch(e){ finalText += jsonText; }
+          }
+        } else {
+          try{ const parsed = JSON.parse(line); const delta = extractDeltaFromParsed(parsed); if(delta) finalText += delta; }catch(e){}
+        }
+      }
+      bubble.innerHTML = safeHtml(finalText);
+    }
+
+    // push to history
+    history.push({ role:'assistant', name: m, text: finalText, time: Date.now() });
+    appendLog('系统', `模型 ${m} 输出完成 (${(finalText||'').slice(0,80)}${finalText.length>80?'...':''})`);
+    clearTimeout(timeoutId);
+
+  } catch (err){
+    if(err.name === 'AbortError'){
+      appendLog('系统', `模型 ${m} 调用被中断（超时或手动停止）`);
+    } else {
+      appendLog('错误', `模型 ${m} 调用失败：${err.message || err}`);
+    }
+    clearTimeout(timeoutId);
+  } finally {
+    controller = null;
+  }
+}
+
+/* helper used in stream parsing */
+function extractDeltaFromParsed(parsed){
+  try {
+    const c = parsed.choices && parsed.choices[0];
+    if(!c) return '';
+    if(c.delta && typeof c.delta === 'object'){
+      if(typeof c.delta.content === 'string') return c.delta.content;
+      if(c.delta.message && typeof c.delta.message.content === 'string') return c.delta.message.content;
+    }
+    if(c.message && typeof c.message.content === 'string') return c.message.content;
+    if(typeof c.text === 'string') return c.text;
+  } catch(e){}
+  return '';
+}
+
+/* ---------- 人类插入 / 清空 ---------- */
+insertHumanBtn.addEventListener('click', ()=>{
+  const txt = document.getElementById('humanInput').value.trim();
+  if(!txt) return alert('请输入人类发言');
+  history.push({ role:'user', name:'Human', text: txt, time: Date.now() });
+  appendLog('Human', txt);
+  document.getElementById('humanInput').value = '';
+  // 立即触发下一模型（如果运行）
+  if(running) scheduleNextRealCall();
+});
+clearLogBtn.addEventListener('click', ()=>{ logEl.innerHTML = ''; history = []; appendLog('系统','记录已清空'); });
+
+/* small util: extract from parsed (also used earlier) */
+function extractFullContent(data){
+  try {
+    if(data.choices && data.choices[0]){
+      const c = data.choices[0];
+      if(c.message && typeof c.message.content === 'string') return c.message.content;
+      if(typeof c.text === 'string') return c.text;
+      if(c.delta && typeof c.delta.content === 'string') return c.delta.content;
+    }
+    if(data.message && typeof data.message.content === 'string') return data.message.content;
+  } catch(e){}
+  return '';
+}
+
+/* ---------- 手动下一轮支持（当 auto 关闭） ---------- */
+document.getElementById('nextBtn')?.addEventListener('click', ()=>{
+  if(!running){
+    appendLog('系统', '尚未开始（请点击 开始）');
+    return;
+  }
+  // schedule one model call (works even if auto off)
+  scheduleNextRealCall();
+});
+
+/* ---------- /v1/models 可能不可用时的提示 ---------- */
+window.addEventListener('load', ()=>{
+  // 如果模型列表为空，提示
+  setTimeout(()=>{ if(modelSelect.options.length <= 1) modelsInfo.textContent = '模型列表为空（请检查 /v1/models）'; }, 800);
+});
+</script>
+</body>
+</html>

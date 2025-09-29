@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prompts Generate UI</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      padding: 18px;
+      background: #f7f8fb
+    }
+
+    .card {
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 6px 18px rgba(20, 20, 40, 0.06);
+      padding: 16px;
+      max-width: 900px;
+      margin: auto
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      font-weight: 600
+    }
+
+    textarea,
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #e2e8f0
+    }
+
+    button {
+      margin-top: 12px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: none;
+      background: #1f6feb;
+      color: white;
+      font-weight: 600;
+      cursor: pointer
+    }
+
+    button.secondary {
+      background: #6b7280
+    }
+
+    pre {
+      background: #0f1724;
+      color: #e6eef8;
+      padding: 12px;
+      border-radius: 6px;
+      overflow: auto
+    }
+
+    .row {
+      display: flex;
+      gap: 12px
+    }
+
+    .col {
+      flex: 1
+    }
+
+    .results {
+      margin-top: 16px
+    }
+
+    .meta {
+      font-size: 12px;
+      color: #6b7280
+    }
+
+    /* 新增样式：更直观的结果卡片、可折叠长文本、复制按钮 */
+    .result-card {
+      background: linear-gradient(180deg, #ffffff, #fbfdff);
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 12px;
+      border: 1px solid rgba(15, 23, 36, 0.04);
+      box-shadow: 0 4px 10px rgba(15, 23, 36, 0.03)
+    }
+
+    .result-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px
+    }
+
+    .result-meta {
+      font-size: 12px;
+      color: #475569
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px
+    }
+
+    .actions button {
+      background: #eef2ff;
+      color: #0f1724;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer
+    }
+
+    .body {
+      margin-top: 8px
+    }
+
+    /* 重要：prompt 不换行（保留换行但不自动换行），超出显示水平滚动 */
+    pre.prompt {
+      white-space: pre;
+      word-break: normal;
+      font-family: Menlo, Monaco, "Courier New", monospace;
+      background: #f3f4f6;
+      color: #0f1724;
+      padding: 10px;
+      border-radius: 6px;
+      max-height: 320px;
+      overflow: auto;
+      border: 1px solid rgba(2, 6, 23, 0.04)
+    }
+
+    pre.meta-json {
+      font-size: 12px;
+      color: #334155;
+      background: transparent;
+      padding: 6px;
+      border-radius: 6px;
+      overflow: auto
+    }
+
+    .label {
+      font-weight: 700;
+      margin-bottom: 6px
+    }
+
+    /* 折叠时给 prompt 一个更短的高度 */
+    .collapsed {
+      max-height: 48px !important;
+      overflow: hidden !important;
+    }
+
+
+    /* small helpers */
+    .muted {
+      color: #64748b;
+      font-size: 12px
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(0, 0, 0, 0.12);
+      border-top-color: #1f6feb;
+      animation: spin 1s linear infinite;
+      display: inline-block;
+      margin-left: 8px
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h2>Prompts Generate</h2>
+
+    <form id="promptForm">
+      <label>输入 (query)</label>
+      <textarea id="query" rows="5" placeholder="在此输入你的提示词或说明">构造或改进系统提示词：请帮我把下面的指令改写为更明确的系统提示词</textarea>
+
+      <div class="row">
+        <div class="col">
+          <label>模型 (model)</label>
+          <select id="model"></select>
+        </div>
+        <div class="col">
+          <label>Depth 列表 (用逗号或换行分隔)</label>
+          <textarea id="depth" rows="2" placeholder="73,71,72,74">73,71,72,74</textarea>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px; align-items:center; margin-top:8px">
+        <div class="toolbar">
+          <button id="submitBtn" type="submit">发送请求</button>
+          <button type="button" id="clear" class="secondary">清空结果</button>
+          <button type="button" id="example" class="secondary">填写示例</button>
+        </div>
+        <button id="cancel" type="button" style="display:none;margin-left:8px;background:#ef4444">取消</button>
+        <div id="loadingIndicator" style="display:none;margin-left:8px" aria-hidden="true"><span class="spinner"></span>
+        </div>
+      </div>
+    </form>
+
+    <div class="results" id="results">
+      <h3>历史响应</h3>
+      <div id="list"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('promptForm');
+    const list = document.getElementById('list');
+    const clearBtn = document.getElementById('clear');
+    const exampleBtn = document.getElementById('example');
+    const submitBtn = document.getElementById('submitBtn');
+    const cancelBtn = document.getElementById('cancel');
+    const loadingIndicator = document.getElementById('loadingIndicator');
+    const DEFAULT_MODEL = "deepseek:deepseek-reasoner";
+
+    let controller = null; // AbortController used to cancel fetch
+    let isProcessing = false; // prevent double submits
+
+
+    function makeDepthArray(text) {
+      if (!text) return [];
+      // split by commas or newlines, trim, remove empties
+      return text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+    }
+
+    async function postPromptsStream(body) {
+      // prevent multiple concurrent runs
+      if (isProcessing) return;
+      isProcessing = true;
+      submitBtn.disabled = true;
+      exampleBtn.disabled = true;
+      clearBtn.disabled = true;
+      cancelBtn.style.display = 'inline-block';
+      loadingIndicator.style.display = 'inline-block';
+      const originalSubmitText = submitBtn.textContent;
+      submitBtn.textContent = '处理中...';
+
+
+      controller = new AbortController();
+      const signal = controller.signal;
+      try {
+        const res = await fetch('/prompts/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+
+        const now = new Date().toLocaleString();
+
+        if (!res.ok) {
+          const txt = await res.text();
+          appendResult({ error: true, status: res.status, text: txt, when: now });
+          return;
+        }
+
+        // 读取流（response.body 是一个 ReadableStream）
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let { value: chunk, done: readerDone } = await reader.read();
+        let buffer = '';
+        while (!readerDone) {
+          buffer += decoder.decode(chunk, { stream: true });
+          // 按换行分割（处理 NDJSON）
+          const lines = buffer.split(/\r?\n/);
+          // 最后一项可能是不完整的，保留到下一轮
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const obj = JSON.parse(trimmed);
+              // 如果是 done 标志，可以额外处理（可选）
+              if (obj && obj.done) {
+                appendResult({ error: false, status: res.status, data: { done: true }, when: new Date().toLocaleString() });
+                // 继续读取 to fully drain stream (or break if you want)
+                continue;
+              }
+              appendResult({ error: false, status: res.status, data: obj, when: new Date().toLocaleString() });
+            } catch (e) {
+              // 解析失败，直接把原始内容显示出来（用于调试）
+              appendResult({ error: true, status: 'parse', text: line, when: new Date().toLocaleString() });
+            }
+          }
+
+          ({ value: chunk, done: readerDone } = await reader.read());
+        }
+
+        // 读到最后，处理残余 buffer
+        if (buffer && buffer.trim()) {
+          try {
+            const obj = JSON.parse(buffer.trim());
+            appendResult({ error: false, status: res.status, data: obj, when: new Date().toLocaleString() });
+          } catch (e) {
+            appendResult({ error: true, status: 'parse', text: buffer, when: new Date().toLocaleString() });
+          }
+        }
+      } catch (err) {
+        // handle abort separately for clearer UX
+        if (err.name === 'AbortError' || err.message === 'aborted') {
+          appendResult({ error: true, status: 'aborted', text: '已取消请求', when: new Date().toLocaleString() });
+        } else {
+          appendResult({ error: true, status: 'network', text: err.message, when: new Date().toLocaleString() });
+        }
+      }
+      finally {
+        // restore UI
+        isProcessing = false;
+        controller = null;
+        submitBtn.disabled = false;
+        exampleBtn.disabled = false;
+        clearBtn.disabled = false;
+        cancelBtn.style.display = 'none';
+        loadingIndicator.style.display = 'none';
+        submitBtn.textContent = originalSubmitText;
+      }
+    }
+    async function loadModels() {
+      try {
+        const res = await fetch('/models');
+        const models = await res.json();
+
+        const select = document.getElementById('model');
+        select.innerHTML = '';
+
+        // 加一个空选项，允许用户自己输入
+        const customOpt = document.createElement('option');
+        customOpt.value = '';
+        customOpt.textContent = '手动输入...';
+        select.appendChild(customOpt);
+
+        // 默认模型
+        const defaultOpt = document.createElement('option');
+        defaultOpt.value = DEFAULT_MODEL;
+        defaultOpt.textContent = DEFAULT_MODEL + " (默认)";
+        select.appendChild(defaultOpt);
+
+        // 加载返回的模型列表
+        models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m;
+          opt.textContent = m;
+          select.appendChild(opt);
+        });
+
+
+        // 默认选中第一个（如果有的话）
+        if (models.length > 0) {
+          select.value = models[0];
+        }
+        else {
+          select.value = DEFAULT_MODEL;
+        }
+      } catch (err) {
+        console.error('获取模型列表失败:', err);
+        const select = document.getElementById('model');
+        select.innerHTML = `<option value="${DEFAULT_MODEL}" selected>${DEFAULT_MODEL} (默认)</option>`;
+      }
+    }
+    cancelBtn.addEventListener('click', () => {
+      if (!isProcessing || !controller) return;
+      try { controller.abort(); } catch (e) { /* ignore */ }
+    });
+
+    function appendResult(obj) {
+      // card container
+      const container = document.createElement('div');
+      container.className = 'result-card';
+
+
+      // header (meta + actions)
+      const header = document.createElement('div');
+      header.className = 'result-header';
+
+
+      const meta = document.createElement('div');
+      meta.className = 'result-meta';
+      meta.textContent = `[${obj.when}] status: ${obj.status}` + (obj.error ? ' — 错误' : '');
+
+
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.textContent = '复制';
+
+
+      const toggleBtn = document.createElement('button');
+      toggleBtn.type = 'button';
+      toggleBtn.textContent = '折叠';
+
+
+      actions.appendChild(copyBtn);
+      actions.appendChild(toggleBtn);
+
+
+      header.appendChild(meta);
+      header.appendChild(actions);
+      container.appendChild(header);
+
+
+      // body
+      const body = document.createElement('div');
+      body.className = 'body';
+
+
+      // helper to create a pre element
+      function makePre(text, cls = 'prompt') {
+        const p = document.createElement('pre');
+        p.className = cls;
+        p.textContent = text;
+        return p;
+      }
+
+
+      if (obj.error) {
+        const text = (obj.text && typeof obj.text === 'string') ? obj.text : JSON.stringify(obj, null, 2);
+        body.appendChild(makePre(text));
+        // copy copies the error text
+        copyBtn.addEventListener('click', () => navigator.clipboard && navigator.clipboard.writeText(text));
+      } else {
+        const data = obj.data || {};
+        // If result contains a prompt field, show it prominently (preserve newlines and wrap)
+        if (data.prompt) {
+          const lbl = document.createElement('div'); lbl.className = 'label'; lbl.textContent = 'Prompt';
+          const prePrompt = makePre(data.prompt, 'prompt');
+          body.appendChild(lbl);
+          body.appendChild(prePrompt);
+
+
+          // show other fields (reason, depth) as a compact JSON below
+          const small = document.createElement('div'); small.className = 'label'; small.textContent = '其他字段';
+          const copyMeta = Object.assign({}, data);
+          delete copyMeta.prompt;
+          body.appendChild(small);
+          body.appendChild(makePre(JSON.stringify(copyMeta, null, 2), 'meta-json'));
+
+
+          // copy copies the prompt (primary important content)
+          copyBtn.addEventListener('click', () => navigator.clipboard && navigator.clipboard.writeText(data.prompt));
+
+
+        } else {
+          // fallback: show full JSON
+          const txt = JSON.stringify(data, null, 2);
+          body.appendChild(makePre(txt));
+          copyBtn.addEventListener('click', () => navigator.clipboard && navigator.clipboard.writeText(txt));
+        }
+      }
+      // append body to container and insert into the list
+      container.appendChild(body);
+      // show newest at top
+      list.insertBefore(container, list.firstChild);
+
+      // toggle fold/unfold: control max-height on pre.prompt elements
+      toggleBtn.addEventListener('click', () => {
+        const pres = container.querySelectorAll('pre.prompt');
+        if (!pres || pres.length === 0) return;
+        const isCollapsed = pres[0].classList.contains('collapsed');
+        pres.forEach(p => p.classList.toggle('collapsed'));
+        toggleBtn.textContent = isCollapsed ? '折叠' : '展开';
+      });
+
+
+      // small UX: scroll newly added card into view (top)
+      container.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const query = document.getElementById('query').value;
+      const model = document.getElementById('model').value;
+      const depthText = document.getElementById('depth').value;
+      const depth = makeDepthArray(depthText);
+      if (model === '') {
+        model = prompt('请输入自定义模型名称', DEFAULT_MODEL) || undefined;
+      }
+      if (!depth.length) {
+        alert('depth 不能为空，请填写至少一项');
+        return;
+      }
+
+      const body = { query, model, depth };
+      await postPromptsStream(body);
+    });
+
+    clearBtn.addEventListener('click', () => { list.innerHTML = ''; });
+    exampleBtn.addEventListener('click', () => {
+      document.getElementById('query').value = '构造或改进系统提示词：请把下面的任务说明改写为更精确的系统提示词，包含输入、输出与约束条件。';
+      document.getElementById('model').value = DEFAULT_MODEL;
+      document.getElementById('depth').value = '73,71,72,74';
+    });
+    loadModels();
+  </script>
+</body>
+
+</html>

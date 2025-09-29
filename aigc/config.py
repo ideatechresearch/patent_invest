@@ -18,7 +18,9 @@ class Config(object):
     # {{!IGNORE_START!}} (请忽略以下内容)
     DATABASE_PWD = "***"
     SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://technet:{quote_plus(DATABASE_PWD)}@rm-***.mysql.rds.aliyuncs.com:3306/technet?charset=utf8mb4'
-    ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://ideatech:{quote_plus(DATABASE_PWD)}@rm-***.mysql.rds.aliyuncs.com:3306/h3yun?charset=utf8'
+    ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://technet:{quote_plus(DATABASE_PWD)}@rm-***.mysql.rds.aliyuncs.com:3306/technet?charset=utf8mb4'
+    IDEATECH_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://ideatech:{quote_plus(DATABASE_PWD)}@rm-***.mysql.rds.aliyuncs.com:3306/h3yun?charset=utf8'
+
     SQLALCHEMY_COMMIT_ON_TEARDOWN = False
     SQLALCHEMY_TACK_MODIFICATIONS = True
     SQLALCHEMY_ECHO = True
@@ -31,12 +33,14 @@ class Config(object):
     MAX_TASKS = 1024
     MAX_CACHE = 1024
     MAX_CONCURRENT = 100
+    MAX_HTTP_CONNECTIONS = 300
+    MAX_KEEPALIVE_CONNECTIONS = 100
     MAX_RETRY_COUNT = 3
     RETRY_DELAY = 5
     DEVICE_ID = '***'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
-    Version = 'v1.2.7'
+    Version = 'v1.2.8'
     _config_path = 'config.yaml'
     __config_data = {}  # 动态加载的数据，用于还原
     __config_dynamic = {}  # 其他默认配置项，用于运行时
@@ -47,16 +51,17 @@ class Config(object):
     NEO_URI = "bolt://neo4j:7687"
     NEO_Username = "neo4j"
     NEO_Password = '***'
-    DASK_Cluster = 'tcp://127.0.0.1:8786'
+    DASK_Cluster = 'tcp://***:8786'
     DASK_DASHBOARD_HOST = "http://127.0.0.1:8787"
-    QDRANT_HOST = 'qdrant'  
+    QDRANT_HOST = 'qdrant'  # "47.110.156.41"
     QDRANT_GRPC_PORT = 6334
-    QDRANT_URL = "http://***:6333"   # ":memory:"
+    QDRANT_URL = "http://***:6333"  # ":memory:"
     WECHAT_URL = 'http://idea_ai_robot:28089'
     REDIS_HOST = "redis_aigc"
     REDIS_PORT = 6379  # 7007
     REDIS_CACHE_SEC = 99999  # 86400
     REDIS_MAX_CONCURRENT = 300
+    DB_MAX_SIZE = 20
 
     VALID_API_KEYS = {"token-abc123", "token-def456"}
     DEFAULT_LANGUAGE = 'Chinese'
@@ -112,7 +117,7 @@ class Config(object):
     ALIYUN_oss_region = "oss-cn-hangzhou"
     ALIYUN_oss_internal = False  # 是否使用内网地址
     ALIYUN_oss_endpoint = f'https://{ALIYUN_oss_region}.aliyuncs.com'  # 'https://oss-cn-shanghai.aliyuncs.com'
-    ALIYUN_Bucket_Name = 'idea-aigc-images'  # 存储桶名称 'rime'
+    ALIYUN_Bucket_Name = '***-images'  # 存储桶名称 'rime'
     ALIYUN_Bucket_Domain = f"https://{ALIYUN_Bucket_Name}.{ALIYUN_oss_region}{'-internal' if ALIYUN_oss_internal else ''}.aliyuncs.com"  # 加速域名"https://rime.oss-accelerate.aliyuncs.com"
     # https://console.cloud.tencent.com/hunyuan/api-key
     TENCENT_SecretId = '***'
@@ -124,7 +129,7 @@ class Config(object):
     XF_API_Key = '***'
     XF_Secret_Key = '***'
     Spark_Service_Key = '***'  # AK:SK,{XF_API_Key}:{XF_Secret_Key} ws协议的apikey和apisecret 按照ak:sk格式拼接
-    XF_API_Password = ['***','***']  # http协议的APIpassword
+    XF_API_Password = ['***', '***']  # http协议的APIpassword
     # https://aistudio.google.com/apikey
     GEMINI_Service_Key = '***'
     # https://console.anthropic.com/settings/keys
@@ -146,7 +151,7 @@ class Config(object):
     # https://console.x.ai/team/457298eb-40a8-4308-907d-0a36ec706042/api-keys/create
     Grok_Service_Key = '***'
     # https://build.nvidia.com/explore/discover
-    NVIDIA_Service_Key = '***'  
+    NVIDIA_Service_Key = '***' 
     # https://platform.openai.com/settings/organization/admin-keys
     OPENAI_Admin_Service_Key = '***'
     OPENAI_Service_Key = '***'
@@ -161,6 +166,9 @@ class Config(object):
     MINIMAX_Service_Key = '***'
     # https://platform.lingyiwanwu.com/apikeys
     Lingyiwanwu_Service_Key = '***'
+    # https://o3.fan/token
+    OThree_Service_Key = "***"
+    ZZZ_Service_Key = "***"
     # https://ai.youdao.com/console/#/
     YOUDAO_AppID = '775f6562be8c52e4'
     YOUDAO_Service_Key = '***'
@@ -177,8 +185,8 @@ class Config(object):
     # https://console.volcengine.com/iam/keymanage
     VOLC_AK_ID = '***'
     VOLC_Secret_Key = '***'
-    VOLC_AK_ID_admin = '***'  
-    VOLC_Secret_Key_admin = '***'
+    VOLC_AK_ID_admin = '***' 
+    VOLC_Secret_Key_admin = '***'  
     # https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D
     ARK_Service_Key = '***'
 
@@ -192,7 +200,7 @@ class Config(object):
     OPIK_Api_Key = '***'
     OPIK_Workspace = 'dooven-prime'
     # https://www.searchapi.io/
-    SearchApi_Key = '***'  
+    SearchApi_Key = '***'  # TLvdjLW2QAgdotQyYMpcXeqx
     # https://api-dashboard.search.brave.com/app/keys
     # https://api-dashboard.search.brave.com/app/dashboard
     Brave_Api_Key = "***"
@@ -217,7 +225,7 @@ class Config(object):
     # https://www.weatherapi.com/my/
     Weather_Service_Key = '***'
     # https://openweathermap.org/api
-    WeatherMap_APPID = '***'
+    WeatherMap_APPID = '314861a32a11eab5d93c87811d5b6735'
     # https://vectorizer.ai/account#Account-apiKey0
     Vectorizer_Api_Key = '***'
     Vectorizer_Secret_Key = '***'
@@ -229,11 +237,22 @@ class Config(object):
 
     # https://gitee.com/personal_access_tokens
     GITEE_Access_Tokens = '***'
-    # 'https://matrix.ideatech.info'
-    Ideatech_API_Key = '***'
-    Ideatech_Host = '***.info'
 
-    HTTP_Proxy = 'http://***@***:7930'
+    Ideatech_API_Key = '***'
+    Ideatech_Host = '***'  
+
+    Risk_BASE_URL = "https://***"
+    Risk_API_KEY = "***"
+    Risk_DB_CONFIG = {
+        "host": "rm-***.mysql.rds.aliyuncs.com",  # 数据库地址
+        "port": 3306,  # 端口
+        "user": "llm_***",  # 用户名
+        "password": "llm_***",  # 密码
+        "database": "llm_***",  # 库名
+        "charset": "utf8mb4"
+    }
+
+    HTTP_Proxy = 'http://***:***@***:7930'
     HTTP_Proxies = {
         'http': HTTP_Proxy,
         'https': HTTP_Proxy,
@@ -246,7 +265,7 @@ class Config(object):
         if cls.__config_dynamic.get('IS_DEBUG'):
             return
         cls.SQLALCHEMY_DATABASE_URI = f'mysql+pymysql://***:***@10.10.10.5:3306/kettle?charset=utf8mb4'
-        cls.ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://***:***@10.10.10.5:3306/kettle?charset=utf8'
+        cls.ASYNC_SQLALCHEMY_DATABASE_URI = f'mysql+aiomysql://***:***@10.10.10.5:3306/kettle?charset=utf8mb4'
         cls.WEBUI_URL = 'http://127.0.0.1:7000'
         # https://api.qdrant.tech/api-reference
         cls.QDRANT_GRPC_PORT = None
@@ -257,14 +276,15 @@ class Config(object):
         cls.DASK_Cluster = 'tcp://10.10.10.20:8786'
         cls.DASK_DASHBOARD_HOST = "http://host.docker.internal:8787"
 
-        cls.HTTP_Proxy = 'http://***:***7@10.10.10.3:7890'
+        cls.HTTP_Proxy = 'http://***:***@10.10.10.3:7890'
         # cls.HTTP_Proxies = {'http': cls.HTTP_Proxy,'https': cls.HTTP_Proxy}
         os.environ['HTTP_PROXY'] = cls.HTTP_Proxies['http']
         os.environ['HTTPS_PROXY'] = cls.HTTP_Proxies['https']
 
-        cls.Moonshot_Service_Key = "sk-***" 
+        cls.Moonshot_Service_Key = "sk-***"  
         cls.DeepSeek_Service_Key = 'sk-***'
         cls.DashScope_Service_Key = 'sk-***'
+        cls.ARK_Service_Key = '***'
         cls.__config_dynamic['IS_DEBUG'] = True
 
     @staticmethod
@@ -458,6 +478,7 @@ class Config(object):
 AI_Models = [
     # https://dashscope.console.aliyun.com/overview
     # https://bailian.console.aliyun.com/#/home
+    # https://help.aliyun.com/zh/model-studio/use-qwen-by-calling-api?spm=5176.28197632.console-base_help.dexternal.58192e36ZiOCjR#dc02de8e5earc
     # https://pai.console.aliyun.com/?regionId=cn-shanghai&spm=5176.pai-console-inland.console-base_product-drawer-right.dlearn.337e642duQEFXN&workspaceId=567545#/quick-start/models
     {'name': 'qwen', 'type': 'default', 'api_key': '',
      "model": ["qwen-turbo", "qwen1.5-7b-chat", "qwen1.5-32b-chat", "qwen2-7b-instruct",
@@ -477,7 +498,7 @@ AI_Models = [
                "deepseek-r1-distill-qwen-1.5b", "deepseek-r1-distill-qwen-7b",
                "deepseek-r1-distill-qwen-14b", "deepseek-r1-distill-qwen-32b",  # 32k
                "deepseek-r1-distill-llama-8b", "deepseek-r1-distill-llama-70b",
-               "deepseek-v3", "deepseek-r1", ],
+               "deepseek-v3", "deepseek-r1", "deepseek-v3.1"],
      # 'baichuan2-7b-chat-v1','baichuan2-turbo'
      "generation": ["qwen-coder-turbo", "qwen2.5-coder-7b-instruct", "qwen2.5-coder-14b-instruct",
                     "qwen2.5-coder-32b-instruct", "qwen-coder-turbo-latest"],
@@ -526,6 +547,40 @@ AI_Models = [
      'tool_url': "https://open.bigmodel.cn/api/paas/v4/tools",
      'agent_url': "https://open.bigmodel.cn/api/v1/agents",
      'supported_openai': True, 'supported_list': False, "timeout": 300},
+    # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
+    # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
+    # https://www.volcengine.com/docs/82379/1494384
+    {'name': 'doubao', 'type': 'default', 'api_key': '',
+     "model": {"doubao-1.5-lite-32k-250115": "doubao-1-5-lite-32k-250115",
+               "doubao-1.5-pro-32k-250115": "doubao-1-5-pro-32k-250115",  # 'ep-m-20250527140853-wmb69'
+               "doubao-1.5-pro-256k-250115": "doubao-1-5-pro-256k-250115",
+               "doubao-pro-32k-browsing": "doubao-pro-32k-browsing-241115",  # doubao-pro-32k-browsing-240828
+               "doubao-pro-32k-character": "doubao-pro-32k-character-241215",
+               "doubao-pro-32k-functioncall": "doubao-pro-32k-functioncall-241028",
+               "doubao-pro-32k-functioncall-preview": 'doubao-pro-32k-functioncall-preview',
+               "doubao-pro-256k-241115": "doubao-pro-256k-241115",  # "ep-m-20250416135143-wb2hz",
+               "Doubao-Seed-1.6-flash": "doubao-seed-1-6-flash-250715",
+               "Doubao-Seed-1.6-thinking": "doubao-seed-1-6-thinking-250715",
+               "Doubao-Seed-1.6": "doubao-seed-1-6-250615",
+               "Kimi-K2": "kimi-k2-250905",
+               "DeepSeek-V3.1": "deepseek-v3-1-250821", "DeepSeek-V3.1-terminus": "deepseek-v3-1-terminus",
+               # 自定义接入点调用 The model or endpoint doubao-pro-32k does not exist or you do not have access to it
+               "doubao-lite-32k": 'ep-20241206154509-gwsp9',
+               "doubao-pro-32k": 'ep-20241018103141-7hqr7',
+               "doubao-character-pro-32k": 'ep-20241206120328-msvt7',
+               "chatglm3-130-fin": 'ep-20241017110248-fr7z6',
+               "chatglm3-130b-fc": 'ep-20241017105930-drfm8',
+               "doubao-vision-lite-32k": "ep-20241219174540-rdlfj",
+               "doubao-vision-pro-32k": "ep-20241217182411-kdg49",
+               },
+     # [ "GLM3-130B",chatglm3-130-fin,functioncall-preview],
+     'embedding': {'Doubao-embedding': 'doubao-embedding-text-240715',  # 'ep-20241219165520-lpqrl'
+                   'Doubao-embedding-large': 'doubao-embedding-large-text-250515',  # 'ep-20241219165636-kttk2',
+                   "Doubao-embedding-vision": "doubao-embedding-vision-250615"},
+     'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
+     'tokenization_url': 'https://ark.cn-beijing.volces.com/api/v3/tokenization',
+     'base_url': "https://ark.cn-beijing.volces.com/api/v3",
+     'supported_openai': True, 'supported_list': False, "timeout": 100},
     # https://platform.baichuan-ai.com/docs/api
     {'name': 'baichuan', 'type': 'default', 'api_key': '',
      "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', 'Baichuan3-Turbo-128k',
@@ -597,37 +652,6 @@ AI_Models = [
      'classify_url': "https://api.jina.ai/v1/classify",
      'segment_url': 'https://api.jina.ai/v1/segment',
      'supported_openai': False, 'supported_list': False, 'proxy': True, "timeout": 200},
-    # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
-    # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
-    {'name': 'doubao', 'type': 'default', 'api_key': '',
-     "model": {"doubao-1.5-lite-32k-250115": "doubao-1-5-lite-32k-250115",
-               "doubao-1.5-pro-32k-250115": "doubao-1-5-pro-32k-250115",  # 'ep-m-20250527140853-wmb69'
-               "doubao-1.5-pro-256k-250115": "doubao-1-5-pro-256k-250115",
-               "doubao-pro-32k-browsing": "doubao-pro-32k-browsing-241115",  # doubao-pro-32k-browsing-240828
-               "doubao-pro-32k-character": "doubao-pro-32k-character-241215",
-               "doubao-pro-32k-functioncall": "doubao-pro-32k-functioncall-241028",
-               "doubao-pro-32k-functioncall-preview": 'doubao-pro-32k-functioncall-preview',
-               "doubao-pro-256k-241115": "doubao-pro-256k-241115",  # "ep-m-20250416135143-wb2hz",
-               "Doubao-Seed-1.6-flash": "doubao-seed-1-6-flash-250715",
-               "Doubao-Seed-1.6-thinking": "doubao-seed-1-6-thinking-250715",
-               # 自定义接入点调用 The model or endpoint doubao-pro-32k does not exist or you do not have access to it
-               "doubao-lite-32k": 'ep-20241206154509-gwsp9',
-               "doubao-pro-32k": 'ep-20241018103141-7hqr7',
-               "doubao-character-pro-32k": 'ep-20241206120328-msvt7',
-               "chatglm3-130-fin": 'ep-20241017110248-fr7z6',
-               "chatglm3-130b-fc": 'ep-20241017105930-drfm8',
-               "doubao-vision-lite-32k": "ep-20241219174540-rdlfj",
-               "doubao-vision-pro-32k": "ep-20241217182411-kdg49",
-               "Doubao-Seed-1.6": "doubao-seed-1-6-250615",
-               "Kimi-K2": "kimi-k2-250711", "DeepSeek-V3.1": "deepseek-v3-1-250821"},
-     # [ "GLM3-130B",chatglm3-130-fin,functioncall-preview],
-     'embedding': {'Doubao-embedding': 'doubao-embedding-text-240715',  # 'ep-20241219165520-lpqrl'
-                   'Doubao-embedding-large': 'doubao-embedding-large-text-250515',  # 'ep-20241219165636-kttk2',
-                   "Doubao-embedding-vision": "doubao-embedding-vision-250615"},
-     'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-     'tokenization_url': 'https://ark.cn-beijing.volces.com/api/v3/tokenization',
-     'base_url': "https://ark.cn-beijing.volces.com/api/v3",
-     'supported_openai': True, 'supported_list': False, "timeout": 100},
     # open.volcengineapi.com
     # https://cloud.tencent.com/document/product/1729
     # https://cloud.tencent.com/document/product/1729/104753
@@ -655,12 +679,12 @@ AI_Models = [
                "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
                "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
                "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-               "Pro/deepseek-ai/DeepSeek-V3",
+               "Pro/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V3.1",
                "moonshotai/Kimi-K2-Instruct", "moonshotai/Kimi-Dev-72B",
+               "zai-org/GLM-4.5V", "zai-org/GLM-4.5", "zai-org/GLM-4.5",
                "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "internlm/internlm2_5-20b-chat",
-               "Pro/OpenGVLab/InternVL2-8B",
                "baidu/ERNIE-4.5-300B-A47B", "tencent/Hunyuan-A13B-Instruct",
-               "MiniMaxAI/MiniMax-M1-80k",
+               "MiniMaxAI/MiniMax-M1-80k", "stepfun-ai/step3", "ascend-tribe/pangu-pro-moe",
                ],
      # "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/deepseek-vl2","deepseek-ai/DeepSeek-V2-Chat","Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat"
      # "01-ai/Yi-1.5-9B-Chat-16K",  'TeleAI/TeleChat2',"google/gemma-2-9b-it", "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -833,6 +857,115 @@ AI_Models = [
      'generation_url': 'https://api.anthropic.com/v1/complete',
      'base_url': 'https://api.anthropic.com/v1',
      'supported_openai': False, 'supported_list': True, 'proxy': True, "timeout": 300},
+    # https://o3.fan/info/models/
+    # https://o3.fan/account/profile
+    # https://o3.fan/account/pricing
+    {'name': 'othree', 'type': 'default', 'api_key': '',
+     'model': ['codegeex-4', "glm-3-turbo", "kimi-k2-0711-preview", "moonshot-v1-8k", "abab6.5s-chat",
+               "Doubao-1.5-pro-256k", "SparkDesk-Lite", "SparkDesk-Pro",
+               "gpt-5-mini", "gpt-5-nano", "gpt-4o",
+               "gemini-1.5-flash-latest", "gemini-2.0-flash", "gemini-2.5-flash"],
+     'embedding': ["embedding-2", 'embedding-3', 'Doubao-embedding'],
+     'reranker': ['bge-reranker-v2-m3', 'bge-large-zh', "bce-reranker-base_v1"],
+     'url': 'https://api.o3.fan/v1/chat/completions',
+     'embedding_url': 'https://api.o3.fan/v1/embeddings',
+     'reranker_url': 'https://api.o3.fan/v1/rerank',
+     'model_url': 'https://api.o3.fan/v1/models',
+     'base_url': "https://api.o3.fan/v1",
+     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 300},
+    # https://doc.zhizengzeng.com/doc-3979947
+    {'name': 'zzz', 'type': 'default', 'api_key': '',
+     'model': ['gpt-5', 'gpt-5-2025-08-07', 'gpt-5-mini', 'gpt-5-mini-2025-08-07', 'gpt-5-nano',
+               'gpt-5-nano-2025-08-07', 'gpt-5-chat-latest', 'gpt-oss-120b', 'gpt-oss-20b', 'o4-mini',
+               'o4-mini-2025-04-16', 'o3-pro', 'o3-pro-2025-06-10', 'o3', 'o3-2025-04-16', 'gpt-4.1',
+               'gpt-4.1-2025-04-14', 'gpt-4.1-mini', 'gpt-4.1-mini-2025-04-14', 'gpt-4.1-nano',
+               'gpt-4.1-nano-2025-04-14', 'gpt-4.5-preview', 'gpt-4.5-preview-2025-02-27', 'o3-mini',
+               'o3-mini-2025-01-31', 'o1-pro', 'o1-pro-2025-03-19', 'o1', 'o1-2024-12-17', 'o1-preview',
+               'o1-preview-2024-09-12', 'o1-mini', 'o1-mini-2024-09-12', 'gpt-3.5-turbo', 'gpt-3.5-turbo-0301',
+               'gpt-3.5-turbo-0613', 'gpt-3.5-turbo-1106', 'gpt-3.5-turbo-0125', 'gpt-3.5-turbo-16k',
+               'gpt-3.5-turbo-16k-0613', 'gpt-3.5-turbo-instruct', 'gpt-3.5-turbo-instruct-0914', 'gpt-4', 'gpt-4-0314',
+               'gpt-4-0613', 'gpt-4-1106-preview', 'gpt-4-vision-preview', 'gpt-4-1106-vision-preview',
+               'gpt-4-0125-preview', 'gpt-4-turbo', 'gpt-4-turbo-preview', 'gpt-4-turbo-2024-04-09', 'gpt-4o',
+               'gpt-4o-2024-11-20', 'gpt-4o-2024-08-06', 'gpt-4o-2024-05-13', 'gpt-4o-audio-preview',
+               'gpt-4o-audio-preview-2024-10-01', 'gpt-4o-mini', 'gpt-4o-mini-2024-07-18', 'gpt-4o-mini-audio-preview',
+               'gpt-4o-mini-audio-preview-2024-12-17', 'chatgpt-4o-latest', 'gpt-4-32k', 'gpt-4-32k-0314',
+               'gpt-4-32k-0613', 'gpt-4o-transcribe',
+               'gpt-4o-mini-transcribe', 'dall-e-2', 'dall-e-3', 'claude-opus-4-1-20250805',
+               'claude-opus-4-1-20250805-thinking', 'claude-opus-4-20250514', 'claude-sonnet-4-20250514',
+               'claude-opus-4-20250514-thinking', 'claude-sonnet-4-20250514-thinking',
+               'claude-3-7-sonnet-20250219-thinking', 'claude-3-7-sonnet-thinking', 'claude-3-7-sonnet-20250219',
+               'claude-3-7-sonnet-latest', 'claude-3-opus-20240229', 'claude-3-5-sonnet-20241022',
+               'claude-3-5-sonnet-20240620', 'claude-3-sonnet-20240229', 'claude-3-5-haiku-20241022',
+               'claude-3-haiku-20240307', 'claude-2.1', 'claude-2.0', 'gemini-2.5-pro', 'gemini-2.5-pro-thinking',
+               'gemini-2.5-flash', 'gemini-2.5-flash-thinking', 'gemini-2.5-flash-lite',
+               'gemini-2.5-flash-lite-thinking', 'gemini-2.5-flash-preview-05-20',
+               'gemini-2.5-flash-preview-05-20-thinking', 'gemini-2.5-flash-preview-04-17',
+               'gemini-2.5-flash-preview-04-17-thinking', 'gemini-2.5-pro-preview-06-05',
+               'gemini-2.5-pro-preview-06-05-thinking', 'gemini-2.5-pro-preview-05-06',
+               'gemini-2.5-pro-preview-05-06-thinking', 'gemini-2.0-flash', 'gemini-2.0-flash-lite',
+               'gemini-2.0-flash-lite-preview-02-05', 'gemini-1.5-flash', 'gemini-1.5-pro',
+               'gemini-2.0-flash-thinking-exp', 'gemini-2.0-flash-thinking-exp-1219', 'gemini-2.0-flash-exp',
+               'gemini-2.0-pro-exp-02-05', 'gemini-exp-1206', 'gemini-exp-1121', 'gemini-exp-1114', 'grok-4',
+               'grok-4-0709', 'grok-4-latest', 'grok-3', 'grok-3-latest', 'grok-3-beta', 'grok-3-fast',
+               'grok-3-fast-latest', 'grok-3-fast-beta', 'grok-3-mini', 'grok-3-mini-beta', 'grok-3-mini-latest',
+               'grok-3-mini-fast', 'grok-3-mini-fast-latest', 'grok-3-mini-fast-beta', 'grok-2-vision-1212',
+               'grok-2-vision', 'grok-2-vision-latest', 'grok-2-1212', 'grok-2', 'grok-2-latest', 'grok-beta',
+               'grok-vision-beta', 'ernie-x1-turbo-32k', 'ernie-x1-32k-preview', 'ernie-x1-32k',
+               'ernie-4.5-turbo-vl-32k', 'ernie-4.5-turbo-vl-32k-preview', 'ernie-4.5-8k-preview',
+               'ernie-4.5-turbo-32k', 'ernie-4.5-turbo-128k', 'ERNIE-Bot', 'ERNIE-Bot-4', 'ERNIE-4.0-8K',
+               'ernie-4.0-8k', 'ernie-4.0-8k-0613', 'ernie-4.0-8k-latest', 'ernie-4.0-8k-preview',
+               'ernie-4.0-turbo-128k', 'ernie-4.0-turbo-8k', 'ernie-4.0-turbo-8k-0628', 'ernie-4.0-turbo-8k-0927',
+               'ernie-4.0-turbo-8k-latest', 'ernie-4.0-turbo-8k-preview', 'ERNIE-Bot-turbo', 'ERNIE-3.5-8K',
+               'ERNIE-Speed-128K', 'ERNIE-Speed-8K', 'ERNIE-Lite-8K', 'ERNIE-Tiny-8K', 'ernie-3.5-128k',
+               'ernie-3.5-128k-preview', 'ernie-3.5-8k', 'ernie-3.5-8k-0613', 'ernie-3.5-8k-0701',
+               'ernie-3.5-8k-preview', 'glm-4.5', 'glm-4.5v', 'glm-4.5-x', 'glm-4.5-air', 'glm-4.5-airx',
+               'glm-4.5-flash', 'glm-4-plus', 'glm-4-air', 'glm-4-air-250414', 'glm-4-airx', 'glm-4-flashx',
+               'glm-4-flashx-250414', 'glm-4-long', 'glm-z1-air', 'glm-z1-airx', 'glm-z1-flash', 'glm-4v-plus',
+               'glm-4v-plus-0111', 'glm-4v-flash', 'glm-4-0520', 'glm-4-flash', 'glm-4', 'glm-4v', 'glm-3-turbo',
+               'chatglm-6b-v2', 'chatglm3-6b', 'qwen3-235b-a22b', 'qwen3-32b', 'qwen3-30b-a3b', 'qwen3-14b', 'qwen3-8b',
+               'qwen3-4b', 'qwen3-1.7b', 'qwen3-0.6b', 'qwen3-coder-plus', 'qwen3-coder-plus-2025-07-22',
+               'qwen-coder-plus', 'qwen-coder-plus-latest', 'qwen-coder-plus-2024-11-06', 'qwen-coder-turbo',
+               'qwen-coder-turbo-latest', 'qwen-coder-turbo-2024-09-19', 'qwen-max', 'qwen-max-latest',
+               'qwen-max-2025-01-25', 'qwen-max-1201', 'qwen-max-longcontext', 'qwen-plus', 'qwen-turbo', 'qwen-vl-v1',
+               'qwen-vl-chat-v1', 'qwen2.5-vl-72b-instruct', 'Qwen2.5-VL-72B-Instruct', 'qwen2.5-vl-32b-instruct',
+               'qwen2.5-vl-7b-instruct', 'qwen2.5-vl-3b-instruct', 'qwen2.5-3b-instruct', 'qwen2.5-72b-instruct',
+               'qwen2.5-32b-instruct', 'qwen2.5-14b-instruct', 'qwen2.5-7b-instruct', 'qwen2.5-1.5b-instruct',
+               'qwen2.5-0.5b-instruct', 'qwen2-72b-instruct', 'qwen2-57b-instruct', 'qwen2-7b-instruct',
+               'qwen2-1.5b-instruct', 'qwen2-0.5b-instruct', 'qwen1.5-110b-chat', 'qwen1.5-72b-chat', 'qwen-72b-chat',
+               'x1', '4.0Ultra', 'generalv3.5', 'max-32k', 'generalv3', 'pro-128k', 'lite', 'hunyuan-t1-latest',
+               'hunyuan-t1-20250403', 'hunyuan-t1-20250321', 'hunyuan-turbos-latest', 'hunyuan-turbos-20250515',
+               'hunyuan-turbos-20250416', 'hunyuan-turbos-20250313', 'hunyuan-turbos-longtext-128k-20250325',
+               'hunyuan-large', 'hunyuan-turbo', 'hunyuan-standard', 'hunyuan-standard-256k', 'hunyuan-translation',
+               'hunyuan-translation-lite', 'hunyuan-role', 'hunyuan-functioncall', 'hunyuan-code', 'hunyuan-t1-vision',
+               'hunyuan-turbos-vision', 'hunyuan-vision', 'hunyuan-pro', 'hunyuan-lite', 'Baichuan4-Turbo',
+               'Baichuan4-Air', 'Baichuan4', 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', 'Baichuan2-Turbo',
+               'Baichuan2-Turbo-192k', 'Baichuan2-53B', 'baichuan2-7b-chat-v1', 'baichuan2-13b-chat-v1',
+               'baichuan-7b-v1', '360zhinao2-o1', '360gpt2-o1', '360gpt-turbo', '360gpt-pro', '360gpt2-pro',
+               '360gpt-pro-trans', 'moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k',
+               'moonshot-v1-8k-vision-preview', 'moonshot-v1-32k-vision-preview', 'moonshot-v1-128k-vision-preview',
+               'kimi-latest', 'kimi-k2', 'kimi-k2-0711-preview', 'kimi-k2-turbo-preview', 'kimi-thinking-preview',
+               'deepseek-chat', 'deepseek-coder', 'deepseek-v3', 'DeepSeek-V3', 'deepseek-reasoner', 'deepseek-r1',
+               'deepseek-r1-250528', 'yi-lightning', 'yi-large', 'yi-large-turbo', 'yi-large-rag', 'yi-medium',
+               'yi-medium-200k', 'yi-spark', 'yi-vision', 'yi-6b-chat', 'yi-34b-chat', 'MiniMax-M1', 'MiniMax-Text-01',
+               'abab6.5-chat', 'abab6.5s-chat', 'abab6-chat', 'abab5.5-chat', 'abab5.5s-chat', 'doubao-seed-1.6',
+               'doubao-seed-1.6-250615', 'doubao-seed-1.6-thinking', 'doubao-seed-1.6-thinking-250615',
+               'doubao-seed-1.6-flash', 'doubao-seed-1.6-flash-250615', 'doubao-1.5-thinking-vision-pro',
+               'doubao-1.5-thinking-vision-pro-250428', 'doubao-1.5-thinking-pro', 'doubao-1.5-thinking-pro-250415',
+               'doubao-1.5-thinking-pro-m-250428', 'doubao-1.5-thinking-pro-m-250415', 'doubao-1.5-vision-pro',
+               'doubao-1.5-vision-pro-250328', 'doubao-1.5-vision-pro-32k', 'doubao-1.5-vision-pro-32k-250115',
+               'doubao-1.5-vision-lite', 'doubao-1.5-vision-lite-250315', 'doubao-1.5-pro-32k',
+               'doubao-1.5-pro-32k-250115', 'doubao-1.5-pro-256k', 'doubao-1.5-pro-256k-250115', 'Doubao-lite-4k',
+               'Doubao-lite-32k', 'Doubao-1.5-lite-32k', 'Doubao-lite-128k', 'Doubao-pro-4k', 'Doubao-pro-32k',
+               'bot-Doubao-pro-32k-browsing-240828', 'bot-Doubao-pro-32k-functioncall-241028', 'Doubao-pro-128k',
+               'llama-4-maverick-17b-128e-instruct', 'llama-4-scout-17b-16e-instruct', 'llama3-8b-instruct',
+               'llama3-70b-instruct'],
+     'embedding': ['text-embedding-ada-002', 'text-embedding-3-large', 'text-embedding-3-small'],
+     'reranker': ['bge-reranker-v2-m3', 'bge-large-zh', "bce-reranker-base_v1"],
+     'speech': ['tts-1', 'tts-1-1106', 'tts-1-hd', 'tts-1-hd-1106', 'gpt-4o-mini-tts', 'whisper-1'],
+     'url': 'https://api.zhizengzeng.com/v1/chat/completions',
+     'embedding_url': 'https://api.zhizengzeng.com/v1/embeddings',
+     'base_url': "https://api.zhizengzeng.com/v1",
+     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 300},
     # https://platform.openai.com/docs/overview
     {'name': 'gpt', 'type': 'default', 'api_key': '',
      'model': ["o3-mini", "o3-mini-2025-01-31", "o1", "o1-2024-12-17", "o1-preview", "o1-preview-2024-09-12", "o1-mini",
@@ -881,6 +1014,8 @@ def model_api_keys(name: str = None):
         'modelscope': Config.ModelScope_Service_Key,
         'aihubmix': Config.AiHubMix_Service_Key,
         'tokenflux': Config.TokenFlux_Service_Key,
+        'othree': Config.OThree_Service_Key,
+        'zzz': Config.ZZZ_Service_Key
     }
     if not name:
         return api_keys

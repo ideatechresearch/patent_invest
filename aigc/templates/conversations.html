@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>对话记录处理工具台</title>
+    <link rel="icon" href="/static/favicon.ico"/>
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --panel: #0f1623;
+            --muted: #9aa4b2;
+            --text: #e6e9ef;
+            --border: #232b3d;
+            --accent: #6ea8fe;
+            --success: #22c55e;
+            --page-pad: 18px;
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        body {
+            margin: 0;
+            font-family: system-ui, Segoe UI, Roboto, Arial;
+            background: linear-gradient(180deg, #0b0f19, #0b1220);
+            color: var(--text)
+        }
+
+        .wrap {
+            width: 100%;
+            max-width: calc(100% - 2 * var(--page-pad));
+            margin: 12px auto;
+            padding: var(--page-pad);
+            box-sizing: border-box;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 0
+        }
+
+        .hint {
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        main {
+            display: block;
+            margin-top: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .panel {
+            background: linear-gradient(180deg, #111827, #0f1623);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 18px;
+            box-sizing: border-box;
+            width: 100%;
+        }
+
+        label {
+            display: block;
+            font-size: 13px;
+            color: var(--muted);
+            margin-bottom: 6px
+        }
+
+        input,
+        select,
+        textarea,
+        button {
+            width: 100%;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: #0c1220;
+            color: var(--text);
+            font-size: 13px
+        }
+
+        textarea {
+            min-height: 90px;
+            resize: vertical
+        }
+
+        .row {
+            margin-bottom: 10px
+        }
+
+        .row.inline {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .small {
+            flex: 1 1 200px;
+            min-width: 180px;
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        button.primary {
+            background: linear-gradient(180deg, #1f6feb, #2563eb);
+            border-color: #1d4ed8;
+            color: white
+        }
+
+        .out {
+            background: #090d16;
+            border: 1px dashed var(--border);
+            padding: 12px;
+            border-radius: 8px;
+            min-height: 180px;
+            max-height: calc(80vh - 160px);
+            /* 高屏占比，留出 header 和 padding */
+            overflow: auto;
+            white-space: pre-wrap;
+        }
+
+        .out.err {
+            border-color: #8b2d2d;
+            color: #ffc9c9;
+        }
+
+        #loading {
+            display: none;
+            position: fixed;
+            top: 8px;
+            right: 8px;
+            width: 320px;
+            max-width: 90%;
+            background: rgba(10, 12, 18, 0.9);
+            color: white;
+            padding: 10px;
+            border-radius: 8px;
+            z-index: 9999;
+            pointer-events: none;
+            /* 关键：不拦截鼠标事件，页面仍可操作 */
+            box-shadow: 0 6px 30px rgba(0, 0, 0, 0.6);
+        }
+
+        /* loading 内部要能接受点击（例如取消按钮），设置其直接子元素 pointer-events:auto */
+        #loading * {
+            pointer-events: auto;
+        }
+
+        .loading-float {
+            position: fixed;
+            top: 12px;
+            right: 12px;
+            z-index: 9999;
+            width: clamp(300px, 46vw, 720px);
+            max-width: calc(100% - 24px);
+            pointer-events: none;
+            background: rgba(10, 12, 18, 0.94);
+            color: #fff;
+            border-radius: 10px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+            padding: 10px;
+        }
+
+        .loading-float .loading-inner {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            pointer-events: auto;
+        }
+
+        #progress-bar {
+            width: 10%;
+            height: 10px;
+            background: linear-gradient(90deg, #4caf50, #6ee7b7);
+            border-radius: 999px;
+            transition: width .25s ease;
+        }
+
+
+        button[disabled] {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .hint {
+            font-size: 12px;
+            color: var(--muted)
+        }
+
+        input[type="text"],
+        input[type="checkbox"],
+        input[type="radio"] {
+            width: auto;
+        }
+
+        @media(max-width:720px) {
+            :root {
+                --page-pad: 12px;
+            }
+
+            .wrap {
+                padding: 12px;
+                margin: 8px auto;
+            }
+
+            .panel {
+                padding: 12px;
+                border-radius: 10px;
+            }
+
+            .out {
+                min-height: 140px;
+                max-height: calc(70vh - 140px);
+            }
+
+            .row.inline {
+                flex-direction: column;
+            }
+
+            .small {
+                min-width: 100%;
+                flex-basis: 100%;
+            }
+
+            .btn-row {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="wrap">
+    <header>
+        <h1>对话记录处理工具台</h1>
+        <div class="hint">提取 & 筛选；生成总结</div>
+    </header>
+
+    <main>
+        <!-- 上： 提取 -> 筛选 -->
+        <section class="panel" id="panel-extract-filter">
+            <h2 style="margin-top:0">1) 提取 → 筛选</h2>
+            <p class="hint">上传原始对话（JSON），选择来源；默认筛选日期为本月 1 日。执行后会在本页保留筛选结果并支持下载
+                Excel。</p>
+
+            <div class="row">
+                <label>原始对话文件（JSON）</label>
+                <input id="file-input" type="file" accept="application/json,.json"/>
+            </div>
+
+            <div class="row inline">
+                <div class="small">
+                    <label>来源类型</label>
+                    <select id="convo-type">
+                        <option value="gpt">gpt</option>
+                        <option value="deepseek">deepseek</option>
+                    </select>
+                </div>
+                <div class="small">
+                    <label>筛选：保留此日期（含）之后</label>
+                    <input id="after-date" type="date"/>
+                </div>
+            </div>
+
+            <div class="row inline">
+                <div class="small">
+                    <label>
+                        <input type="checkbox" id="download-excel" checked/> 下载筛选结果（Excel）
+                    </label>
+                </div>
+                <div class="small">
+                    <label>
+                        <input type="checkbox" id="use-stream"/> 提取使用流（内部）
+                    </label>
+                </div>
+                <div class="small">
+                    <label>姓名: <input type="text" id="convo-name" placeholder="请输入名称"/></label>
+                </div>
+            </div>
+
+            <div class="row btn-row">
+                <button id="run-extract" class="primary">执行：提取 → 筛选</button>
+                <button id="clear-extract">重置</button>
+            </div>
+
+            <div class="row">
+                <label>筛选输出（JSON 摘要 / 错误）</label>
+                <div id="extract-out" class="out">尚未执行。</div>
+            </div>
+        </section>
+
+        <!-- 右上角小浮层：不拦截页面交互 -->
+        <div id="loading" style="display:none; position:fixed; top:12px; right:12px; width:320px;
+    background:rgba(10,12,18,0.92); color:white; padding:10px; border-radius:8px; z-index:9999;
+    box-shadow:0 6px 24px rgba(0,0,0,0.6); pointer-events:none;">
+            <div style="display:flex; align-items:center; gap:8px;">
+                <div style="font-size:14px">⏳ 正在执行…</div>
+                <div style="flex:1; height:8px; background:#222; border-radius:6px; overflow:hidden;">
+                    <div id="progress-bar"
+                         style="width:10%; height:100%; background:#4caf50; transition:width 350ms;"></div>
+                </div>
+                <!-- 内部按钮允许点击（pointer-events:auto） -->
+                <button id="cancel-summary" style="display:none; margin-left:8px; pointer-events:auto;">取消</button>
+            </div>
+        </div>
+        <!-- 下： 生成总结 -->
+        <section class="panel" id="panel-summary">
+            <h2 style="margin-top:0">2) 生成总结 </h2>
+            <p class="hint">上传文件或粘贴文本</p>
+
+            <div class="row">
+                <label>上传用于摘要的文件（单个，JSON / Excel，可选）</label>
+                <input id="summary-file" type="file" accept="application/json,.json,.xlsx,.xls"/>
+            </div>
+
+            <div class="row">
+                <label>或：粘贴文本（每行为一段或 JSON 数组）</label>
+                <textarea id="summary-text" placeholder='在此粘贴文本，或粘贴 JSON 数组'></textarea>
+            </div>
+
+            <div class="row inline">
+                <div class="small">
+                    <label>extract_model</label>
+                    <input id="su-extract-model" type="text" value="qwen:qwen-long"/>
+                </div>
+                <div class="small">
+                    <label>summary_model</label>
+                    <input id="su-summary-model" type="text" value="qwen:qwen-plus"/>
+                </div>
+            </div>
+
+            <div class="row inline">
+                <div class="small">
+                    <label>max_tokens</label>
+                    <input id="su-max-tokens" type="number" value="4096"/>
+                </div>
+                <div class="small">
+                    <label>max_segment_length</label>
+                    <input id="su-max-seg" type="number" value="10000"/>
+                </div>
+            </div>
+
+            <div class="row">
+                <label>extract_prompt（可选）</label>
+                <textarea id="su-extract-prompt" placeholder="用于信息抽取的提示词…"></textarea>
+            </div>
+            <div class="row">
+                <label>summary_prompt（可选）</label>
+                <textarea id="su-summary-prompt" placeholder="用于最终归纳输出的提示词…"></textarea>
+            </div>
+
+            <div class="row btn-row">
+                <button id="run-summary" class="primary">生成总结</button>
+                <button id="clear-summary">清空</button>
+            </div>
+
+            <div class="row">
+                <label>摘要输出</label>
+                <div id="summary-out" class="out">尚未执行。</div>
+            </div>
+        </section>
+
+        <div style="text-align:center;margin-top:12px;color:var(--muted);font-size:13px">© 对话处理工具
+        </div>
+    </main>
+</div>
+
+<script>
+    const $ = id => document.getElementById(id);
+    let lastFiltered = null; // 存放上一步筛选结果（JSON array）
+    let currentSummaryAbortController = null;
+    // 默认日期：本月 1 日
+    function setDefaultDateToMonthStart() {
+        const d = new Date(); d.setDate(1);
+        const y = d.getFullYear(); const m = String(d.getMonth() + 1).padStart(2, '0'); const day = String(d.getDate()).padStart(2, '0');
+        const iso = `${y}-${m}-${day}`; const el = $('after-date'); if (el) el.value = iso;
+    }
+    setDefaultDateToMonthStart();
+
+
+    function showLoading() {
+        const el = $('loading');
+        if (!el) return;
+        el.style.display = 'block';
+        const bar = $('progress-bar');
+        if (bar) bar.style.width = '10%';
+
+        // 只禁用“生成”按钮，允许其他操作
+        $('run-summary').disabled = true;
+        // 显示取消按钮（在页面按钮区域）
+        const cancelBtn = $('cancel-summary');
+        if (cancelBtn) cancelBtn.style.display = 'inline-block';
+    }
+    function hideLoading() {
+        const el = $('loading');
+        if (!el) return;
+        el.style.display = 'none';
+        const bar = $('progress-bar');
+        if (bar) bar.style.width = '0%';
+        $('run-summary').disabled = false;
+        const cancelBtn = $('cancel-summary');
+        if (cancelBtn) cancelBtn.style.display = 'none';
+        // 清理 abort controller
+        currentSummaryAbortController = null;
+    }
+
+    function saveBlob(blob, filename) { const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename || 'download'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url) }
+
+    function showOut(el, data, append = false, isError = false) {
+        try {
+            const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+            if (!append) el.textContent = text;
+            else el.textContent += (el.textContent ? '\n' : '') + text;
+            el.classList.toggle('err', isError);
+            // 滚动到底部
+            el.scrollTop = el.scrollHeight;
+        } catch (e) {
+            if (!append) el.textContent = String(data); else el.textContent += '\n' + String(data);
+        }
+    }
+    async function postForm({ url, formData, expectJSON }) {
+        const res = await fetch(url, { method: 'POST', body: formData });
+        if (!res.ok) {
+            const txt = await res.text().catch(() => '<no body>');
+            throw new Error(`${res.status} ${res.statusText} - ${txt}`);
+        }
+        const ct = res.headers.get('content-type') || '';
+        if (expectJSON || ct.includes('application/json')) return await res.json();
+        return await res.blob();
+    }
+    // 将用户输入转换为数组
+    function coerceText(raw) {
+        const t = (raw || '').trim();
+        if (!t) return [];
+        try {
+            const p = JSON.parse(t);
+            if (Array.isArray(p)) return p;
+            if (typeof p === 'string') return [p];
+            // 如果是对象等，把它 stringify 成一条
+            return [JSON.stringify(p)];
+        } catch (e) {
+            // fallback：按行拆分（支持 \r\n 和 \n）
+            return t.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+        }
+    }
+    // 解析 SSE style 内容（给定一个字符串，提取 data: 行，支持多条）
+    function parseSSEChunk(chunkStr) {
+        const events = [];
+        // 拆成行，处理 data: 前缀（简单实现）
+        const lines = chunkStr.split(/\r?\n/);
+        for (const line of lines) {
+            const m = line.match(/^\s*data:\s*(.*)$/);
+            if (m) {
+                events.push(m[1]);
+            }
+        }
+        return events;
+    }
+
+    // ---------- 提取 -> 筛选 ----------
+    $('run-extract').addEventListener('click', async () => {
+        showLoading();
+        const out = $('extract-out');
+        const file = $('file-input').files[0]; if (!file) { showOut(out, '请先选择 JSON 文件', false); return }
+        const convo_type = $('convo-type').value; const after_date = $('after-date').value; const downloadExcel = $('download-excel').checked; const useStream = $('use-stream').checked; const name = $('convo-name').value.trim();
+
+        showOut(out, '开始提取结构化数据…');
+        try {
+            const fd1 = new FormData(); fd1.append('file', file); fd1.append('convo_type', convo_type); fd1.append('stream', String(useStream));
+            const res1 = await fetch('/conversations/extract', { method: 'POST', body: fd1 }); if (!res1.ok) { const t = await res1.text(); throw new Error('提取失败: ' + res1.status + ' ' + t); }
+            const structured = await res1.json(); showOut(out, `已提取（记录 ${Array.isArray(structured) ? structured.length : 0}）进行筛选…`, true);
+
+            // filter (use stream to get JSON)
+            const jsonBlob = new Blob([JSON.stringify(structured, null, 2)], { type: 'application/json' });
+            const fd2 = new FormData(); fd2.append('files', jsonBlob, 'conversations_structured.json'); fd2.append('stream', String(true)); if (after_date) fd2.append('after_date', after_date); fd2.append('name', name);
+            const res2 = await fetch('/conversations/filter', { method: 'POST', body: fd2 }); if (!res2.ok) { const t = await res2.text(); throw new Error('筛选失败: ' + res2.status + ' ' + t); }
+            const filtered = await res2.json(); lastFiltered = filtered; showOut(out, `已筛选（${filtered.length || 0} 条）`, true);
+
+            // 下载 Excel（如选）
+            if (downloadExcel) {
+                const fd3 = new FormData(); fd3.append('files', jsonBlob, 'conversations_structured.json'); fd3.append('stream', String(false)); if (after_date) fd3.append('after_date', after_date);
+                const res3 = await fetch('/conversations/filter', { method: 'POST', body: fd3 }); if (!res3.ok) { const t = await res3.text(); throw new Error('下载筛选结果失败: ' + res3.status + ' ' + t); }
+                const blob = await res3.blob(); const fname = `conversations_filter_${after_date || 'all'}.xlsx`; saveBlob(blob, fname); showOut(out, `已筛选并下载：${fname}`, true);
+            }
+        } catch (err) { showOut(out, err.message, false, true); } finally {
+            hideLoading();
+        }
+    });
+
+    $('clear-extract').addEventListener('click', () => { $('file-input').value = ''; $('after-date').value = ''; setDefaultDateToMonthStart(); $('extract-out').textContent = '尚未执行。'; lastFiltered = null });
+
+    // ---------- 生成总结 ----------
+    $('run-summary').addEventListener('click', async () => {
+        const fileEl = $('summary-file');
+        const file = fileEl && fileEl.files && fileEl.files[0];
+        const textArr = coerceText(document.getElementById('summary-text').value); // array
+        const extract_model = $('su-extract-model').value || 'qwen:qwen-long';
+        const summary_model = $('su-summary-model').value || 'qwen:qwen-plus';
+        const max_tokens = Number($('su-max-tokens').value || 4096);
+        const max_segment_length = Number($('su-max-seg').value || 100000);
+        const extract_prompt = $('su-extract-prompt').value || null;
+        const summary_prompt = $('su-summary-prompt').value || null;
+
+        const out = $('summary-out');
+        showOut(out, '执行中…', false);
+        try {
+            if (!file && textArr.length === 0) {
+                throw new Error('请上传文件或粘贴文本');
+            }
+            // 1) 如果上传了文件 -> 优先与 text 一并发送（text 可以为空数组）
+            const fd = new FormData();
+            if (file) {
+                fd.append('file', file); // 单文件，用字段名 'file'
+            }
+            if (textArr && textArr.length) {
+                fd.append('text', JSON.stringify(textArr));
+            }
+            if (extract_prompt) fd.append('extract_prompt', extract_prompt);
+            if (summary_prompt) fd.append('summary_prompt', summary_prompt);
+            fd.append('extract_model', extract_model);
+            fd.append('summary_model', summary_model);
+            fd.append('max_tokens', String(max_tokens));
+            fd.append('max_segment_length', String(max_segment_length));
+
+            const controller = new AbortController();
+            currentSummaryAbortController = controller;
+            showLoading();
+            const res = await fetch('/summary', { method: 'POST', body: fd, signal: controller.signal });
+
+            if (!res.ok) {
+                const txt = await res.text().catch(() => '<no body>');
+                throw new Error(`${res.status} ${res.statusText} - ${txt}`);
+            }
+
+            const ct = (res.headers.get('content-type') || '').toLowerCase();
+            // 流式 SSE（text/event-stream）处理
+            if (res.body && ct.includes('text/event-stream')) {
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                showOut(out, '开始接收流…', false);
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+
+                    // SSE 事件以空行分隔 \n\n，可能收到部分或多条事件
+                    let idx;
+                    while ((idx = buf.indexOf('\n\n')) !== -1) {
+                        const raw = buf.slice(0, idx);
+                        buf = buf.slice(idx + 2);
+                        if (!raw.trim()) continue;
+                        // 解析 raw 里所有 data: 行
+                        const datas = parseSSEChunk(raw);
+                        for (const d of datas) {
+                            if (d === '[DONE]') {
+                                break;
+                            } else {
+                                try {
+                                    const obj = JSON.parse(d);
+                                    // 如果是结构化 chunk，追加展示
+                                    showOut(out, obj, true);
+                                } catch (e) {
+                                    // 不是 JSON，直接追加文本
+                                    showOut(out, d, true);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 处理剩余（若有不完整块）
+                if (buf && buf.trim()) {
+                    const remaining = buf.trim();
+                    const datas = parseSSEChunk(remaining);
+                    for (const d of datas) {
+                        if (d === '[DONE]') {
+                            showOut(out, '\n[STREAM DONE]', true);
+                        } else {
+                            try {
+                                showOut(out, JSON.parse(d), true);
+                            } catch {
+                                showOut(out, d, true);
+                            }
+                        }
+                    }
+                }
+
+            } else {
+                // 非流式返回：尝试解析 JSON，否则作为文本显示
+                const text = await res.text();
+                try {
+                    const obj = JSON.parse(text);
+                    showOut(out, obj, false);
+                } catch {
+                    showOut(out, text, false);
+                }
+            }
+
+        } catch (err) {
+            // 区分取消与其它错误
+            const msg = (err && err.name === 'AbortError') ? '已取消' : (err.message || String(err));
+            showOut($('summary-out'), `错误：${msg}`, false, true);
+        } finally {
+            hideLoading();
+        }
+    });
+
+    // 清空按钮
+    $('clear-summary').addEventListener('click', () => {
+        $('summary-file').value = '';
+        $('summary-text').value = '';
+        $('summary-out').textContent = '尚未执行。';
+        $('summary-out').classList.remove('err');
+    });
+
+    $('cancel-summary').addEventListener('click', (e) => {
+        if (currentSummaryAbortController) {
+            currentSummaryAbortController.abort();
+            // 立即恢复按钮状态（流中断时也会走 finally）
+            hideLoading();
+            showOut($('summary-out'), '[已取消]', true);
+        }
+    });
+
+    // 可选：如果希望 file 存在时禁用文本输入（提示文件优先）
+    $('summary-file').addEventListener('change', (e) => {
+        const f = e.target.files && e.target.files[0];
+        if (f) {
+            $('summary-text').disabled = true;
+            showOut($('summary-out'), `已选文件：${f.name}`, false);
+        } else {
+            $('summary-text').disabled = false;
+        }
+    });
+
+</script>
+</body>
+
+</html>

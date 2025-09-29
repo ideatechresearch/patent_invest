@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, model_validator, condecimal, conint
+from pydantic import BaseModel, Field, AnyUrl, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from abc import ABC, abstractmethod
 from collections.abc import Callable as IsCallable
@@ -287,7 +287,6 @@ class OpenAIRequest(BaseModel):
                 "max_tokens": 512,
                 "stream": False,
                 # "stop": '\n\n',
-                # "extra_body": {"enable_thinking": False}
             }
         }
 
@@ -306,6 +305,7 @@ class OpenAIRequestMessage(BaseModel):
     temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
     top_p: Optional[float] = 1.0
     max_tokens: Optional[conint(ge=1)] = 512
+    max_completion_tokens: Optional[int] = None
     stream: Optional[bool] = False
     store: Optional[bool] = False
 
@@ -317,7 +317,6 @@ class OpenAIRequestMessage(BaseModel):
     user: Optional[str] = None  # 用户标识符,最终用户的唯一标识符
 
     reasoning_effort: Optional[str] = None  # 探索高级推理和问题解决模型 low,medium,high
-    # max_completion_tokens
     response_format: Optional[dict] = None  # 结构化输出,响应符合 JSON 架构
     prediction: Optional[dict] = None  # 预测输出,减少模型响应的延迟
     stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
@@ -354,7 +353,7 @@ class OpenAIRequestMessage(BaseModel):
                 "top_p": 1,
                 "max_tokens": 1024,
                 "stream": False,
-                "extra_body": {"enable_thinking": False},
+                "extra_body": {"enable_thinking": False,  "thinking": {"type": "disabled"}},
                 "tools": [{
                     "type": "baidu_search",
                     "baidu_search": {'query': '大象像什么'}
@@ -382,6 +381,9 @@ class OpenAIRequestMessage(BaseModel):
         if not values:
             return []
         return [t for t in values if isinstance(t, dict) and t]
+
+    def payload(self):
+        return self.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream', 'user'})
 
 
 class OpenAIResponse(BaseModel):
@@ -493,7 +495,7 @@ class IError(Exception):
 
 
 class PromptRequest(BaseModel):
-    query: Optional[str] = None
+    query: str
     model: Optional[str] = "deepseek:deepseek-reasoner"
     depth: List[str] = Field(default_factory=lambda: ["73", "71", "72", "74"])
 
@@ -617,11 +619,11 @@ class FunctionCallItem(BaseModel):
 
 class CallbackUrl(BaseModel):
     format: Literal["query", "json", "form"] = "json"
-    url: Optional[str] = None
-    payload: Optional[Dict[str, Union[str, int]]] = None
+    url: Optional[str] = Field(None, description="The callback URL")
+    payload: Optional[Dict[str, Any]] = Field(None, description="Optional JSON payload to send")
     mapping: Optional[Dict[str, Union[str, int]]] = None
-    params: Optional[Dict[str, str]] = None
-    headers: Optional[Dict[str, str]] = None
+    params: Optional[Dict[str, str]] = Field(None, description="Optional query parameters")
+    headers: Optional[Dict[str, str]] = Field(None, description="Optional request headers")
 
     @model_validator(mode="before")
     @classmethod
@@ -652,7 +654,8 @@ class AgentRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = Field(default_factory=list)
     user: Optional[str] = Field(default=None)
     model: Optional[str] = 'deepseek-chat'
-    callback: Optional[CallbackUrl] = Field(default=None, description="外部函数调用信息")
+    callback: Optional[Union[str, CallbackUrl]] = Field(default=None,
+                                                        description="Callback info: either a URL string, or a dict with url + optional payload/params/headers")
 
     class Config:
         protected_namespaces = ()
@@ -670,7 +673,8 @@ class CompletionParams(BaseModel):
     temperature: float = Field(0.8, description="Temperature for response generation")
     top_p: float = Field(0.8, description="The probability threshold setting for the model.")
     max_tokens: Optional[int] = Field(1024, description="Maximum number of tokens the model can generate.")
-
+    thinking: Optional[int] = Field(0, ge=0,
+                                    description="Number of thinking tokens. 0 disables thinking; >0 enables thinking and adds token budget.")
     prompt: Optional[str] = Field(default=None,
                                   description="The initial system content or prompt used to guide the AI's response.")
     question: Optional[Union[str, List[str]]] = Field(None,
@@ -680,12 +684,13 @@ class CompletionParams(BaseModel):
     suffix: Optional[str] = Field(None, description="The suffix for the AI to respond to completion. ")
     extract: Optional[Union[str, List[str]]] = Field(None,
                                                      description="Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)")
-    callback: Optional[CallbackUrl] = Field(default=None,
-                                            description='Callback info: a URL string or a dict with url and optional payload,params,headers')
     model_name: str = Field("moonshot",
                             description=("Specify the name of the model to be used. It can be any available model, "
                                          "such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek', or other models."))
     model_id: int = Field(0, description="Model ID to be used")
+    # ---- 复杂参数（body）----
+    callback: Optional[CallbackUrl] = Field(default=None,
+                                            description='Callback info: a URL string or a dict with url and optional payload,params,headers')
     keywords: Optional[List[Union[
         str,
         Tuple[str, Any],
@@ -725,9 +730,9 @@ class CompletionParams(BaseModel):
             "examples": [
                 {
                     'prompt': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
+                    "stream": False,
                     "question": ["请解释人工智能的原理。", "AI是什么啊,可以描述一下吗?"],
                     "agent": "0",
-                    "stream": False,
                     "temperature": 0.7,
                     "top_p": 0.8,
                     "model_name": "silicon",
@@ -739,9 +744,9 @@ class CompletionParams(BaseModel):
                     "callback": None
                 },
                 {
-                    "stream": False,
                     "extract": "wechat",
                     "callback": None,
+                    "stream": False,
                     "model_name": "doubao",
                     "model_id": -1,
                     "prompt": "这是什么啊,可以描述一下吗?。",
@@ -752,7 +757,8 @@ class CompletionParams(BaseModel):
                     "suffix": "这是",
                     "temperature": 0.7,
                     "max_tokens": 4096,
-                    "tools": []
+                    "tools": [],
+                    "thinking": 0
                 }
             ]
         }
@@ -811,12 +817,13 @@ class CompletionParams(BaseModel):
 
         return keywords_func
 
-    def asdict(self):
-        return self.model_dump()
+    def asdict(self, include: set | list) -> dict:
+        return self.dict(include=set(include))
+        # {k: v for k, v in self.dict().items() if k in ['temperature', 'top_p', 'max_tokens', 'stream']}
 
     def payload(self):
-        return self.model_dump(include={'temperature', 'top_p', 'max_tokens', 'stream'})
-        # {k: v for k, v in self.dict().items() if k in ['temperature', 'top_p', 'max_tokens', 'stream']}
+        return self.model_dump(include={'temperature', 'top_p', 'max_tokens', "model_name", "model_id",
+                                        "agent", "tools", "keywords", "images", "thinking"})
 
     def set_data(self, **kwargs):
         # from_dict
@@ -833,7 +840,8 @@ class SubmitMessagesRequest(BaseModel):
     use_hist: bool = Field(default=False, description="Use historical messages.")
     filter_limit: Optional[int] = Field(-500,
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
-    filter_time: Optional[int] = Field(0, description="The timestamp to filter historical messages.")
+    filter_time: Optional[Union[int, float]] = Field(0, description="The timestamp to filter historical messages.")
+    stream: bool = Field(False, description="Whether to stream the response")
 
     messages: Optional[List[ChatMessage]] = Field(default_factory=list,
                                                   description="A list of message objects representing the current conversation. "
@@ -854,6 +862,7 @@ class SubmitMessagesRequest(BaseModel):
                 "use_hist": False,
                 "filter_limit": -500,
                 "filter_time": 0.0,
+                "stream": False,
                 "messages": [
                     {
                         "role": "user",
@@ -864,7 +873,6 @@ class SubmitMessagesRequest(BaseModel):
                 "params": [
                     {
                         "name": None,
-                        "stream": False,
                         "temperature": 0.8,
                         "top_p": 0.8,
                         "max_tokens": 1024,
@@ -890,7 +898,6 @@ class SubmitMessagesRequest(BaseModel):
                         "model_name": "qwen",
                         "prompt": "",
                         "question": "感冒灵颗粒好用吗",
-                        "stream": False,
                         "temperature": 0.8,
                         "tools": [],
                         "top_p": 0.8
@@ -907,9 +914,8 @@ class SubmitMessagesRequest(BaseModel):
         cleaned = []
         for item in values["params"]:
             if isinstance(item, dict):
-                item["tools"] = CompletionParams.clean_tools(item.get("tools"))
-                item["keywords"] = CompletionParams.clean_keywords(item.get("keywords"))
-            elif isinstance(item, BaseModel):
+                item = CompletionParams(**item)
+            if isinstance(item, BaseModel):
                 item.tools = CompletionParams.clean_tools(item.tools)
                 item.keywords = CompletionParams.clean_keywords(item.keywords)
             cleaned.append(item)
@@ -925,7 +931,8 @@ class ChatCompletionRequest(CompletionParams):
     use_hist: bool = Field(default=False, description="use historical messages.")
     filter_limit: Optional[int] = Field(-500,
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")
-    filter_time: float = Field(default=0, description="The timestamp to filter historical messages.")
+    filter_time: Optional[Union[int, float]] = Field(default=0,
+                                                     description="The timestamp to filter historical messages.")
 
     messages: Optional[List[ChatMessage]] = Field(default_factory=list,
                                                   description="A list of message objects representing the current conversation. "
@@ -972,7 +979,8 @@ class ChatCompletionRequest(CompletionParams):
                         "type": "web_search"
                     }
                 ],
-                'images': [],
+                "images": [],
+                "thinking": 0,
                 "extract": 'wechat',
                 "callback": None,
                 "stream": False,
@@ -986,7 +994,7 @@ class ChatCompletionRequest(CompletionParams):
 
 
 class SummaryRequest(BaseModel):
-    text: Union[List[str],str]
+    text: Union[List[str], str]
     extract_prompt: Optional[str] = None
     summary_prompt: Optional[str] = None
     extract_model: str = 'qwen:qwen-long'

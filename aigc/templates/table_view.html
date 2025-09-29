@@ -47,8 +47,11 @@
                 <tr>
                     {% for column in columns %}
                     <td>
+                        {% set col_name = column.name.lower() %}
                         {% if row[column.name] is none %}
                             <span class="null-value">NULL</span>
+                        {% elif "content" in col_name and "hash" not in col_name %}
+                            {{ row[column.name] | make_md_link | safe }}
                         {% else %}
                             {{ row[column.name] }}
                         {% endif %}
@@ -67,9 +70,13 @@
     </div>
 
     <script>
+        const baseUrl = '{{ prefix.rstrip("/") }}'; // 确保没有多余斜线
+        const table = '{{ table_name }}';
+        const totalRecords = {{ total or 0 }};
         function changePerPage(select) {
-            const perPage = select.value;
-            window.location.href = `${prefix}/view/{{ table_name }}?page=1&per_page=${perPage}`;
+            const perPage = Number(select.value) || 10;
+            const newTotalPages = Math.max(1, Math.ceil(totalRecords / perPage));
+            window.location.href = `${baseUrl}/view/${table}?page=${newTotalPages}&per_page=${perPage}`;
         }
     </script>
 </body>

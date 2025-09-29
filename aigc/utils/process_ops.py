@@ -1,4 +1,5 @@
 import io, os, sys, socket
+import random
 import re, json
 import pickle, joblib
 import subprocess
@@ -11,8 +12,9 @@ import tracemalloc
 from pathlib import Path
 from collections import deque
 import base64, hashlib
-from typing import Union, Iterable, get_origin, get_args
+from typing import Union, Iterable, Callable, AsyncGenerator, Any, get_origin, get_args
 import aiofiles, asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 
 def execute_code_results(text):
@@ -157,15 +159,15 @@ def configure_event_loop():
             print("🚀 uvloop activated")
         except ImportError:
             print("⚠️ uvloop not available, using default event loop")
-    else:
-        # 启用IOCP
-        if sys.platform.startswith('win'):
-            if sys.version_info >= (3, 8):
-                # Python 3.8+ 使用更高效的 Proactor
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            else:
-                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # 使用 Selector
-        print("🖥️ Windows detected, using optimized event loop policy")
+    # else:
+    #     # 启用IOCP
+    #     if sys.platform.startswith('win'):
+    #         if sys.version_info >= (3, 8):
+    #             # Python 3.8+ 使用更高效的 Proactor
+    #             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    #         else:
+    #             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # 使用 Selector
+    #     print("🖥️ Windows detected, using optimized event loop policy")
 
 
 def kill_process_tree(pid: int):
@@ -215,16 +217,12 @@ def async_to_sync(func, *args, **kwargs):
     return asyncio.run(func(*args, **kwargs))
 
 
-async def wrap_sync(func, *args, **kwargs):
-    # 同步代码转换为异步执行,在后台独立线程中运行,以避免阻塞主事件循环,使用 await 来执行
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-
 async def run_with_async(func, *args, **kwargs):
     """
     通用方法：根据函数是否为协程自动选择 await 或直接调用
     支持在异步上下文中统一处理同步/异步函数调用
-
+    # 同步代码转换为异步执行,在后台独立线程中运行,以避免阻塞主事件循环,使用 await 来执行
+    # await asyncio.get_event_loop().run_in_executor(None, func, *args)
     :param func: 待执行函数（同步或异步）
     :param args: 位置参数
     :param kwargs: 关键字参数
@@ -233,7 +231,19 @@ async def run_with_async(func, *args, **kwargs):
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     else:
-        return await asyncio.to_thread(func, *args, **kwargs)  # 用 asyncio.to_thread 以避免阻塞
+        return await asyncio.to_thread(func, *args, **kwargs)  # 用 asyncio.to_thread 以避免阻塞, 等价于传统的 run_in_executor
+
+
+async def run_with_executor(func, *args, max_workers: int = 10):
+    # asyncio 中并发执行线程池任务
+    loop = asyncio.get_running_loop()
+    if max_workers <= 1:  # 单线程直接调用
+        return [await loop.run_in_executor(None, func, *args)]  # to_thread
+    results = []  # 多线程执行,使用自定义线程池
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        tasks = [loop.run_in_executor(pool, func, *args) for _ in range(max_workers)]
+        results = await asyncio.gather(*tasks)
+    return results
 
 
 async def run_with_semaphore(func, *args, semaphore=None, **kwargs):
@@ -242,6 +252,249 @@ async def run_with_semaphore(func, *args, semaphore=None, **kwargs):
             return await func(*args, **kwargs)
     else:
         return await func(*args, **kwargs)
+
+
+def chunks_iterable(lst, n: int):
+    """将大数据分成小块"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def run_togather(max_concurrent: int = 100, batch_size: int = -1, input_key: str = None, return_exceptions=True):
+    """
+    concurrency 并发限制装饰器，支持批量调用控制并发数量
+    参数：
+        max_concurrent: 最大并发数，默认 100；若 <=0 则不限制。
+        batch_size: 批量大小，默认 -1 表示不分批；若 >0 则按批调用函数。
+        - 第一个参数为单个输入（如 str|list[str],list[tuple]），或用 inputs=... 关键字传入。
+        input_key: 如果不为 None，则以关键字参数方式传递输入值，如 func(**{input_key: x})
+    用法：
+        @run_togather(max_concurrent=10, batch_size=16)
+        async def create_embeddings(input: List[str]|str, ..., model='xxx'):
+            ...
+        process_func = run_togather(max_concurrent=100, input_key="input")(cls.generate_metadata)
+        results = await process_func(inputs=func_list,**kwargs)
+    """
+    semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+
+    def decorator(func: Callable[..., Any]):
+        @wraps(func)
+        async def wrapper(*args, inputs: list = None, **kwargs):
+            _args = list(args)
+            if inputs is None and _args:
+                inputs = _args.pop(0)  # 允许 positional 方式传 list
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+
+            async def run_semaphore(x):
+                if input_key:
+                    coro = func(*_args, **{input_key: x}, **kwargs)
+                else:
+                    coro = func(x, *_args, **kwargs)
+                if semaphore:
+                    async with semaphore:
+                        return await coro
+                return await coro
+
+            if batch_size <= 0:
+                # 所有 input 独立请求
+                tasks = [run_semaphore(item) for item in inputs]
+            else:
+                tasks = [run_semaphore(inputs[i:i + batch_size]) for i in range(0, len(inputs), batch_size)]
+
+            return await asyncio.gather(*tasks, return_exceptions=return_exceptions)  # 确保任务取消时不会引发异常，并发执行多个异步任务
+
+        return wrapper
+
+    return decorator
+
+
+def run_repeat(max_concurrent: int = 100, repeat: int = 1, return_exceptions: bool = True):
+    # 创建信号量控制并发,按完成顺序返回(index, result),并发生成器装饰器，AI多次生成
+    semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+
+    def decorator(func: Callable[..., Any]):
+        @wraps(func)
+        async def async_generator(*args, **kwargs) -> AsyncGenerator[tuple[int, Any], None]:
+            async def worker(index):
+                try:
+                    if semaphore:
+                        async with semaphore:
+                            return index, await func(*args, **kwargs)
+                    return index, await func(*args, **kwargs)
+                except Exception as e:
+                    if return_exceptions:
+                        return index, e  # isinstance(r, Exception)
+                    raise
+
+            tasks = [asyncio.create_task(worker(i)) for i in range(repeat)]
+            # 使用 as_completed 按完成顺序处理结果
+            for coro in asyncio.as_completed(tasks):
+                yield await coro  # (index, result or exception)/ task.get_coro().cr_frame.f_locals['index']
+
+        return async_generator
+
+    return decorator
+
+
+def run_generator(max_concurrent: int = 100, input_key: str = None, return_exceptions: bool = True):
+    """
+    并发、异常处理、索引映射都继承自 run_repeat
+    并发生成器装饰器，将异步函数转换为按完成顺序生成结果的异步生成器
+    async for idx, res in ai_generates(inputs=[...])
+    参数:
+        max_concurrent: 最大并发数
+        input_key: 如果不为 None，则以关键字参数方式传递输入值
+        return_exceptions: 是否将异常作为结果返回，而不是抛出
+
+    返回:
+        异步生成器，按完成顺序生成 (index, result)
+    """
+
+    def decorator(func: Callable[..., Any]):
+        @wraps(func)
+        async def async_generator(*args, inputs: list = None, **kwargs):
+            _args = list(args)
+            if inputs is None and _args:  # 获取输入列表
+                inputs = _args.pop(0)
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+
+            semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+
+            async def wrapper(index: int):
+                try:
+                    if input_key:
+                        coro = func(*_args, **{input_key: inputs[index]}, **kwargs)
+                    else:
+                        coro = func(inputs[index], *_args, **kwargs)
+                    if semaphore:
+                        async with semaphore:
+                            return index, await coro
+                    return index, await coro
+                except Exception as e:
+                    if return_exceptions:
+                        return index, e
+                    raise
+
+            tasks = [asyncio.create_task(wrapper(i)) for i in range(len(inputs))]
+            for coro in asyncio.as_completed(tasks):
+                yield await coro  # (index, result 或 exception)
+
+        return async_generator
+
+    return decorator
+
+
+def make_runner(func: Callable, max_concurrent: int = 10, stream: bool = True, input_key: str = None,
+                return_exceptions=True, **kwargs):
+    """
+    根据 stream 参数，返回 run_generator 或 run_togather 包装后的函数
+    """
+    if stream:
+        @run_generator(max_concurrent=max_concurrent, input_key=input_key, return_exceptions=return_exceptions)
+        async def wrapped(item):
+            return await func(item, **kwargs)
+    else:
+        @run_togather(max_concurrent=max_concurrent, batch_size=-1, input_key=input_key,
+                      return_exceptions=return_exceptions)
+        async def wrapped(data: tuple[int, Any]):
+            idx, item = data
+            return idx, await func(item, **kwargs)
+    return wrapped
+
+
+async def runner_togather_sample(params: list, func: Callable, max_concurrent: int = 10, stream=True,
+                                 input_key: str = None, **kwargs):
+    """
+     通用并发执行入口
+     :param params: 输入列表
+     :param func: 单个元素处理函数 async def func(item, **kwargs)
+     :param stream: True -> run_generator (流式输出), False -> run_togather (批量输出)
+     :param max_concurrent: 最大并发数
+     :param input_key
+     """
+    runner = make_runner(func, max_concurrent=max_concurrent, stream=stream, input_key=input_key, **kwargs)
+
+    def wrap_result(i, r):
+        """统一结果格式，区分 dict / Exception / 普通值"""
+        if isinstance(r, dict):
+            return {'id': i, **r}
+        elif isinstance(r, Exception):
+            return {'id': i, 'error': str(r)}
+        else:
+            return {'id': i, 'value': r}
+
+    if stream:
+        results = []
+        async for i, r in runner(inputs=params):
+            print(f"[stream] idx={i} res={r}")
+            # yield wrap_result(i, r)
+            results.append(wrap_result(i, r))
+        return sorted(results, key=lambda x: x['id'])
+    else:
+        results = await runner(inputs=[(i, p) for i, p in enumerate(params)])  # 已经是 [(idx, result), ...] 保持输入顺
+        return [wrap_result(i, r) for i, r in results]
+
+
+def run_by_threads(max_concurrency: int = 10, repeat: int = 1):
+    """
+    通用多线程批处理装饰器
+    :param max_concurrency: 并发线程数
+    :param repeat: 每个任务重复次数
+    """
+    import threading
+    from queue import Queue
+    def decorator(func):
+        @wraps(func)
+        def wrapper(inputs: list, **kwargs):
+            results = [None] * (len(inputs) * repeat)
+            lock = threading.Lock()
+            q = Queue()
+
+            # 填充队列
+            for i, x in enumerate(inputs):
+                for j in range(repeat):
+                    q.put((i, j, x))
+
+            def worker():
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    _i, _j, _x = item
+                    idx: int = _i * repeat + _j
+                    try:
+                        res = func(_x, **kwargs)
+                        with lock:
+                            results[idx] = res
+                    except Exception as e:
+                        with lock:
+                            results[idx] = {"error": str(e), "task": item}
+                    finally:
+                        q.task_done()
+
+            # 启动线程
+            threads = []
+            for _ in range(max_concurrency):
+                t = threading.Thread(target=worker)
+                t.start()
+                threads.append(t)
+
+            # 等待所有任务完成
+            q.join()
+
+            # 停止线程
+            for _ in range(max_concurrency):
+                q.put(None)
+            for t in threads:
+                t.join()
+
+            return results
+
+        return wrapper
+
+    return decorator
 
 
 _StringLikeT = Union[bytes, str, memoryview]
@@ -985,4 +1238,50 @@ if __name__ == "__main__":
         print(json.dumps(filtered_files, indent=2, ensure_ascii=False))
 
 
-    main()
+    import random
+
+
+    async def test(params: list, stream=True):
+        @run_togather(max_concurrent=10, batch_size=-1)
+        async def single(data: tuple[int, dict]):
+            i, param = data
+            await asyncio.sleep(10)
+            print(i, param)
+            result = {**param, 'id': i}
+            return result
+
+        @run_generator(max_concurrent=10, return_exceptions=True)
+        async def single_item(param):
+            await asyncio.sleep(random.randint(3, 7))
+
+            return param
+
+        if stream:
+            raw_results = []
+            async for idx, r in single_item(inputs=params):
+                print(idx, r)
+                r = {'id': idx, **r}
+                # yield res
+                raw_results.append(r)
+            results = sorted(raw_results, key=lambda x: x['id'], reverse=True)
+        else:
+            results = await single(inputs=[(i, p) for i, p in enumerate(params)])
+
+        return results
+
+
+    async def single_item(param):
+        await asyncio.sleep(random.randint(3, 7))
+
+        return param
+
+
+    res = asyncio.run(runner_togather_sample([{"agents": ["*"],
+                                               "script": ["*"],
+                                               "docker": ["*"],
+                                               "data": ["*.yaml", "*.pkl"]},
+                                              {"global_exclude": ["__pycache__/*", "*.py[cod]", "*.log"]}], single_item,
+                                             stream=True))
+    print(res)
+
+    # main()

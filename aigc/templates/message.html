@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ai-chat</title>
+  <style>
+    :root {
+      --primary: #377ba8;
+      --bg: #fff;
+      --muted: #666;
+      --card: #f8f9fa;
+      --accent: #0366d6;
+      font-size: 16px;
+    }
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 12px;
+      font-family: Inter, Arial, Helvetica, sans-serif;
+      color: var(--muted);
+      background: var(--bg)
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px
+    }
+
+    h1 {
+      color: var(--primary);
+      margin: 0;
+      font-size: 1.1rem
+    }
+
+    /* settings button */
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    button,
+    select,
+    input {
+      font: inherit
+    }
+
+    .btn {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer
+    }
+
+    .btn.ghost {
+      background: transparent;
+      color: var(--primary);
+      border: 1px solid var(--primary)
+    }
+
+    .chat-wrap {
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      max-width: 100%;
+      height: 80vh;
+      max-height: 100vh
+    }
+
+    .chat-box {
+      flex: 1;
+      padding: 12px;
+      overflow: auto;
+      background: #fff
+    }
+
+    .composer {
+      display: flex;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid #eee;
+      background: #fafafa
+    }
+
+    textarea {
+      flex: 1;
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      resize: none
+    }
+
+    .message {
+      padding: 6px 8px;
+      margin: 5px 0;
+      border-radius: 6px;
+      max-width: 85%;
+      font-size: 13px;
+      /* 你可以改成 12px/13px/0.9rem 等 */
+      line-height: 1.4;
+      word-wrap: break-word;
+      /* 防止长词撑破布局 */
+    }
+
+    .user {
+      background: #d0eaff;
+      color: #0b3a57;
+      margin-left: auto;
+      /* 自动把气泡推到右边 */
+      text-align: left;
+      /* 文字正常左对齐 */
+      border-bottom-right-radius: 2px;
+      /* 右下角略方，像聊天气泡 */
+    }
+
+    .ai {
+      background: #f1f0f0;
+      color: #222;
+      font-size: 13px;
+      margin-right: auto;
+      border-bottom-left-radius: 2px;
+      /* 左下角略方 */
+    }
+
+    /* loading */
+    .loading {
+      height: 3px;
+      background: #f3f3f3;
+      overflow: hidden
+    }
+
+    .loading .bar {
+      height: 3px;
+      background: var(--accent);
+      width: 0;
+      animation: load 2.2s linear infinite
+    }
+
+    @keyframes load {
+      0% {
+        width: 0
+      }
+
+      50% {
+        width: 100%
+      }
+
+      100% {
+        width: 0
+      }
+    }
+
+    .fullscreen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      background-color: white;
+      z-index: 99;
+    }
+
+
+    /* simple modal */
+    .modal {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, .35);
+      z-index: 100
+    }
+
+    .modal.show {
+      display: flex
+    }
+
+    .modal .panel {
+      width: min(680px, 96%);
+      background: var(--bg);
+      padding: 16px;
+      border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, .15)
+    }
+
+    code,
+    pre {
+      font-size: 0.9em;
+    }
+
+
+    pre {
+      background: var(--card);
+      padding: 8px;
+      border-radius: 6px;
+      overflow: auto
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.9em;
+    }
+
+    th,
+    td {
+      border: 1px solid #999;
+      padding: 6px 8px;
+      text-align: left;
+    }
+
+    th {
+      background-color: var(--card);
+      font-weight: 600;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px
+    }
+
+    .row label {
+      min-width: 86px;
+      color: var(--muted)
+    }
+
+    .row .field {
+      flex: 1
+    }
+
+    /* mobile tweaks */
+    @media (max-width: 700px) {
+      :root {
+        font-size: 15px
+      }
+
+      .chat-wrap {
+        height: 64vh;
+        width: 99vw;
+        max-width: 100vw;
+      }
+
+      .message {
+        font-size: 15px;
+      }
+
+      .btn {
+        padding: 4px 8px;
+        font-size: 0.9em;
+        border-radius: 4px;
+      }
+
+      code,
+      pre {
+        font-size: 0.95em;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="header">
+    <h1>ai-chat</h1>
+    <div class="controls">
+      <div id="who" style="color:var(--muted)"></div>
+      <button class="btn" id="open-settings">设置</button>
+      <button class="btn" id="download-chat">导出</button>
+      <button class="btn ghost" id="clear">清空</button>
+      <button class="btn ghost" id="zoom">Zoom</button>
+    </div>
+  </div>
+
+  <div class="chat-wrap" id="chat-wrap">
+    <div class="chat-box" id="chat-box">
+      <div class="message ai">Hello! How can I help you today?</div>
+    </div>
+    <div class="loading" id="loading-bar" style="display:none">
+      <div class="bar"></div>
+    </div>
+    <div class="composer">
+      <textarea id="chat-input" rows="3" placeholder="输入消息，Shift+Enter 发送..."></textarea>
+      <button class="btn" id="send">Send</button>
+    </div>
+  </div>
+
+  <!-- Modal: settings -->
+  <div class="modal" id="modal">
+    <div class="panel" role="dialog" aria-modal="true">
+      <h3 style="margin-top:0;color:var(--primary)">设置</h3>
+
+      <div class="row">
+        <label for="topn">上下文数量</label>
+        <div class="field"><select id="topn"></select></div>
+      </div>
+
+      <div class="row">
+        <label>最大回复长度</label>
+        <div class="field"><input id="max_tokens" type="number" min="100" max="10000" step="50" value="4000" /></div>
+      </div>
+
+      <div class="row">
+        <label>最大思维链长度</label>
+        <div class="field"><input id="max_thinking_tokens" type="number" min="0" max="10000" step="100" value="1000" />
+        </div>
+      </div>
+
+      <div class="row">
+        <label for="top_p">核采用率</label>
+        <div class="field"><input id="top_p" type="number" min="0" max="0.99" step="0.01" /></div>
+      </div>
+
+      <div class="row">
+        <label for="temperature">温度系数</label>
+        <div class="field"><input id="temperature" type="number" min="0" max="0.99" step="0.01" /></div>
+      </div>
+
+      <div class="row">
+        <label for="stream">流式输出</label>
+        <div class="field"><input id="stream" type="checkbox" /></div>
+      </div>
+
+      <div class="row">
+        <label for="model">语言模型</label>
+        <div class="field"><select id="model"></select></div>
+      </div>
+
+      <div class="row">
+        <label for="agent">代理角色</label>
+        <div class="field">
+          <select id="agent">
+            {% for agent in agents %}
+            <option value="{{agent.value}}" {% if agent.value=='0' %}selected{% endif %}>{{agent.name}}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <label for="format">格式</label>
+        <div class="field">
+          <select id="format">
+            <option value="raw">raw</option>
+            <option value="markdown">markdown</option>
+            <option value="remark">remarkdown</option>
+            <option value="html" selected>html</option>
+            <option value="spans">spans</option>
+            <option value="json_object">json</option>
+            <option value="code.code">code</option>
+            <option value="wechat">wechat</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+        <button class="btn ghost" id="cancel">取消</button>
+        <button class="btn" id="save-settings">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --------- constants & helpers ---------
+    const DEFAULT_MODEL = 'qwen-plus';
+    const STORAGE_PREFIX = 'ai_chat_';
+
+    const el = id => document.getElementById(id);
+    const qs = sel => document.querySelector(sel);
+
+    // populate topn select (1..32)
+    const topn = el('topn');
+    for (let i = 1; i <= 32; i++) { const o = document.createElement('option'); o.value = i; o.textContent = i; if (i === 10) o.selected = true; topn.appendChild(o); }
+
+    // show who
+    const USERNAME = '{{ username }}' || localStorage.getItem('username');
+    const UID = '{{ uid }}' || localStorage.getItem('uid');
+    if (USERNAME) localStorage.setItem('username', USERNAME); else if (UID) localStorage.setItem('uid', UID);
+    el('who').textContent = USERNAME || UID || '';
+
+    // load settings from localStorage
+    function loadSettings() {
+      const keys = ['topn', 'top_p', 'max_tokens', 'max_thinking_tokens', 'temperature', 'stream', 'model', 'agent', 'format'];
+      keys.forEach(k => {
+        const v = localStorage.getItem(STORAGE_PREFIX + k);
+        if (v == null) return;
+        const node = el(k);
+        if (!node) return;
+        if (node.type === 'checkbox') node.checked = v === 'true';
+        else node.value = v;
+      });
+    }
+
+    function saveSettings() {
+      const keys = ['topn', 'top_p', 'max_tokens', 'max_thinking_tokens', 'temperature', 'stream', 'model', 'agent', 'format'];
+      keys.forEach(k => {
+        const node = el(k);
+        if (!node) return;
+        const v = node.type === 'checkbox' ? node.checked : node.value;
+        localStorage.setItem(STORAGE_PREFIX + k, String(v));
+      });
+    }
+
+    // init UI values with sensible defaults
+    el('top_p').value = '0.6';
+    el('max_tokens').value = '4000';
+    el('max_thinking_tokens').value = '2000';
+    el('temperature').value = '0.4';
+    el('stream').checked = true;
+    el('format').value = 'html';
+
+
+    // --------- modal behavior ---------
+    const modal = el('modal');
+    el('open-settings').addEventListener('click', () => { loadSettings(); modal.classList.add('show'); });
+    el('cancel').addEventListener('click', () => modal.classList.remove('show'));
+    el('save-settings').addEventListener('click', () => { saveSettings(); modal.classList.remove('show'); });
+    el('download-chat').addEventListener('click', () => {
+      const history = Array.from(el('chat-box').children).map(d => ({ role: d.classList.contains('user') ? 'user' : 'assistant', content: d.textContent }));
+      const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `ichat_${new Date().toISOString()}.json`; a.click(); URL.revokeObjectURL(url);
+    });
+
+    // clear chat
+    el('clear').addEventListener('click', () => {
+      const chatBox = el('chat-box');
+      chatBox.innerHTML = '';
+      localStorage.setItem('ChatCleanTime', Date.now());
+    });
+
+    el('zoom').addEventListener('click', function () {
+      var chatElement = qs('.chat-wrap');
+      var zoomBtn = el('zoom');
+
+      if (chatElement.classList.contains('fullscreen')) {
+        chatElement.classList.remove('fullscreen');
+        chatElement.style.borderRadius = '10px';
+      } else {
+        chatElement.classList.add('fullscreen');
+        chatElement.style.borderRadius = '0';
+      }
+
+      zoomBtn.style.zIndex = 101;
+    });
+
+    // --------- model loader & messages loader ---------
+    async function loadModels() {
+      const sel = el('model');
+      sel.innerHTML = '';
+      const defaultOpt = new Option(DEFAULT_MODEL + ' (默认)', DEFAULT_MODEL, true, true);
+      sel.add(defaultOpt);
+      try {
+        const res = await fetch('/models');
+        if (!res.ok) throw new Error('models error');
+        const models = await res.json();
+        models.forEach(m => sel.add(new Option(m, m)));
+        if (models.length) sel.value = models[0];
+      } catch (e) { console.warn('loadModels failed', e); }
+    }
+
+    async function loadMessages() {
+      try {
+        const resp = await fetch(`/message/get/?filter_time=${localStorage.getItem('ChatCleanTime') || 0}`);
+        if (!resp.ok) return;
+        const messages = await resp.json();
+        const chatBox = el('chat-box');
+        if (messages && messages.length) chatBox.innerHTML = '';
+        messages.forEach(m => {
+          const div = document.createElement('div');
+          div.className = 'message ' + (m.role === 'user' ? 'user' : 'ai');
+          div.innerHTML = (m.content ? m.content.replace(/\n/g, '<br>') : '');
+          if (m.timestamp) div.dataset.timestamp = m.timestamp * 1000;
+          if (m.reference) div.title = m.reference;
+          chatBox.appendChild(div);
+        });
+        chatBox.scrollTop = chatBox.scrollHeight;
+      } catch (e) { console.warn('loadMessages', e); }
+    }
+
+    // --------- message rendering & format helper ---------
+    function addMessage(text, cls = 'ai', title) {
+      const chatBox = el('chat-box');
+      const node = document.createElement('div'); node.className = 'message ' + cls; node.dataset.timestamp = Date.now();
+      node.innerHTML = text ? text : 'No response.';
+      if (title) node.title = title;
+      chatBox.appendChild(node); chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    // --------- send handlers (non-blocking, keep original capabilities) ---------
+    el('send').addEventListener('click', sendMessageHandler);
+    el('chat-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendMessageHandler(); }
+    });
+
+    async function sendMessageHandler() {
+      // prevent double send
+      if (el('loading-bar').style.display === 'block') return alert('正在接收消息...');
+      const input = el('chat-input'); const text = input.value.trim(); if (!text) return;
+      addMessage(text, 'user'); input.value = '';
+
+      // build params
+      const settings = {
+        topn: parseInt(localStorage.getItem(STORAGE_PREFIX + 'topn') || el('topn').value, 10),
+        max_tokens: parseInt(localStorage.getItem(STORAGE_PREFIX + 'max_tokens') ?? el('max_tokens').value, 10) || 4000,
+        max_thinking_tokens: parseInt(localStorage.getItem(STORAGE_PREFIX + 'max_thinking_tokens') ?? el('max_thinking_tokens').value, 10) || 2000,
+        top_p: parseFloat(localStorage.getItem(STORAGE_PREFIX + 'top_p') || el('top_p').value),
+        temperature: parseFloat(localStorage.getItem(STORAGE_PREFIX + 'temperature') || el('temperature').value),
+        stream: (localStorage.getItem(STORAGE_PREFIX + 'stream') || el('stream').checked) === 'true' || el('stream').checked,
+        model: localStorage.getItem(STORAGE_PREFIX + 'model') || el('model').value || DEFAULT_MODEL,
+        agent: localStorage.getItem(STORAGE_PREFIX + 'agent') || el('agent').value,
+        format: localStorage.getItem(STORAGE_PREFIX + 'format') || el('format').value || 'raw'
+      };
+
+      // user params
+      const filterTimestamp = el('chat-box').getAttribute('data-timestamp') || localStorage.getItem('ChatCleanTime') || 0;
+      const user_params = { user: 'html', name: localStorage.getItem('username'), request_id: localStorage.getItem('uid'), filter_time: parseFloat(filterTimestamp / 1000), filter_limit: -settings.topn };
+
+      const apiParams = { question: text, agent: settings.agent, model_name: settings.model, temperature: settings.temperature, top_p: settings.top_p, max_tokens: settings.max_tokens, thinking: settings.max_thinking_tokens, stream: settings.stream, extract: settings.format };
+
+      // if need to submit whole page history when anonymous
+      let task_id = null;
+      if (!localStorage.getItem('username')) {
+        const history = Array.from(el('chat-box').children).map(d => ({ role: d.classList.contains('user') ? 'user' : 'assistant', content: d.textContent }));
+        const merged = { ...user_params, messages: history };
+        task_id = await submitMessages(merged);
+      }
+
+      // streaming or single
+      if (settings.stream) await chunkMessage(apiParams, task_id, user_params);
+      else await sendMessage(apiParams, task_id, user_params);
+    }
+
+    async function sendMessage(params, task_id = null, user_params = {}) {
+      el('loading-bar').style.display = 'block';
+      try {
+        const resp = await (task_id ? fetch(`/message/${task_id}?${new URLSearchParams(params)}`) : fetch('/message/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...params, ...user_params }) }));
+        if (!resp.ok) throw new Error('network');
+        const data = await resp.json();
+        const display = (data.transform !== undefined && data.transform !== null) ? data.transform : (data.answer !== undefined && data.answer !== null ? data.answer.replace(/\n/g, '<br>') : (data.content || ''));
+        addMessage(display, 'ai', data.reference || null);
+      } catch (e) { console.error(e); addMessage('请求出错: ' + e.message, 'ai'); }
+      finally { el('loading-bar').style.display = 'none'; }
+    }
+
+    // streaming version (supports SSE task_id or fetch streaming)
+    async function chunkMessage(params, task_id = null, user_params = {}) {
+      el('loading-bar').style.display = 'block';
+      const chatBox = el('chat-box');
+      const msgEl = document.createElement('div'); msgEl.className = 'message ai'; msgEl.dataset.timestamp = Date.now();
+      chatBox.appendChild(msgEl); chatBox.scrollTop = chatBox.scrollHeight;
+
+      let acc = '';
+      let reference = '';           // reference（如果后端先发）
+      let transform = '';      // 最终 assistant.transform（如果后端发送）
+      let lastUpdate = 0;
+      let done = false;
+
+      function render() {
+        const show = transform ? transform : (acc || 'No response');
+        if (!show) { msgEl.innerHTML = ''; chatBox.scrollTop = chatBox.scrollHeight; return; }
+        const now = Date.now();
+        // 如果后端说明了 （后端负责安全/转义）
+        if (params.extract && params.extract != 'raw') {
+          msgEl.innerHTML = show;
+        } else {
+          // 其它格式：做最小的 HTML 转义并把换行替为 <br>
+          if (done || now - lastUpdate >= 100) {
+            if (params.extract == 'raw') {
+              msgEl.textContent = show;// 原样输出
+            } else {
+              msgEl.innerHTML = show.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+            }
+          }
+        }
+        if (reference) {
+          msgEl.title = reference;
+        }
+        chatBox.scrollTop = chatBox.scrollHeight;
+        lastUpdate = now;
+      }
+
+      if (task_id) {
+        const url = `/message/${task_id}?${new URLSearchParams(params)}`;
+        const es = new EventSource(url);
+        es.onmessage = (e) => {
+          if (e.data === '[DONE]') { done = true; render(); el('loading-bar').style.display = 'none'; es.close(); return; }
+          try {
+            const p = JSON.parse(e.data);
+            if (p.role === 'reference') { reference = p.content || reference; msgEl.title = reference; }
+            else if (p.role === 'assistant') { acc = p.content || acc; transform = p.transform || transform; }
+            else if (p.choices && p.choices[0]?.delta?.content) acc += p.choices[0].delta.content;
+            else { acc += data; }
+          } catch { acc += e.data; }
+
+          render();
+        };
+        es.onerror = (err) => { console.error('SSE', err); el('loading-bar').style.display = 'none'; es.close(); };
+      } else {
+        // fetch + stream
+        try {
+          const resp = await fetch('/message/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...params, ...user_params }) });
+          if (!resp.body) { el('loading-bar').style.display = 'none'; throw new Error('no stream'); }
+          const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
+          while (!done) {
+            const { done: streamDone, value } = await reader.read(); if (streamDone) break; buf += dec.decode(value, { stream: true }); // assume server uses SSE or plain chunks
+            // naive split by \n\n (SSE-like)
+            const parts = buf.split(/\n\n/); buf = parts.pop();
+            for (const p of parts) {
+              let line = p;
+              if (line.startsWith('data:')) line = line.replace(/^data:\s*/, '');
+              if (!line) continue;
+              if (line === '[DONE]') { done = true; break; }
+              try {
+                const j = JSON.parse(data);
+                if (j.role === 'reference') { reference = j.content || reference; msgEl.title = reference; }
+                else if (j.role === 'assistant') { acc = j.content || acc; transform = j.transform || transform; }
+                else if (j.choices && j.choices[0]?.delta?.content) acc += j.choices[0].delta.content;
+                else acc += line;// 纯文本块（增量）
+              } catch { acc += line; }
+              render();
+            }
+          }
+          render();
+        } catch (err) {
+          console.error('stream', err);
+          addMessage('流式请求出错: ' + err.message, 'ai');
+        } finally {
+          el('loading-bar').style.display = 'none';
+        }
+      }
+    }
+
+    async function submitMessages(params) {
+      try {
+        const r = await fetch('/message/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) });
+        if (!r.ok) return null; const j = await r.json(); return j.task_id;
+      } catch (e) { console.error('submit', e); }
+    }
+
+    // init
+    (async () => { await loadModels(); loadSettings(); loadMessages(); })();
+  </script>
+</body>
+
+</html>

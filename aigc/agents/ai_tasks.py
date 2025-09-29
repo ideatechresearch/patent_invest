@@ -211,7 +211,7 @@ class TaskStatus(Enum):
     FAILED = "failed"  # error，timeout，这里不做细分
 
     RECEIVED = "received"  # 客户接收数据，等待延时释放
-    CANCELLED = "cancelled"  # 手动取消
+    CANCELLED = "cancelled"  # 手动取消,expired
 
 
 class TaskCommand(Enum):
@@ -234,7 +234,7 @@ class TaskNode:
     command: Dict[str, Any] = field(default_factory=dict)  # cmd 任务控制逻辑,节点执行函数动态跳转,goto,静态边走 TaskEdge，内部控制
 
     status: TaskStatus = TaskStatus.PENDING
-    progress: int = 0  # 执行进度，适合长任务、流任务场景（0-100）
+    progress: float = 0  # 执行进度，适合长任务、流任务场景（0-100）
     priority: int = 10  # bias 执行顺序控制，优先级
     tags: List[str] = field(default_factory=list)  # channel,label 辅助标签，分类/搜索，索引、分组、过滤
 
@@ -242,7 +242,7 @@ class TaskNode:
     end_time: float = 0  # updated_at
 
     data: Any = field(default_factory=dict)  # metadata,动态更新参数，自由定义不用明确结构，此处不限制，保持灵活性，Dict[str, Any]
-    params: Any = field(default_factory=list)  # input payload,context,message 执行输入参数,dict/list[dict]
+    params: Any = field(default_factory=dict)  # input payload,context,message 执行输入参数,dict/list[dict]
     result: Any = field(default_factory=list)  # output 输出结果，允许 reason，error，此处不限制，不约束类型保持灵活性
     count: int = 0  # 结果条目数量，自定义 result_count,event_count
 
@@ -265,7 +265,7 @@ class TaskNode:
     def duration(self) -> float:
         return (self.end_time - self.start_time) if self.end_time > self.start_time else 0.0
 
-    async def to_redis(self, redis_client, ex=3600, key_prefix='task'):
+    async def to_redis(self, redis_client, ex: int = 3600, key_prefix='task'):
         key = f"{key_prefix}:{self.name}"
         payload = dataclass2dict(self)
         if self.function and (asyncio.iscoroutinefunction(self.function) or asyncio.iscoroutine(self.function)):
@@ -325,7 +325,7 @@ class TaskManager:
     key_prefix = 'task'
 
     @classmethod
-    async def add_task(cls, task_id: str, task: TaskNode, redis_client=None, ex=3600):
+    async def add_task(cls, task_id: str, task: TaskNode, redis_client=None, ex: int = 3600):
         if redis_client:
             await task.to_redis(redis_client, ex=ex, key_prefix=cls.key_prefix)
 
@@ -333,12 +333,12 @@ class TaskManager:
             cls.Task_queue[task_id or task.name] = task
 
     @classmethod
-    async def add(cls, redis=None, **kwargs) -> tuple[str, TaskNode]:
+    async def add(cls, redis=None, ex: int = 3600, **kwargs) -> tuple[str, TaskNode]:
         task_id = kwargs.pop('name', str(uuid.uuid4()))
         redis = redis or get_redis()
         task_fields = TaskNode.default_node_attrs(task_id, **kwargs)
         task = TaskNode(**task_fields)
-        await cls.add_task(task_id, task, redis_client=redis, ex=3600)
+        await cls.add_task(task_id, task, redis_client=redis, ex=ex)
         return task_id, task
 
     @classmethod
@@ -369,14 +369,44 @@ class TaskManager:
         return None
 
     @classmethod
-    async def set_task_status(cls, task: TaskNode, status: TaskStatus, progress: int = 10, redis_client=None):
+    async def set_task_status(cls, task: TaskNode, status: TaskStatus, progress: float = 0, redis_client=None):
         async with cls.Task_lock:
             task.status = status
-            task.progress = progress
+            if progress > 0:
+                task.progress = progress
             cls.Task_queue[task.name] = task
 
         if redis_client:
             await task.to_redis(redis_client, key_prefix=cls.key_prefix)
+
+    @classmethod
+    async def put_task_result(cls, task: TaskNode, result, total: int = -1, status: TaskStatus = None,
+                              params: dict = None, redis_client=None) -> TaskNode:
+        async with cls.Task_lock:
+            task.result.append(result)
+            task.count = len(task.result)
+            if params is not None:
+                task.params = params
+
+            if total > 0:
+                task.progress = round(task.count * 100 / total, 2)
+                if task.count >= total:
+                    task.progress = 100.0
+            if status is not None:
+                task.status = status
+            else:
+                if task.count >= total > 0:
+                    task.status = TaskStatus.COMPLETED  # 标记完成,最终状态
+                else:
+                    task.status = TaskStatus.IN_PROGRESS  # 中间更新,-1 任务还没结束
+
+            task.end_time = time.time()
+            cls.Task_queue[task.name] = task
+
+        if redis_client:  # 把IO操作放到锁外
+            await task.to_redis(redis_client, key_prefix=cls.key_prefix)
+
+        return task
 
     @classmethod
     async def update_task_result(cls, task_id: str, result, status: TaskStatus = TaskStatus.COMPLETED,
@@ -1279,7 +1309,6 @@ class WebSearchGraph:
         """
 
         return load_graph_from_dict(self.nodes, self.adjacency_list)
-
 
 
 # async def setr(key, value, ex=None):

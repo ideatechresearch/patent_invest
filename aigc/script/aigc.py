@@ -816,7 +816,7 @@ def aigc_message_callback(question, system, history: list[dict] = None, keywords
                           callback_data: str | dict = None, model_id='moonshot', agent='0', host=AIGC_HOST,
                           time_out: int | float = 100, **kwargs) -> dict:
     headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
-    url = f"http://{host}:7000/submit_messages"
+    url = f"http://{host}:7000/message/submit"
     param = {
         "stream": False,
         "temperature": 0.6,
@@ -872,7 +872,7 @@ def aigc_message_callback(question, system, history: list[dict] = None, keywords
 def aigc_message_wechat(question, system, name=None, history: list[dict] = None, keywords: list = None,
                         model_id='moonshot', agent='0', host=AIGC_HOST, time_out: int | float = 100, **kwargs) -> dict:
     headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
-    url = f"http://{host}:7000/submit_messages"
+    url = f"http://{host}:7000/message/submit"
 
     body = {
         "uuid": None,
