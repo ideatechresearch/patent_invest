@@ -62,13 +62,11 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
     prompt = System_content.get('84').format(code_type=code_type.lower(), function_code=function_code)
     lines = [f"帮我根据函数代码生成提取函数元数据（JSON格式）。"]
     if metadata:
-        lines.append(f"当前已有初始元数据如下，请在此基础上补全或修正:{json.dumps(metadata, ensure_ascii=False)}")
+        lines.append(f"当前已有初始元数据如下，请在此基础上补全或修正:\n{json.dumps(metadata, ensure_ascii=False)}")
     if description:
         lines.append(f"工具描述为:{description}，请结合此信息完善函数用途和说明")
 
-    prompt_user = "\n".join(lines)
-    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": prompt_user}]
-
+    messages = create_analyze_messages(prompt, "\n".join(lines))
     content, row_id = await ai_client_completions(messages, client=None, model=model_name, get_content=True,
                                                   max_tokens=1000, temperature=0.3, dbpool=dbpool, **kwargs)
     if content:
@@ -76,7 +74,7 @@ async def ai_generate_metadata(function_code: str, metadata: dict = None, model_
         if parsed:
             metadata = parsed
             await BaseReBot.async_save(
-                data={"reference": BaseMysql.format_value(metadata), "transform": BaseMysql.format_value(parsed)},
+                data={"reference": BaseMysql.format_value(function_code), "transform": BaseMysql.format_value(parsed)},
                 row_id=row_id, dbpool=dbpool or DB_Client)
         else:
             logging.warning(f'metadata extract failed:{content}')
@@ -219,8 +217,7 @@ async def ai_auto_calls(question, user_messages: list = None, system_prompt: str
         if not any(msg.get('role') == 'system' for msg in user_messages):
             user_messages.insert(0, {"role": "system", "content": system_prompt})
     else:
-        user_messages = [{"role": "system", "content": system_prompt},
-                         {"role": "user", "content": question}]
+        user_messages = create_analyze_messages(system_prompt, question)
     # 获取工具列表
     func_manager = get_func_manager()
     tools_metadata = AI_Tools + await func_manager.get_tools_metadata(func_list=[])
@@ -231,8 +228,9 @@ async def ai_auto_calls(question, user_messages: list = None, system_prompt: str
     #         "search_query": "自定义搜索的关键词",
     #          "search_result": True,#默认为禁用,允许用户获取详细的网页搜索来源信息
     #     }}]
-    tool_messages, row_id = await ai_client_completions(user_messages, client=None, model=model_name, get_content=False,
-                                                        tools=tools_metadata, top_p=0.95, temperature=0.01, **kwargs)
+    completion, row_id = await ai_client_completions(user_messages, client=None, model=model_name, get_content=False,
+                                                     tools=tools_metadata, top_p=0.95, temperature=0.01, **kwargs)
+    tool_messages = completion.choices[0].message
     if not tool_messages:
         return []
 
@@ -304,7 +302,7 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
     return messages
 
 
-async def ai_batch(inputs_list: List[list[dict] | tuple[str, str]], task_id: str, model: str = 'qwen-long',
+async def ai_batch(inputs: List[list[dict] | tuple[str, str]], task_id: str, model: str = 'qwen-long',
                    search_field: str = 'model', **kwargs):
     model_info, name = find_ai_model(model, -1, search_field)
     endpoint_map = {  # 选择Embedding文本向量模型进行调用时，url的值需填写"/v1/embeddings",其他模型填写/v1/chat/completions
@@ -316,9 +314,8 @@ async def ai_batch(inputs_list: List[list[dict] | tuple[str, str]], task_id: str
     input_filename = f'{task_id}_input.jsonl'
     file_path = Path(Config.DATA_FOLDER) / input_filename
     async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-        for i, msg in enumerate(inputs_list):
-            messages = [{"role": "system", "content": msg[0]},
-                        {"role": "user", "content": msg[1]}] if isinstance(msg, tuple) else msg
+        for i, msg in enumerate(inputs):
+            messages = create_analyze_messages(msg[0], msg[1]) if isinstance(msg, tuple) else msg
             body = {"model": name, "messages": messages, **kwargs}
             request = {"custom_id": i, "method": "POST", "url": endpoint, "body": body}
             await f.write(json.dumps(request, separators=(',', ':'), ensure_ascii=False) + "\n")
@@ -621,9 +618,9 @@ async def ai_reranker(query: str, documents: List[str], top_n: int, model_name="
 
 
 @async_error_logger(1)
-async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = None, model: str = 'deepseek-chat',
-                                get_content=True, tools: list[dict] = None, max_tokens=4096, top_p: float = 0.95,
-                                temperature: float = 0.1, dbpool=None, **kwargs):
+async def ai_client_completions(messages: list[dict], client: Optional[AsyncOpenAI] = None,
+                                model: str = 'deepseek-chat', get_content=True, tools: list[dict] = None,
+                                max_tokens=4096, top_p: float = 0.95, temperature: float = 0.1, dbpool=None, **kwargs):
     """
     return: str or 模型响应的消息对象, lastrowid
     """
@@ -660,36 +657,22 @@ async def ai_client_completions(messages: list, client: Optional[AsyncOpenAI] = 
             completion = await client.chat.completions.create(**payload)
             row_id = await BaseReBot.async_save(model=model, messages=messages, model_response=completion.model_dump(),
                                                 dbpool=dbpool or DB_Client, user='local', agent='chat')
-            return (completion.choices[0].message.content if get_content else completion.choices[0].message), row_id
+            return (completion.choices[0].message.content if get_content else completion), row_id
         else:
             payload['prompt'] = build_prompt(messages, use_role=False)
             payload.pop('messages', None)
             completion = await client.completions.create(**payload)
             row_id = await BaseReBot.async_save(model=model, messages=messages, model_response=completion.model_dump(),
                                                 dbpool=dbpool or DB_Client, user='local', agent='generate')
-            return completion.choices[0].text, row_id
+            return (completion.choices[0].text if get_content else completion), row_id
     except Exception as e:
-        print(f"OpenAI error occurred: {e}")
+        logger.error(f"OpenAI error occurred: {e}")
         raise
 
 
-async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc: str = None,
-                     model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2, dbpool=None, **kwargs):
-    user_request = results if isinstance(results, str) else json.dumps(results, ensure_ascii=False)
-    if desc:
-        user_request = f"{desc}: {user_request}"
-
-    messages = [{"role": "system", "content": system_prompt}, {'role': 'user', 'content': user_request}]
-    content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,
-                                             max_tokens=max_tokens, temperature=temperature, dbpool=dbpool, **kwargs)
-    logging.info(f'</{desc}>: {content}')
-    return content.split("</think>")[-1]
-
-
-async def ai_analyze_together(variable_name: str, variable_values: list,
-                              system_prompt: str = None, user_request: str = None,
-                              model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2,
-                              max_retries: int = 2, max_concurrent: int = Config.MAX_CONCURRENT, dbpool=None, **kwargs):
+async def ai_batch_run(variable_name: str, variable_values: list, messages: list[dict] = None,
+                       model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2, get_content: bool = True,
+                       max_retries: int = 2, max_concurrent: int = Config.MAX_CONCURRENT, dbpool=None, **kwargs):
     '''
     多变量并发分析，对同一数据使用不同变量值进行多角度分析,返回分析结果列表
     顺序与variable_values对应,variable_name: 要变化的变量名(覆盖)
@@ -700,20 +683,37 @@ async def ai_analyze_together(variable_name: str, variable_values: list,
         model_info, name = find_ai_model(model, 0, search_field='model')
         client = AI_Client.get(model_info['name'], None)
 
-    @run_togather(max_concurrent=max_concurrent, batch_size=-1, input_key=variable_name)
+    payload = {"messages": messages, "model": model, "max_tokens": max_tokens, "temperature": temperature, **kwargs}
+
+    @run_togather(max_concurrent=max_concurrent, batch_size=-1, return_exceptions=True)
     async def _run(item):
-        payload = {"system_prompt": system_prompt, "user_request": user_request, "model": model,
-                   "max_tokens": max_tokens, "temperature": temperature, **kwargs, variable_name: item}
-        messages = [{"role": "system", "content": payload.pop('system_prompt')},
-                    {'role': 'user', 'content': payload.pop('user_request')}]
-        content, row_id = await ai_client_completions(messages, client=client, get_content=True, dbpool=dbpool,
-                                                      **payload, max_retries=max_retries)
-        return {"content": content, "variable_item": item}  # , "row_id": row_id
+        params = {**payload, variable_name: item}
+        msg = params.pop("messages", messages)
+        response, row_id = await ai_client_completions(msg, client=client, get_content=get_content,
+                                                       dbpool=dbpool, **params, max_retries=max_retries)
+        result = {"content": response} if get_content else response.model_dump()
+        return {**result, f"variable_{variable_name}": item}
 
     results = await _run(inputs=variable_values)
-    return [{'id': i, **r} for i, r in enumerate(results) if
-            not isinstance(r, Exception)], [{'id': i, 'error': str(r)} for i, r in enumerate(results) if
-                                            isinstance(r, Exception)]
+    return [{'id': i, 'error': str(r)} if isinstance(r, Exception) else {'id': i, **r}
+            for i, r in enumerate(results)]
+
+
+def create_analyze_messages(system_prompt: str, user_request: str) -> list[dict]:
+    return [{"role": "system", "content": system_prompt}, {'role': 'user', 'content': user_request}]
+
+
+async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc: str = None,
+                     model='deepseek-reasoner', max_tokens=4096, temperature: float = 0.2, dbpool=None, **kwargs):
+    user_request = results if isinstance(results, str) else f"```json\n{json.dumps(results, ensure_ascii=False)}```"
+    if desc:
+        user_request = f"{desc}:\n{user_request}"
+
+    messages = create_analyze_messages(system_prompt, user_request)
+    content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,
+                                             max_tokens=max_tokens, temperature=temperature, dbpool=dbpool, **kwargs)
+    logging.info(f'</{desc}>: {content}')
+    return content.split("</think>")[-1]
 
 
 async def ai_summary(long_text: str | list[str | dict],
@@ -878,7 +878,7 @@ async def openai_ollama_chat_completions(messages: list, model_name="qwen3:14b",
                     "role": "assistant",
                     "content": content,
                 },
-                "finish_reason": response.get('done_reason', "stop"),
+                "finish_reason": response.get('done_reason', "stop"),  # length/content_filter
             }
         ],
         "usage": {
@@ -1074,12 +1074,16 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
     thinking_budget = max(0, thinking) or extra_body.get('thinking_budget', 0)
     # https://help.aliyun.com/zh/model-studio/deep-thinking?spm=a2c4g.11186623.0.0.31a44823XJPxi9#e7c0002fe4meu
     if name in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b", "qwq-32b", "qwen-turbo", "qwen-plus",
-                "qwen-plus-2025-04-28", "deepseek-v3.1"):
+                "qwen-plus-2025-04-28", "deepseek-v3.1",
+                "Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-32B", "Qwen/Qwen3-235B-A22B",
+                "tencent/Hunyuan-A13B-Instruct"
+                "deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.1-Terminus"):
         # 开启深度思考,参数开启思考过程，该参数对 qwen3-30b-a3b-thinking-2507、qwen3-235b-a22b-thinking-2507、QwQ 模型无效
         extra_body["enable_thinking"] = enable_thinking
         if thinking_budget > 0:
             extra_body["thinking_budget"] = thinking_budget
-    if name in ('deepseek-v3-1-terminus', "deepseek-v3-1-250821", "doubao-seed-1-6-250615"):
+    if name in ('deepseek-v3-1-terminus', "deepseek-v3-1-250821", "doubao-seed-1-6-250615",
+                "doubao-seed-1-6-flash-250715"):
         extra_body["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}  # /"auto"
         if 'max_completion_tokens' in payload:
             payload.pop('max_tokens', None)  # 不可与 max_tokens 字段同时设置，会直接报错
@@ -1603,6 +1607,23 @@ async def forward_stream(response):
                 yield {"json": parsed_content}
             except json.JSONDecodeError:
                 yield {"text": line_data}
+
+
+async def ai_parse(model_info: Optional[Dict[str, Any]], format_model: Optional[Dict] = None, payload=None, **kwargs):
+    if not payload:
+        model_info, payload, _ = await get_chat_payload(**kwargs)
+    else:
+        # payload=copy(payload)
+        payload.update(kwargs)
+
+    client = AI_Client.get(model_info['name'], None)
+    completion = await client.beta.chat.completions.parse(
+        model="doubao-seed-1-6-250615",  # 替换为您需要使用的模型
+        messages=create_analyze_messages("你是一位数学辅导老师。", "使用中文解题: 8x + 9 = 32 and x + y = 1"),
+        response_format=format_model or {"type": "json_object"},  # BaseModel:json_schema/json_object
+    )
+    resp = completion.choices[0].message.parsed
+    return resp.model_dump()  # resp.model_dump_json(indent=2)
 
 
 Assistant_Cache = {}

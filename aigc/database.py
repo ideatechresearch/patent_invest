@@ -443,7 +443,7 @@ class BaseChatHistory(Base):
         # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
 
     @classmethod
-    async def initialize_processor(cls, get_session_func):
+    async def initialize(cls, get_session_func):
         """初始化批量处理器"""
         if cls._batch_processor is None:
             cls._batch_processor = AsyncBatchAdd(
@@ -455,7 +455,7 @@ class BaseChatHistory(Base):
             await cls._batch_processor.initialize()
 
     @classmethod
-    async def shutdown_processor(cls):
+    async def shutdown(cls):
         """关闭批量处理器"""
         if cls._batch_processor:
             await cls._batch_processor.shutdown()

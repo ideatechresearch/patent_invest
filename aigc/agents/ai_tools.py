@@ -201,7 +201,7 @@ class FunctionManager:
             metadata = json.loads(cached_metadata) if isinstance(cached_metadata, str) else cached_metadata
             return cache_key, metadata, function_code
 
-        print(f"Metadata no cached for function: {func_name}\n{function_code}")
+        # print(f"Metadata no cached for function: {func_name}\n{function_code}")
         return cache_key, {}, function_code
 
     @classmethod

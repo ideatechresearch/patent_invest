@@ -1372,7 +1372,7 @@ class CollectorMysql(AsyncMysql):
         if instance is not None:
             super().__init__(host=instance.host, user=instance.user, password=instance.password,
                              db_name=instance.db_name, port=instance.port, charset=instance.charset)
-            self.pool = instance.pool
+            self.pool = instance.pool  # 共享池
         else:
             config = parse_database_uri(Config.SQLALCHEMY_DATABASE_URI)
             super().__init__(**config)
@@ -2147,9 +2147,12 @@ class ModelList:
         返回：
         - List[str]: 包含所有模型名称及其子模型的列表
         """
-        # list(itertools.chain(*[sublist[1] for sublist in extract_ai_model("model")]))
         extracted_data = extract_ai_model("model", ai_models)
-        return [i for item in extracted_data for i in [item[0]] + item[1]]  # flattened_list
+        flattened_list = [i for item in extracted_data for i in [item[0]] + item[1]]
+        # duplicates = {item: count for item, count in Counter(flattened_list).items() if count > 1}
+        # print("模型数量:", len(flattened_list), "重复模型:", duplicates)
+        # list(itertools.chain(*[sublist[1] for sublist in extract_ai_model("model")])) #去重并保持顺序
+        return list(dict.fromkeys(flattened_list))
 
     @classmethod
     async def set(cls, redis=None, worker_id: str = None, ai_models: list = AI_Models):
@@ -2367,9 +2370,10 @@ def find_ai_model(name: str, model_id: int = 0, search_field: str = 'model') -> 
         owner, model_name = parts[0], parts[1]
         model = next((item for item in AI_Models if item['name'] == owner), None)
         if model:
-            model_items = model.get(search_field, [])
-            if model_name in model_items:
-                return model, model_items[model_name] if isinstance(model_items, dict) else model_name
+            if model_name in model.get(search_field, []):
+                return model, model_name
+            if model_name in model.get('model_map', {}):
+                return model, model['model_map'][model_name]
 
     model = next(
         (item for item in AI_Models if item['name'] == name or name in item.get(search_field, [])),
@@ -2391,6 +2395,8 @@ def find_ai_model(name: str, model_id: int = 0, search_field: str = 'model') -> 
             keys = list(model_items.keys())
             model_id = model_id if abs(model_id) < len(keys) else 0
             return model, model_items[keys[model_id]]
+        elif name in model.get('model_map', {}):
+            return model, model['model_map'][name]
 
         return model, name if model_items == name else ''
 
@@ -2419,6 +2425,10 @@ def extract_ai_model(search_field: str = "model", ai_models: list = AI_Models):
             extracted_data.append((name, list(field_value.keys())))
         else:
             extracted_data.append((name, [field_value]))
+
+        model_map = model.get('model_map', {})
+        if model_map:
+            extracted_data.append((name, list(model_map.keys())))
 
     return extracted_data
 

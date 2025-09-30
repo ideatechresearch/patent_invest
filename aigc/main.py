@@ -53,9 +53,9 @@ async def lifespan(app: FastAPI):
 
         app.state.redis = await get_redis_connection()
         app.state.collector = CollectorMysql(instance=DB_Client, max_wait_seconds=1.0)
-        await DB_Client.init_pool(minsize=2, maxsize=Config.DB_MAX_SIZE)
+        await app.state.collector.init_pool(minsize=2, maxsize=Config.DB_MAX_SIZE)
         await app.state.collector.start()
-        await BaseChatHistory.initialize_processor(get_session_context)
+        await BaseChatHistory.initialize(get_session_context)
         app.state.httpx_client = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
         app.state.logger = logging.getLogger(__name__)
 
@@ -75,8 +75,6 @@ async def lifespan(app: FastAPI):
             print("Main worker started. Do once-only init. Total workers:", app.state.worker_num)
             # app.state.dask_client = get_dask_client()
             print(Config.get_config_data())
-            duplicates = {item: count for item, count in Counter(ModelList.models).items() if count > 1}
-            print("模型数量:", len(ModelList.models), "重复模型:", duplicates)
             # print( json.dumps(AI_Models, indent=4))
         else:
             pass
@@ -122,9 +120,9 @@ async def lifespan(app: FastAPI):
         engine.dispose()
         # await async_engine.dispose()
         # MysqlData().close()
+        await BaseChatHistory.shutdown()
         await app.state.collector.stop(flush=True)
-        await DB_Client.close_pool()
-        await BaseChatHistory.shutdown_processor()
+        await app.state.collector.close_pool()
 
         await shutdown_httpx()
         await shutdown_redis()
@@ -977,8 +975,7 @@ async def get_tools(request: ToolRequest):
     最终根据 messages 与 tools 调用大模型，解析 tool_call 执行结果并返回。
     """
     if not request.messages:
-        request.messages = [{"role": "system", "content": System_content.get('31')},
-                            {"role": "user", "content": request.prompt}]
+        request.messages = create_analyze_messages(System_content.get('31'), request.prompt)
     tools_metadata = request.tools
     if not request.tools:
         if request.user:
@@ -995,10 +992,11 @@ async def get_tools(request: ToolRequest):
     if not tools_metadata:
         tools_metadata = await app.state.func_manager.get_tools_metadata(func_list=[])
 
-    tool_messages, _ = await ai_client_completions(messages=request.messages, client=None, model=request.model_name,
-                                                   get_content=False, tools=tools_metadata or AI_Tools,
-                                                   top_p=request.top_p, temperature=request.temperature)
+    completion, _ = await ai_client_completions(messages=request.messages, client=None, model=request.model_name,
+                                                get_content=False, tools=tools_metadata or AI_Tools,
+                                                top_p=request.top_p, temperature=request.temperature)
 
+    tool_messages = completion.choices[0].message
     if not tool_messages:
         raise HTTPException(status_code=500, detail="No response from AI model.")
 
@@ -1023,11 +1021,9 @@ async def generate_metadata_from_code(req: MetadataRequest):
         return {"metadata": metadata, 'key_meta': key_meta, "key": key}
 
     metadata = await ai_generate_metadata(
-        req.function_code,
-        req.metadata,
-        req.model_name,
-        description=req.description,
-        code_type=req.code_type or "Python"
+        req.function_code, req.metadata, req.model_name,
+        description=req.description, code_type=req.code_type or "Python",
+        dbpool=app.state.collector
     )
 
     registry = metadata.get("function", {}).copy()
@@ -1473,18 +1469,17 @@ async def websocket_chat(websocket: WebSocket):
 
 
 @app.post("/batch/submit")
-async def create_batch(
-        messages_list: List[List[Dict]] = Body(...,
-                                               description="消息数组列表，每个元素是一组对话，[[{role + content}...]]"),
-        model: str = "qwen-plus",
-):
+async def create_batch(request: OpenAIRequestBatch):
     """
     上传消息列表并启动批处理任务
     """
-    redis = get_redis()
+    messages_list = [[msg.model_dump() for msg in m] for m in request.messages_list]
+    kwargs = request.payload()
     total = len(messages_list)
     data = {"messages": messages_list, "size": total}
-    params = {"model": model}
+    params = {"model": request.model, **kwargs}
+
+    redis = get_redis()
     task_id, task = await TaskManager.add(redis=redis,
                                           description='批处理任务',
                                           action='batch',
@@ -1493,21 +1488,33 @@ async def create_batch(
                                           # status=TaskStatus.PENDING,
                                           start_time=time.time(),
                                           ex=86400 * 2)
+    if request.completion_window == '24h':
+        result = await ai_batch(inputs=messages_list, task_id=task_id, model=request.model, search_field="model",
+                                **kwargs)
+        if isinstance(result, dict) and result.get("batch_id"):
+            params.update(result)
+            await TaskManager.put_task_result(task, result=result, total=total, status=TaskStatus.READY, params=params,
+                                              redis_client=redis)
+        else:
+            task.status = TaskStatus.FAILED
+        return {
+            "task_id": task_id, "status": task.status.value,
+            "url": f'{Config.WEBUI_URL}/batch/{task_id}?interval=-1',
+            "file": f'{Config.WEBUI_URL}/files/{result.get("input_file")}',
+            **result
+        }
 
-    result = await ai_batch(inputs_list=messages_list, task_id=task_id, model=model, search_field="model")
-    if isinstance(result, dict) and result.get("batch_id"):
-        params.update(result)
-        await TaskManager.put_task_result(task, result=result, total=total, status=TaskStatus.READY, params=params,
-                                          redis_client=redis)
-    else:
-        task.status = TaskStatus.FAILED
-    return {
-        "task_id": task_id,
-        "status": task.status.value,
-        "url": f'{Config.WEBUI_URL}/batch/{task_id}?interval=-1',
-        "file": f'{Config.WEBUI_URL}/files/{result.get("input_file")}',
-        **result
-    }
+    async def _process(task_id):
+        results = await ai_batch_run(variable_name='messages', variable_values=messages_list, model=request.model,
+                                     dbpool=app.state.collector, **kwargs)
+        status = TaskStatus.FAILED if all(r.get("error") for r in results) else TaskStatus.COMPLETED
+        return await TaskManager.update_task_result(task_id, result=results, status=status, redis_client=redis)
+
+    asyncio.create_task(_process(task_id))
+    return JSONResponse(content={'task_id': task_id, 'url': f'{Config.WEBUI_URL}/task/{task_id}',
+                                 'result': f'{Config.WEBUI_URL}/get/{TaskManager.key_prefix}:{task_id}',
+                                 'html': f'{Config.WEBUI_URL}/task/{task_id}?platform=html',
+                                 'file': f'{Config.WEBUI_URL}/task/{task_id}?platform=file'})
 
 
 @app.get("/batch/{task_id}")

@@ -517,6 +517,7 @@ AI_Models = [
      'url': 'https://api.deepseek.com/chat/completions',
      'generation_url': "https://api.deepseek.com/beta",  # https://api.deepseek.com/beta/completions
      'base_url': 'https://api.deepseek.com',
+     'extra_url': ["https://api.deepseek.com/v3.1_terminus_expires_on_20251015"],
      'supported_openai': True, 'supported_list': True, "timeout": 300},  # /v1
     # https://platform.moonshot.cn/console/api-keys
     {'name': 'moonshot', 'type': 'default', 'api_key': '',
@@ -551,28 +552,23 @@ AI_Models = [
     # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
     # https://www.volcengine.com/docs/82379/1494384
     {'name': 'doubao', 'type': 'default', 'api_key': '',
-     "model": {"doubao-1.5-lite-32k-250115": "doubao-1-5-lite-32k-250115",
-               "doubao-1.5-pro-32k-250115": "doubao-1-5-pro-32k-250115",  # 'ep-m-20250527140853-wmb69'
-               "doubao-1.5-pro-256k-250115": "doubao-1-5-pro-256k-250115",
-               "doubao-pro-32k-browsing": "doubao-pro-32k-browsing-241115",  # doubao-pro-32k-browsing-240828
-               "doubao-pro-32k-character": "doubao-pro-32k-character-241215",
-               "doubao-pro-32k-functioncall": "doubao-pro-32k-functioncall-241028",
-               "doubao-pro-32k-functioncall-preview": 'doubao-pro-32k-functioncall-preview',
-               "doubao-pro-256k-241115": "doubao-pro-256k-241115",  # "ep-m-20250416135143-wb2hz",
-               "Doubao-Seed-1.6-flash": "doubao-seed-1-6-flash-250715",
-               "Doubao-Seed-1.6-thinking": "doubao-seed-1-6-thinking-250715",
-               "Doubao-Seed-1.6": "doubao-seed-1-6-250615",
-               "Kimi-K2": "kimi-k2-250905",
-               "DeepSeek-V3.1": "deepseek-v3-1-250821", "DeepSeek-V3.1-terminus": "deepseek-v3-1-terminus",
-               # 自定义接入点调用 The model or endpoint doubao-pro-32k does not exist or you do not have access to it
-               "doubao-lite-32k": 'ep-20241206154509-gwsp9',
-               "doubao-pro-32k": 'ep-20241018103141-7hqr7',
-               "doubao-character-pro-32k": 'ep-20241206120328-msvt7',
-               "chatglm3-130-fin": 'ep-20241017110248-fr7z6',
-               "chatglm3-130b-fc": 'ep-20241017105930-drfm8',
-               "doubao-vision-lite-32k": "ep-20241219174540-rdlfj",
-               "doubao-vision-pro-32k": "ep-20241217182411-kdg49",
-               },
+     "model": ["doubao-1-5-lite-32k-250115", "doubao-1-5-pro-32k-250115", "doubao-1-5-pro-256k-250115",
+               "doubao-pro-32k-browsing-241115", "doubao-pro-32k-character-241215",
+               "doubao-pro-32k-functioncall-241028", 'doubao-pro-32k-functioncall-preview',
+               "doubao-pro-256k-241115",
+               "doubao-seed-1-6-flash-250715", "doubao-seed-1-6-thinking-250715", "doubao-seed-1-6-250615",
+               "kimi-k2-250905", "deepseek-v3-1-250821", "deepseek-v3-1-terminus",
+               ],
+     "model_map": {
+         # 自定义接入点调用 The model or endpoint doubao-pro-32k does not exist or you do not have access to it
+         "doubao-lite-32k": 'ep-20241206154509-gwsp9',
+         "doubao-pro-32k": 'ep-20241018103141-7hqr7',
+         "doubao-character-pro-32k": 'ep-20241206120328-msvt7',
+         "chatglm3-130-fin": 'ep-20241017110248-fr7z6',
+         "chatglm3-130b-fc": 'ep-20241017105930-drfm8',
+         "doubao-vision-lite-32k": "ep-20241219174540-rdlfj",
+         "doubao-vision-pro-32k": "ep-20241217182411-kdg49",
+     },
      # [ "GLM3-130B",chatglm3-130-fin,functioncall-preview],
      'embedding': {'Doubao-embedding': 'doubao-embedding-text-240715',  # 'ep-20241219165520-lpqrl'
                    'Doubao-embedding-large': 'doubao-embedding-large-text-250515',  # 'ep-20241219165636-kttk2',
@@ -679,11 +675,12 @@ AI_Models = [
                "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
                "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
                "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-               "Pro/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V3.1",
-               "moonshotai/Kimi-K2-Instruct", "moonshotai/Kimi-Dev-72B",
+               "Pro/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V3.1", "deepseek-ai/DeepSeek-V3.1-Terminus",
+               "moonshotai/Kimi-K2-Instruct", "moonshotai/Kimi-Dev-72B", "moonshotai/Kimi-K2-Instruct-0905",
                "zai-org/GLM-4.5V", "zai-org/GLM-4.5", "zai-org/GLM-4.5",
+               "inclusionAI/Ring-flash-2.0", "ByteDance-Seed/Seed-OSS-36B-Instruct",
                "internlm/internlm2_5-7b-chat", "Pro/internlm/internlm2_5-7b-chat", "internlm/internlm2_5-20b-chat",
-               "baidu/ERNIE-4.5-300B-A47B", "tencent/Hunyuan-A13B-Instruct",
+               "baidu/ERNIE-4.5-300B-A47B", "tencent/Hunyuan-A13B-Instruct", "tencent/Hunyuan-MT-7B",
                "MiniMaxAI/MiniMax-M1-80k", "stepfun-ai/step3", "ascend-tribe/pangu-pro-moe",
                ],
      # "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/deepseek-vl2","deepseek-ai/DeepSeek-V2-Chat","Qwen/Qwen1.5-7B-Chat", "Qwen/Qwen1.5-32B-Chat"

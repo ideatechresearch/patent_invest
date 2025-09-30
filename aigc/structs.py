@@ -300,7 +300,7 @@ class OpenAIRequest(BaseModel):
 
 class OpenAIRequestMessage(BaseModel):
     # model: Literal[*tuple(MODEL_LIST.models)]
-    model: Annotated[str, lambda v: MODEL_LIST.contains(v)]
+    model: str
     messages: List[ChatMessage]
     temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
     top_p: Optional[float] = 1.0
@@ -353,7 +353,7 @@ class OpenAIRequestMessage(BaseModel):
                 "top_p": 1,
                 "max_tokens": 1024,
                 "stream": False,
-                "extra_body": {"enable_thinking": False,  "thinking": {"type": "disabled"}},
+                "extra_body": {"enable_thinking": False, "thinking": {"type": "disabled"}},
                 "tools": [{
                     "type": "baidu_search",
                     "baidu_search": {'query': '大象像什么'}
@@ -384,6 +384,47 @@ class OpenAIRequestMessage(BaseModel):
 
     def payload(self):
         return self.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream', 'user'})
+
+
+class OpenAIRequestBatch(BaseModel):
+    model: str = Field("qwen-plus", description="模型名称")
+    messages_list: List[List[ChatMessage]] = Field(...,
+                                                   description="消息数组列表，每个元素是一组对话，[[{role + content}...]]")
+    temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[conint(ge=1)] = 1024
+
+    completion_window: Literal["24h", "now"] = "24h"
+
+    def payload(self):
+        return self.model_dump(exclude_unset=True, exclude={'messages', 'model', 'messages_list', 'completion_window'})
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model": "qwen-plus",
+                "messages_list": [
+                    [
+                        {
+                            "role": "system",
+                            "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+                        },
+                        {"role": "user", "content": "你好,有问题要问你", }
+                    ],
+                    [
+                        {
+                            "role": "system",
+                            "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+                        },
+                        {"role": "user", "content": "请问1到100的和怎么计算?", }
+                    ]
+                ],
+                "temperature": 1,
+                "top_p": 1,
+                "max_tokens": 1024,
+                "completion_window": "24h"
+            }
+        }
 
 
 class OpenAIResponse(BaseModel):
