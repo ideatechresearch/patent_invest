@@ -300,12 +300,20 @@ def generate_random_hash(length=16):
     return ''.join(random.choice(chars) for _ in range(length))
 
 
-def defaultdict_to_dict(d):
+def defaultdict_to_dict(d) -> dict:
     if isinstance(d, defaultdict):
         d = {k: defaultdict_to_dict(v) for k, v in d.items()}
     elif isinstance(d, dict):
         d = {k: defaultdict_to_dict(v) for k, v in d.items()}
     return d
+
+
+def records_to_list(records: list[dict]) -> dict[str, list]:
+    result = defaultdict(list)
+    for row in records:
+        for key, value in row.items():
+            result[key].append(value)
+    return dict(result)
 
 
 def extract_json_struct(input_data: str | dict) -> dict | None:

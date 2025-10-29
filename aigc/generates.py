@@ -4,6 +4,7 @@ from openai import AsyncOpenAI, BadRequestError
 
 from utils import *
 from service import *
+from secure import *
 from agents import *
 from database import BaseReBot
 
@@ -1084,7 +1085,9 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
             extra_body["thinking_budget"] = thinking_budget
     if name in ('deepseek-v3-1-terminus', "deepseek-v3-1-250821", "doubao-seed-1-6-250615",
                 "doubao-seed-1-6-flash-250715"):
-        extra_body["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}  # /"auto"
+        # enable_thinking = extra_body.get('thinking', {}).get("type") == "enabled"
+        if not "thinking" in extra_body:
+            extra_body["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}  # /"auto"
         if 'max_completion_tokens' in payload:
             payload.pop('max_tokens', None)  # 不可与 max_tokens 字段同时设置，会直接报错
         else:

@@ -1,6 +1,5 @@
 from qdrant_client import QdrantClient, AsyncQdrantClient, grpc
 from qdrant_client.client_base import QdrantBase
-import asyncio
 # from qdrant_client.qdrant_remote import QdrantRemote
 # from qdrant_client.models import Filter, FieldCondition, IsEmptyCondition, HasIdCondition, MatchValue,PointStruct,DiscoverQuery,ContextQuery,NearestQuery,RecommendQuery
 import qdrant_client.models as qcm

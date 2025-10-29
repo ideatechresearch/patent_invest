@@ -1,6 +1,6 @@
 import igraph as ig
 import json, time, random, os, pickle
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -464,7 +464,7 @@ class TaskEdge:
     """定义任务依赖关系的有向边"""
     relation: tuple[str, str]  # (source,target),依赖的起始任务ID,被触发的任务ID
     # 边上的触发条件（与源任务的状态相关),["done",{"deadline": time.time() + 60}]
-    condition: Union[str, Dict[str, Any]]  # 触发条件，如 "done" 或 {"deadline": timestamp}，dependencies
+    condition: Union[str, Dict[str, Any]]  # 触发条件，如 "done" 或 {"deadline": timestamp}，dependencies,lambda->rule
 
     # 使用field提供默认值以避免可变默认值问题,absolute,relative,[None, {"relative": 5}]
     trigger_time: Optional[Dict[str, Union[int, float]]] = field(
@@ -1430,58 +1430,59 @@ class TimeWheel:
         self.current_pos: int = 0
         self.wheel = [[] for _ in range(slots)]
         self.next_wheel = None
-        self.timer = None
 
-    def set_next_wheel(self, next_wheel):
+        self._running = False
+        self._task: asyncio.Task | None = None
+        # self._timer = None
+
+    def set_next_wheel(self, next_wheel: "TimeWheel"):
         self.next_wheel = next_wheel
 
-    def add_task(self, delay: float | int, task):
-        ticks = delay // self.tick_duration
-        if ticks < self.slots:
-            rounds = 0  # ticks // self.slots
-            pos = int((self.current_pos + ticks) % self.slots)
-            self.wheel[pos].append((rounds, task))
-        else:
-            # 需要传递到上层时间轮
-            if self.next_wheel:
-                remaining_delay = delay - (self.slots - self.current_pos) * self.tick_duration
-                self.next_wheel.add_task(remaining_delay, task)
-            else:
-                # 如果没有上层时间轮，使用rounds机制, threading.Timer(delay, task).start()
-                rounds = ticks // self.slots
-                pos = int((self.current_pos + ticks) % self.slots)
-                self.wheel[pos].append((rounds, task))
+    def add_task(self, delay: float | int, task, *args, **kwargs):
+        ticks = int(delay // self.tick_duration)
+        rounds = ticks // self.slots
+        pos = int((self.current_pos + ticks) % self.slots)
 
-    def start(self):
-        def tick():
-            # 执行当前槽的任务
-            tasks = self.wheel[self.current_pos]
-            remaining_tasks = []
+        wrapped_task = partial(task, *args, **kwargs)
+        self.wheel[pos].append((rounds, wrapped_task))
 
-            for rounds, task in tasks:
-                if rounds <= 0:
-                    try:
-                        task()
-                    except Exception as e:
-                        print(f"[{self.name}] Task execution failed: {e}")
-                else:
-                    remaining_tasks.append((rounds - 1, task))
+    @property
+    def elapsed_time(self) -> float:
+        """当前时间轮已推进的秒数"""
+        return self.current_pos * self.tick_duration
 
-            self.wheel[self.current_pos] = remaining_tasks
-            self.current_pos = int((self.current_pos + 1) % self.slots)  # 移动指针
+    async def tick_once(self) -> bool:
+        """
+        执行一次 tick（供外部手动控制）
+        如果触发了上层时间轮 tick，则返回 True，否则 False
+        """
+        tasks = self.wheel[self.current_pos]
+        remaining_tasks = []
 
-            # 如果转完一圈，通知上层时间轮
-            if self.current_pos == 0 and self.next_wheel:
-                # 将上层时间轮的任务降级到本层
-                self.cascade_tasks()
+        for rounds, task in tasks:
+            if rounds > 0:
+                remaining_tasks.append((rounds - 1, task))
+            else:  # 执行到期任务
+                try:
+                    if asyncio.iscoroutinefunction(task):
+                        await task()
+                    else:
+                        await asyncio.to_thread(task)  # task() 支持普通函数
+                except Exception as e:
+                    print(f"[{self.name}] Task execution failed: {e}")
 
-            # 继续下一次tick
-            self.timer = threading.Timer(self.tick_duration, tick)
-            self.timer.start()
+        self.wheel[self.current_pos] = remaining_tasks  # 更新轮槽
+        self.current_pos = (self.current_pos + 1) % self.slots
 
-        tick()
+        # 级联上层任务,如果转完一圈，通知上层时间轮
+        if self.current_pos == 0 and self.next_wheel:
+            self.cascade_tasks()  # 将上层时间轮的任务降级到本层
+            return True  # 通知外部“我转完一圈”
+
+        return False
 
     def cascade_tasks(self):
+        """把上层时间轮当前槽的任务下放到本层"""
         if not self.next_wheel:
             return
 
@@ -1492,13 +1493,48 @@ class TimeWheel:
         # 将这些任务重新添加到本层时间轮
         for rounds, task in tasks:
             new_rounds = int(rounds * (self.next_wheel.slots // self.slots))  # 计算在新层的rounds
-            self.add_task(new_rounds * self.tick_duration, task)
+            delay = new_rounds * self.tick_duration
+            self.add_task(delay, task)
 
         self.next_wheel.wheel[next_pos] = []  # 清空上层时间轮的这些任务
 
+    async def run(self):
+        """自动运行 tick 循环"""
+        self._running = True
+        print(f"[{self.name}] started (tick={self.tick_duration}s)")
+        try:
+            while self._running:
+                await self.tick_once()
+                await asyncio.sleep(self.tick_duration)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._running = False
+            print(f"[{self.name}] stopped")
+
+    def start(self, loop=None):
+        """启动自动循环"""
+        if not self._running:
+            loop = loop or asyncio.get_event_loop()
+            self._task = loop.create_task(self.run())
+
+        # def tick():
+        #     self.tick_once()
+        #
+        #     # 继续下一次tick
+        #     self._timer = threading.Timer(self.tick_duration, tick)
+        #     self._timer.start()
+        #
+        # tick()
+
     def stop(self):
-        if self.timer:
-            self.timer.cancel()
+        """停止自动循环"""
+        if self._task:
+            self._running = False
+            self._task.cancel()
+
+        # if self._timer:
+        #     self._timer.cancel()
 
 
 class HierarchicalTimeWheel:
@@ -1508,49 +1544,99 @@ class HierarchicalTimeWheel:
         self.minute_wheel = TimeWheel(60, 60, "minute")  # 60 slots, 60s per tick
         self.hour_wheel = TimeWheel(24, 3600, "hour")  # 24 slots, 3600s per tick
         self.day_wheel = TimeWheel(30, 86400, "day")  # 30 slots, 86400s per tick
-        self.month_wheel = TimeWheel(12, 2592000, "month")  # 12 slots, ~30 days per tick
 
         # 连接各层时间轮
         self.second_wheel.set_next_wheel(self.minute_wheel)
         self.minute_wheel.set_next_wheel(self.hour_wheel)
         self.hour_wheel.set_next_wheel(self.day_wheel)
-        self.day_wheel.set_next_wheel(self.month_wheel)
 
-        self.running = False
+        self._loop = None
 
-    def add_task(self, execute_time: datetime | float, task):
-        """添加定时任务
+    @property
+    def elapsed_time(self) -> float:
+        # get_estimated_time
+        total_seconds = (
+                self.second_wheel.elapsed_time +
+                self.minute_wheel.elapsed_time +
+                self.hour_wheel.elapsed_time +
+                self.day_wheel.elapsed_time
+        )
+        return total_seconds
+
+    def add_task(self, execute_time: datetime | float, task, *args, **kwargs):
+        """
+        添加定时任务，可传入 datetime 或时间戳
         :param execute_time: 执行时间(datetime对象或时间戳)
         :param task: 要执行的任务(函数)
         """
         if isinstance(execute_time, datetime):
             execute_time = execute_time.timestamp()
 
-        now = time.time()
-        delay: float = max(0, execute_time - now)
-
-        if delay == 0:
-            threading.Thread(target=task).start()  # 立即执行
+        delay = max(0.0, execute_time - time.time())
+        if delay <= 60:
+            self.second_wheel.add_task(delay, task, *args, **kwargs)
+        elif delay <= 3600:
+            self.minute_wheel.add_task(delay, task, *args, **kwargs)
+        elif delay <= 86400:
+            self.hour_wheel.add_task(delay, task, *args, **kwargs)
         else:
-            # 根据延迟时间选择合适的时间轮
-            if delay <= 60:
-                self.second_wheel.add_task(delay, task)
-            elif delay <= 3600:
-                self.minute_wheel.add_task(delay, task)
-            elif delay <= 86400:
-                self.hour_wheel.add_task(delay, task)
-            elif delay <= 2592000:  # ~30 days
-                self.day_wheel.add_task(delay, task)
+            self.day_wheel.add_task(delay, task, *args, **kwargs)
+
+    def add_daily_task(self, hour: int, minute: int, task, *args, **kwargs):
+        """每天固定时刻执行任务"""
+        now = datetime.now()
+        run_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run_time < now:
+            run_time += timedelta(days=1)  # 今天的时间已过 → 明天执行
+
+        def wrapper():
+            if asyncio.iscoroutinefunction(task):  # 执行任务
+                asyncio.run_coroutine_threadsafe(task(*args, **kwargs), self._loop)
             else:
-                self.month_wheel.add_task(delay, task)
+                task(*args, **kwargs)
+            self.add_daily_task(hour, minute, task, *args, **kwargs)  # 计算下一次运行时间并注册，重新注册下一次任务
+
+        self.add_task(run_time, wrapper)
+
+    async def tick(self, level: str = "second"):
+        mapping = {
+            "second": self.second_wheel,
+            "minute": self.minute_wheel,
+            "hour": self.hour_wheel,
+            "day": self.day_wheel,
+            "month": self.day_wheel,  # 暂时复用 day_wheel
+        }
+        wheel = mapping.get(level)
+        if not wheel:
+            print(f"[TimeWheel] Invalid level: {level}")
+            return False
+        return await wheel.tick_once()
 
     def start(self):
-        self.running = True
-        self.second_wheel.start()
+        if self._loop is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._loop = loop
+            self.second_wheel.start(loop)  # 已经在异步上下文中
+        except RuntimeError:
+            # 没有运行中的事件循环 → 创建一个新的 独立线程方式
+            def loop_thread_background():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self._loop = loop
+                self.second_wheel.start(loop)  # 创建任务必须在 loop 中
+                loop.run_forever()
+
+            threading.Thread(target=loop_thread_background, daemon=True).start()  # 在独立线程中运行事件循环
+            while self._loop is None:
+                time.sleep(0.1)
 
     def stop(self):
-        self.running = False
         self.second_wheel.stop()
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop = None
 
 
 class AsyncCaller:
@@ -1603,12 +1689,16 @@ class AsyncCaller:
 
     @staticmethod
     def async_dec(ac_attr):
+        """允许类通过 ac_attr 指定的钩子函数拦截方法调用。通过属性（ac_attr）动态决定是否拦截并包装某个方法的调用逻辑"""
+
         def decorator_func(func):
+            @wraps(func)
             def wrapper(self, *args, **kwargs):
-                if isinstance(getattr(self, ac_attr, None), Callable):
-                    return getattr(self, ac_attr)(func, self, *args, **kwargs)
-                else:
-                    return func(self, *args, **kwargs)
+                hook = getattr(self, ac_attr, None)
+                if isinstance(hook, Callable):
+                    return hook(func, self, *args, **kwargs)
+
+                return func(self, *args, **kwargs)
 
             return wrapper
 
@@ -1694,7 +1784,7 @@ if __name__ == "__main__":
 
     def test():
         import pprint
-        scheduler = TaskGraphManager(cluster=Config.DASK_Cluster)
+        scheduler = TaskGraphManager()
 
         # 添加任务节点
         scheduler.set_task_node("task1", {"priority": 1})
@@ -1758,8 +1848,6 @@ if __name__ == "__main__":
 
     test()
 
-    from datetime import timedelta
-
 
     def print_time(msg):
         time.sleep(1)  # 模拟耗时操作
@@ -1775,27 +1863,38 @@ if __name__ == "__main__":
     # 等待所有任务完成
     caller.wait()
 
-    tw = TimeWheel(60, 1, "second")
-    tw.add_task(5, lambda: print_time("5秒后执行"))  # 5秒后执行
-    tw.add_task(65, lambda: print_time("65秒后执行"))
-    tw.start()
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
+    # async def print_time(msg):
+    #     await asyncio.sleep(1)  # 模拟耗时操作
+    #     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+    async def main():
+        tw = TimeWheel(60, 1, "second")
+        tw.add_task(5, lambda: print_time("5秒后执行"))  # 5秒后执行
+        tw.add_task(65, lambda: print_time("65秒后执行"))
+        tw.start()
+
+        await asyncio.sleep(75)  # 等待任务执行
         tw.stop()
-        print_time("时间轮停止")
+        print("时间轮停止", tw.elapsed_time)
 
-    tw = HierarchicalTimeWheel()
+
+    asyncio.run(main())
+
+    ht = HierarchicalTimeWheel()
     now = datetime.now()
 
-    tw.add_task(now + timedelta(seconds=10), lambda: print_time("10秒后执行"))
-    tw.add_task(now + timedelta(minutes=2), lambda: print_time("2分钟后执行"))
-    tw.start()
+    ht.add_task(now + timedelta(seconds=10), lambda: print_time("10秒后执行"))
+    ht.add_task(now + timedelta(minutes=2), lambda: print_time("2分钟后执行"))
+    ht.start()
+
+    ht.add_task(time.time() + 5, lambda: print_time("5秒后"))
+    ht.add_daily_task(18, 0, lambda: print_time("每天18:00"))
 
     try:
-        while True:
-            time.sleep(1)
+        input("按回车退出...\n")
+        print(ht.elapsed_time)
     except KeyboardInterrupt:
-        tw.stop()
+        print('KeyboardInterrupt')
+    finally:
+        ht.stop()

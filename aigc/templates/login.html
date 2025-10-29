@@ -1,0 +1,320 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Login</title>
+  <style>
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #f6f8fa;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+
+    .login-card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      padding: 2rem;
+      width: 320px;
+      text-align: center;
+    }
+
+    h2 {
+      margin-top: 0;
+      color: #333;
+    }
+
+    label {
+      display: block;
+      margin: 0.5rem 0 0.2rem;
+      text-align: left;
+      color: #555;
+      font-size: 0.9rem;
+    }
+
+    input {
+      width: 100%;
+      padding: 0.5rem;
+      font-size: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: #0078d7;
+      box-shadow: 0 0 0 2px rgba(0, 120, 215, 0.2);
+    }
+
+    .btn {
+      margin-top: 1rem;
+      padding: 0.6rem;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+
+    #loginBtn {
+      background: #0078d7;
+      color: white;
+    }
+
+    #loginBtn:hover {
+      background: #005fa3;
+    }
+
+    #logoutBtn {
+      background: #ccc;
+      margin-top: 0.5rem;
+    }
+
+    #logoutBtn:hover {
+      background: #aaa;
+    }
+
+    #status {
+      margin-top: 1rem;
+      font-weight: 500;
+    }
+
+    .code-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .code-group input {
+      flex: 1;
+    }
+
+    .code-group button {
+      padding: 0.5rem;
+      border: none;
+      background: #f0f0f0;
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.3s;
+    }
+
+    .code-group button:hover {
+      background: #ddd;
+    }
+
+    .link {
+      margin-top: 12px;
+      text-align: center;
+      font-size: 0.9rem;
+    }
+
+    .link a {
+      color: #3498db;
+      text-decoration: none;
+    }
+
+    .link a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>Login</h2>
+  <div class="login-card">
+    <!-- 切换按钮 -->
+    <div style="text-align:center; margin-bottom:1rem;">
+      <button type="button" id="toggleLoginBtn">API Key 认证</button>
+    </div>
+
+    <!-- 用户名/密码登录 -->
+    <form id="loginForm">
+      <div id="userPassSection">
+        <label>Username: <input name="username" type="text" placeholder="请输入用户名" /></label><br />
+        <label>Password: <input name="password" type="password" placeholder="请输入密码或留空" /></label><br />
+        <div id="codeSection" style="display:none;">
+          <label>Code</label>
+          <div class="code-group">
+            <input name="code" type="text" placeholder="输入验证码" maxlength="6" />
+            <button type="button" id="sendCodeBtn">获取验证码</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- API Key 登录 -->
+      <div id="apiKeySection" style="display:none;">
+        <label>API Key: <input name="api_key" type="text" placeholder="输入 API Key，系统将为您生成访问令牌" /></label>
+      </div>
+
+      <button id="loginBtn" class="btn" type="submit">Login</button>
+      <button id="logoutBtn" class="btn" type="button">Logout</button>
+    </form>
+
+    <div id="status"></div>
+  </div>
+
+  <div class="link">
+    没有账号？<a href="/register">注册</a>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const form = document.getElementById('loginForm');
+    const logoutBtn = document.getElementById('logoutBtn');
+
+    const sendCodeBtn = document.getElementById('sendCodeBtn');
+    const codeSection = document.getElementById('codeSection');
+
+    const toggleBtn = document.getElementById('toggleLoginBtn');
+    const userPassSection = document.getElementById('userPassSection');
+    const apiKeySection = document.getElementById('apiKeySection');
+
+    function setStatus(text, color = 'black') {
+      statusEl.textContent = text;
+      statusEl.style.color = color;
+    }
+
+    // 切换登录方式
+    toggleBtn.addEventListener('click', () => {
+      if (userPassSection.style.display !== 'none') {
+        userPassSection.style.display = 'none';
+        apiKeySection.style.display = '';
+        toggleBtn.textContent = '账号登录';
+      } else {
+        apiKeySection.style.display = 'none';
+        userPassSection.style.display = '';
+        toggleBtn.textContent = 'API Key 认证';
+      }
+    });
+
+    async function sendCode(username) {
+      try {
+        const resp = await fetch(`/send_wechat_code?username=${encodeURIComponent(username)}`);
+        const data = await resp.json();
+        if (resp.ok) setStatus('📨 验证码已发送，请检查微信消息', 'green');
+        else setStatus('❌ 发送验证码失败：' + data.detail, 'red');
+      } catch (e) {
+        setStatus('网络错误，无法发送验证码', 'red');
+      }
+    }
+    async function loginWithUserPass(formData) {
+      const username = formData.get('username');
+      const password = formData.get('password');
+      const code = formData.get('code');
+
+      if (!username) {
+        setStatus('请输入用户名', 'red');
+        return;
+      }
+
+      // 如果没有密码，也没有验证码 → 先触发发送验证码
+      if (!password && !code) {
+        codeSection.style.display = 'block';
+        await sendCode(username);
+        return;
+      }
+
+      // 准备 JSON payload
+      const payload = { username, password, code };
+
+      try {
+        const resp = await fetch('/authenticate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload),
+          credentials: 'same-origin' // <--- 关键：允许浏览器接收 HttpOnly cookie（Set-Cookie）
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: 'login failed' }));
+          setStatus(`❌ 登录失败: ${err.detail || JSON.stringify(err)}`, 'red');
+          return;
+        }
+
+        const json = await resp.json();
+        // json.access_token contains token returned in body (optional)
+        if (json.access_token) {
+          // 1) 可选：存进 localStorage（注意 XSS 风险）
+          localStorage.setItem('access_token', json.access_token);
+          // 2) 设置全局变量或 wrapper，用于后续设置 Authorization header，立即可用（当前页）
+          window.__ACCESS_TOKEN = json.access_token;
+        }
+
+        setStatus('✅ 登录成功，即将跳转...', 'green');
+        setTimeout(() => (window.location.href = '/'), 800);// 需要跳转的页面
+
+      } catch (e) {
+        console.error('login error', e);
+        setStatus('网络错误，请稍后再试', 'red');
+      }
+    }
+
+    // API Key 登录
+    async function loginWithApiKey(formData) {
+      const api_key = formData.get('api_key');
+      if (!api_key) return setStatus('请输入 API Key', 'red');
+      try {
+        const body = new URLSearchParams();
+        body.append("api_key", api_key);
+        const resp = await fetch('/api/login', {
+          method: 'POST',
+          body: body,
+          credentials: 'same-origin'
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          return setStatus('❌ 登录失败: ' + (err.detail || '未知错误'), 'red');
+        }
+        const json = await resp.json();
+        if (json.access_token) {
+          window.__ACCESS_TOKEN = json.access_token;
+          localStorage.setItem('access_token', json.access_token);
+          sessionStorage.setItem('auth_token', json.access_token);
+          setStatus('✅ 登录成功，access token 已保存', 'green');
+          setTimeout(() => (window.location.href = '/'), 800);
+        }
+      } catch (e) {
+        setStatus('网络错误，请稍后重试', 'red');
+      }
+    }
+
+    form.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(form);
+      if (userPassSection.style.display !== 'none') loginWithUserPass(fd);
+      else loginWithApiKey(fd);
+    });
+
+    logoutBtn.addEventListener('click', async () => {
+      window.__ACCESS_TOKEN = undefined;
+      localStorage.removeItem('access_token');
+      sessionStorage.removeItem('auth_token');
+      setStatus('已登出');
+
+      try {
+        await fetch('/api/logout', {
+          method: 'POST',
+          credentials: 'include' // 让浏览器带上 cookie 'same-origin' 
+        });
+      } catch (e) {
+        console.error('登出失败:', e);
+      }
+    });
+    sendCodeBtn.addEventListener('click', async () => {
+      const username = form.querySelector('[name="username"]').value.trim();
+      if (!username) return setStatus('请输入用户名后再获取验证码', 'red');
+      await sendCode(username);
+    });
+
+  </script>
+</body>
+
+</html>

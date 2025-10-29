@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, Header, Depends, Query, Body, File, Upload
 from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, HTMLResponse, RedirectResponse
 # from starlette.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 # from fastmcp import FastMCP
 from starlette.middleware.sessions import SessionMiddleware
 from sse_starlette.sse import EventSourceResponse
@@ -59,18 +59,16 @@ async def lifespan(app: FastAPI):
         app.state.httpx_client = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
         app.state.logger = logging.getLogger(__name__)
 
-        worker_id, worker_info = get_worker_identity()
-        app.state.worker_id = worker_id
-        app.state.worker_info = worker_info
+        app.state.worker_id = get_worker_identity()
         app.state.worker_num = int(os.environ.get("UVICORN_WORKERS") or os.environ.get("GUNICORN_WORKERS", 1))
         app.state.is_debug = Config.get('IS_DEBUG', False)
         if app.state.is_debug:
             tracemalloc.start()
 
         await init_ai_clients(AI_Models)
-        await ModelList.set(redis=app.state.redis, worker_id=worker_id, ai_models=AI_Models)
+        await ModelList.set(redis=app.state.redis, worker_id=app.state.worker_id, ai_models=AI_Models)
 
-        app.state.is_main = await is_main_worker(worker_id, redis=app.state.redis)
+        app.state.is_main = await is_main_worker(worker_id=app.state.worker_id, redis=app.state.redis)
         if app.state.is_main:
             print("Main worker started. Do once-only init. Total workers:", app.state.worker_num)
             # app.state.dask_client = get_dask_client()
@@ -81,7 +79,10 @@ async def lifespan(app: FastAPI):
             # app.state.dask_client = get_dask_client(Config.DASK_Cluster)
 
         app.state.ai_scheduler = TaskGraphManager(dask_client=None)
-        tick_task = asyncio.create_task(async_tick())
+        app.state.ht = HierarchicalTimeWheel()  # app.state.ht.start()
+        app.state.tick_time: datetime = None
+        t = asyncio.create_task(handle_minute())  # asyncio.create_task(async_tick())
+        app.state.cron_tasks = [t]
         if not scheduler.get_job("hour_job"):
             scheduler.add_job(handle_hour, 'interval', id="hour_job", seconds=3600, misfire_grace_time=60,
                               jobstore='memory', executor='default')  # , max_instances=3
@@ -97,7 +98,7 @@ async def lifespan(app: FastAPI):
         if not scheduler.running:
             scheduler.start()
 
-        print(app.state.worker_info, "worker inited.")
+        print(app.state.worker_id, "inited.")
         # task1 = asyncio.create_task(message_zero_mq.start())
         # global_function_registry()
         # if Config.get('WORKERS',0) == 1:
@@ -106,15 +107,15 @@ async def lifespan(app: FastAPI):
         async with mcp_app.lifespan(app):
             yield
 
-        tick_task.cancel()
-
     except asyncio.CancelledError:
         logging.warning("Lifespan 被取消（应用关闭中）")
-        await tick_task
     except Exception as e:
         logging.error(f"生命周期异常: {e}")
         # asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     finally:
+        for t in app.state.cron_tasks:
+            t.cancel()
+        await asyncio.gather(*app.state.cron_tasks, return_exceptions=True)
         print("Shutting down.")
         scheduler.shutdown()
         engine.dispose()
@@ -166,24 +167,28 @@ app.mount("/data", StaticFiles(directory=Config.DATA_FOLDER), name="data")
 # directory=os.path.abspath('.') + "/static")
 # 配置静态文件和模板
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/.well-known", StaticFiles(directory="static/.well-known"), name="well-known")
 app.mount("/mcp", mcp_app)
 
 app.include_router(index_router, prefix="")
 app.include_router(ideatech_router, prefix="/ideatech")
 app.include_router(table_router, prefix="/table")
 app.include_router(chat_router, prefix="/chat")
+
+
 # model_config['protected_namespaces'] = ()
 
-MTick_Time: datetime = None
-
+# @async_timer_cron(interval=1)
+# async def async_tick():
+#     await app.state.ht.tick(level="second")  # 推动时间轮每秒执行一次
 
 @async_timer_cron(interval=60)
-async def async_tick():
-    global MTick_Time
+async def handle_minute():
     tick_now = datetime.now()
-    if not MTick_Time or MTick_Time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
-        MTick_Time = tick_now.replace(second=0, microsecond=0)
-        # print(f'Async Tick! The time is: {time.time()}, {MTick_Time.strftime("%Y-%m-%d %H:%M:%S")}')
+    if not app.state.tick_time or app.state.tick_time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
+        app.state.tick_time = tick_now.replace(second=0, microsecond=0)
+        # print(f'Async Tick! The time is: {time.time()}, {app.state.tick_time.strftime("%Y-%m-%d %H:%M:%S")}')
+        await app.state.ht.tick(level="minute")  # 推动分钟轮
         if len(TaskManager.Task_queue):
             await TaskManager.clean_old_tasks(3600)
 
@@ -191,8 +196,12 @@ async def async_tick():
 
 
 async def handle_hour():
-    if MTick_Time:
-        print(f"Tick new bar! The time is: {MTick_Time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if app.state.tick_time:
+        print(f"Tick new bar! The time is: {app.state.tick_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if app.state.tick_time.hour == 18:
+        if app.state.is_main:
+            res = await run_adjustment_sync_tasks(concurrent=False)
+            print(f'[adjustment_sync]:{res}')
 
     BaseChatHistory.flush_cache()
 
@@ -231,38 +240,16 @@ async def handle_hour():
 #         raise HTTPException(status_code=401, detail="Invalid API key")
 #     response = await call_next(request)
 #     return response
-# 用于依赖注入
-# async def verify_api_key(authorization: str = Header(None)):
-#     if not authorization:
-#         raise HTTPException(status_code=401, detail="Missing API key")
-#     api_key = authorization.replace("Bearer ", "")  # 如果用的是 Bearer Token 格式
-#     if api_key not in Config.VALID_API_KEYS:
-#         raise HTTPException(status_code=401, detail="Invalid API key")
-
-def require_api_key(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        request: Request = kwargs.get("request")
-        authorization = request.headers.get("Authorization")
-        if not authorization:
-            raise HTTPException(status_code=401, detail="Missing API key")
-        api_key = authorization.replace("Bearer ", "")  # 如果用的是 Bearer Token
-        if api_key not in Config.VALID_API_KEYS:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        return await func(*args, **kwargs)
-
-    return wrapper
 
 
 @app.get("/send_wechat_code")
 async def send_verification_code(username: str):
     if not username:
         raise HTTPException(status_code=400, detail="用户名不能为空")
-    r = get_redis()
     key_verify = f"verify_code:{username}"
 
     code = str(random.randint(100000, 999999))
-    await r.setex(key_verify, int(Config.VERIFY_TIMEOUT_SEC), code)
+    await app.state.redis.setex(key_verify, int(Config.VERIFY_TIMEOUT_SEC), code)
     response = await send_to_wechat(username, f'验证码：{code}，{Config.VERIFY_TIMEOUT_SEC // 60}分钟有效期') or {}
     return {"status": "success", "message": "验证码已发送", "data": {**response}}
 
@@ -283,7 +270,7 @@ async def register_user(request: Registration, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400,
                             detail="At least one of username, eth_address, or public_key must be provided")
 
-    db_user = User.get_user(db, username, public_key, eth_address)
+    db_user = User.get_user(db, username, public_key=public_key, eth_address=eth_address)
     if db_user:
         raise HTTPException(status_code=400, detail="User already registered")
     # 验证签名
@@ -299,8 +286,8 @@ async def register_user(request: Registration, db: Session = Depends(get_db)):
                 raise HTTPException(status_code=400, detail="Public key authentication failed")
 
     if request.code:
-        r = get_redis()
         key_verify = f"verify_code:{username}"
+        r = app.state.redis or get_redis()
         stored_code = await r.get(key_verify)
         if not stored_code:
             raise HTTPException(status_code=400, detail="验证码已过期或未发送")
@@ -322,7 +309,7 @@ async def register_user(request: Registration, db: Session = Depends(get_db)):
 
 
 @app.post("/authenticate", response_model=Token)
-async def authenticate_user(request: AuthRequest, db: Session = Depends(get_db)):
+async def authenticate_user(request: AuthRequest, response: Response, db: Session = Depends(get_db)):
     '''
     登录路由，颁发访问令牌和刷新令牌,令牌生成 login_for_access_token,
     如果 eth_address 或 public_key 认证成功，通过公钥验证签名则不需要密码。
@@ -352,10 +339,7 @@ async def authenticate_user(request: AuthRequest, db: Session = Depends(get_db))
             is_verified |= 1 << 1
 
         if is_verified and db_user:
-            access_token = create_access_token(
-                data={"sub": db_user.username or db_user.user_id, 'user_id': db_user.user_id},
-                expires_minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES)
-            return {"access_token": access_token, "token_type": "bearer"}
+            return issue_access_token(response, db_user, Config.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     if username:
         db_user = User.get_user(db=db, username=username)  # user_id=request.uuid ,User.validate_credentials(
@@ -368,8 +352,8 @@ async def authenticate_user(request: AuthRequest, db: Session = Depends(get_db))
             is_verified |= 1 << 2
 
         if request.code:
-            r = get_redis()
             key_verify = f"verify_code:{username}"
+            r = app.state.redis or get_redis()
             stored_code = await r.get(key_verify)
             if not stored_code:
                 raise HTTPException(status_code=400, detail="验证码已过期或未发送")
@@ -379,89 +363,137 @@ async def authenticate_user(request: AuthRequest, db: Session = Depends(get_db))
             is_verified |= 1 << 3
 
         if is_verified:
-            access_token = create_access_token(data={"sub": username, 'user_id': db_user.user_id},
-                                               expires_minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES)
-            return {"access_token": access_token, "token_type": "bearer"}
+            return issue_access_token(response, db_user, Config.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     raise HTTPException(status_code=400, detail="Invalid authentication request")
 
 
-async def verify_request_signature(request: Request, api_secret_keys):
-    # 请求签名验证的函数，主要用于确保请求的来源可信，防止请求在传输过程中被篡改
-    api_key = request.headers.get("X-API-KEY")
-    signature = request.headers.get("X-SIGNATURE")
-    timestamp = request.headers.get("X-TIMESTAMP")
-
-    if not all([api_key, signature, timestamp]):
-        raise HTTPException(status_code=400, detail="Missing authentication headers")
-
-    # 检查时间戳是否超时
-    current_time = int(time.time())
-    request_time = int(timestamp)
-    if abs(current_time - request_time) > Config.VERIFY_TIMEOUT_SEC:  # 5分钟的时间窗口
-        raise HTTPException(status_code=403, detail="Request timestamp expired")
-
-    # 检查API Key是否合法
-    secret = api_secret_keys.get(api_key)
-    if not secret:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-
-    # 从请求中构造签名字符串
-    method = request.method
-    url = str(request.url)
-    body = await request.body() if request.method in ["POST", "PUT"] else b""
-
-    # 拼接签名字符串 build_signature
-    message = f"{method}{url}{body.decode()}{timestamp}"
-
-    # 使用 HMAC-SHA256 生成服务器端的签名
-    server_signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
-
-    if not hmac.compare_digest(server_signature, signature):
-        raise HTTPException(status_code=403, detail="Invalid signature")
-
-    return True
-
-
-@app.post("/protected")
-async def protected(request: Request, db: Session = Depends(get_db)):
-    """防止伪造 API Key,防止请求内容被篡改,防止重放攻击（时间戳）,避免签名泄露,HMAC 使用安全算法（SHA256）"""
-    # api_key, secret_key = User.create_api_key(1, db)
-    # User.update_user(1, db,public_key='83e2c687a44f839f6b3414d63e1a54ad32d8dbe4706cdd58dc6bd4233a592f78367ee1bff0e081ba678a5dfdf068d4b4c72f03085aa6ba5f0678e157fc15d305')
-    api_keys = User.get_api_keys(db)
-    await verify_request_signature(request, api_keys)
-    return {"message": "Request authenticated successfully"}
-
-
-# 检查该用户是否在数据库中有效或是否具备某些标志位
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    username = verify_access_token(token)
-    if username is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials,Invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    user = User.get_user(db, username=username, user_id=username)
-    if not user:
-        raise HTTPException(status_code=404, detail="Access forbidden,User not found")
-    if user.disabled:  # or user.expires_at <= time.time()
-        raise HTTPException(status_code=400, detail="Access forbidden,Inactive user")
-    return user
+@app.post("/refresh_token", response_model=Token)  # dict
+async def refresh_token(token: str = Form(...)):
+    new_access_token = refresh_access_token(token)
+    return {"access_token": new_access_token, "token_type": "bearer"}
 
 
 @app.post("/secure")
-async def secure_route(user: User = Depends(get_current_user)):
-    return {"message": "Access granted", "user": user.username}
+async def secure_route(request: Request, db: Session = Depends(get_db)):
+    """防止伪造 API Key,防止请求内容被篡改,防止重放攻击（时间戳）,避免签名泄露,HMAC 使用安全算法（SHA256）"""
+    # User.update_user( db,1, public_key='83e2c687a44f839f6b3414d63e1a54ad32d8dbe4706cdd58dc6bd4233a592f78367ee1bff0e081ba678a5dfdf068d4b4c72f03085aa6ba5f0678e157fc15d305')
+    username = get_access_user(request)
+    api_keys = {}
+    if username:
+        user = User.get_user(db=db, username=username)
+        if user and not user.disabled:
+            api_keys = User.get_api_keys(db, _id=user.id)
+    if not api_keys:
+        api_keys = await User.get_active_api_keys(redis=app.state.redis, ex=Config.VERIFY_TIMEOUT_SEC)
+    await verify_request_signature(request, api_keys, time_out=Config.VERIFY_TIMEOUT_SEC)
+    return {"status": "success", "message": "Request authenticated successfully"}
 
 
-@app.post("/refresh_token", response_model=Token)  # dict
-async def refresh_access_token(username: str = Depends(verify_access_token)):
-    if username is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-    new_access_token = create_access_token(data={"sub": username},
-                                           expires_minutes=Config.ACCESS_TOKEN_EXPIRE_MINUTES)
-    return {"access_token": new_access_token, "token_type": "bearer"}
+def issue_access_token(response: Response, user: User,
+                       expires_minutes: int = Config.ACCESS_TOKEN_EXPIRE_MINUTES) -> Token:
+    """
+    签发访问令牌（Access Token），并写入安全 Cookie。
+    """
+    if user.disabled:
+        raise HTTPException(status_code=403, detail="Access forbidden,Inactive user")
+    if user.expires_at and user.expires_at <= int(time.time()):  # 防止已过期账户登录
+        raise HTTPException(status_code=403, detail="Access forbidden: user expired")
+
+    access_token = create_access_token(data={"sub": user.username, 'user_id': user.user_id, "type": "access"},
+                                       expires_minutes=expires_minutes)
+    max_age = int(expires_minutes * 60)
+    response.set_cookie(key="access_token", value=access_token,
+                        httponly=True,
+                        secure=True,  # 生产部署时强制 https
+                        samesite="lax",  # 或 "strict" / "none"（前后端分离、跨域时应为 "none" 且 secure=True）
+                        max_age=max_age,
+                        path="/")  # extract_token->cookie_token
+    return Token(access_token=access_token, token_type="bearer", expires_in=max_age)
+
+
+# 检查该用户是否在数据库中有效或是否具备某些标志位, 严格依赖
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    username = verify_access_token(token)
+    user = User.get_user(db, username=username, user_id=username)
+    if not user:
+        raise HTTPException(status_code=404, detail="Access forbidden,Invalid credentials,User not found")
+    if user.disabled:
+        raise HTTPException(status_code=403, detail="Access forbidden,Inactive user")
+    if user.expires_at and user.expires_at <= int(time.time()):
+        raise HTTPException(status_code=403, detail="Access forbidden: user expired")
+    return user
+
+
+@app.post("/protected")
+async def protected_route(user: User = Depends(get_current_user)):
+    '一般认证需求,访问控制'
+    return {"message": "Access granted", "username": user.username}
+
+
+@app.get("/api/key/")
+async def get_apikey(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.api_key:
+        return {"username": user.username, 'api_key': user.api_key}
+
+    api_key, secret_key = User.create_api_key(db, user.id)
+    return {"username": user.username, 'api_key': api_key}  # 标识和授权用户请求
+
+
+@app.post("/api/login", response_model=Token)
+async def login_with_apikey(api_key: str = Form(...), response: Response = None, db: Session = Depends(get_db)):
+    """
+    通过 API Key 登录，验证后返回 JWT Token 并写入 Cookie。
+    """
+    user = User.get_user(db=db, api_key=api_key)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return issue_access_token(response, user)
+
+
+@app.post("/api/logout")
+async def logout(request: Request, response: Response):
+    """
+    安全登出接口：清除后端 Cookie。
+    """
+    response.delete_cookie(key="access_token", path="/")
+    request.session.pop("username", None)
+    # if request.session.get("user_id"):
+    #     request.session.clear(), 用于跟踪客户端,不重复初始化用户状态
+    return {"status": "success", "message": "Logged out successfully"}
+
+
+@app.get("/admin/")
+async def admin(user: User = Depends(get_current_user)):
+    if user.username == 'admin' and user.role == 'admin':
+        return JSONResponse(
+            content={'history': BaseChatHistory.Chat_History_Cache, 'task': dataclass2dict(TaskManager.Task_queue),
+                     'task_nodes': app.state.ai_scheduler.export_nodes(),
+                     'task_edges': app.state.ai_scheduler.export_adjacency_list(),
+                     'job': get_job_list(scheduler)})
+    return {"message": "Access denied: Admin privileges required"}
+
+
+@app.get('/user/')
+async def user(request: Request, db: Session = Depends(get_db)):
+    '''尝试使用 optional token（header/cookie/query)'''
+    username = get_access_user(request)
+    if username:
+        # 没 token -> 如果 session 中有 user_id 就认为是匿名用户
+        user = User.get_user(db, username=username, user_id=username)  # user=get_current_user(token=token, db=db)
+        if not user:
+            return {"error": "User not found"}
+        if user.disabled:
+            return {"error": f"Access forbidden for disabled users {username}"}
+        request.session['username'] = username  # 注意多worker缓存用户名 失效，内存不共享
+        return {"user": username, "type": "authenticated"}
+
+    session_uid = request.session.get('user_id')
+    if not session_uid:
+        session_uid = str(uuid.uuid4())
+        request.session['user_id'] = session_uid  # 伪用户信息用于 session,匿名用户临时标识
+
+    return {"user": session_uid, "type": "anonymous"}
 
 
 @app.get("/status/")
@@ -469,7 +501,7 @@ async def system_status():
     thread_count = threading.active_count()
     task_count = len(asyncio.all_tasks())  # asyncio 任务数
 
-    redis_info = await get_redis().info()
+    redis_info = await app.state.redis.info()
     pool = engine.pool
 
     return JSONResponse(content={
@@ -479,7 +511,6 @@ async def system_status():
         "processor": platform.processor(),
         "event_loop_type": str(type(asyncio.get_running_loop())),  # asyncio.get_event_loop()
         "worker_id": app.state.worker_id,
-        "worker_info": app.state.worker_info,
         "worker_num": app.state.worker_num,
         "pid": os.getpid(),
         "threads": thread_count,
@@ -496,7 +527,8 @@ async def system_status():
         "db_connections_idle": pool.checkedin(),
         "task_queue_count": len(TaskManager.Task_queue),
         'history_cache_count': len(BaseChatHistory.Chat_History_Cache),
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "tick_time": app.state.tick_time.strftime('%Y-%m-%d %H:%M:%S')
     })
 
 
@@ -505,41 +537,17 @@ async def get_logs_info(lines: int = 100):
     return await get_log_lines("app.log", lines)
 
 
-@app.get("/admin/")
-async def admin(username: str = Depends(verify_access_token)):
-    if username == 'admin':
-        return JSONResponse(
-            content={'history': BaseChatHistory.Chat_History_Cache, 'task': dataclass2dict(TaskManager.Task_queue),
-                     'task_nodes': app.state.ai_scheduler.export_nodes(),
-                     'task_edges': app.state.ai_scheduler.export_adjacency_list(),
-                     'job': get_job_list(scheduler)})
-    return {"message": "Access denied: Admin privileges required"}
+@app.get("/status/routes")
+def list_routes():
+    return [{"path": r.path, "name": r.name} for r in app.routes]
 
 
-@app.get('/user/')
-async def user(request: Request, token: str = None, db: Session = Depends(get_db)):
-    if token:
-        username = verify_access_token(token)
-        if username is None:
-            return {"error": "Invalid credentials"}
-        user = User.get_user(db, username=username, user_id=username)
-        if user and not user.disabled:
-            return {"user": username}
-        return {"error": "Access forbidden for virtual users"}
-
-    user_id = request.session.get('user_id', '')
-    if not user_id:
-        user_id = str(uuid.uuid1())
-        request.session['user_id'] = user_id  # 伪用户信息用于 session,临时用户标识
-
-    return {"user": user_id}
-
-
+@require_api_key
 @app.post("/data")
 async def push_redis_data(payload: dict):
-    redis = get_redis()
+    'VALID_API_KEYS'
     try:
-        await redis.lpush("task_queue", json.dumps(payload))
+        await app.state.redis.lpush("task_queue", json.dumps(payload))
         return {"status": "queued"}
     except (ConnectionError, TimeoutError) as e:
         return JSONResponse(status_code=503, content={"error": "Redis 连接失败", "detail": str(e)})
@@ -549,9 +557,8 @@ async def push_redis_data(payload: dict):
 
 @app.get("/get/{key}")
 async def read_redis_value(key: str = 'funcmeta:*'):
-    redis = get_redis()
     try:
-        result = await get_redis_value(redis, key)
+        result = await get_redis_value(app.state.redis, key)
         if result is None:
             return {"error": f"Key '{key}' not found"}
         return {"result": result}
@@ -560,11 +567,12 @@ async def read_redis_value(key: str = 'funcmeta:*'):
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
+@require_api_key
 @app.delete("/delete/{key}")
 async def delete_redis_key(key: str):
-    redis = get_redis()
     try:
         if "*" in key or "?" in key or "[" in key:
+            redis = app.state.redis or get_redis()
             keys = await redis.keys(key)
             if not keys:
                 return {"error": f"No keys match pattern '{key}'"}
@@ -603,34 +611,22 @@ async def healthcheck():
     return {"status": True}
 
 
-@app.get("/route_info")
-def list_routes():
-    return [{"path": r.path, "name": r.name} for r in app.routes]
-
-
-@app.get("/mcp_tool")
-async def get_mcp_tool():
-    await app.state.func_manager.register_mcp_tools()
-    mcp_tools = await app.state.func_manager.get_mcp_tools()
-    return JSONResponse(content={k: v.__repr__() for k, v in mcp_tools.items()})
-
-
-@app.get("/mcp_sse")
-async def mcp_sse(request: Request):
-    """SSE 端点用于 MCP 实时通信"""
-
-    async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
-            # 发送心跳保持连接
-            yield {
-                "event": "heartbeat",
-                "data": json.dumps({"timestamp": datetime.now().isoformat()})
-            }
-            await asyncio.sleep(30)
-
-    return EventSourceResponse(event_generator())
+# @app.get("/mcp_sse")
+# async def mcp_sse(request: Request):
+#     """SSE 端点用于 MCP 实时通信"""
+#
+#     async def event_generator():
+#         while True:
+#             if await request.is_disconnected():
+#                 break
+#             # 发送心跳保持连接
+#             yield {
+#                 "event": "heartbeat",
+#                 "data": json.dumps({"timestamp": datetime.now().isoformat()})
+#             }
+#             await asyncio.sleep(30)
+#
+#     return EventSourceResponse(event_generator())
 
 
 # @app.get("/mcp_openai")
@@ -979,8 +975,7 @@ async def get_tools(request: ToolRequest):
     tools_metadata = request.tools
     if not request.tools:
         if request.user:
-            redis = get_redis()
-            tools_metadata = await scan_from_redis(redis, "registry_meta", user=request.user)
+            tools_metadata = await scan_from_redis(app.state.redis, "registry_meta", user=request.user)
         else:
             tools_metadata = AI_Tools + await app.state.func_manager.get_registered_tools_metadata(
                 model_name=request.model_metadata)
@@ -1007,10 +1002,45 @@ async def get_tools(request: ToolRequest):
     return JSONResponse(await ai_tools_results(tool_messages, app.state.func_manager))
 
 
+@app.get("/tools/mcp")
+async def get_mcp_tool():
+    await app.state.func_manager.register_mcp_tools()
+    mcp_tools = await app.state.func_manager.get_mcp_tools()
+    return JSONResponse(content={k: v.to_mcp_tool().model_dump() for k, v in mcp_tools.items()})
+
+
+from rime.allele import Allele
+
+ClassMethodRegistry.register_class(Allele)
+
+
+@app.get('/classes/{class_name}')
+async def get_class_info(class_name: str):
+    """获取特定类的详细信息"""
+    try:
+        return ClassMethodRegistry.get_class_info(class_name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post('/call/<class_name>/<method_name>')
+async def call_registered_method(class_name: str, method_name: str, request: FunctionCallItem):
+    """调用注册的类方法"""
+    try:
+        result = ClassMethodRegistry.call_method(class_name, method_name, *request.args, **request.kwargs)
+        return JSONResponse({"result": dataclass2dict(result), "class": class_name, "method": method_name})
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except TypeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/metadata")
 async def generate_metadata_from_code(req: MetadataRequest):
     cache_key = generate_hash_key(req.metadata, req.function_code, req.description)
-    redis = get_redis()
+    redis = app.state.redis or get_redis()
     key_meta = f"registry_meta:{req.user}:{cache_key}"
     cached_metadata = await redis.get(key_meta)
     if cached_metadata:
@@ -1182,7 +1212,7 @@ async def generate_batch_text(request: CompletionParams,
     process_func = run_togather(max_concurrent=Config.REDIS_MAX_CONCURRENT)(process_one)
 
     if use_task:
-        redis = get_redis()
+        redis = app.state.redis or get_redis()
         task_id, task = await TaskManager.add(redis=redis,
                                               description=prompt,
                                               action='llm',
@@ -1216,7 +1246,6 @@ async def generate_batch_text(request: CompletionParams,
     return JSONResponse(results[0] if len(results) == 1 else results)
 
 
-# ,current_user: User = Depends(get_current_user)
 @app.post("/message/")
 async def generate_message(request: ChatCompletionRequest,
                            session: AsyncSession = Depends(get_db_session)) -> StreamingResponse or JSONResponse:
@@ -1230,7 +1259,7 @@ async def generate_message(request: ChatCompletionRequest,
     agent = request.agent
     extract = request.extract
     chat_history = ChatHistory(request.user, request.name, request.robot_id, agent, request.model_name,
-                               timestamp=time.time(), request_uid=request.request_id)
+                               timestamp=time.time(), session_uid=request.request_id)
 
     if not extract:
         agent_format = {
@@ -1366,7 +1395,7 @@ async def get_models(model: Optional[str] = Query(None,
     return JSONResponse(content=response_data)
 
 
-@app.get("/models")
+@app.get("/models/")
 async def get_models_list(model_type: Literal["model", "embedding", "reranker"] = Query("model",
                                                                                         description=f"custom models/embedding/reranker.")):
     if model_type == "model":
@@ -1401,7 +1430,7 @@ async def websocket_chat(websocket: WebSocket):
                 request.get('question'), user, name, robot_id, db=db,
                 user_history=request.get('messages', []), use_hist=request.get('use_hist', True),
                 filter_limit=request.get('filter_limit', -500), filter_time=request.get('filter_time', 0.0),
-                agent=agent, request_uid=request.get('request_id')
+                agent=agent, session_uid=request.get('session_uid')
             )
 
             # 生成系统提示和模型请求
@@ -1434,7 +1463,7 @@ async def websocket_chat(websocket: WebSocket):
                     save_chat_history(
                         user_request, assistant_content, user, name, robot_id, agent,
                         hist_size, model_name, current_timestamp, db=db,
-                        refer=refer, transform=transform, request_uid=request.get('request_id'))
+                        refer=refer, transform=transform, session_uid=request.get('session_uid'))
 
                 # 流式传输消息到 WebSocket
                 async for stream_chunk in generate_stream():
@@ -1448,7 +1477,7 @@ async def websocket_chat(websocket: WebSocket):
                 save_chat_history(
                     user_request, assistant_content, user, name, robot_id, agent,
                     hist_size, model_name, current_timestamp, db=db,
-                    refer=refer, transform=transform, request_uid=request.get('request_id')
+                    refer=refer, transform=transform, session_uid=request.get('session_uid')
                 )
 
                 await websocket.send_text(
@@ -1479,7 +1508,7 @@ async def create_batch(request: OpenAIRequestBatch):
     data = {"messages": messages_list, "size": total}
     params = {"model": request.model, **kwargs}
 
-    redis = get_redis()
+    redis = app.state.redis or get_redis()
     task_id, task = await TaskManager.add(redis=redis,
                                           description='批处理任务',
                                           action='batch',
@@ -1519,7 +1548,7 @@ async def create_batch(request: OpenAIRequestBatch):
 
 @app.get("/batch/{task_id}")
 async def get_batch_result(task_id: str, interval: int = 10, timeout: int = 300, oss_expires: int = 0):
-    redis = get_redis()
+    redis = app.state.redis or get_redis()
     task = await TaskManager.get_task(task_id, redis)
     waiting_status = (TaskStatus.PENDING, TaskStatus.READY, TaskStatus.IN_PROGRESS)
     if not task:
@@ -1566,16 +1595,25 @@ async def get_batch_result(task_id: str, interval: int = 10, timeout: int = 300,
 
 
 @app.get("/message/get/")
-async def get_messages(request: Request, user: str = Query(""), name: str = None,
-                       robot_id: str = None, filter_time: float = Query(0.0),
-                       agent: str = None, db: Session = Depends(get_db)):
-    request_id = request.session.get('user', '')
-    if not user and not request_id:
+async def get_messages(request: Request, user: str = Query(""), robot_id: Optional[str] = None,
+                       agent: Optional[str] = None, filter_time: float = Query(0.0),
+                       session: AsyncSession = Depends(get_db_session)):
+    """
+    获取用户消息历史：
+    1. 优先从 JWT token（Authorization / cookie / query）中识别真实用户；
+    2. 否则使用 session 内的 user_id 作为匿名访客；
+    """
+    access_user = get_access_user(request)  # 优先：从 token 认证用户
+    session_uid = request.session.get('user_id')
+    uid = access_user or session_uid
+    if not (user or uid):
         return JSONResponse(status_code=400, content={"error": "No user id found in session"})
+
     if filter_time > 1e12:  # 很可能是毫秒
         filter_time = filter_time / 1000.0
-    filter_history = get_user_history(user, name, robot_id, filter_time, db, agent=agent,
-                                      request_uid=request_id)
+    # filter_history = get_user_history(user, access_user, robot_id, filter_time, db, agent=agent,session_uid=session_uid)
+    filter_history = await BaseChatHistory.async_user_history(session, user, uid, robot_id, agent=agent,
+                                                              filter_time=filter_time)
     for item in filter_history:
         if isinstance(item.get('created_at'), datetime):
             item['created_at'] = item['created_at'].isoformat()
@@ -1587,32 +1625,34 @@ async def get_messages(request: Request, user: str = Query(""), name: str = None
 #     return redirect("http://host.docker.internal:8080")
 
 @app.post("/message/submit")
-async def submit_messages(request: SubmitMessagesRequest, session: AsyncSession = Depends(get_db_session)):
+async def submit_messages(request: Request, body: SubmitMessagesRequest,
+                          session: AsyncSession = Depends(get_db_session)):
     if len(TaskManager.Task_queue) > Config.MAX_TASKS:
         return JSONResponse(status_code=400, content={'task_id': '', "error": "任务队列已满"})
-    if not request.messages and not request.params:
+    if not body.messages and not body.params:
         return JSONResponse(status_code=400,
                             content={'task_id': '', 'error': 'Please provide messages or a question to process.'})
 
+    name = body.name or get_access_user(request)
     current_timestamp = time.time()
-    chat_history = ChatHistory(request.user, request.name, request.robot_id, agent=None, model=None,
-                               timestamp=current_timestamp, request_uid=request.request_id)
+    chat_history = ChatHistory(body.user, name, body.robot_id, agent=None, model=None, timestamp=current_timestamp,
+                               session_uid=body.request_id)
 
-    history: List[dict] = await chat_history.build('', request.messages or [], request.use_hist,
-                                                   request.filter_limit, request.filter_time, session=session)
-    data = {"messages": history, "size": chat_history.index, "user": request.user, "name": request.name,
-            "robot_id": request.robot_id, 'request_uid': request.request_id}
+    history: List[dict] = await chat_history.build('', body.messages or [], body.use_hist,
+                                                   body.filter_limit, body.filter_time, session=session)
+    data = {"messages": history, "size": chat_history.index, "user": body.user, "name": name,
+            "robot_id": body.robot_id, 'session_uid': body.request_id}
     # generate_hash_key(data,datetime.datetime.now().date().isoformat())
-    redis = get_redis()
+    redis = app.state.redis or get_redis()
     task_id, task = await TaskManager.add(redis=redis,
                                           description=chat_history.user_request,
                                           action='message',
-                                          params=request.params,  # List[CompletionParams]
+                                          params=body.params,  # List[CompletionParams]
                                           data=data,
                                           # status=TaskStatus.PENDING,
                                           start_time=current_timestamp)
 
-    if not request.params:  # task.params
+    if not body.params:  # task.params
         return JSONResponse(content={'task_id': task_id, 'url': f'{Config.WEBUI_URL}/message/{task_id}'})
     if not task:
         return JSONResponse(status_code=400,
@@ -1656,7 +1696,7 @@ async def submit_messages(request: SubmitMessagesRequest, session: AsyncSession 
             if param.callback and param.callback.url:
                 await send_callback(param.callback.model_dump(),
                                     result=transform if isinstance(transform, (dict, list)) else result)
-            if request.stream:
+            if body.stream:
                 await TaskManager.put_task_result(task, result, len(params), redis_client=redis)
 
             return result
@@ -1730,7 +1770,7 @@ async def get_ai_param(
 @app.get("/message/{task_id}")
 async def response_message(task_id: str, param: CompletionParams = Depends(get_ai_param),
                            session: AsyncSession = Depends(get_db_session)) -> StreamingResponse or JSONResponse:
-    redis = get_redis()
+    redis = app.state.redis or get_redis()
     task = await TaskManager.get_task(task_id, redis)
 
     if not task:
@@ -1755,7 +1795,7 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
     chat_history = ChatHistory(task.data.get('user'), task.data.get('name'), task.data.get('robot_id'),
                                agent=param.agent, model=param.model_name,
                                timestamp=task.start_time, index=task.data.get("size"),
-                               request_uid=task.data.get('request_uid'),
+                               session_uid=task.data.get('session_uid'),
                                user_request=task.description, user_history=history)
 
     if not param.question:
@@ -1831,7 +1871,7 @@ def cleanup_old_tempfiles(min_age=600, prefix="tmp_"):
 
 @app.get("/task/{task_id}")
 async def get_task_status(task_id: str, platform: Literal['json', 'file', 'html'] = 'json'):
-    redis = get_redis()
+    redis = app.state.redis or get_redis()
     task: TaskNode = await TaskManager.get_task(task_id, redis)
     if not task:
         return {'error': "Invalid task ID,Task not found", "status": "not_found"}

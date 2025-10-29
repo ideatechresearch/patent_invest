@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <title>用户注册</title>
+  <style>
+    body {
+      font-family: "Segoe UI", "PingFang SC", sans-serif;
+      background: #f4f6f8;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+
+    h2 {
+      color: #2c3e50;
+    }
+
+    form {
+      background: white;
+      padding: 2rem;
+      border-radius: 12px;
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+      width: 350px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 0.5rem;
+      color: #333;
+      font-size: 0.9rem;
+    }
+
+    input {
+      width: 100%;
+      padding: 0.5rem;
+      margin-bottom: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 1rem;
+    }
+
+    button {
+      padding: 0.6rem;
+      background: #3498db;
+      border: none;
+      color: white;
+      border-radius: 6px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      display: block;
+      margin: 0 auto;
+    }
+
+    button:hover {
+      background: #005fa3;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .row input {
+      margin-bottom: 0;
+    }
+
+    .small-btn {
+      flex: 0 0 auto;
+      background: #1abc9c;
+      white-space: nowrap;
+    }
+
+    .small-btn:hover {
+      background: #2980b9;
+    }
+
+    .status {
+      margin-top: 10px;
+      text-align: center;
+      font-size: 0.9rem;
+    }
+
+    .link {
+      margin-top: 12px;
+      text-align: center;
+      font-size: 0.9rem;
+    }
+
+    .link a {
+      color: #3498db;
+      text-decoration: none;
+    }
+
+    .link a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>注册新用户</h2>
+
+  <form id="registerForm">
+    <label>用户名</label>
+    <input name="username" type="text" placeholder="请输入用户名" required />
+
+    <label>密码</label>
+    <input name="password" type="password" placeholder="请输入密码（如使用公钥注册可留空）" />
+
+    <label>验证码</label>
+    <div class="row">
+      <input name="code" type="text" placeholder="6位验证码" />
+      <button type="button" id="sendCodeBtn" class="small-btn">发送</button>
+    </div>
+
+    <label>公钥</label>
+    <input name="public_key" type="text" placeholder="0xABCDEF...（可选）" />
+
+    <label>以太坊地址</label>
+    <input name="eth_address" type="text" placeholder="0x123456...（可选）" />
+
+    <button type="submit">注册</button>
+    <div class="status" id="status"></div>
+  </form>
+
+  <div class="link">
+    已有账号？<a href="/login">登录</a>
+  </div>
+
+  <script>
+    const form = document.getElementById('registerForm');
+    const sendCodeBtn = document.getElementById('sendCodeBtn');
+    const statusEl = document.getElementById('status');
+
+    function setStatus(msg, color = 'black') {
+      statusEl.textContent = msg;
+      statusEl.style.color = color;
+    }
+
+    // 发送验证码
+    sendCodeBtn.addEventListener('click', async () => {
+      const username = form.username.value.trim();
+      if (!username) {
+        setStatus('请先输入用户名', 'red');
+        return;
+      }
+
+      sendCodeBtn.disabled = true;
+      sendCodeBtn.textContent = '发送中...';
+      try {
+        const res = await fetch(`/send_wechat_code?username=${encodeURIComponent(username)}`);
+        const data = await res.json();
+        if (data.status === 'success') {
+          setStatus('验证码已发送，请查阅微信', 'green');
+        } else {
+          setStatus(`验证码发送失败：${data.detail || JSON.stringify(data)}`, 'red');
+        }
+      } catch (e) {
+        setStatus('网络错误，稍后再试', 'red');
+      } finally {
+        sendCodeBtn.disabled = false;
+        sendCodeBtn.textContent = '发送验证码';
+      }
+    });
+
+    // 提交注册
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(form);
+      const payload = Object.fromEntries(fd.entries());
+
+      try {
+        const resp = await fetch('/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await resp.json();
+        if (data.status === 'success') {
+          setStatus('✅ 注册成功！请前往登录页登录。', 'green');
+          setTimeout(() => (window.location.href = '/login'), 1200);
+        } else {
+          setStatus(`❌ 注册失败：${data.detail || JSON.stringify(data)}`, 'red');
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus('网络错误，请稍后再试', 'red');
+      }
+    });
+  </script>
+</body>
+
+</html>

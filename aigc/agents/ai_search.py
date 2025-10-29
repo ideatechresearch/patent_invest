@@ -5,9 +5,10 @@ import uuid, base64
 from typing import List, Dict, Literal
 
 from utils import convert_to_pinyin
-from config import Config, md5_sign, get_baidu_access_token, get_xfyun_authorization, get_tencent_signature
-from service import get_httpx_client, async_error_logger
 
+from secure import md5_sign, get_baidu_access_token, get_xfyun_authorization, get_tencent_signature
+from service import get_httpx_client, async_error_logger
+from config import Config
 
 # if os.getenv('AIGC_DEBUG', '0').lower() in ('1', 'true', 'yes'):
 # Config.load('../config.yaml')
@@ -1092,7 +1093,7 @@ def caiyun_translate(source, direction="auto2zh"):
 
 __all__ = ['arxiv_search', 'web_search_intent', 'baidu_search', 'baidu_translate', 'bing_search', 'brave_search',
            'caiyun_translate', 'duckduckgo_search', 'exa_retrieved', 'exa_search', 'firecrawl_scrape',
-           'firecrawl_search','get_amap_location', 'get_bmap_location', 'get_httpx_client', 'get_weather', 'is_city',
+           'firecrawl_search', 'get_amap_location', 'get_bmap_location', 'get_httpx_client', 'get_weather', 'is_city',
            'search_amap_location', 'search_bmap_location', 'search_by_api', 'segment_with_jina', 'serper_search',
            'tencent_translate', 'tokenize_with_zhipu', 'web_extract_exa', 'web_extract_firecrawl',
            'web_extract_jina', 'web_extract_tavily', 'web_search_async', 'web_search_jina', 'web_search_tavily',

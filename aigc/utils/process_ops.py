@@ -159,15 +159,15 @@ def configure_event_loop():
             print("🚀 uvloop activated")
         except ImportError:
             print("⚠️ uvloop not available, using default event loop")
-    # else:
-    #     # 启用IOCP
-    #     if sys.platform.startswith('win'):
-    #         if sys.version_info >= (3, 8):
-    #             # Python 3.8+ 使用更高效的 Proactor
-    #             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    #         else:
-    #             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # 使用 Selector
-    #     print("🖥️ Windows detected, using optimized event loop policy")
+    else:
+        # 启用IOCP
+        if sys.platform.startswith('win'):
+            if sys.version_info >= (3, 8):
+                # Python 3.8+ 使用更高效的 Proactor
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            else:
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # 使用 Selector
+        print("🖥️ Windows detected, using optimized event loop policy")
 
 
 def kill_process_tree(pid: int):
@@ -497,6 +497,38 @@ def run_by_threads(max_concurrency: int = 10, repeat: int = 1):
     return decorator
 
 
+def class_property(attr_name: str):
+    """
+    缓存装饰器，支持首次调用生成值并缓存到类属性。
+    自定义缓存属性名，适合无参或固定参数的懒加载。
+    用于类级懒加载（lazy load）型类属性。仅检查当前类。
+    :param attr_name: 缓存属性名
+    @class_property("cached_value")
+    """
+
+    def decorator(func) -> classmethod:
+        def wrapper(cls, *args):
+            if not hasattr(cls, attr_name):
+                print(f"{attr_name} -> {cls.__name__}.{func.__name__}")
+                setattr(cls, attr_name, func(cls, *args))
+            return getattr(cls, attr_name)
+
+        return classmethod(wrapper)
+
+    return decorator
+
+
+def chainable_method(func):
+    """装饰器，使方法支持链式调用"""
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        func(self, *args, **kwargs)
+        return self
+
+    return wrapper
+
+
 _StringLikeT = Union[bytes, str, memoryview]
 
 
@@ -661,6 +693,157 @@ def extract_function_metadata(func) -> dict:
     return metadata
 
 
+class ClassMethodRegistry:
+    """类方法注册表 - 使用类变量"""
+    _registry: dict[str, dict] = {}
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @classmethod
+    def register_class(cls, target_class, exclude: list[str] = None):
+        """注册一个类及其所有类方法"""
+        if exclude is None:
+            exclude = []
+
+        class_name = target_class.__name__
+        class_info = {
+            "class": target_class,
+            "doc": target_class.__doc__,
+            "methods": {}
+        }
+
+        # 收集所有类方法
+        for name in dir(target_class):
+            if name.startswith('_') or name in exclude:
+                continue
+            attr = getattr(target_class, name)  #
+            if callable(attr):
+                func = attr.__func__ if isinstance(attr, classmethod) else attr
+                sig = inspect.signature(attr)
+                class_info["methods"][name] = {
+                    "function": func,
+                    "doc": func.__doc__,
+                    "signature": sig,
+                    "type": cls.determine_method_type(sig, attr, target_class.__dict__.get(name, None))
+                }
+
+        cls._registry[class_name] = class_info
+        # print(f"Registered {class_name} with methods: {list(cls._registry[class_name]['methods'].keys())}")
+        return target_class
+
+    @classmethod
+    def call_method(cls, class_name: str, method_name: str, *args, **kwargs):
+        """调用注册的类方法"""
+        if class_name not in cls._registry:
+            raise ValueError(f"Class '{class_name}' not registered")
+
+        class_info = cls._registry[class_name]
+        if method_name not in class_info["methods"]:
+            raise ValueError(
+                f"Method '{method_name}' not found in class '{class_name}'. Available: {list(class_info['methods'].keys())}")
+
+        method_info = class_info["methods"][method_name]
+        func = getattr(class_info["class"], method_name, method_info["function"])
+        try:
+            if method_info.get("type") == "instance":
+                instance = class_info["class"]()  # 对于实例方法，创建实例后调用
+                return func(instance, *args, **kwargs)
+            return func(*args, **kwargs)  # 对于类方法和静态方法，直接调用
+        except TypeError as e:
+            raise TypeError(f"参数不匹配: {e}")
+
+    @classmethod
+    def list_classes(cls) -> dict[str, Any] | None:
+        """列出所有注册的类"""
+        return {
+            name: {
+                "doc": info["doc"],
+                "methods": list(info["methods"].keys())
+            }
+            for name, info in cls._registry.items()
+        }
+
+    @classmethod
+    def get_class_info(cls, class_name: str) -> dict[str, Any] | None:
+        """获取类的详细信息"""
+        if class_name not in cls._registry:
+            raise ValueError(f"Class '{class_name}' not registered")
+
+        info = cls._registry[class_name]
+        method_details = {}
+
+        for method_name, method_info in info["methods"].items():
+            method_details[method_name] = {
+                "doc": method_info["doc"],
+                "type": method_info.get("type", cls.determine_method_type(method_info["signature"],
+                                                                          method_info["function"])),
+                "parameters": cls.get_parameters_info(method_info["signature"]),
+            }
+
+        return {
+            "class": class_name,
+            "doc": info["doc"],
+            "methods": method_details
+        }
+
+    @staticmethod
+    def get_parameters_info(signature) -> dict[str, Any]:
+        """获取参数信息"""
+        params = {}
+        for param_name, param in signature.parameters.items():
+            if param_name in ['cls', 'self']:  # 跳过cls,self参数
+                continue
+            params[param_name] = {
+                "kind": str(param.kind),
+                "default": param.default if param.default != param.empty else None,
+                "annotation": str(param.annotation) if param.annotation != param.empty else "any"
+            }
+        return params
+
+    @staticmethod
+    def determine_method_type(signature, method_obj=None, raw_obj=None) -> str:
+        """确定方法的类型"""
+        # 优先从类定义本身（未绑定）中取
+        if isinstance(raw_obj, classmethod):
+            return "classmethod"
+        if isinstance(raw_obj, staticmethod):
+            return "staticmethod"
+
+        params = list(signature.parameters.values())
+        # 如果有参数，检查第一个参数名
+        if params:
+            first_param = params[0].name
+            if first_param == 'cls':
+                return "classmethod"
+            elif first_param == 'self':
+                return "instance"
+
+        # 判断绑定对象（适用于 bound method）
+        if method_obj is not None and hasattr(method_obj, "__self__"):
+            bound_self = getattr(method_obj, "__self__")
+            if isinstance(bound_self, type):
+                return "classmethod"
+            elif bound_self is not None:
+                return "instance"
+
+        # 默认认为是类方法（对于使用自定义@class_property装饰器的方法）
+        return "classmethod"
+
+    @classmethod
+    def clear_registry(cls):
+        """清空注册表（主要用于测试）"""
+        cls._registry.clear()
+
+
+def register_class(cls, exclude: list[str] = None):
+    """装饰器，用于自动注册类"""
+    return ClassMethodRegistry.register_class(cls, exclude)
+
+
 def get_module_functions(module_name: str = None):
     module = importlib.import_module(module_name) if module_name else inspect.getmodule(inspect.currentframe())
     module_name = module.__name__
@@ -691,6 +874,28 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str | 
         return function_registry_dynamic(functions_list, module_name)
     return functions_registry_safe(functions_list, module_name)
     # get_function_parameters
+
+
+def function_registry_dynamic(functions_list: list, module_names: list):
+    """
+    动态加载模块并注册函数
+    :param functions_list: 需要注册的函数名列表
+    :param module_names: 模块名称列表（字符串形式）
+    :return: 函数注册表
+    """
+    registry = {}
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)  # 动态加载模块
+            for name in functions_list:
+                if name in registry:  # 避免重复覆盖，只注册第一个找到的
+                    continue
+                func = getattr(module, name, None)
+                if func is not None and callable(func):
+                    registry[name] = func
+        except ModuleNotFoundError:
+            print(f"Module '{module_name}' not found.")
+    return registry
 
 
 def functions_registry_safe(functions_list: list, module_name: str = None) -> dict:
@@ -731,28 +936,6 @@ def functions_registry_safe(functions_list: list, module_name: str = None) -> di
             registry[name] = None
             print(f"[⚠️] 加载函数失败: {name} → {type(e).__name__}: {e}")
 
-    return registry
-
-
-def function_registry_dynamic(functions_list: list, module_names: list):
-    """
-    动态加载模块并注册函数
-    :param functions_list: 需要注册的函数名列表
-    :param module_names: 模块名称列表（字符串形式）
-    :return: 函数注册表
-    """
-    registry = {}
-    for module_name in module_names:
-        try:
-            module = importlib.import_module(module_name)  # 动态加载模块
-            for name in functions_list:
-                if name in registry:  # 避免重复覆盖，只注册第一个找到的
-                    continue
-                func = getattr(module, name, None)
-                if func is not None and callable(func):
-                    registry[name] = func
-        except ModuleNotFoundError:
-            print(f"Module '{module_name}' not found.")
     return registry
 
 
@@ -1065,19 +1248,16 @@ def is_port_open(host, port):
 
 
 def get_worker_identity():
-    """获取当前 Worker 的唯一标识"""
-    #  使用进程 ID + 主机名 + 启动时间
+    """获取当前 Worker 的唯一标识,使用进程 ID + 主机名 + 启动时间"""
+    worker_id = os.environ.get("GUNICORN_WORKER_ID", None)  # 使用 Gunicorn 环境变量（如果使用 Gunicorn）
+    if worker_id is not None:
+        return worker_id
     pid = os.getpid()
     hostname = socket.gethostname()
     # start_time = os.times().elapsed  # 进程启动后的时间
     worker_info = f"{pid}-{hostname}"
-
-    worker_id = os.environ.get("GUNICORN_WORKER_ID", None)  # 使用 Gunicorn 环境变量（如果使用 Gunicorn）
-    if worker_id is not None:
-        # is_main_worker = worker_id == "0"
-        return worker_id, worker_info
-    unique_id = hashlib.sha256(worker_info.encode()).hexdigest()[:16]  # 使用唯一哈希标识
-    return f"worker-{unique_id}", worker_info
+    # unique_id = hashlib.sha256(worker_info.encode()).hexdigest()[:16]  # 使用唯一哈希标识
+    return f"worker-{worker_info}"
 
 
 def memory_monitor(threshold_percent: float = 60, desc: bool = False):
@@ -1187,6 +1367,21 @@ def load_datasets(path):
         for line_num, line in enumerate(f, 1):
             samples.append(json.loads(line.strip()))
     return samples
+
+
+async def save_markdown(content: str, filename: str, folder="data/output"):
+    """异步保存单个Markdown文件"""
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    if not filename.endswith('.md'):
+        filename += '.md'
+
+    filepath = os.path.join(folder, filename)
+    async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+        await f.write(content)
+
+    return filepath
 
 
 def pickle_serialize(obj):

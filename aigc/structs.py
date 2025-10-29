@@ -70,6 +70,15 @@ def dataclass2dict(data):
     通用的递归转换函数，支持 dataclass、BaseModel、Enum、datetime、列表、字典等嵌套结构。serialize
     """
 
+    def convert_key(key):
+        if isinstance(key, (str, int, float, bool, type(None))):
+            return key
+        if isinstance(key, (set, frozenset)):
+            return f"{{{','.join(map(str, sorted(key)))}}}"
+        elif isinstance(key, tuple):
+            return f"({','.join(map(str, key))})"
+        return str(key)
+
     def convert(obj):
         if isinstance(obj, (str, int, float, bool)):
             return obj
@@ -82,7 +91,7 @@ def dataclass2dict(data):
         elif is_dataclass(obj):
             return {k: convert(getattr(obj, k)) for k in obj.__dataclass_fields__}  # asdict(obj)
         elif isinstance(obj, dict):
-            return {k: convert(v) for k, v in obj.items()}
+            return {convert_key(k): convert(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple, set, frozenset)):
             return [convert(v) for v in obj]  # list(obj)
         elif isinstance(obj, IsCallable):  # 用于运行时判断
@@ -353,11 +362,14 @@ class OpenAIRequestMessage(BaseModel):
                 "top_p": 1,
                 "max_tokens": 1024,
                 "stream": False,
-                "extra_body": {"enable_thinking": False, "thinking": {"type": "disabled"}},
+                "extra_body": {"enable_thinking": False},
                 "tools": [{
                     "type": "baidu_search",
                     "baidu_search": {'query': '大象像什么'}
-                }]
+                }],
+                "thinking": {
+                    "type": "disabled"
+                }
             }
         }
 
@@ -381,6 +393,16 @@ class OpenAIRequestMessage(BaseModel):
         if not values:
             return []
         return [t for t in values if isinstance(t, dict) and t]
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_extra_value(cls, values):
+        thinking = values.pop("thinking", None)
+        if thinking is not None:
+            extra_body = values.get("extra_body", {})
+            extra_body["thinking"] = thinking
+            values["extra_body"] = extra_body
+        return values
 
     def payload(self):
         return self.model_dump(exclude_unset=True, exclude={'messages', 'model', 'stream', 'user'})
@@ -484,6 +506,8 @@ class AuthRequest(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     public_key: Optional[str] = None
+
+    phone: Optional[str] = None
     code: Optional[str] = None
 
     class Config:
@@ -495,9 +519,20 @@ class AuthRequest(BaseModel):
                 "eth_address": None,
                 "signed_message": None,
                 "original_message": None,
+                "phone": None,
                 "code": None,  # "NUM"
             }
         }
+
+    @model_validator(mode="before")
+    @classmethod
+    def clean(cls, values):
+        for k in ("eth_address", "public_key"):
+            v = values.get(k)
+            if isinstance(v, str):
+                v = v.strip()
+            values[k] = v or None
+        return values
 
 
 class Registration(AuthRequest):
@@ -508,13 +543,13 @@ class Registration(AuthRequest):
         json_schema_extra = {
             "example": {
                 "username": "test",
-                "password": "secure_password",
+                "password": "123456",
                 "role": "user",
                 "group": '0',
                 "public_key": "0x123456789ABCDEF",
                 "eth_address": "0x123456789ABCDEF",
-                "signed_message": "signed_message_here",
-                "original_message": "original_message_here",
+                "signed_message": None,
+                "original_message": None,
                 "code": '123456',  # "NUM"
             }
         }
@@ -522,7 +557,9 @@ class Registration(AuthRequest):
 
 class Token(BaseModel):
     access_token: str
-    token_type: str
+    token_type: str = "bearer"
+    refresh_token: Optional[str] = None
+    expires_in: Optional[int] = None  # sec
 
 
 class TokenData(BaseModel):
@@ -626,12 +663,12 @@ class ToolRequest(BaseModel):
             }
         }
 
-        @field_validator("tools")
-        @classmethod
-        def clean_tools(cls, values):
-            if not values:
-                return []
-            return [t for t in values if isinstance(t, dict) and t]
+    @field_validator("tools")
+    @classmethod
+    def clean_tools(cls, values):
+        if not values:
+            return []
+        return [t for t in values if isinstance(t, dict) and t]
 
 
 class AssistantToolsEnum(str, Enum):
@@ -653,9 +690,17 @@ class AssistantRequest(BaseModel):
 
 class FunctionCallItem(BaseModel):
     function: Optional[str] = None
-    args: Optional[List[Any]] = None
+    args: Optional[List[Any]] = Field(None)
     kwargs: Optional[Dict[str, Any]] = None
     env: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_default_value(cls, values):
+        values["args"] = values.get("args", [])
+        values["kwargs"] = values.get("kwargs", {})
+        values["env"] = values.get("env", {})
+        return values
 
 
 class CallbackUrl(BaseModel):
@@ -874,10 +919,10 @@ class CompletionParams(BaseModel):
 
 
 class SubmitMessagesRequest(BaseModel):
-    request_id: Optional[str] = None
     name: Optional[str] = None
     user: Optional[str] = None
     robot_id: Optional[str] = None
+    request_id: Optional[str] = None
     use_hist: bool = Field(default=False, description="Use historical messages.")
     filter_limit: Optional[int] = Field(-500,
                                         description="The limit count(<0) or max len(>0) to filter historical messages.")

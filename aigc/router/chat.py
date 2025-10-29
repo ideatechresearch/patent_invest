@@ -1,5 +1,4 @@
 from router.base import *
-import uuid
 
 chat_router = APIRouter()
 
@@ -53,17 +52,10 @@ AGENTS_NAME = [
 
 @chat_router.get('/message', response_class=HTMLResponse)
 async def message_page(request: Request):
-    # username: str = Depends(verify_access_token)
-
-    session_user = request.session.get('username', '')
-    if not session_user:
-        session_user = str(uuid.uuid4())
-        request.session['username'] = session_user
-
+    session_uid = request.session.get('user_id','')
     context = {
         "request": request,
-        # "username": user_name,
-        "uid": session_user,
+        "user_id": session_uid,  # 后端至少提供一个匿名ID
         "agents": AGENTS_NAME,
     }
     return templates.TemplateResponse("message.html", context)
@@ -72,12 +64,9 @@ async def message_page(request: Request):
 @chat_router.get('/ichat', response_class=HTMLResponse)
 async def send_chat(request: Request):
     # username: str = Depends(verify_access_token)
+    # username = get_access_user(request)
 
-    session_user = request.session.get('username', '')
-    if not session_user:
-        session_user = str(uuid.uuid4())
-        request.session['username'] = session_user
-
+    session_user = request.session.get('user_id', '')
     # user_name = username or session_user
     # user = User.get_user(db, username=username, user_id=username)
     context = {
@@ -89,6 +78,6 @@ async def send_chat(request: Request):
     # if user and not user.disabled:
     #     context["username"] = user_name
     # else:
-    #     context["uuid"] = session_user
+    #     context["uid"] = session_user
 
     return templates.TemplateResponse("message_bak.html", context)

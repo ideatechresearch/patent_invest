@@ -1,4 +1,4 @@
-from script.rime.allele import *
+from rime.allele import *
 import uuid
 import random
 from typing import List, Optional, Tuple
@@ -11,7 +11,7 @@ class Human:
 
     def __init__(self,
                  generation: int = 0,
-                 parents: Optional[Tuple['Human', 'Human']] = None,
+                 parents: Optional[tuple['Human', 'Human']] = None,
                  gender: Optional[str] = None,
                  blood_type: Optional[BloodType] = None):
         """
@@ -23,11 +23,13 @@ class Human:
         self.id = self._generate_id()
         self.generation = generation
         self.parents = parents
-        self.gender = gender if gender else random.choice(['male', 'female'])
-        self.blood_type = blood_type if blood_type else self._random_blood_type()
+        self.children: list['Human'] = []  # 子代对象列表
 
-        self.members = {}  # {id: {'pheno':str, 'parents':[id1,id2], ...}}
-        self.children = []  # 子代对象列表
+        self.gender = gender if gender else random.choice(['male', 'female'])
+        self.blood_type = blood_type if blood_type else BloodType()
+        self.possible_types = {self.blood_type.phenotype} if blood_type else set(Allele.phenotypes())
+
+        self.members: dict[str, dict] = {}  # {id: {'pheno':str, 'parents':[id1,id2], ...}}# 存储待解决的家族树问题
         self._register()
 
     def _register(self):
@@ -45,18 +47,73 @@ class Human:
         """通过ID获取人类实例"""
         return cls._registry.get(human_id)
 
-    @staticmethod
-    def _random_blood_type() -> Allele:
-        """随机生成ABO血型（简化版）"""
-        alleles = random.choice([
-            ('A', 'A'), ('A', 'O'),
-            ('B', 'B'), ('B', 'O'),
-            ('A', 'B'), ('O', 'O')
-        ])
-        return Allele(alleles)
+    def add_parent(self, parent: 'Human'):
+        if not self.parents:
+            self.parents = (parent,)
+        elif parent not in self.parents:
+            self.parents = self.parents + (parent,)
+        if self not in parent.children:
+            parent.children.append(self)
 
-    def familytree(self, member_id, pheno, parents=None):
+    def familytree(self, member_id: str, pheno: str, parents=None):
         self.members[member_id] = {'pheno': pheno, 'parents': parents or []}
+
+    @staticmethod
+    def generate_familytree(family_size: int) -> dict:
+        """生成随机家族树（简化实现）"""
+        # 实际实现需要更复杂的家族树生成逻辑
+        # 这里返回一个简化的结构
+        tree = {}
+        phenotypes = Allele.phenotypes()
+        for i in range(family_size):
+            # 随机生成血型
+            blood_type = random.choice(phenotypes)
+            tree[i] = {
+                'blood_type': blood_type,
+                'parents': [] if i < 2 else [i - 2, i - 1],  # 简化的父母关系
+                'children': [] if i >= family_size - 2 else [i + 1, i + 2]  # 简化的子女关系
+            }
+        return tree
+
+    @staticmethod
+    def select_revealed_nodes(family_tree: dict, ratio: float) -> dict:
+        """选择要披露的血型节点"""
+        revealed = {}
+        node_count = len(family_tree)
+        reveal_count = max(1, int(node_count * ratio))
+
+        # 优先选择叶子节点（最年轻一代）
+        leaf_nodes = [i for i in family_tree if not family_tree[i]['children']]
+        random.shuffle(leaf_nodes)
+
+        for i in range(min(reveal_count, len(leaf_nodes))):
+            node_id = leaf_nodes[i]
+            revealed[node_id] = family_tree[node_id]['blood_type']
+
+        return revealed
+
+    @staticmethod
+    def get_blood_type_constraints(person: 'Human') -> set[str]:
+        """根据遗传规则获取可能的血型"""
+        if person.blood_type is not None:
+            return {person.blood_type.phenotype}
+
+        # 如果没有父母信息，返回所有可能血型
+        if not person.parents:
+            return set(Allele.phenotypes())
+
+        # 根据父母血型推断可能血型
+        possible_types = set()
+
+        # 获取父母所有可能的血型组合
+        parent1, parent2 = person.parents
+        for p1_type in parent1.possible_types:
+            for p2_type in parent2.possible_types:
+                # 根据父母血型组合计算子女可能血型
+                child_possible = Allele.get_child_probability(p1_type, p2_type)
+                possible_types.update(child_possible.keys())
+
+        return possible_types
 
     def reproduce(self, partner: 'Human', num_children: int = 1) -> List['Human']:
         """与配偶繁殖后代"""
@@ -66,16 +123,14 @@ class Human:
         children = []
         for _ in range(num_children):
             # 从父母处各随机获取一个等位基因
-            gamete_self = random.choice(self.blood_type.get_gametes())
-            gamete_partner = random.choice(partner.blood_type.get_gametes())
-            child_alleles = tuple(sorted([gamete_self, gamete_partner]))
+            child_alleles = BloodType.child_alleles(self.blood_type, partner.blood_type)
 
             # 创建子代对象
             child = Human(
                 generation=max(self.generation, partner.generation) + 1,
                 parents=(self, partner),
                 gender=random.choice(['male', 'female']),
-                blood_type=BloodType(child_alleles)
+                blood_type=BloodType(alleles=child_alleles)
             )
             self.children.append(child)
             partner.children.append(child)
@@ -240,10 +295,11 @@ def evolve(population, archive):
 
     return new_pop, archive
 
+
 def print_debug(population, generation):
     print(f"\n=== Generation {generation} ===")
     print("Behaviors:", [ind.behavior for ind in population[:3]])
-    print("Novelties:", [round(ind.novelty,2) for ind in population[:3]])
+    print("Novelties:", [round(ind.novelty, 2) for ind in population[:3]])
     print("Archive samples:", list(archive)[-3:])
 
 
@@ -286,13 +342,11 @@ class NoveltySearch:
             print(f'Generation {gen + 1}, Avg Novelty: {np.mean(novelties):.4f}, Archive Size: {len(self.archive)}')
 
 
-
 if __name__ == "__main__":
     # 初始化
     # ns = NoveltySearch()
     # archive = ns.evolve(generations=50)
-
-
+    from collections import deque
     population = [Individual() for _ in range(POPULATION_SIZE)]
     archive = deque(maxlen=ARCHIVE_SIZE)
     # 进化循环

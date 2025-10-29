@@ -1,7 +1,8 @@
 import httpx, aiohttp, aiofiles, requests
 import asyncio
 import logging
-import json, uuid, os, time
+import json, os, time, uuid
+
 from typing import Callable, Optional, Type, Dict, List, Tuple, Any, Union, Awaitable, AsyncIterator, AsyncGenerator, \
     Coroutine
 
@@ -10,7 +11,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 # from starlette.routing import Route, Mount
 from logging.handlers import RotatingFileHandler
-from utils import async_to_sync, generate_hash_key, parse_database_uri, is_port_open, chunks_iterable, get_file_type_wx
+from utils import async_to_sync, generate_hash_key, parse_database_uri, is_port_open, chunks_iterable, get_file_type_wx, \
+    records_to_list
 from config import Config, AI_Models, model_api_keys
 
 # Config.load('config.yaml')
@@ -739,14 +741,17 @@ class BaseMysql:
         return str(value)  # 其他类型保持原样 (None等)
 
     @staticmethod
-    def build_insert(table_name: str, params_data: dict, update_fields: list[str] | None = None) -> tuple[str, tuple]:
+    def build_insert(table_name: str, params_data: dict, update_fields: list[str] | None = None,
+                     explode: bool = False, with_new: bool = True) -> tuple[str, tuple | list]:
         """
         生成插入 SQL（可选 ON DUPLICATE KEY UPDATE）
 
         Args:
             table_name: 表名
-            params_data: 数据字典
+            params_data: 数据字典 {"col1":[v1,v2], "col2":[v3,v4], ...} .to_dict(orient="list")
             update_fields: 冲突时更新的字段，None 表示默认更新非主键字段
+            explode: True -> [(v1,v3), (v2,v4)] 每行 tuple,把字典的每列拆开, False -> ([v1,v2], [v3,v4])
+            with_new
 
         Returns:
             tuple: (sql, values)
@@ -755,28 +760,77 @@ class BaseMysql:
             raise ValueError("params_data 不能为空")
 
         fields = list(params_data.keys())
-        values = tuple(params_data.values())  # [tuple(row[f] for f in fields) for row in params_data]
+        values = list(zip(*params_data.values())) if explode else tuple(params_data.values())
+        # [tuple(row[f] for f in fields) for row in params_data]
         field_str = ', '.join(f"`{field}`" for field in fields)  # columns_str
         placeholder_str = ', '.join(['%s'] * len(fields))
         sql = f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str})"
 
         if update_fields is None:
-            update_fields = [f for f in fields if f.lower() not in ("id", "created_at", "created_time")]
+            update_fields = [f for f in fields if f.lower() not in ("id", "batch_no", "created_at", "created_time")]
 
         if update_fields:
-            sql += " AS new"
-            update_str = ', '.join(f"`{field}` = new.`{field}`" for field in update_fields)
-            if "updated_at" in fields and "updated_at" not in update_fields:
+            if with_new:
+                sql += " AS new"
+                update_list = [f"`{field}` = new.`{field}`" for field in update_fields if field != "updated_at"]
+            else:
+                update_list = [f"`{field}` = VALUES(`{field}`)" for field in update_fields if field != "updated_at"]
+            update_str = ', '.join(update_list)
+            if "updated_at" not in fields and "updated_at" in update_fields:
                 update_str += ", `updated_at` = CURRENT_TIMESTAMP"
             sql += f" ON DUPLICATE KEY UPDATE {update_str}"
 
         return sql, values
 
     @staticmethod
-    def get_dataframe(db_config: dict, sql: str, params: tuple | dict = None):
+    def build_insert_dataframe(table_name: str, df, update_fields: list[str] | None = None,
+                               with_new: bool = True) -> tuple[str, tuple | list]:
+        import numpy as np
         import pandas as pd
-        # with create_engine(SQLALCHEMY_DATABASE_URI).connect() as conn:
-        conn = pymysql.connect(**db_config)
+        df = df.replace({np.nan: None})  # df.where(pd.notnull(df), None)
+        for col in ['created_at', 'updated_at', 'completed_at']:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: x.to_pydatetime() if pd.notnull(x) else None)
+        params_data = df.to_dict(orient="list")  # 转 dict {列名: [值, 值, 值]} df.values.tolist()
+        sql, values = BaseMysql.build_insert(table_name, params_data=params_data, update_fields=update_fields,
+                                             explode=True, with_new=with_new)
+        return sql, values
+
+    @staticmethod
+    def write(db_config: dict, sql: str, params: tuple | dict | list = None, conn=None) -> bool:
+        """
+        通用 SQL 执行器
+        """
+        should_release = False
+        if not conn:
+            conn = pymysql.connect(**db_config)
+            should_release = True
+        try:
+            with conn.cursor() as cursor:
+                if isinstance(params, list) and params:
+                    cursor.executemany(sql, params)  # 批量执行
+                else:
+                    cursor.execute(sql, params or ())  # 单条执行
+            conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"[SQL Write ERROR]: {e},{sql}")
+            return False
+        finally:
+            if should_release:
+                conn.close()
+
+    @staticmethod
+    def read(db_config: dict, sql: str, params: tuple | dict | str = None, conn=None):
+        import pandas as pd
+        if isinstance(params, str):
+            params = (params,)
+        should_release = False
+        if not conn:
+            conn = pymysql.connect(**db_config)
+            should_release = True
         try:
             with conn.cursor() as cursor:
                 cursor.execute(sql, params or ())
@@ -784,9 +838,13 @@ class BaseMysql:
                 cols = [desc[0] for desc in cursor.description]
                 return pd.DataFrame(rows, columns=cols)
         except Exception as e:
-            return pd.read_sql(sql, conn, params=params)
+            print(f"[SQL Read ERROR]: {e},{sql}")
+            # with create_engine(SQLALCHEMY_DATABASE_URI).connect() as conn:
+            # with engine.connect() as conn:
+            #     return pd.read_sql(sql, conn, params=params)
         finally:
-            conn.close()
+            if should_release:
+                conn.close()
 
     @staticmethod
     def query_dataframe_process(conn, sql: str, process_chunk: Callable = None, params: tuple | dict = None,
@@ -930,18 +988,6 @@ class SyncMysql(BaseMysql):
         result = self.cur.fetchall()
         return result
 
-    def execute(self, sql: str, params: tuple | dict | list = None):
-        # INSERT,UPDATE,DELETE
-        try:
-            if isinstance(params, list):
-                self.cur.executemany(sql, params)  # 批量执行
-            else:
-                self.cur.execute(sql, params or ())  # 单条执行
-            self.conn.commit()
-        except Exception as e:
-            self.conn.rollback()
-            print(f"执行 SQL 出错: {e}")
-
     def insert(self, sql: str = None, params: tuple | dict = None, table_name: str = None):
         # 单条 INSERT 语句，且目标表有 AUTO_INCREMENT 字段
         if isinstance(params, dict) and table_name:
@@ -1011,13 +1057,16 @@ class SyncMysql(BaseMysql):
 
 class AsyncMysql(BaseMysql):
     def __init__(self, *args, **kwargs):
+        self.minsize = int(kwargs.pop("minsize", 1))
+        self.maxsize = int(kwargs.pop("maxsize", 3))
+        self.autocommit = bool(kwargs.pop("autocommit", True))
         super().__init__(*args, **kwargs)
         self.pool: Optional[aiomysql.Pool] = None
-        self.conn = None  # used only when temporarily acquiring
+        self.conn: Optional[aiomysql.Connection] = None  # used only when temporarily acquiring
 
     async def __aenter__(self):
         if self.pool is None:
-            await self.init_pool()
+            await self.init_pool(self.minsize, self.maxsize, self.autocommit)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -1025,7 +1074,10 @@ class AsyncMysql(BaseMysql):
 
     async def init_pool(self, minsize: int = 1, maxsize: int = 30, autocommit: bool = True):
         if self.pool is not None:
-            return
+            if self.minsize == minsize and self.maxsize == maxsize and self.autocommit == autocommit:
+                return self.pool
+            else:
+                await self.close_pool()
         try:
             self.pool = await aiomysql.create_pool(
                 host=self.host,
@@ -1038,28 +1090,72 @@ class AsyncMysql(BaseMysql):
                 minsize=minsize,
                 maxsize=maxsize
             )
+            self.minsize, self.maxsize, self.autocommit = minsize, maxsize, autocommit
         except Exception as e:
             print(f"[Async] 创建连接池失败: {e}")
             self.pool = None
+        return self.pool
 
     async def close_pool(self):
+        """关闭连接池和单连接"""
         if self.pool is not None:
             self.pool.close()
             await self.pool.wait_closed()
             self.pool = None
+        if self.conn is not None:
+            await self.conn.ensure_closed()
+            self.conn = None
 
-    async def get_conn(self):
-        if self.pool is None:
-            await self.init_pool()
-        return await self.pool.acquire()
+    async def get_conn(self, init: bool = False) -> aiomysql.Connection:
+        if self.pool is None and init:
+            await self.init_pool(self.minsize, self.maxsize, self.autocommit)  # 初始化连接池
+        if self.pool:
+            return await self.pool.acquire()
+        if self.conn is None or self.conn.closed:
+            self.conn = await aiomysql.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password,
+                db=self.db_name,
+                charset=self.charset,
+                autocommit=self.autocommit
+            )
+        return self.conn  # 返回单连接
 
     def release(self, conn):
+        if not conn:
+            return
+
         if self.pool is not None:
+            self.pool.release(conn)
+        else:
+            conn.close()
+            if conn == self.conn:
+                self.conn = None
+
+    @asynccontextmanager
+    async def get_conn_ctx(self) -> AsyncIterator[aiomysql.Connection]:
+        if self.pool is None:
+            await self.init_pool(self.minsize, self.maxsize, self.autocommit)
+        conn = await self.pool.acquire()
+        try:
+            if not self.autocommit:
+                await conn.begin()
+            yield conn
+            if not self.autocommit:
+                await conn.commit()
+        except Exception:
+            if not self.autocommit:
+                await conn.rollback()
+            raise
+        finally:
             self.pool.release(conn)
 
     @asynccontextmanager
     async def get_cursor(self, conn=None) -> AsyncIterator[aiomysql.Cursor]:
-        """获取游标（支持自动释放）
+        """
+        获取游标（支持自动释放）自动管理连接
         释放 await cursor.close()
         Args:
             conn: 外部传入的连接对象。如果为None，则自动创建新连接
@@ -1075,12 +1171,17 @@ class AsyncMysql(BaseMysql):
         if conn is None:
             conn = await self.get_conn()
             should_release = True
-
         try:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 yield cursor
+        except Exception:
+            if not self.autocommit:
+                await conn.rollback()
+            raise
         finally:
             if should_release:
+                if not self.autocommit:
+                    await conn.commit()
                 self.release(conn)
 
     async def async_run(self, sql: str, params: tuple | dict | list = None, conn=None):
@@ -1106,9 +1207,7 @@ class AsyncMysql(BaseMysql):
         try:
             if conn:
                 return await _run(conn)
-            if self.pool is None:
-                await self.init_pool()
-            async with self.pool.acquire() as conn:
+            async with self.get_conn_ctx() as conn:
                 return await _run(conn)
 
         except Exception as e:
@@ -1124,9 +1223,7 @@ class AsyncMysql(BaseMysql):
         if conn:
             should_release = False
         else:
-            if self.pool is None:
-                await self.init_pool()
-            conn = await self.pool.acquire()
+            conn = await self.get_conn()
             should_release = True
 
         try:
@@ -1173,13 +1270,8 @@ class AsyncMysql(BaseMysql):
 
         if cursor:
             return await _run(cursor)
-
-        if self.pool is None:
-            await self.init_pool()
-
-        async with self.pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-                return await _run(cur)
+        async with self.get_cursor() as cur:
+            return await _run(cur)
 
     async def query_one(self, sql: str, params: tuple | dict = (), cursor=None) -> dict | None:
         results = await self.async_query([(sql, params)], fetch_all=False, cursor=cursor)
@@ -1196,15 +1288,17 @@ class AsyncMysql(BaseMysql):
         sql, values = self.build_insert(table_name, params_data, update_fields=[])
         return await self.async_run(sql, values, conn=conn)
 
-    async def async_merge(self, table_name: str, params_list: list[dict], update_fields: list[str] = None, conn=None):
+    async def async_merge(self, table_name: str, params_records: list[dict], update_fields: list[str] = None,
+                          conn=None):
         """
         批量插入/更新数据,返回true（根据主键或唯一键自动合并）
         update_fields (list): 需要更新的字段列表，默认为除了主键以外的字段,在发生冲突时被更新的字段列表,[]为插入
         """
-        if not params_list:
+        if not params_records:
             raise ValueError("参数列表不能为空")
-        sql_list = [self.build_insert(table_name, row, update_fields=update_fields or []) for row in params_list]
-        return await self.async_execute(sql_list, conn=conn)  # list[tuple[str, tuple]]
+        params_data: dict = records_to_list(params_records)
+        sql, values = self.build_insert(table_name, params_data, update_fields=update_fields or [], explode=True)
+        return await self.async_run(sql, values, conn=conn)
 
     async def async_update(self, table_name: str, params_data: dict, row_id: int, primary_key: str = "id", conn=None):
         """
@@ -1228,7 +1322,7 @@ class AsyncMysql(BaseMysql):
         return await self.async_run(sql, values, conn=conn)
 
     async def get_offset(self, table_name: str, page: int = None, per_page: int = 10, cursor=None,
-                         use_estimate: bool = True):
+                         use_estimate: bool = False):
         total = 0
         if use_estimate:
             row = await self.query_one(
@@ -1268,13 +1362,8 @@ class AsyncMysql(BaseMysql):
 
         if cursor:
             return await _run(cursor)
-
-        if self.pool is None:
-            await self.init_pool()
-
-        async with self.pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-                return await _run(cur)
+        async with self.get_cursor() as cur:
+            return await _run(cur)
 
     async def get_primary_key(self, table_name: str, cursor=None) -> Optional[str]:
         columns = await self.get_table_columns(table_name, cursor=cursor)
@@ -1293,6 +1382,7 @@ class OperationMysql(AsyncMysql, SyncMysql, BaseMysql):
     db_config = parse_database_uri(Config.SQLALCHEMY_DATABASE_URI)
 
     """
+    dbop =OperationMysql(async_mode=True,db_config=Config.Risk_DB_CONFIG)
     dbop = OperationMysql(persistent=True,async_mode=True)
     await dbop.init_pool()
     result = await dbop.async_run("SELECT * FROM users WHERE id=%s", (...,))
@@ -1300,6 +1390,10 @@ class OperationMysql(AsyncMysql, SyncMysql, BaseMysql):
 
     async with OperationMysql(async_mode=True) as dbop:
         result = await dbop.async_run("SELECT ...")
+        
+    async with OperationMysql.context(...) as dbop:
+        async with dbop.get_conn_ctx() as conn:
+            await dbop.async_run(...,conn)
         
     with SyncMysql(host, user, password, db) as db:
         result = db.run("SELECT * FROM users WHERE id=%s", (...,))
@@ -1346,7 +1440,8 @@ class OperationMysql(AsyncMysql, SyncMysql, BaseMysql):
             SyncMysql.__exit__(self, exc_type, exc_val, exc_tb)
 
     @classmethod
-    async def get_async_conn(cls, **kwargs):
+    async def context(cls, **kwargs):
+        """类级别的异步上下文生成器,创建实例并托管,对外暴露类接口,提供外部使用"""
         async with cls(async_mode=True, **kwargs) as dbop:
             yield dbop
 
@@ -1425,7 +1520,7 @@ class CollectorMysql(AsyncMysql):
 
     @asynccontextmanager
     async def context(self):
-        """上下文管理器，用于安全地初始化和关闭处理器"""
+        """实例级上下文管理器，用于对象内资源安全地初始化和关闭处理器"""
         await self.start()
         try:
             yield self
@@ -1482,7 +1577,7 @@ class CollectorMysql(AsyncMysql):
             if not batch:
                 continue
 
-            conn = await self.get_conn()
+            conn = await self.get_conn(init=True)
             try:
                 await self._flush_batch(batch, conn)  # 处理 batch（异步执行 DB 写）
             except Exception as e:
@@ -2343,13 +2438,6 @@ async def init_ai_clients(ai_models: list = AI_Models):
                                                                                max_retries=Config.MAX_RETRY_COUNT)
 
 
-# client = AI_Client['deepseek']
-# print(dir(client.chat.completions))# 'create', 'with_raw_response', 'with_streaming_response'
-# print(dir(client.completions))
-# print(dir(client.embeddings))
-# print(dir(client.files)) #'content', 'create', 'delete', 'list', 'retrieve', 'retrieve_content', 'wait_for_processing'
-
-
 def find_ai_model(name: str, model_id: int = 0, search_field: str = 'model') -> Tuple[dict, str]:
     """
     在 AI_Models 中查找模型。如果找到名称匹配的模型，返回模型及其类型或具体的子模型名称。
@@ -2508,6 +2596,12 @@ if __name__ == "__main__":
     # nest_asyncio.apply()
     import threading
 
+
+    # client = AI_Client['deepseek']
+    # print(dir(client.chat.completions))# 'create', 'with_raw_response', 'with_streaming_response'
+    # print(dir(client.completions))
+    # print(dir(client.embeddings))
+    # print(dir(client.files)) #'content', 'create', 'delete', 'list', 'retrieve', 'retrieve_content', 'wait_for_processing'
 
     # mcp.run(transport="sse", log_level="debug")
     # from fastmcp.server.proxy import FastMCPProxy

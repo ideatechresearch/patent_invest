@@ -5,9 +5,13 @@ import dashscope
 # import qianfan
 from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription, RecognitionCallback
+import time, base64, json, uuid
+from urllib.parse import urlencode, urlparse, unquote
 
 from service import get_httpx_client
-from config import *
+from secure import get_xfyun_signature, get_tencent_signature, get_xfyun_authorization, get_ark_signature, \
+    get_baidu_access_token, get_aliyun_access_token, generate_hmac_signature
+from config import Config
 
 
 # from lagent import tool_api

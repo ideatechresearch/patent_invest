@@ -285,7 +285,7 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.utc_timestamp(),
                                                  default=func.utc_timestamp())
     expires_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    chatcut_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, default=0)
+    login_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, default=0)
 
     def __repr__(self):
         return f"<User {self.username}>"
@@ -296,12 +296,13 @@ class User(Base):
     def update(self, db: Session, eth_address: Optional[str] = None, public_key: Optional[str] = None,
                expires_day: Optional[int] = 0, **kwargs):
         update_data = {}
-        if eth_address is not None:
+        if eth_address:
             update_data['eth_address'] = eth_address
-        if public_key is not None:
+        if public_key:
             update_data['public_key'] = public_key
         if expires_day:
             update_data['expires_at'] = int((datetime.now(timezone.utc) + timedelta(days=expires_day)).timestamp())
+        update_data["updated_at"] = datetime.now(timezone.utc)
 
         for key, value in kwargs.items():
             if hasattr(self, key):  # in cls.__mapper__.c:
@@ -326,8 +327,8 @@ class User(Base):
             password=cls.hash_password(password) if password else None,
             role=role,
             group=group,
-            eth_address=eth_address,
-            public_key=public_key
+            eth_address=eth_address or None,
+            public_key=public_key or None
         )
         db.add(new_user)
         db.commit()
@@ -336,12 +337,14 @@ class User(Base):
 
     @classmethod
     def get_user(cls, db: Session, username: Optional[str] = None, user_id: Optional[str] = None,
-                 public_key: Optional[str] = None, eth_address: Optional[str] = None):
+                 api_key: Optional[str] = None, public_key: Optional[str] = None, eth_address: Optional[str] = None):
         query = db.query(cls)
         if username:
             return query.filter_by(username=username).first()
         if user_id:
             return query.filter_by(user_id=user_id).first()
+        if api_key:
+            return query.filter_by(api_key=api_key).first()
         if public_key:
             return query.filter_by(public_key=public_key).first()
         if eth_address:
@@ -349,27 +352,61 @@ class User(Base):
         return None
 
     @classmethod
-    def update_user(cls, _id: int, db: Session, eth_address: Optional[str] = None, public_key: Optional[str] = None,
+    def update_user(cls, db: Session, _id: int, eth_address: Optional[str] = None, public_key: Optional[str] = None,
                     expires_day: Optional[int] = 0, **kwargs):
         user = db.query(cls).filter_by(id=_id).first()
         if user:
-            return user.update(db=db, eth_address=eth_address, public_key=public_key, expires_day=expires_day, **kwargs)
+            try:
+                return user.update(db=db, eth_address=eth_address, public_key=public_key, expires_day=expires_day,
+                                   **kwargs)
+            except Exception as e:
+                db.rollback()
+                print(f"Error update user: {e}")
         return None
 
     @classmethod
-    def create_api_key(cls, _id: int, db: Session):
+    def create_api_key(cls, db: Session, _id: int):
         while True:
             api_key = str(uuid.uuid4())
             if not db.query(cls).filter_by(api_key=api_key).first():
                 break
         secret_key = secrets.token_urlsafe(32)
-        cls.update_user(_id, db, api_key=api_key, secret_key=secret_key)
+        if cls.update_user(db, _id, api_key=api_key, secret_key=secret_key) is None:
+            raise RuntimeError("Failed to generate unique API key")
         return api_key, secret_key
 
     @classmethod
-    def get_api_keys(cls, db: Session):
-        api_keys = db.query(cls.api_key, cls.secret_key).all()
+    def get_api_keys(cls, db: Session, _id: Optional[int] = None) -> dict[str, str]:
+        query = db.query(cls.api_key, cls.secret_key)
+        if _id is not None:
+            query = query.filter(cls.id == _id)
+        api_keys = query.all()
         return {api_key: secret_key for api_key, secret_key in api_keys}
+
+    @classmethod
+    async def refresh_api_keys(cls, session: AsyncSession, redis=None, ex: int = 300) -> dict[str, str]:
+        stmt = select(cls.api_key, cls.secret_key)
+        result = await session.execute(stmt)
+        api_keys = {api_key: secret_key for api_key, secret_key in result.all()}
+        if redis:
+            await redis.setex("active_api_keys", ex, json.dumps(api_keys))
+        return api_keys
+
+    @classmethod
+    async def get_active_api_keys(cls, session: AsyncSession = None, redis=None, ex: int = 300) -> dict[str, str]:
+        """
+        优先从 Redis 读取，否则刷新。
+        """
+        if redis:
+            data = await redis.get("active_api_keys")
+            if data:
+                return json.loads(data)
+
+        if session:
+            return await cls.refresh_api_keys(session, redis=redis, ex=ex)
+        async with AsyncSessionLocal() as session:
+            api_keys = await cls.refresh_api_keys(session, redis=redis, ex=ex)
+            return api_keys
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -425,8 +462,8 @@ class BaseChatHistory(Base):
 
     # chat_cache_lock: ClassVar[Lock] = Lock()
 
-    def __init__(self, role, content: str, user, name=None, robot_id=None, model=None, agent=None, index: int = 0,
-                 reference=None, transform=None, timestamp: int = 0):
+    def __init__(self, role: str, content: str, user: str, name: str = None, robot_id: str = None, model: str = None,
+                 agent: str = None, index: int = 0, reference=None, transform=None, timestamp: int = 0):
         self.role = role or 'user'
         self.content = content or ''
         self.name = name
@@ -634,8 +671,8 @@ class BaseChatHistory(Base):
 
 
 def get_user_history(user: str, name: Optional[str], robot_id: Optional[str], filter_time: float, db: Session,
-                     agent: str = None, request_uid: Optional[str] = None) -> List[dict]:
-    user_history = BaseChatHistory(None, None, user=user or request_uid, name=name, robot_id=robot_id,
+                     agent: str = None, session_uid: Optional[str] = None) -> List[dict]:
+    user_history = BaseChatHistory('', '', user=user, name=name or session_uid, robot_id=robot_id,
                                    agent=agent).get_cache(filter_time)
     if user and db:  # 从数据库中补充历史记录
         user_history.extend(
@@ -647,14 +684,13 @@ def get_user_history(user: str, name: Optional[str], robot_id: Optional[str], fi
 
 def build_chat_history(user_request: str, user: str, name: Optional[str], robot_id: Optional[str],
                        db: Session, user_history: List[dict] = None, use_hist=False,
-                       filter_limit: int = -500, filter_time: float = 0,
-                       agent: Optional[str] = None, request_uid: Optional[str] = None):
+                       filter_limit: int = -500, filter_time: float = 0, agent: Optional[str] = None,
+                       session_uid: Optional[str] = None):
     # 构建用户的聊天历史记录，并生成当前的用户消息。
     history = []
     if not user_history:
         if use_hist:
-            user_history = get_user_history(user, name, robot_id, filter_time, db, agent=agent,
-                                            request_uid=request_uid)
+            user_history = get_user_history(user, name, robot_id, filter_time, db, agent=agent, session_uid=session_uid)
             last_records = cut_chat_history(sorted(user_history, key=lambda x: x['timestamp']),
                                             max_size=filter_limit, max_pairs=-filter_limit,
                                             model_name=Config.DEFAULT_MODEL_ENCODING)
@@ -676,16 +712,16 @@ def build_chat_history(user_request: str, user: str, name: Optional[str], robot_
 def save_chat_history(user_request: str, bot_response: str,
                       user: str, name: Optional[str], robot_id: Optional[str],
                       agent: Optional[str], hist_size: int, model: str, timestamp: float,
-                      db: Session, refer: List[str], transform=None, request_uid: Optional[str] = None):
+                      db: Session, refer: List[str], transform=None, session_uid: Optional[str] = None):
     if not user_request or not bot_response:
         return
-    uid = user or request_uid
-    if not uid:
+    uid = name or session_uid
+    if not (user or uid):
         return
     new_history = [
-        {'role': 'user', 'content': user_request, 'name': name, 'robot_id': robot_id, 'user': uid,
+        {'role': 'user', 'content': user_request, 'name': uid, 'robot_id': robot_id, 'user': user,
          'agent': agent, 'index': hist_size + 1, 'timestamp': timestamp},
-        {'role': 'assistant', 'content': bot_response, 'name': name, 'robot_id': robot_id, 'user': uid,
+        {'role': 'assistant', 'content': bot_response, 'name': uid, 'robot_id': robot_id, 'user': user,
          'agent': agent, 'index': hist_size + 2, 'model': model,  # 'timestamp': time.time(),
          'reference': json.dumps(refer, ensure_ascii=False) if refer else None,  # '\n'.join(refer)
          'transform': json.dumps(transform, ensure_ascii=False) if transform else None}
@@ -697,7 +733,7 @@ def save_chat_history(user_request: str, bot_response: str,
 class ChatHistory(BaseChatHistory):
     def __init__(self, user: str, name: Optional[str], robot_id: Optional[str],
                  agent: Optional[str], model: Optional[str], timestamp: float,
-                 index: int = 0, request_uid: Optional[str] = None, **kwargs):
+                 index: int = 0, session_uid: Optional[str] = None, **kwargs):
         self.user_request = kwargs.get("user_request", '')
         self.user_history: List[dict] = kwargs.get('user_history', [])
         super().__init__(
@@ -711,7 +747,7 @@ class ChatHistory(BaseChatHistory):
             index=index,
             timestamp=int(timestamp)
         )
-        self.uid = user or request_uid
+        self.uid = name or session_uid
 
     async def build(self, user_request: str, user_messages: List[dict | BaseModel] = None, use_hist=False,
                     filter_limit: int = -500, filter_time: float = 0, session: AsyncSession = None):
@@ -721,7 +757,7 @@ class ChatHistory(BaseChatHistory):
                 self.user_history = []  # self.get_cache(filter_time)
                 if session:  # 从数据库中补充历史记录
                     self.user_history = await BaseChatHistory.async_user_history(
-                        session, self.user, self.name, self.robot_id, agent=self.agent, filter_time=filter_time,
+                        session, self.user, self.uid, self.robot_id, agent=self.agent, filter_time=filter_time,
                         all_payload=True)
                 self.index = max((msg.get("index", 0) for msg in self.user_history), default=self.index)
                 message_records = cut_chat_history(sorted(self.user_history, key=lambda x: x['timestamp']),
@@ -743,10 +779,11 @@ class ChatHistory(BaseChatHistory):
                                                model_name=Config.DEFAULT_MODEL_ENCODING)
             history.extend(message_records)
 
-            if not self.name:
-                self.name = next((msg.get("name") for msg in reversed(history) if msg.get("role") == "user"), None)
             if not self.uid:
-                self.uid = next((msg.get("name") for msg in reversed(history) if msg.get("role") == "assistant"), None)
+                self.uid = next((msg.get("name") for msg in reversed(history) if msg.get("role") == "user"), None)
+            if not self.robot_id:
+                self.robot_id = next((msg.get("name") for msg in reversed(history)
+                                      if msg.get("role") == "assistant"), None)
 
             if not user_request:
                 if history and history[-1]["role"] == 'user':
@@ -786,17 +823,17 @@ class ChatHistory(BaseChatHistory):
         if not user_request or not bot_response:
             print('no content to save')
             return
-        if not self.uid:
+        if not (self.user or self.uid):
             return
 
         current_max = max(self.index, len(self.user_history))
         new_history = [
-            {'role': 'user', 'content': user_request, 'name': self.name,
-             'user': self.uid, 'robot_id': self.robot_id, 'agent': self.agent,
+            {'role': 'user', 'content': user_request, 'name': self.uid,  # 对应User.username
+             'user': self.user, 'robot_id': self.robot_id, 'agent': self.agent,
              'index': current_max + 1, 'model': self.model or model, 'timestamp': self.timestamp
              },
-            {'role': 'assistant', 'content': bot_response, 'name': self.name,
-             'user': self.uid, 'robot_id': self.robot_id, 'agent': self.agent,
+            {'role': 'assistant', 'content': bot_response, 'name': self.uid,
+             'user': self.user, 'robot_id': self.robot_id, 'agent': self.agent,
              'index': current_max + 2, 'model': model or self.model,
              'reference': json.dumps(refer, ensure_ascii=False, default=str) if refer else None,  # '\n'.join(refer)
              'transform': json.dumps(transform, ensure_ascii=False, default=str) if transform else None
@@ -1043,7 +1080,7 @@ class BaseReBot(Base):
         if session:
             await instance.insert(session)
         else:
-            with AsyncSessionLocal() as session:
+            async with AsyncSessionLocal() as session:
                 await instance.insert(session)
         return instance
 

@@ -4,6 +4,139 @@
  */
 
 export interface paths {
+    "/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Index Page */
+        get: operations["index_page__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Login Page
+         * @description 登录页路由：若无 session 则分配唯一 user_id。
+         */
+        get: operations["login_page_login_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Register Page */
+        get: operations["register_page_register_get"];
+        put?: never;
+        /**
+         * Register User
+         * @description 如果提供了 eth_address 或 public_key，则不强制提供密码。
+         *     如果提供了 username 或 uuid，并且没有提供 eth_address 或 public_key，则需要提供密码进行注册。
+         */
+        post: operations["register_user_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api User Page */
+        get: operations["api_user_page_api_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/markdown/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Markdown */
+        get: operations["get_markdown_markdown__get"];
+        put?: never;
+        /**
+         * Post Markdown
+         * @description 统一 Markdown 渲染接口：
+         *     - 如果 data 是 str 或 {"text": str} → 渲染普通 Markdown
+         *     - 如果 data 是 dict 或 list[dict] → 渲染结构化 summary Markdown
+         */
+        post: operations["post_markdown_markdown__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/markdown/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post Markdown Check */
+        post: operations["post_markdown_check_markdown_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ideatech/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Send Page */
+        get: operations["send_page_ideatech__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ideatech/knowledge/": {
         parameters: {
             query?: never;
@@ -79,6 +212,86 @@ export interface paths {
          * @description 确认分类并更新模板库,人工确认 insert/update 的操作, status True 表示同意，False 表示拒绝
          */
         post: operations["confirm_action_ideatech_confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ideatech/task_question/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Check Task Question
+         * @description /ideatech/task_question/check?date=2025-10-01
+         */
+        get: operations["check_task_question_ideatech_task_question_check_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ideatech/task_summary_question/filter": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Task Summary Question
+         * @description /ideatech/task_summary_question/filter?final_score=-60
+         *     final_score<0:score<=final_score
+         *     final_score>0:score>=final_score
+         *     final_score=0:adjustments_score<0
+         */
+        get: operations["get_task_summary_question_ideatech_task_summary_question_filter_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ideatech/task_summary_question/filter_adjustment/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Run Sync Summary Question Adjustment */
+        post: operations["run_sync_summary_question_adjustment_ideatech_task_summary_question_filter_adjustment_sync_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ideatech/task_summary_question/filter_adjustment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Task Summary Question Adjustment
+         * @description /ideatech/task_summary_question/filter_adjustment?ret_object=false&group=true
+         */
+        get: operations["get_task_summary_question_adjustment_ideatech_task_summary_question_filter_adjustment_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -170,6 +383,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/chat/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Chat Page */
+        get: operations["chat_page_chat__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chat/prompt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Send Prompt */
+        get: operations["send_prompt_chat_prompt_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chat/debate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Send Debate */
+        get: operations["send_debate_chat_debate_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chat/consensus": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Send Consensus */
+        get: operations["send_consensus_chat_consensus_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chat/conversations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Send Conversations */
+        get: operations["send_conversations_chat_conversations_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chat/message": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Message Page */
+        get: operations["message_page_chat_message_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chat/ichat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Send Chat */
+        get: operations["send_chat_chat_ichat_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/send_wechat_code": {
         parameters: {
             query?: never;
@@ -181,27 +513,6 @@ export interface paths {
         get: operations["send_verification_code_send_wechat_code_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/register": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Register User
-         * @description 如果提供了 eth_address 或 public_key，则不强制提供密码。
-         *     如果提供了 username 或 uuid，并且没有提供 eth_address 或 public_key，则需要提供密码进行注册。
-         */
-        post: operations["register_user_register_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -230,7 +541,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/protected": {
+    "/refresh_token": {
         parameters: {
             query?: never;
             header?: never;
@@ -239,11 +550,8 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /**
-         * Protected
-         * @description 防止伪造 API Key,防止请求内容被篡改,防止重放攻击（时间戳）,避免签名泄露,HMAC 使用安全算法（SHA256）
-         */
-        post: operations["protected_protected_post"];
+        /** Refresh Token */
+        post: operations["refresh_token_refresh_token_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -259,7 +567,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Secure Route */
+        /**
+         * Secure Route
+         * @description 防止伪造 API Key,防止请求内容被篡改,防止重放攻击（时间戳）,避免签名泄露,HMAC 使用安全算法（SHA256）
+         */
         post: operations["secure_route_secure_post"];
         delete?: never;
         options?: never;
@@ -267,7 +578,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/refresh_token": {
+    "/protected": {
         parameters: {
             query?: never;
             header?: never;
@@ -276,23 +587,26 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Refresh Access Token */
-        post: operations["refresh_access_token_refresh_token_post"];
+        /**
+         * Protected Route
+         * @description 一般认证需求,访问控制
+         */
+        post: operations["protected_route_protected_post"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/status/": {
+    "/api/key/": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** System Status */
-        get: operations["system_status_status__get"];
+        /** Get Apikey */
+        get: operations["get_apikey_api_key__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -301,17 +615,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/logs": {
+    "/api/login": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Get Logs Info */
-        get: operations["get_logs_info_logs_get"];
+        get?: never;
         put?: never;
-        post?: never;
+        /**
+         * Login With Apikey
+         * @description 通过 API Key 登录，验证后返回 JWT Token 并写入 Cookie。
+         */
+        post: operations["login_with_apikey_api_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description 安全登出接口：清除后端 Cookie。
+         */
+        post: operations["logout_api_logout_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -342,8 +679,62 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** User */
+        /**
+         * User
+         * @description 尝试使用 optional token（header/cookie/query)
+         */
         get: operations["user_user__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/status/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** System Status */
+        get: operations["system_status_status__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/status/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Logs Info */
+        get: operations["get_logs_info_status_logs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/status/routes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Routes */
+        get: operations["list_routes_status_routes_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -361,7 +752,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Push Redis Data */
+        /**
+         * Push Redis Data
+         * @description VALID_API_KEYS
+         */
         post: operations["push_redis_data_data_post"];
         delete?: never;
         options?: never;
@@ -457,40 +851,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/route_info": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List Routes */
-        get: operations["list_routes_route_info_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/mcp_tool": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Mcp Tool */
-        get: operations["get_mcp_tool_mcp_tool_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/retrieval/{text}": {
         parameters: {
             query?: never;
@@ -576,7 +936,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/create_embeddings_collection/": {
+    "/vec/create_collection/": {
         parameters: {
             query?: never;
             header?: never;
@@ -584,7 +944,7 @@ export interface paths {
             cookie?: never;
         };
         /** Create Embeddings Collection */
-        get: operations["create_embeddings_collection_create_embeddings_collection__get"];
+        get: operations["create_embeddings_collection_vec_create_collection__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -593,7 +953,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/upsert_embeddings_points": {
+    "/vec/upsert_points": {
         parameters: {
             query?: never;
             header?: never;
@@ -603,14 +963,14 @@ export interface paths {
         get?: never;
         put?: never;
         /** Upsert Embeddings Points */
-        post: operations["upsert_embeddings_points_upsert_embeddings_points_post"];
+        post: operations["upsert_embeddings_points_vec_upsert_points_post"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/search_embeddings_points": {
+    "/vec/search_points": {
         parameters: {
             query?: never;
             header?: never;
@@ -620,14 +980,14 @@ export interface paths {
         get?: never;
         put?: never;
         /** Search Embeddings Points */
-        post: operations["search_embeddings_points_search_embeddings_points_post"];
+        post: operations["search_embeddings_points_vec_search_points_post"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/recommend_points": {
+    "/vec/recommend_points": {
         parameters: {
             query?: never;
             header?: never;
@@ -637,7 +997,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Recommend Points */
-        post: operations["recommend_points_recommend_points_post"];
+        post: operations["recommend_points_vec_recommend_points_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -661,15 +1021,15 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/markdown/": {
+    "/prompts/": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Get Markdown */
-        get: operations["get_markdown_markdown__get"];
+        /** Get Prompts */
+        get: operations["get_prompts_prompts__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -678,7 +1038,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/prompts": {
+    "/prompts/generate": {
         parameters: {
             query?: never;
             header?: never;
@@ -687,8 +1047,8 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Get Prompts */
-        post: operations["get_prompts_prompts_post"];
+        /** Generate Prompts */
+        post: operations["generate_prompts_prompts_generate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -711,6 +1071,63 @@ export interface paths {
          *     最终根据 messages 与 tools 调用大模型，解析 tool_call 执行结果并返回。
          */
         post: operations["get_tools_tools_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tools/mcp": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Mcp Tool */
+        get: operations["get_mcp_tool_tools_mcp_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/classes/{class_name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Class Info
+         * @description 获取特定类的详细信息
+         */
+        get: operations["get_class_info_classes__class_name__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/call/<class_name>/<method_name>": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Call Registered Method
+         * @description 调用注册的类方法
+         */
+        post: operations["call_registered_method_call__class_name___method_name__post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -890,15 +1307,15 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/chat": {
+    "/models/": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Chat Page */
-        get: operations["chat_page_chat_get"];
+        /** Get Models List */
+        get: operations["get_models_list_models__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -907,15 +1324,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/get_messages/": {
+    "/batch/submit": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Get Messages */
-        get: operations["get_messages_get_messages__get"];
+        get?: never;
+        put?: never;
+        /**
+         * Create Batch
+         * @description 上传消息列表并启动批处理任务
+         */
+        post: operations["create_batch_batch_submit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/batch/{task_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Batch Result */
+        get: operations["get_batch_result_batch__task_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -924,7 +1361,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/submit_messages": {
+    "/message/get/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Messages
+         * @description 获取用户消息历史：
+         *     1. 优先从 JWT token（Authorization / cookie / query）中识别真实用户；
+         *     2. 否则使用 session 内的 user_id 作为匿名访客；
+         */
+        get: operations["get_messages_message_get__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/message/submit": {
         parameters: {
             query?: never;
             header?: never;
@@ -934,7 +1393,7 @@ export interface paths {
         get?: never;
         put?: never;
         /** Submit Messages */
-        post: operations["submit_messages_submit_messages_post"];
+        post: operations["submit_messages_message_submit_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1071,23 +1530,6 @@ export interface paths {
         put?: never;
         /** Send Wechat Scheduler */
         post: operations["send_wechat_scheduler_send_wechat_scheduler_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Send Page */
-        get: operations["send_page__get"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1303,8 +1745,11 @@ export interface components {
              * @default deepseek-chat
              */
             model: string | null;
-            /** @description 外部函数调用信息 */
-            callback?: components["schemas"]["CallbackUrl"] | null;
+            /**
+             * Callback
+             * @description Callback info: either a URL string, or a dict with url + optional payload/params/headers
+             */
+            callback?: string | components["schemas"]["CallbackUrl"] | null;
         };
         /** AssistantRequest */
         AssistantRequest: {
@@ -1354,6 +1799,8 @@ export interface components {
             password?: string | null;
             /** Public Key */
             public_key?: string | null;
+            /** Phone */
+            phone?: string | null;
             /** Code */
             code?: string | null;
         };
@@ -1364,6 +1811,17 @@ export interface components {
              * Format: binary
              */
             file: string;
+            /**
+             * Convo Type
+             * @default gpt
+             * @enum {string}
+             */
+            convo_type: "gpt" | "deepseek";
+            /**
+             * Stream
+             * @default false
+             */
+            stream: boolean;
         };
         /** Body_files_process_fp_post */
         Body_files_process_fp_post: {
@@ -1372,11 +1830,17 @@ export interface components {
         };
         /** Body_filter_conversations_conversations_filter_post */
         Body_filter_conversations_conversations_filter_post: {
+            /** Files */
+            files: string[];
+            /** After Date */
+            after_date?: string;
             /**
-             * File
-             * Format: binary
+             * Stream
+             * @default false
              */
-            file: string;
+            stream: boolean;
+            /** Name */
+            name?: string | null;
         };
         /** Body_generate_image_visual_post */
         Body_generate_image_visual_post: {
@@ -1414,6 +1878,29 @@ export interface components {
              */
             file?: string;
         };
+        /** Body_login_with_apikey_api_login_post */
+        Body_login_with_apikey_api_login_post: {
+            /** Api Key */
+            api_key: string;
+        };
+        /** Body_refresh_token_refresh_token_post */
+        Body_refresh_token_refresh_token_post: {
+            /** Token */
+            token: string;
+        };
+        /** Body_response_message_message__task_id__get */
+        Body_response_message_message__task_id__get: {
+            /**
+             * Keywords
+             * @description A list of keywords used to guide the retrieval of relevant information or sources based on search terms.
+             */
+            keywords?: unknown[] | null;
+            /**
+             * Tools
+             * @description tools 参数
+             */
+            tools?: Record<string, never>[] | null;
+        };
         /** Body_send_wechat_scheduler_send_wechat_scheduler_post */
         Body_send_wechat_scheduler_send_wechat_scheduler_post: {
             /**
@@ -1439,12 +1926,34 @@ export interface components {
         };
         /** Body_summary_extract_text_summary_post */
         Body_summary_extract_text_summary_post: {
-            request: components["schemas"]["SummaryRequest"];
+            /** File */
+            file?: string | null;
+            /** Text */
+            text?: string | null;
+            /** Extract Prompt */
+            extract_prompt?: string | null;
+            /** Summary Prompt */
+            summary_prompt?: string | null;
             /**
-             * File
-             * Format: binary
+             * Extract Model
+             * @default qwen:qwen-long
              */
-            file?: string;
+            extract_model: string;
+            /**
+             * Summary Model
+             * @default qwen:qwen-plus
+             */
+            summary_model: string;
+            /**
+             * Max Tokens
+             * @default 4096
+             */
+            max_tokens: number;
+            /**
+             * Max Segment Length
+             * @default 10000
+             */
+            max_segment_length: number;
         };
         /** Body_upload_file_upload_post */
         Body_upload_file_upload_post: {
@@ -1454,8 +1963,8 @@ export interface components {
              */
             file: string;
         };
-        /** Body_upsert_embeddings_points_upsert_embeddings_points_post */
-        Body_upsert_embeddings_points_upsert_embeddings_points_post: {
+        /** Body_upsert_embeddings_points_vec_upsert_points_post */
+        Body_upsert_embeddings_points_vec_upsert_points_post: {
             /** Payloads */
             payloads: Record<string, never>[];
             /** Inputs */
@@ -1475,21 +1984,31 @@ export interface components {
              * @enum {string}
              */
             format: "query" | "json" | "form";
-            /** Url */
+            /**
+             * Url
+             * @description The callback URL
+             */
             url?: string | null;
-            /** Payload */
-            payload?: {
-                [key: string]: string | number;
-            } | null;
+            /**
+             * Payload
+             * @description Optional JSON payload to send
+             */
+            payload?: Record<string, never> | null;
             /** Mapping */
             mapping?: {
                 [key: string]: string | number;
             } | null;
-            /** Params */
+            /**
+             * Params
+             * @description Optional query parameters
+             */
             params?: {
                 [key: string]: string;
             } | null;
-            /** Headers */
+            /**
+             * Headers
+             * @description Optional request headers
+             */
             headers?: {
                 [key: string]: string;
             } | null;
@@ -1513,6 +2032,7 @@ export interface components {
          *       "question": "什么是区块链金融?",
          *       "stream": false,
          *       "temperature": 0.4,
+         *       "thinking": 0,
          *       "tools": [
          *         {
          *           "intent_search": {
@@ -1559,6 +2079,12 @@ export interface components {
              */
             max_tokens: number | null;
             /**
+             * Thinking
+             * @description Number of thinking tokens. 0 disables thinking; >0 enables thinking and adds token budget.
+             * @default 0
+             */
+            thinking: number | null;
+            /**
              * Prompt
              * @description The initial system content or prompt used to guide the AI's response.
              */
@@ -1583,8 +2109,6 @@ export interface components {
              * @description Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)
              */
             extract?: string | string[] | null;
-            /** @description Callback info: a URL string or a dict with url and optional payload,params,headers */
-            callback?: components["schemas"]["CallbackUrl"] | null;
             /**
              * Model Name
              * @description Specify the name of the model to be used. It can be any available model, such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek', or other models.
@@ -1597,6 +2121,8 @@ export interface components {
              * @default 0
              */
             model_id: number;
+            /** @description Callback info: a URL string or a dict with url and optional payload,params,headers */
+            callback?: components["schemas"]["CallbackUrl"] | null;
             /**
              * Keywords
              * @description A list of keywords or tuples of (keyword, function, *args,*kwargs) used to search for relevant information across various sources, A list of tools represented as tuples, where each tuple consists of a callable and its corresponding arguments. such as online searches, database queries, or vector-based search systems. These keywords help guide the retrieval of data based on the specific terms provided.
@@ -1647,7 +2173,7 @@ export interface components {
              * @description The timestamp to filter historical messages.
              * @default 0
              */
-            filter_time: number;
+            filter_time: number | null;
             /**
              * Messages
              * @description A list of message objects representing the current conversation. If no messages are provided and `use_hist` is set to `True`, the system will filter existing chat history using the fields `name`, `user`, and `filter_time`. If `messages` are provided, the last user message will be used as the question.
@@ -1838,6 +2364,7 @@ export interface components {
          *       "stream": false,
          *       "suffix": "这是",
          *       "temperature": 0.7,
+         *       "thinking": 0,
          *       "tools": [],
          *       "top_p": 0.8
          *     }
@@ -1868,6 +2395,12 @@ export interface components {
              */
             max_tokens: number | null;
             /**
+             * Thinking
+             * @description Number of thinking tokens. 0 disables thinking; >0 enables thinking and adds token budget.
+             * @default 0
+             */
+            thinking: number | null;
+            /**
              * Prompt
              * @description The initial system content or prompt used to guide the AI's response.
              */
@@ -1892,8 +2425,6 @@ export interface components {
              * @description Response Format,The type of content to extract from response(e.g., code.python,code.bash,code.cpp,code.sql,json,header,links)
              */
             extract?: string | string[] | null;
-            /** @description Callback info: a URL string or a dict with url and optional payload,params,headers */
-            callback?: components["schemas"]["CallbackUrl"] | null;
             /**
              * Model Name
              * @description Specify the name of the model to be used. It can be any available model, such as 'moonshot', 'glm', 'qwen', 'ernie', 'hunyuan', 'doubao','spark','baichuan','deepseek', or other models.
@@ -1906,6 +2437,8 @@ export interface components {
              * @default 0
              */
             model_id: number;
+            /** @description Callback info: a URL string or a dict with url and optional payload,params,headers */
+            callback?: components["schemas"]["CallbackUrl"] | null;
             /**
              * Keywords
              * @description A list of keywords or tuples of (keyword, function, *args,*kwargs) used to search for relevant information across various sources, A list of tools represented as tuples, where each tuple consists of a callable and its corresponding arguments. such as online searches, database queries, or vector-based search systems. These keywords help guide the retrieval of data based on the specific terms provided.
@@ -1963,6 +2496,17 @@ export interface components {
              * @default false
              */
             normalize: boolean;
+        };
+        /** FunctionCallItem */
+        FunctionCallItem: {
+            /** Function */
+            function?: string | null;
+            /** Args */
+            args?: unknown[] | null;
+            /** Kwargs */
+            kwargs?: Record<string, never> | null;
+            /** Env */
+            env?: Record<string, never> | null;
         };
         /** FuzzyMatchRequest */
         FuzzyMatchRequest: {
@@ -2143,6 +2687,72 @@ export interface components {
             extra_query?: Record<string, never> | null;
         };
         /**
+         * OpenAIRequestBatch
+         * @example {
+         *       "completion_window": "24h",
+         *       "max_tokens": 1024,
+         *       "messages_list": [
+         *         [
+         *           {
+         *             "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+         *             "role": "system"
+         *           },
+         *           {
+         *             "content": "你好,有问题要问你",
+         *             "role": "user"
+         *           }
+         *         ],
+         *         [
+         *           {
+         *             "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+         *             "role": "system"
+         *           },
+         *           {
+         *             "content": "请问1到100的和怎么计算?",
+         *             "role": "user"
+         *           }
+         *         ]
+         *       ],
+         *       "model": "qwen-plus",
+         *       "temperature": 1,
+         *       "top_p": 1
+         *     }
+         */
+        OpenAIRequestBatch: {
+            /**
+             * Model
+             * @description 模型名称
+             * @default qwen-plus
+             */
+            model: string;
+            /**
+             * Messages List
+             * @description 消息数组列表，每个元素是一组对话，[[{role + content}...]]
+             */
+            messages_list: components["schemas"]["ChatMessage"][][];
+            /**
+             * Temperature
+             * @default 1
+             */
+            temperature: number | null;
+            /**
+             * Top P
+             * @default 1
+             */
+            top_p: number | null;
+            /**
+             * Max Tokens
+             * @default 1024
+             */
+            max_tokens: number | null;
+            /**
+             * Completion Window
+             * @default 24h
+             * @enum {string}
+             */
+            completion_window: "24h" | "now";
+        };
+        /**
          * OpenAIRequestMessage
          * @example {
          *       "extra_body": {
@@ -2163,6 +2773,9 @@ export interface components {
          *       "model": "qwen-turbo",
          *       "stream": false,
          *       "temperature": 1,
+         *       "thinking": {
+         *         "type": "disabled"
+         *       },
          *       "tools": [
          *         {
          *           "baidu_search": {
@@ -2195,6 +2808,8 @@ export interface components {
              * @default 512
              */
             max_tokens: number | null;
+            /** Max Completion Tokens */
+            max_completion_tokens?: number | null;
             /**
              * Stream
              * @default false
@@ -2280,7 +2895,7 @@ export interface components {
          */
         PromptRequest: {
             /** Query */
-            query?: string | null;
+            query: string;
             /**
              * Model
              * @default deepseek:deepseek-reasoner
@@ -2295,11 +2910,9 @@ export interface components {
          *       "code": "123456",
          *       "eth_address": "0x123456789ABCDEF",
          *       "group": "0",
-         *       "original_message": "original_message_here",
-         *       "password": "secure_password",
+         *       "password": "123456",
          *       "public_key": "0x123456789ABCDEF",
          *       "role": "user",
-         *       "signed_message": "signed_message_here",
          *       "username": "test"
          *     }
          */
@@ -2316,6 +2929,8 @@ export interface components {
             password?: string | null;
             /** Public Key */
             public_key?: string | null;
+            /** Phone */
+            phone?: string | null;
             /** Code */
             code?: string | null;
             /**
@@ -2395,7 +3010,6 @@ export interface components {
          *           "model_name": "moonshot",
          *           "prompt": "",
          *           "question": "中国今年多少新生儿",
-         *           "stream": false,
          *           "temperature": 0.8,
          *           "tools": [],
          *           "top_p": 0.8
@@ -2418,25 +3032,25 @@ export interface components {
          *           "model_name": "qwen",
          *           "prompt": "",
          *           "question": "感冒灵颗粒好用吗",
-         *           "stream": false,
          *           "temperature": 0.8,
          *           "tools": [],
          *           "top_p": 0.8
          *         }
          *       ],
+         *       "stream": false,
          *       "use_hist": false,
          *       "user": "aigc_test"
          *     }
          */
         SubmitMessagesRequest: {
-            /** Request Id */
-            request_id?: string | null;
             /** Name */
             name?: string | null;
             /** User */
             user?: string | null;
             /** Robot Id */
             robot_id?: string | null;
+            /** Request Id */
+            request_id?: string | null;
             /**
              * Use Hist
              * @description Use historical messages.
@@ -2456,6 +3070,12 @@ export interface components {
              */
             filter_time: number | null;
             /**
+             * Stream
+             * @description Whether to stream the response
+             * @default false
+             */
+            stream: boolean;
+            /**
              * Messages
              * @description A list of message objects representing the current conversation. If no messages are provided and `use_hist` is set to `True`, the system will filter existing chat history using the fields `name`, `user`, and `filter_time`. If `messages` are provided, the last user message will be used as the question.
              */
@@ -2463,41 +3083,19 @@ export interface components {
             /** Params */
             params?: (components["schemas"]["CompletionParams"] | Record<string, never>)[] | null;
         };
-        /** SummaryRequest */
-        SummaryRequest: {
-            /** Text */
-            text?: string | string[] | null;
-            /** Extract Prompt */
-            extract_prompt?: string | null;
-            /** Summary Prompt */
-            summary_prompt?: string | null;
-            /**
-             * Extract Model
-             * @default qwen:qwen-long
-             */
-            extract_model: string;
-            /**
-             * Summary Model
-             * @default qwen:qwen-plus
-             */
-            summary_model: string;
-            /**
-             * Max Tokens
-             * @default 4096
-             */
-            max_tokens: number;
-            /**
-             * Max Segment Length
-             * @default 100000
-             */
-            max_segment_length: number;
-        };
         /** Token */
         Token: {
             /** Access Token */
             access_token: string;
-            /** Token Type */
+            /**
+             * Token Type
+             * @default bearer
+             */
             token_type: string;
+            /** Refresh Token */
+            refresh_token?: string | null;
+            /** Expires In */
+            expires_in?: number | null;
         };
         /**
          * ToolRequest
@@ -2598,6 +3196,236 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    index_page__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    login_page_login_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    register_page_register_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    register_user_register_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Registration"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_user_page_api_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_markdown_markdown__get: {
+        parameters: {
+            query?: {
+                text?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_markdown_markdown__post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": unknown;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_markdown_check_markdown_check_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": unknown;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    send_page_ideatech__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
     knowledge_ideatech_knowledge__post: {
         parameters: {
             query: {
@@ -2714,6 +3542,128 @@ export interface operations {
                 "application/json": components["schemas"]["SampleResult"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_task_question_ideatech_task_question_check_get: {
+        parameters: {
+            query?: {
+                date?: string;
+                ret_object?: boolean;
+                is_test?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_task_summary_question_ideatech_task_summary_question_filter_get: {
+        parameters: {
+            query?: {
+                date?: string;
+                ret_object?: boolean;
+                is_test?: boolean;
+                final_score?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_sync_summary_question_adjustment_ideatech_task_summary_question_filter_adjustment_sync_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_task_summary_question_adjustment_ideatech_task_summary_question_filter_adjustment_get: {
+        parameters: {
+            query?: {
+                date?: string;
+                ret_object?: boolean;
+                group?: boolean;
+                is_test?: boolean;
+                final_score?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -2891,11 +3841,9 @@ export interface operations {
             };
         };
     };
-    send_verification_code_send_wechat_code_get: {
+    chat_page_chat__get: {
         parameters: {
-            query: {
-                username: string;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -2908,32 +3856,141 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "text/html": string;
                 };
             };
         };
     };
-    register_user_register_post: {
+    send_prompt_chat_prompt_get: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["Registration"];
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
             };
         };
+    };
+    send_debate_chat_debate_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    send_consensus_chat_consensus_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    send_conversations_chat_conversations_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    message_page_chat_message_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    send_chat_chat_ichat_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    send_verification_code_send_wechat_code_get: {
+        parameters: {
+            query: {
+                username: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -2988,14 +4045,18 @@ export interface operations {
             };
         };
     };
-    protected_protected_post: {
+    refresh_token_refresh_token_post: {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": components["schemas"]["Body_refresh_token_refresh_token_post"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -3003,7 +4064,16 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["Token"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -3028,16 +4098,58 @@ export interface operations {
             };
         };
     };
-    refresh_access_token_refresh_token_post: {
+    protected_route_protected_post: {
         parameters: {
-            query: {
-                token: string;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_apikey_api_key__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    login_with_apikey_api_login_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": components["schemas"]["Body_login_with_apikey_api_login_post"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -3055,6 +4167,66 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    logout_api_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    admin_admin__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    user_user__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };
@@ -3079,7 +4251,7 @@ export interface operations {
             };
         };
     };
-    get_logs_info_logs_get: {
+    get_logs_info_status_logs_get: {
         parameters: {
             query?: {
                 lines?: number;
@@ -3110,11 +4282,9 @@ export interface operations {
             };
         };
     };
-    admin_admin__get: {
+    list_routes_status_routes_get: {
         parameters: {
-            query: {
-                token: string;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -3128,46 +4298,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    user_user__get: {
-        parameters: {
-            query?: {
-                token?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -3319,46 +4449,6 @@ export interface operations {
         };
     };
     healthcheck_health_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    list_routes_route_info_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    get_mcp_tool_mcp_tool_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -3542,7 +4632,7 @@ export interface operations {
             };
         };
     };
-    create_embeddings_collection_create_embeddings_collection__get: {
+    create_embeddings_collection_vec_create_collection__get: {
         parameters: {
             query: {
                 collection_name: string;
@@ -3574,7 +4664,7 @@ export interface operations {
             };
         };
     };
-    upsert_embeddings_points_upsert_embeddings_points_post: {
+    upsert_embeddings_points_vec_upsert_points_post: {
         parameters: {
             query: {
                 collection_name: string;
@@ -3586,7 +4676,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["Body_upsert_embeddings_points_upsert_embeddings_points_post"];
+                "application/json": components["schemas"]["Body_upsert_embeddings_points_vec_upsert_points_post"];
             };
         };
         responses: {
@@ -3610,7 +4700,7 @@ export interface operations {
             };
         };
     };
-    search_embeddings_points_search_embeddings_points_post: {
+    search_embeddings_points_vec_search_points_post: {
         parameters: {
             query: {
                 collection_name: string;
@@ -3652,7 +4742,7 @@ export interface operations {
             };
         };
     };
-    recommend_points_recommend_points_post: {
+    recommend_points_vec_recommend_points_post: {
         parameters: {
             query: {
                 collection_name: string;
@@ -3726,10 +4816,10 @@ export interface operations {
             };
         };
     };
-    get_markdown_markdown__get: {
+    get_prompts_prompts__get: {
         parameters: {
             query?: {
-                text?: string;
+                agent?: string;
             };
             header?: never;
             path?: never;
@@ -3743,7 +4833,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/html": string;
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */
@@ -3757,7 +4847,7 @@ export interface operations {
             };
         };
     };
-    get_prompts_prompts_post: {
+    generate_prompts_prompts_generate_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -3800,6 +4890,93 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ToolRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_mcp_tool_tools_mcp_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_class_info_classes__class_name__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                class_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    call_registered_method_call__class_name___method_name__post: {
+        parameters: {
+            query: {
+                class_name: string;
+                method_name: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FunctionCallItem"];
             };
         };
         responses: {
@@ -4113,7 +5290,7 @@ export interface operations {
     get_models_v1_models_get: {
         parameters: {
             query?: {
-                /** @description Retrieves a model instance, providing basic information about the model such as the owner and permissioning. e.g., moonshot,glm,qwen,doubao,spark,ernie,baichuan,lingyiwanwu,hunyuan,deepseek,minimax,mistral,jina,gemini,grok,claude,silicon,modelscope,aihubmix,tokenflux or custom models. */
+                /** @description Retrieves a model instance, providing basic information about the model such as the owner and permissioning. e.g., moonshot,glm,qwen,doubao,spark,ernie,baichuan,lingyiwanwu,hunyuan,deepseek,minimax,mistral,jina,gemini,grok,claude,silicon,modelscope,aihubmix,tokenflux,othree,zzz or custom models. */
                 model?: string | null;
             };
             header?: never;
@@ -4142,34 +5319,11 @@ export interface operations {
             };
         };
     };
-    chat_page_chat_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/html": string;
-                };
-            };
-        };
-    };
-    get_messages_get_messages__get: {
+    get_models_list_models__get: {
         parameters: {
             query?: {
-                user?: string;
-                name?: string;
-                robot_id?: string;
-                filter_time?: number;
-                agent?: string;
+                /** @description custom models/embedding/reranker. */
+                model_type?: "model" | "embedding" | "reranker";
             };
             header?: never;
             path?: never;
@@ -4197,7 +5351,109 @@ export interface operations {
             };
         };
     };
-    submit_messages_submit_messages_post: {
+    create_batch_batch_submit_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OpenAIRequestBatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_batch_result_batch__task_id__get: {
+        parameters: {
+            query?: {
+                interval?: number;
+                timeout?: number;
+                oss_expires?: number;
+            };
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_messages_message_get__get: {
+        parameters: {
+            query?: {
+                user?: string;
+                robot_id?: string | null;
+                agent?: string | null;
+                filter_time?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_messages_message_submit_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -4241,20 +5497,20 @@ export interface operations {
                 top_p?: number;
                 /** @description The maximum number of tokens the model can generate in the response. */
                 max_tokens?: number | null;
+                /** @description Number of thinking tokens. 0 disables thinking; >0 enables thinking and adds token budget. */
+                thinking?: number | null;
                 /** @description The initial context or system message to guide the AI's behavior. */
                 prompt?: string | null;
                 /** @description The main question or user prompt for the AI to respond to. */
                 question?: string | null;
                 /** @description Contextual identifier for different use cases, enabling selection of appropriate system behavior. */
                 agent?: string | null;
-                /** @description Specify the model to use, e.g., moonshot,glm,qwen,doubao,spark,ernie,baichuan,lingyiwanwu,hunyuan,deepseek,minimax,mistral,jina,gemini,grok,claude,silicon,modelscope,aihubmix,tokenflux or custom models. */
+                /** @description Specify the model to use, e.g., moonshot,glm,qwen,doubao,spark,ernie,baichuan,lingyiwanwu,hunyuan,deepseek,minimax,mistral,jina,gemini,grok,claude,silicon,modelscope,aihubmix,tokenflux,othree,zzz or custom models. */
                 model_name?: string;
                 /** @description An optional model ID for selecting different versions or configurations of a model. */
                 model_id?: number;
                 /** @description Specify the type of content to extract from the AI's response (e.g., key phrases, summaries). */
                 extract?: string | null;
-                /** @description A list of keywords used to guide the retrieval of relevant information or sources based on search terms. */
-                keywords?: string[] | null;
             };
             header?: never;
             path: {
@@ -4262,7 +5518,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["Body_response_message_message__task_id__get"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -4517,32 +5777,9 @@ export interface operations {
             };
         };
     };
-    send_page__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/html": string;
-                };
-            };
-        };
-    };
     extract_conversations_conversations_extract_post: {
         parameters: {
-            query?: {
-                convo_type?: "gpt" | "deepseek";
-                stream?: boolean;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -4575,10 +5812,7 @@ export interface operations {
     };
     filter_conversations_conversations_filter_post: {
         parameters: {
-            query?: {
-                after_date?: string;
-                stream?: boolean;
-            };
+            query?: never;
             header?: never;
             path?: never;
             cookie?: never;
@@ -4616,7 +5850,7 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody: {
+        requestBody?: {
             content: {
                 "multipart/form-data": components["schemas"]["Body_summary_extract_text_summary_post"];
             };
@@ -4853,6 +6087,7 @@ export interface operations {
             query?: {
                 question?: string;
                 model_name?: string;
+                max_tokens?: number;
             };
             header?: never;
             path?: never;

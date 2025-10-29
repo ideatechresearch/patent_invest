@@ -11,10 +11,12 @@ include CI
 recursive-include agents *
 recursive-include utils *
 recursive-include script *
+recursive-include rime *
 recursive-include static *
 recursive-include router *
 recursive-include templates *
 recursive-include docker *
+recursive-include co_analyis *
 
 # 包含数据文件
 include data/*.yaml
@@ -24,13 +26,13 @@ prune .venv
 prune .git
 #prune data
 prune docker_build
-prune script/data
 
 # 排除特定文件
 exclude script/nlp.py
 
 # 排除所有 __pycache__ 目录及其内容
 global-exclude __pycache__
+global-exclude */data/*
 global-exclude *.py[cod]
 global-exclude *.log
 global-exclude *.png

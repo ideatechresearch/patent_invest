@@ -7,11 +7,11 @@
   <title>ai-chat</title>
   <style>
     :root {
-      --primary: #377ba8;
+      --primary: #2563eb;
       --bg: #fff;
       --muted: #666;
       --card: #f8f9fa;
-      --accent: #0366d6;
+      --accent: #377ba8;
       font-size: 16px;
     }
 
@@ -264,7 +264,7 @@
 
       .btn {
         padding: 4px 8px;
-        font-size: 0.9em;
+        font-size: 0.8em;
         border-radius: 4px;
       }
 
@@ -280,7 +280,7 @@
   <div class="header">
     <h1>ai-chat</h1>
     <div class="controls">
-      <div id="who" style="color:var(--muted)"></div>
+      <div id="who" style="color:var(--muted);font-weight:bold"></div>
       <button class="btn" id="open-settings">设置</button>
       <button class="btn" id="download-chat">导出</button>
       <button class="btn ghost" id="clear">清空</button>
@@ -389,10 +389,8 @@
     for (let i = 1; i <= 32; i++) { const o = document.createElement('option'); o.value = i; o.textContent = i; if (i === 10) o.selected = true; topn.appendChild(o); }
 
     // show who
-    const USERNAME = '{{ username }}' || localStorage.getItem('username');
-    const UID = '{{ uid }}' || localStorage.getItem('uid');
-    if (USERNAME) localStorage.setItem('username', USERNAME); else if (UID) localStorage.setItem('uid', UID);
-    el('who').textContent = USERNAME || UID || '';
+    const UID = '{{ user_id }}' || localStorage.getItem('user_id');
+    el('who').textContent = localStorage.getItem('username') || UID || '';
 
     // load settings from localStorage
     function loadSettings() {
@@ -466,17 +464,51 @@
       const defaultOpt = new Option(DEFAULT_MODEL + ' (默认)', DEFAULT_MODEL, true, true);
       sel.add(defaultOpt);
       try {
-        const res = await fetch('/models');
+        const res = await fetch('/models/');
         if (!res.ok) throw new Error('models error');
         const models = await res.json();
         models.forEach(m => sel.add(new Option(m, m)));
         if (models.length) sel.value = models[0];
       } catch (e) { console.warn('loadModels failed', e); }
     }
+    // --- Fetch wrapper helper: 用于后续 API 请求自动带 Authorization header when present ---
+    async function apiFetch(url, options = {}) {
+      options.headers = options.headers || {};
+      const token = window.__ACCESS_TOKEN || localStorage.getItem('access_token');
+      if (token) {
+        options.headers['Authorization'] = 'Bearer ' + token;
+      }
+      options.credentials = options.credentials || 'same-origin'; //同源，跨域
+      return fetch(url, options);
+    }
+
+    async function loadUser() {
+      try {
+        const res = await apiFetch('/user/');
+        const data = await res.json();
+        if (data.user) {
+          document.getElementById('who').textContent = data.user;
+          if (data.type === 'authenticated') {
+            localStorage.setItem('username', data.user);
+          } else localStorage.setItem('user_id', data.user);
+          return data.user;
+        }
+      } catch (e) {
+        console.warn('User fetch failed:', e);
+      }
+    }
 
     async function loadMessages() {
       try {
-        const resp = await fetch(`/message/get/?filter_time=${localStorage.getItem('ChatCleanTime') || 0}`);
+        const filterTime = localStorage.getItem('ChatCleanTime') || 0;
+        const accessToken = window.__ACCESS_TOKEN || localStorage.getItem('access_token');
+        // 如果有 token（localStorage），把它放到 Authorization（优先）
+        const headers = accessToken ? { 'Authorization': `Bearer ${accessToken}` } : {};
+        const resp = await fetch(`/message/get/?user=html&filter_time=${encodeURIComponent(filterTime)}`, {
+          method: 'GET',
+          headers,
+          credentials: 'same-origin'//'include'
+        });
         if (!resp.ok) return;
         const messages = await resp.json();
         const chatBox = el('chat-box');
@@ -529,7 +561,7 @@
 
       // user params
       const filterTimestamp = el('chat-box').getAttribute('data-timestamp') || localStorage.getItem('ChatCleanTime') || 0;
-      const user_params = { user: 'html', name: localStorage.getItem('username'), request_id: localStorage.getItem('uid'), filter_time: parseFloat(filterTimestamp / 1000), filter_limit: -settings.topn };
+      const user_params = { user: 'html', name: localStorage.getItem('username'), request_id: localStorage.getItem('user_id'), filter_time: parseFloat(filterTimestamp / 1000), filter_limit: -settings.topn };
 
       const apiParams = { question: text, agent: settings.agent, model_name: settings.model, temperature: settings.temperature, top_p: settings.top_p, max_tokens: settings.max_tokens, thinking: settings.max_thinking_tokens, stream: settings.stream, extract: settings.format };
 
@@ -545,7 +577,12 @@
       if (settings.stream) await chunkMessage(apiParams, task_id, user_params);
       else await sendMessage(apiParams, task_id, user_params);
     }
-
+    async function submitMessages(params) {
+      try {
+        const r = await fetch('/message/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) });
+        if (!r.ok) return null; const j = await r.json(); return j.task_id;
+      } catch (e) { console.error('submit', e); }
+    }
     async function sendMessage(params, task_id = null, user_params = {}) {
       el('loading-bar').style.display = 'block';
       try {
@@ -566,33 +603,31 @@
       chatBox.appendChild(msgEl); chatBox.scrollTop = chatBox.scrollHeight;
 
       let acc = '';
-      let reference = '';           // reference（如果后端先发）
+      let reference = '';      // reference（如果后端先发）
       let transform = '';      // 最终 assistant.transform（如果后端发送）
       let lastUpdate = 0;
       let done = false;
 
       function render() {
-        const show = transform ? transform : (acc || 'No response');
+
+        const show = acc || 'No response';
         if (!show) { msgEl.innerHTML = ''; chatBox.scrollTop = chatBox.scrollHeight; return; }
-        const now = Date.now();
-        // 如果后端说明了 （后端负责安全/转义）
-        if (params.extract && params.extract != 'raw') {
-          msgEl.innerHTML = show;
-        } else {
-          // 其它格式：做最小的 HTML 转义并把换行替为 <br>
-          if (done || now - lastUpdate >= 100) {
-            if (params.extract == 'raw') {
-              msgEl.textContent = show;// 原样输出
-            } else {
-              msgEl.innerHTML = show.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-            }
+        if (done) {
+          if (params.extract == 'raw') msgEl.textContent = show;
+          else msgEl.innerHTML = transform ? transform : show;
+          // console.info('reference', reference);
+          // console.info('transform', transform);
+        }
+        else {
+          const now = Date.now();
+          if (now - lastUpdate >= 30) {
+            if (params.extract == 'raw') msgEl.textContent = show;// 原样输出
+            else msgEl.innerHTML = show.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>'); // 如果后端说明了 （后端负责安全/转义）
           }
+          lastUpdate = now;
         }
-        if (reference) {
-          msgEl.title = reference;
-        }
+        if (reference) msgEl.title = reference;
         chatBox.scrollTop = chatBox.scrollHeight;
-        lastUpdate = now;
       }
 
       if (task_id) {
@@ -627,11 +662,11 @@
               if (!line) continue;
               if (line === '[DONE]') { done = true; break; }
               try {
-                const j = JSON.parse(data);
+                const j = JSON.parse(line);
                 if (j.role === 'reference') { reference = j.content || reference; msgEl.title = reference; }
                 else if (j.role === 'assistant') { acc = j.content || acc; transform = j.transform || transform; }
                 else if (j.choices && j.choices[0]?.delta?.content) acc += j.choices[0].delta.content;
-                else acc += line;// 纯文本块（增量）
+                else acc += data; // 纯文本块（增量）
               } catch { acc += line; }
               render();
             }
@@ -645,16 +680,15 @@
         }
       }
     }
-
-    async function submitMessages(params) {
-      try {
-        const r = await fetch('/message/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) });
-        if (!r.ok) return null; const j = await r.json(); return j.task_id;
-      } catch (e) { console.error('submit', e); }
-    }
-
     // init
-    (async () => { await loadModels(); loadSettings(); loadMessages(); })();
+    (async () => {
+      await Promise.all([
+        loadModels(),
+        loadUser()
+      ]);
+      loadSettings();
+      await loadMessages();
+    })();
   </script>
 </body>
 

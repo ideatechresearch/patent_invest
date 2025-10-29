@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <title>获取 API Key</title>
+  <style>
+    body {
+      font-family: "Segoe UI", sans-serif;
+      background: #f4f6f8;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+
+    h2 {
+      color: #2c3e50;
+    }
+
+    #container {
+      background: white;
+      padding: 2rem;
+      border-radius: 12px;
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.1);
+      width: 400px;
+      text-align: center;
+    }
+
+    button {
+      padding: 0.6rem 1.2rem;
+      background: #3498db;
+      border: none;
+      color: white;
+      border-radius: 6px;
+      font-size: 1rem;
+      cursor: pointer;
+      margin-top: 1rem;
+    }
+
+    button:hover {
+      background: #16a085;
+    }
+
+    input {
+      width: 100%;
+      padding: 0.5rem;
+      margin-top: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 1rem;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>获取 API Key</h2>
+  <div id="container">
+    <button id="getKeyBtn">获取</button>
+    <input type="text" id="apiKeyInput" placeholder="API Key 会显示在这里" readonly>
+  </div>
+
+  <script>
+    async function apiFetch(url, options = {}) {
+      options.headers = options.headers || {};
+      const token = window.__ACCESS_TOKEN || localStorage.getItem('access_token');
+      if (token) {
+        options.headers['Authorization'] = 'Bearer ' + token;
+      }
+      options.credentials = options.credentials || 'same-origin';
+      return fetch(url, options);
+    }
+
+    const btn = document.getElementById('getKeyBtn');
+    const input = document.getElementById('apiKeyInput');
+
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = "加载中...";
+      try {
+        const resp = await apiFetch('/api/key');
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          alert("获取 API Key 失败: " + (err.detail || resp.statusText));
+          return;
+        }
+        const data = await resp.json();
+        input.value = data.api_key || '';
+      } catch (e) {
+        console.error(e);
+        alert("请求失败，请重试");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "获取";
+      }
+    });
+  </script>
+</body>
+
+</html>

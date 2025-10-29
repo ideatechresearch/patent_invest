@@ -7,7 +7,7 @@ REM ============================================
 
 :: 源目录和目标目录
 set "SRC=%CD%"
-set "DST=Z:\Document\aigc"
+set "DST=E:\Downloads\aigc"
 
 echo 正在同步: %SRC% - %DST%
 echo.
@@ -20,10 +20,21 @@ for /d %%D in (*) do (
     if /I not "!dirname!"==".venv" ^
     if /I not "!dirname!"==".idea" ^
     if /I not "!dirname!"==".git" ^
+    if /I not "!dirname!"=="dist" ^
     if /I not "!dirname:~0,1!"=="." (
         if exist "%DST%\%%D\" (
             echo 更新目录: %%D
-            xcopy "%%D" "%DST%\%%D\" /E /D /Y /I >nul
+
+            for /r "%%D" %%F in (*) do (
+                set "relpath=%%F"
+                set "relpath=!relpath:%SRC%\=!"
+                if exist "%DST%\!relpath!" (
+                    echo 更新文件: !relpath!
+                    xcopy "%%F" "%DST%\!relpath!" /D /Y >nul
+                ) else (
+                    echo 跳过文件: !relpath! （目标中不存在）
+                )
+            )
         ) else (
             echo 跳过目录: %%D （目标中不存在）
         )
