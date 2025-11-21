@@ -1,4 +1,4 @@
-import requests, httpx, json
+import requests, httpx
 from utils import map_fields
 from service import get_httpx_client, call_http_request, async_error_logger
 from config import Config
@@ -1074,8 +1074,6 @@ def get_eastmoney_reports(stock_code, report_type='年报'):
 
 
 if __name__ == "__main__":
-    from utils import get_module_functions
-
     # funcs = get_module_functions('agents.ai_company')
     # print([i[0] for i in funcs])
 

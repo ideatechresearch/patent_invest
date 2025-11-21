@@ -1,26 +1,31 @@
 from typing import Callable, Dict, Any, Optional, Union, List, Tuple
 from functools import partial, wraps
-import asyncio
+import inspect
 import json
+
+from agents.ai_generates import ai_generate_metadata
 from utils import fix_indentation, remove_function_decorators, generate_hash_key, extract_function_metadata, \
-    functions_registry, extract_method_calls, safe_eval_call, run_with_async, run_togather, \
-    description_tools, register_class, strip_kwargs_wrapper
-from service import get_redis, get_redis_retry, scan_from_redis, run_with_lock, distributed_lock, FastMCP
+    functions_registry, extract_method_calls, safe_eval_call, run_with_async, run_bound_tasks, run_by_future, \
+    run_togather, ClassMethodRegistry, strip_kwargs_wrapper
+from service import get_redis, get_redis_retry, scan_from_redis, run_with_lock, send_callback, logger, FastMCP
 from config import Config
 
 
 class FunctionManager:
-    _meta_store: Dict[str, dict] = {}  # Function_MetaData_Store cache_func_key:cached_metadata
+    _meta_store: Dict[str, dict] = {}  # Function_MetaData_Store {cache_func_key:cached_metadata}
     global_registry: Dict[str, Callable[..., Any]] = {}  # 全局标准函数注册表（自动加载模块）Function_Registry_Global
-    mcp_server: Optional[FastMCP] = None
+    class_registry = ClassMethodRegistry
+    mcp_server = FastMCP(name="DEF MCP Server")
     key_meta = "funcmeta"
+    key_reg_name = "registry"  # {cache_key:func_name}
 
-    def __init__(self, keywords_registry: Dict[str, Callable] = None, copy=True,
-                 mcp_server: FastMCP = None, user='local'):
+    def __init__(self, keywords_registry: Dict[str, Callable] = None, copy: bool = True,
+                 mcp_server: Optional[FastMCP] = None, redis=None):
         """外部手动注册函数表"""
-        self.registry_key = f"registry:{user}"
-        self.registry_meta: Dict[str, dict] = {}  # 缓存函数元数据 function_name:metadata
+        self.redis = redis or get_redis()
+        self.registry_meta: Dict[str, dict] = {}  # 缓存函数元数据 {function_name:metadata}
         self.keywords_registry: Dict[str, Callable[..., Any]] = keywords_registry or {}  # handlers
+
         if mcp_server:
             self.__class__.mcp_server = mcp_server
             print('Mcp_Server:', self.mcp_server)
@@ -29,14 +34,23 @@ class FunctionManager:
         if not self.__class__.global_registry:
             for m, f in Registry_Module.items():
                 self.set_registry_global(functions_list=f, module_name=m)
-            print('Function_Registry:', self.__class__.global_registry)
+            print('Function_Registry:', len(self.__class__.global_registry))
 
         if copy:
             self.update_registry(self.__class__.global_registry)
 
+    def __str__(self):
+        return (f"Global_Registry: {list(self.__class__.global_registry.keys())}"
+                f"Keywords_Registry: {list(self.keywords_registry.keys())}")
+
     def update_registry(self, keywords_registry: Dict[str, Callable] = None):
         """外部手动更新函数表,外部手动注册函数表,用户自定义关键词映射（支持 lambda、闭包等）"""
         self.keywords_registry.update(keywords_registry or {})  # 合并 keywords 映射
+
+    @classmethod
+    def set_registry_global(cls, functions_list: list, module_name: str = None):
+        cls.global_registry.update(functions_registry(functions_list=functions_list,
+                                                      module_name=None if module_name == 'default' else module_name))
 
     @classmethod
     async def get_mcp_tools(cls) -> dict:
@@ -51,22 +65,31 @@ class FunctionManager:
         return func
 
     @classmethod
-    def set_registry_global(cls, functions_list: list, module_name: str | list = None):
-        cls.global_registry.update(functions_registry(functions_list=functions_list,
-                                                      module_name=None if module_name == 'default' else module_name))
-
-    @classmethod
     async def register_mcp_tools(cls):
-        if cls.mcp_server:
-            tools = await cls.get_mcp_tools()
-            for name, func in cls.global_registry.items():
-                if name in tools:
-                    continue  # Tool already exists
-                func = strip_kwargs_wrapper(func)
-                try:
-                    cls.mcp_server.tool(func, name=name)  # from_function
-                except Exception as e:
-                    print(name, e)
+        tools = await cls.get_mcp_tools()
+        for name, func in cls.global_registry.items():
+            if name in tools:
+                continue  # Tool already exists
+            func = strip_kwargs_wrapper(func)
+            try:
+                cls.mcp_server.tool(func, name=name)  # from_function
+            except Exception as e:
+                logger.error(f"[register_mcp_tools] {name}: {e}")
+
+    @property
+    def registered_method(self):
+        """返回当前实例可用的注册方法表（优先实例级，否则用全局级）"""
+        return self.keywords_registry or self.__class__.global_registry
+
+    @property
+    def class_method(self):
+        """返回类级的 class_registry"""
+        return self.__class__.class_registry
+
+    @property
+    def mcp_handler(self):
+        """返回类级的 mcp_server"""
+        return self.__class__.mcp_server
 
     # global_function_registry
     def get_function_registered(self, func_name: str | list = None) -> Union[Callable, Dict[str, Callable]]:
@@ -76,24 +99,21 @@ class FunctionManager:
         :return: 如果 func_name 为 None，返回整个注册表；否则返回指定名称的函数。
         """
         if func_name is None:
-            return self.keywords_registry or self.global_registry
+            return self.registered_method
         if isinstance(func_name, list):
             return {f: self.keywords_registry.get(f) for f in func_name if f in self.keywords_registry}
         return self.keywords_registry.get(func_name, None)
 
-    @staticmethod
-    async def get_function_registered_callback(func_name: str, arguments: dict, **kwargs):
-        from generates import send_callback
-        redis = get_redis()
-        key = f"registry:{func_name}"
-        data = await redis.get(key)
-        if not data:
+    @classmethod
+    async def get_function_registered_callback(cls, func_name: str, arguments: dict, redis=None, **kwargs):
+        redis = redis or get_redis()
+        registered = await redis.hgetall(cls.key_reg_name)  # await redis.hget(cls.key_reg_name, cache_key)
+        cache_key = next((k for k, v in registered.items() if v == func_name), None)
+        if not cache_key:
             return None
-
-        registry = json.loads(data)
-        # 判断是否是远程调用
-        if "x-url" in registry:
-            return await send_callback(registry["x-url"], arguments, **kwargs)
+        registry = await cls.get_metadata_from_cache(cache_key, redis=redis, retry=1)
+        if "callback" in registry:  # 判断是否是远程调用
+            return await send_callback(registry["callback"], arguments, **kwargs)
         registry["parameters"] = registry.get("parameters", {})
         registry["parameters"]["arguments"] = arguments
         return registry
@@ -106,8 +126,8 @@ class FunctionManager:
         metadata = self.registry_meta.get(func_name, {})
         if metadata:
             return metadata, func
-        redis = get_redis()  # 尝试从缓存获取 或者生成元数据
-        metadata = await self.generate_metadata(func, model_name, redis)
+        # 尝试从缓存获取 或者生成元数据
+        metadata = await self.generate_metadata(func, model_name, redis=self.redis)
         if metadata and isinstance(metadata, dict):
             self.registry_meta[func_name] = metadata
         return metadata, func
@@ -157,7 +177,7 @@ class FunctionManager:
             if func_reg:
                 func_out = await run_with_async(func_reg, **func_args)
             else:
-                func_out = await self.get_function_registered_callback(func_name, arguments=func_args)
+                func_out = await self.get_function_registered_callback(func_name, arguments=func_args, redis=self.redis)
                 if not func_out:
                     func_names = extract_method_calls(func_name)
                     if func_names:
@@ -175,121 +195,175 @@ class FunctionManager:
 
         except Exception as e:
             error = f"Error in {func_name}: {str(e)}" if func_reg else f"Error: Function '{func_name}' not found."
+            logger.error(error)
             return {'role': 'tool', 'content': error, 'tool_call_id': tool_id, 'name': func_name}
 
-    @classmethod
-    async def get_metadata_from_cache(cls, func: Callable, redis=None, retry=2):
-        # 获取函数的名称、参数以及docstring
-        func_name = func.__name__
-        function_code = fix_indentation(remove_function_decorators(func))
-        # extract_function_metadatas(function_code)
-        cache_key = generate_hash_key(func_name, function_code)
+    # retriever
+    async def retrieved_reference(self, keywords: List[Union[str, Tuple[str, ...]]] = None,
+                                  tool_calls: List[Callable[[...], Any]] = None):
+        """
+          根据用户请求和关键字调用多个工具函数，并返回处理结果。
 
-        try:
-            if redis:
-                cache_full_key = f"{cls.key_meta}:{cache_key}"
-                cached_metadata = await get_redis_retry(redis, cache_full_key, retry=retry)
-                await redis.expire(cache_full_key, Config.REDIS_CACHE_SEC)
+          :param keywords: 关键字列表，可以是字符串或元组（函数名, 参数）。
+          :param tool_calls: 工具函数列表。
+          :return: 处理结果的扁平化列表。
+        """
+
+        # docs = retriever(question)
+        # Assume this is the document retrieved from RAG
+        # function_call = Agent_Functions.get(agent, lambda *args, **kwargs: [])
+        # refer = function_call(user_message, ...)
+        tool_calls = tool_calls or []
+        keywords = keywords or []
+        callables = {}
+        # 多个keywords,用在registry list 的 user_calls,自定义func参数
+        for item in keywords:
+            if isinstance(item, tuple):  # (函数名,无参,单个参数,多个位置参数列表,关键字参数字典)
+                try:
+                    tool_name = item[0]
+                    _func = self.get_function_registered(tool_name)  # user_calls 函数
+                    if _func:
+                        func_args = item[1] if len(item) > 1 else []
+                        func_kwargs = item[2] if len(item) > 2 else {}
+                        callable_key = generate_hash_key(id(_func), func_args, **func_kwargs)
+                        bound_func = partial(_func, *func_args, **func_kwargs)
+                        callables[callable_key] = bound_func
+                        # callables.append((_func, func_args, func_kwargs)))
+                except TypeError as e:
+                    logger.error(f"类型错误: {e},{item}")
+                except Exception as e:
+                    logger.error(f"其他错误: {e},{item}")
+
+        for bound_func in filter(callable, tool_calls):
+            if isinstance(bound_func, partial):
+                callable_key = generate_hash_key(id(bound_func), bound_func.args, **bound_func.keywords)
+                callables[callable_key] = bound_func
+                logger.info(f"{bound_func.func.__name__} with args: {bound_func.args}, kwargs: {bound_func.keywords}")
             else:
-                raise Exception
+                func_name = getattr(bound_func, "__name__", type(bound_func).__name__)
+                logger.warning(f"{func_name}(not partial)")
+
+        refer = await run_bound_tasks(bound_funcs=[f for _, f in callables.items()])
+        # 展平嵌套结果,(result.items() if isinstance(result, dict) else result)
+        return [item for result in refer if not isinstance(result, Exception)
+                for item in (result if isinstance(result, list) else [result])]
+
+    @classmethod
+    async def get_metadata_from_cache(cls, cache_key: str, redis=None, retry: int = 2, ex: int = 0):
+        try:
+            if not redis:
+                raise RuntimeError("Redis not available")
+            cache_full_key = f"{cls.key_meta}:{cache_key}"
+            cached_metadata = await get_redis_retry(redis, cache_full_key, retry=retry)
+            await redis.expire(cache_full_key, ex or Config.REDIS_CACHE_SEC)
+            await redis.expire(cls.key_reg_name, ex or Config.REDIS_CACHE_SEC)
+            if cached_metadata:
+                return json.loads(cached_metadata)
         except Exception:
             # Too many connections
-            cached_metadata = cls._meta_store.get(cache_key, {})
+            return cls._meta_store.get(cache_key, {})
 
-        if cached_metadata:
-            # print(f"Metadata already cached for function: {func_name},{cached_metadata}")
-            metadata = json.loads(cached_metadata) if isinstance(cached_metadata, str) else cached_metadata
-            return cache_key, metadata, function_code
+    @classmethod
+    async def set_metadata_to_cache(cls, metadata: dict, cache_key: str, func_name: str, redis=None, ex: int = 0):
+        """存储生成的元数据"""
+        if redis:
+            try:
+                await redis.setex(f"{cls.key_meta}:{cache_key}", ex or Config.REDIS_CACHE_SEC,
+                                  json.dumps(metadata, ensure_ascii=False))
+                await redis.hset(cls.key_reg_name, cache_key, func_name)  # mapping={cache_key:func_name}
+                await redis.expire(cls.key_reg_name, ex or Config.REDIS_CACHE_SEC)
+            except Exception as e:
+                logger.error(f'[set_metadata_to_cache]:{e}')
+        cls._meta_store[cache_key] = metadata
 
-        # print(f"Metadata no cached for function: {func_name}\n{function_code}")
-        return cache_key, {}, function_code
+    @classmethod
+    async def get_tools_metadata_by_redis(cls, func_name: str = None, redis=None) -> list[dict]:
+        redis = redis or get_redis()
+        if not func_name:
+            return await scan_from_redis(redis, key=cls.key_meta, batch_count=50)
+
+        registered = await redis.hgetall(cls.key_reg_name)  # await redis.hget(cls.key_reg_name, cache_key)
+        cache_keys = [f'{cls.key_meta}:{k}' for k, v in registered.items() if v == func_name]
+        if not cache_keys:
+            return []
+        cached_values = await redis.mget(*cache_keys)
+        return [json.loads(v) for v in cached_values if v]
 
     @classmethod
     async def generate_metadata(cls, func: Callable, model_name: str = None, redis=None, retry=2, **kwargs) -> dict:
         '''
         为单个函数生成元数据（可从 Redis/本地缓存中恢复）
         '''
-        from generates import ai_generate_metadata
-        cache_key, metadata, function_code = await cls.get_metadata_from_cache(func, redis, retry)
+        # 获取函数的名称、参数以及docstring
+        func_name = func.__name__
+        function_code = fix_indentation(remove_function_decorators(func))
+        cache_key = generate_hash_key(func_name, function_code)
+        metadata = await cls.get_metadata_from_cache(cache_key, redis=redis, retry=retry)
         if metadata:
+            # print(f"Metadata already cached for function: {func_name},{metadata}")
             return metadata
+        # print(f"Metadata no cached for function: {func_name}\n{function_code}")
 
         metadata = extract_function_metadata(func)
         metadata = await ai_generate_metadata(function_code, metadata, model_name=model_name, **kwargs)
-        # 获取并存储生成的元数据
-        if redis:
-            try:
-                await redis.setex(f"{cls.key_meta}:{cache_key}", Config.REDIS_CACHE_SEC,
-                                  json.dumps(metadata, ensure_ascii=False))
-                # await redis.set(f‘registry:{ metadata["function"]["name"]}', str(metadata))  # 用函数名作为Redis的键,存储为JSON格式
-            except Exception as e:
-                print(e)
-
-        cls._meta_store[cache_key] = metadata
+        func_name = metadata.get("function", {}).get("name", func.__name__)
+        await cls.set_metadata_to_cache(metadata, cache_key, func_name, redis=redis)
         return metadata
 
     @classmethod
-    async def get_tools_metadata(cls, func_list: list[Callable] = None, model_name=None, **kwargs) -> list[dict]:
+    async def get_tools_metadata(cls, func_list: list[Callable] = None, model_name=None, redis=None,
+                                 **kwargs) -> list[dict]:
         """
         为给定函数列表获取或生成元数据（批量）
         如果没有 func_list []，直接redis里面获取，否则逐个检查 func_list 注册的缓存或者生成；返回元数据列表
         :return tools_metadata: list[dict]
         """
-        redis = get_redis()
         if not func_list:
-            # all_key = f"{cls.key_meta}:all"
-            tools_metadata = await scan_from_redis(redis, cls.key_meta, batch_count=50) or list(
-                cls._meta_store.values())
-            return tools_metadata
+            tools_metadata = None
+            if redis:
+                tools_metadata = await cls.get_tools_metadata_by_redis(func_name=None, redis=redis)
+            return tools_metadata or list(cls._meta_store.values())
 
         process_func = run_togather(max_concurrent=Config.REDIS_MAX_CONCURRENT)(cls.generate_metadata)
         results = await process_func(inputs=func_list, model_name=model_name, redis=redis, **kwargs)
         return [metadata for metadata in results if isinstance(metadata, dict)]
 
-    async def get_registered_tools_metadata(self, model_name=Config.DEFAULT_MODEL_METADATA, **kwargs) -> list[dict]:
+    async def tools_metadata(self, model_name: str = Config.DEFAULT_MODEL_METADATA, registered: bool = True,
+                             **kwargs) -> list[dict]:
         '''
-        获取所有注册表中的函数元数据（keywords + global）
+        registered:获取所有注册表中的函数元数据（keywords + global）
+        否则 cache获取（redis or local）
         '''
-        registered = self.keywords_registry or self.global_registry
-        function_list: list[Callable] = [v for k, v in registered.items()]
-        return await self.get_tools_metadata(func_list=function_list, model_name=model_name, **kwargs)
+        function_list: list[Callable] = [v for k, v in self.registered_method.items()] if registered else None
+        return await self.get_tools_metadata(func_list=function_list, model_name=model_name, redis=self.redis, **kwargs)
 
     async def generate_tools_metadata(self, model_name: str = Config.DEFAULT_MODEL_METADATA, lock_timeout: int = 600):
         '''
         加锁后生成所有注册表函数元数据，用于定时任务等场景
         '''
-        await run_with_lock(self.get_registered_tools_metadata, lock_timeout=lock_timeout,
-                            lock_key="lock:generate_tools_metadata", model_name=model_name)
+        await run_with_lock(self.tools_metadata, lock_timeout=lock_timeout, lock_key="lock:generate_tools_metadata",
+                            model_name=model_name, registered=True)
 
     @classmethod
-    def generate_metadata_async(cls, func: Callable):
+    def generate_metadata_future(cls, func: Callable):
         """
         异步生成函数元数据，不影响函数执行，自动检测事件循环状态，选择合适的执行方式
         """
-        import inspect
         # print(func.__name__, type(func))
         if inspect.isfunction(func):
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(cls.generate_metadata(func, redis=get_redis()))
-            else:
-                asyncio.run(cls.generate_metadata(func, redis=get_redis()))
+            run_by_future(cls.generate_metadata, func, redis=get_redis())
 
     @classmethod
     def metadata_decorator(cls, func: Callable) -> Callable:
         """
         类方法装饰器，用于在后台生成函数元数据
         @FunctionManager.metadata_decorator
-        参数:
-            func: 被装饰的函数
-        返回:
-            注册后的函数，保持原函数功能不变
         """
 
         @wraps(func)
         def wrapper(*args, **kwargs):
             # 在函数执行前启动元数据生成（不阻塞）
-            cls.generate_metadata_async(func)
+            cls.generate_metadata_future(func)
             return func(*args, **kwargs)  # 执行原函数
 
         return cls.register(wrapper)  # 返回注册过的包装函数
@@ -305,7 +379,8 @@ Registry_Module = {
     "utils": ["get_times_shift", "date_range_calculator", 'extract_json_struct', 'extract_json_array',
               "get_day_range", "get_week_range", "get_month_range", "lang_token_size",
               "get_quarter_range", "get_year_range", "get_half_year_range", "math_solver",
-              "extract_links", "extract_web_content", "remove_markdown", "extract_table_segments"],
+              "extract_links", "extract_web_content", "remove_markdown", "extract_table_segments",
+              "save_markdown", "read_markdown"],
     "agents.ai_multi": ['xunfei_ppt_create', 'tencent_generate_image'],
     "agents.ai_company": ['annual_report_info', 'base_account_record', 'case_filing', 'company_black_list',
                           'company_exception_list', 'company_out_investment', 'company_personnel_risk',

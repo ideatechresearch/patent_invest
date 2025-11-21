@@ -1,15 +1,16 @@
 from collections import deque
 from functools import wraps
 import itertools
+import numpy as np
 
 
 def chainable_method(func):
-    """装饰器，使方法支持链式调用"""
+    """装饰器，使方法支持链式调用，保留显式返回值"""
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
-        func(self, *args, **kwargs)
-        return self
+        result = func(self, *args, **kwargs)
+        return self if result is None else result
 
     return wrapper
 
@@ -64,16 +65,28 @@ class CircularBand:
             self.cursor = insert_pos
 
     @chainable_method
-    def remove(self):
+    def remove(self, pos: int = None):
         """删除指针位置元素（自动连接相邻元素）"""
         if not self.data:
             return
 
-        del self.data[self.cursor]
+        n = len(self.data)
+        if pos is None:
+            pos = self.cursor
+        else:
+            pos %= n  # 支持负索引
+
+        del self.data[pos]
+
+        # 处理删除后的光标位置
         if not self.data:
             self.cursor = 0
-        elif self.cursor >= len(self.data):
+        elif pos >= len(self.data):
+            # 删的是最后一个 → 回到 0（环形首）
             self.cursor = 0
+        else:
+            # 否则光标仍指向原删除位置（删除后的下一个元素）
+            self.cursor = pos
 
     @chainable_method
     def expand(self, items):
@@ -145,19 +158,20 @@ class CircularBand:
         """将数据结构首尾镜像反转"""
         if not self.data:
             return
-        current_item = self.data[self.cursor]
+        n = len(self.data)
         self.data.reverse()
-        # 找到原元素的新位置
-        self.cursor = self.data.index(current_item)
+        # 对称更新光标位置
+        self.cursor = n - 1 - self.cursor  # self.data.index(current_item)
 
     @chainable_method
-    def swap(self):
+    def swap(self, pos: int = None):
         """交换当前元素与下一个元素，并将指针移到下一个元素"""
         n = len(self.data)
         if n < 2:
             return
-
-        next_pos = (self.cursor + 1) % n
+        next_pos = (self.cursor + 1) % n if pos is None else pos % n
+        if next_pos == self.cursor:
+            return
         self.data[self.cursor], self.data[next_pos] = self.data[next_pos], self.data[self.cursor]
         self.cursor = next_pos
 
@@ -226,11 +240,12 @@ class CircularBand:
             return []
         return list(self) if start_from_current else self.data.copy()
 
-    def to_matrix(self, block_size: int = 4) -> list[list]:
+    def to_matrix(self, block_size: int = 4, transpose: bool = False) -> list[list]:
         """
         将当前 data 视作按列填充的矩阵并返回（不修改 data）。
         语义：把 data 按列填充到 4 行（block_size 行），即 column-major 填充，
         最后返回按行的矩阵（rows x cols）。
+        transpose: 是否返回转置后的矩阵
         要求 len(data) % block_size == 0（否则最后一列会被补 None）。
         """
         import math
@@ -249,6 +264,8 @@ class CircularBand:
                     matrix[r][c] = next(it)
                 except StopIteration:
                     matrix[r][c] = None
+        if transpose:
+            matrix = [list(row) for row in zip(*matrix)]
         return matrix
 
     def to_round(self, n_slices: int = 4, start_from_current: bool = False,
@@ -290,11 +307,12 @@ class CircularBand:
 
         return chunks
 
-    @classmethod
-    def to_square_projection(cls, bands: list['CircularBand'], base: int = 8, fill_center_with=None) -> list:
+    @staticmethod
+    def to_square_projection(bands: list['CircularBand'], start_batch: int = 8,
+                             center_value=None) -> list[list]:
         """
         使用 bands[i].to_round(per_side) 将 bands 投影到方阵。
-        - base: 第一层的 batch_size 基数（如 8），第 i 层的 batch_size = base*(i+1)
+        - base: 第一层的 batch_size 基数（如 8），第 i 层的 batch_size = start_batch*(i+1)
         """
         n_layers = len(bands)
         grid_size = 2 * n_layers + 1
@@ -303,10 +321,10 @@ class CircularBand:
 
         for i, band in enumerate(bands):
             layer = i + 1  # radius 第几层（半径）
-            batch_size = base * layer  # e.g. 8,16,...,8*n = 4*per_edge
+            batch_size = start_batch * layer  # e.g. 8,16,...,8*n = 4*per_edge
             assert len(band) == batch_size, f"第 {i} 层数据长度应为 {batch_size}，实际为 {len(band)}"
 
-            slices = band.to_round(n_slices=4, start_from_current=False, pad_value=fill_center_with)
+            slices = band.to_round(n_slices=4, start_from_current=False, pad_value=center_value)
             top, right, bottom, left = slices
 
             top_row = center - layer
@@ -331,10 +349,161 @@ class CircularBand:
                 grid[bottom_row - j][left_col] = val
 
         # 处理中心点
-        if fill_center_with is not None:
-            grid[center][center] = fill_center_with
+        if center_value is not None:
+            grid[center][center] = center_value
 
         return grid
+
+    @staticmethod
+    def split_matrix_blocks(matrix, rotate: bool = True) -> tuple:
+        """
+        将 n x n 矩阵按中心分成 4 块（奇数去掉中心点）。
+        每块元素数 = c*(c+1)，形状 = (c+1) x c, n_layers=c
+        每块元素数相同，形状为 (c+1) x c（c = n//2）。rotate 控制是否把
+        两块需要旋转的子块转置成相同形状。
+        返回 (blocks, coords)：
+          blocks: [R1, R2, R3, R4]  2D lists
+          coords: [(rows_list, cols_list), ...] 对应每块在原矩阵中的索引范围
+        块顺序: R1=左上, R2=右上, R3=右下, R4=左下
+        """
+        n = len(matrix)
+        assert all(len(row) == n for row in matrix), "必须是方阵"
+        c = n // 2
+
+        if n % 2 == 0:  # 偶数， total:4*c*c+=n*n
+            # 切片范围
+            r0 = range(0, c)
+            r1 = range(c, n)
+            c0 = range(0, c)
+            c1 = range(c, n)
+
+            S1 = [row[c0.start:c0.stop] for row in matrix[r0.start:r0.stop]]  # 左上
+            S2 = [row[c1.start:c1.stop] for row in matrix[r0.start:r0.stop]]  # 右上
+            S3 = [row[c1.start:c1.stop] for row in matrix[r1.start:r1.stop]]  # 右下
+            S4 = [row[c0.start:c0.stop] for row in matrix[r1.start:r1.stop]]  # 左下
+
+            coords = [
+                (list(r0), list(c0)),
+                (list(r0), list(c1)),
+                (list(r1), list(c1)),
+                (list(r1), list(c0)),
+            ]
+            if not rotate:
+                return [S1, S2, S3, S4], coords
+
+        else:  # 奇数（覆盖除中心外所有点） total:4*c*(c+1)=n*n-1
+            # 定义四个区块的行列 range，用 range 合理构建
+            r1, c1 = range(0, c), range(0, c + 1)  # S1
+            r2, c2 = range(0, c + 1), range(c + 1, n)  # S2
+            r3, c3 = range(c + 1, n), range(c, n)  # S3
+            r4, c4 = range(c, n), range(0, c)  # S4
+
+            # 切片上界是排他的
+            S1 = [row[c1.start:c1.stop] for row in matrix[r1.start:r1.stop]]  # c x (c+1)
+            S2 = [row[c2.start:c2.stop] for row in matrix[r2.start:r2.stop]]  # (c+1) x c
+            S3 = [row[c3.start:c3.stop] for row in matrix[r3.start:r3.stop]]  # c x (c+1)
+            S4 = [row[c4.start:c4.stop] for row in matrix[r4.start:r4.stop]]  # (c+1) x c
+
+            coords = [
+                (list(r1), list(c1)),  # S1 rows,cols
+                (list(r2), list(c2)),  # S2 rows,cols (原始)
+                (list(r3), list(c3)),  # S3
+                (list(r4), list(c4))  # S4
+            ]
+            if not rotate:
+                return [S1, S2, S3, S4], coords
+
+        # 选择 S1 作为基准方向，旋转其他三个以与 S1 朝向一致,把 S1..S4 变形/旋转成相同形状并使方向一致
+        R1 = S1  # 下面旋转方向选择保证“中心对称旋转关系”
+        R2 = [list(row) for row in zip(*S2)]  # transpose
+        R2 = R2[::-1]  # reverse row order
+        R3 = [row[::-1] for row in S3[::-1]]
+        R4 = [list(row) for row in zip(*S4)]
+        R4 = [row[::-1] for row in R4]
+
+        blocks = [R1, R2, R3, R4]
+        return blocks, coords
+
+    @staticmethod
+    def split_matrix_rotational(matrix):
+        """
+        按中心分成四块，并统一方向（中心旋转对称）。
+        奇数：去掉中心点，每块 (c+1)×c
+        偶数：每块 c×c
+        块顺序：(R1,R2,R3,R4) = (左上, 右上, 右下, 左下)
+        """
+        A = np.array(matrix)
+        n = A.shape[0]
+        assert A.shape[0] == A.shape[1], "必须是方阵"
+        c = n // 2
+        if n % 2 == 0:
+            # 偶数：直接 4 象限
+            S1 = A[:c, :c]  # 左上
+            S2 = A[:c, c:]  # 右上
+            S3 = A[c:, c:]  # 右下
+            S4 = A[c:, :c]  # 左下
+        else:
+            # 奇数：去掉中心点
+            S1 = A[0:c, 0:c + 1]  # 左上: rows[0:c], cols[0:c+1]
+            S2 = A[0:c + 1, c + 1:n]  # 右上: rows[0:c+1], cols[c+1:n]
+            S3 = A[c + 1:n, c:n]  # 右下: rows[c+1:n], cols[c:n]
+            S4 = A[c:n, 0:c]  # 左下: rows[c:n], cols[0:c]
+
+        R1 = S1.copy()
+        R2 = np.flipud(S2.T)  # R2: transpose + flipud
+        R3 = np.fliplr(np.flipud(S3))  # R3: 180 degrees = flipud + fliplr
+        R4 = np.fliplr(S4.T)  # R4: transpose + fliplr
+
+        return R1, R2, R3, R4  # [R1.tolist(), R2.tolist(), R3.tolist(), R4.tolist()]
+
+    @staticmethod
+    def merge_rotated_blocks(blocks: tuple | list | np.ndarray, center_value=None):
+        """
+        R1~R4: 四块 numpy array，已按统一朝向旋转
+        center_value: 奇数矩阵中心点填充值
+        返回原矩阵 numpy array
+        """
+        if isinstance(blocks, np.ndarray) and blocks.ndim == 3:
+            if blocks.shape[0] != 4:
+                raise ValueError("3D array 输入必须是 (4, h, w)")
+            R1, R2, R3, R4 = blocks[0], blocks[1], blocks[2], blocks[3]
+        else:
+            R1, R2, R3, R4 = blocks
+
+        c = R1.shape[0]
+        if R1.shape[1] == c + 1:  # 奇数矩阵
+            n = 2 * c + 1
+            mat = np.empty((n, n), dtype=R1.dtype)
+
+            mat[0:c, 0:c + 1] = R1  # 左上: R1 不动
+            mat[0:c + 1, c + 1:n] = np.flipud(R2).T  # 右上: R2 逆旋转 -> flipud + transpose
+            mat[c + 1:n, c:n] = np.flipud(np.fliplr(R3))  # 右下: R3 逆旋转 -> flipud + fliplr (180°)
+            mat[c:n, 0:c] = np.fliplr(R4).T  # 左下: R4 逆旋转 -> fliplr + transpose
+
+            mat[c, c] = center_value  # 中心点
+
+        else:  # 偶数矩阵，c = R1.rows = R1.cols
+            n = 2 * c
+            mat = np.empty((n, n), dtype=R1.dtype)
+
+            # 同样旋转逆操作
+            mat[0:c, 0:c] = R1
+            mat[0:c, c:n] = np.flipud(R2).T
+            mat[c:n, c:n] = np.flipud(np.fliplr(R3))
+            mat[c:n, 0:c] = np.fliplr(R4).T
+
+        return mat
+
+    @staticmethod
+    def blocks_to_diagonal(blocks: tuple | list):
+        # 提取对角元素
+        # [block[i][i] for i in range(min(len(block), len(block[0])))]
+        return np.vstack([np.diag(block) for block in blocks])
+
+    @staticmethod
+    def blocks_to_axle(blocks: tuple | list):
+        # 提取轴列元素(最后一列),左上(右侧)，右上（下），右下（左），左下（上）
+        return np.vstack([b[:, -1] for b in blocks])  # top:第一行b[0, 1:]
 
     def save(self, filename):
         """保存数据到文件（包括指针位置）"""
@@ -597,7 +766,22 @@ if __name__ == "__main__":
 
     print("total processed:", total_processed)
 
-    g = CircularBand.to_square_projection(bands)
+    g = CircularBand.to_square_projection(bands, start_batch=8)
     print(len(g))
     for i, b in enumerate(g):
         print(i, b)  # 9,9：None
+
+    g[9][9] = ('O', 'O')
+    m = []
+    for i, b in enumerate(g):
+        m.extend(b)
+
+    mapping = {g: i for i, g in enumerate(Allele.genotypes())}
+    print(len(m), mapping)
+    byte_data = Allele.states_encode(m, mapping)
+    print(byte_data)
+    print(byte_data.__sizeof__(), f"编码后大小: {len(byte_data)} 字节")
+    m2 = Allele.states_decode(byte_data, len(m), mapping)
+    print(m2)
+    c_id = 9 * 19 + 9
+    print(c_id, m2[c_id])

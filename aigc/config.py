@@ -34,7 +34,7 @@ class Config(object):
     DEVICE_ID = 'IusetTHaVvDmji5odDRZBQIhcTvcGWs6'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
-    Version = 'v1.2.9'
+    Version = 'v1.3.0'
     _config_path = 'config.yaml'
     __config_data = {}  # 动态加载的数据，用于还原
     __config_dynamic = {}  # 其他默认配置项，用于运行时
@@ -164,6 +164,7 @@ class Config(object):
     # https://o3.fan/token
     OThree_Service_Key = "***"
     ZZZ_Service_Key = "***"
+    AI147_Service_Key = '***'
     # https://ai.youdao.com/console/#/
     YOUDAO_AppID = '775f6562be8c52e4'
     YOUDAO_Service_Key = '***'
@@ -958,6 +959,10 @@ AI_Models = [
      'embedding_url': 'https://api.zhizengzeng.com/v1/embeddings',
      'base_url': "https://api.zhizengzeng.com/v1",
      'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 300},
+    {'name': '147', 'type': 'default', 'api_key': '', 'model': ['deepseek-v3-2-exp'],
+     'url': 'https://147ai.com/v1/chat/completions',
+     'base_url': "https://147ai.com/v1",
+     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 600},
     # https://platform.openai.com/docs/overview
     {'name': 'gpt', 'type': 'default', 'api_key': '',
      'model': ["o3-mini", "o3-mini-2025-01-31", "o1", "o1-2024-12-17", "o1-preview", "o1-preview-2024-09-12", "o1-mini",
@@ -1007,7 +1012,8 @@ def model_api_keys(name: str = None):
         'aihubmix': Config.AiHubMix_Service_Key,
         'tokenflux': Config.TokenFlux_Service_Key,
         'othree': Config.OThree_Service_Key,
-        'zzz': Config.ZZZ_Service_Key
+        'zzz': Config.ZZZ_Service_Key,
+        '147': Config.AI147_Service_Key
     }
     if not name:
         return api_keys

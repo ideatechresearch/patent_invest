@@ -1,27 +1,25 @@
-import igraph as ig
-import json, time, random, os, pickle
+import json, time, random, uuid
+from typing import Dict, List, Union, Callable, Optional, Any
+
+from collections import defaultdict
 from datetime import datetime, timedelta
+
 import threading
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 from functools import partial, wraps
-from redis.asyncio import Redis, StrictRedis, ConnectionPool
-from typing import Dict, List, Tuple, Union, Iterable, Callable, Optional, Any, Type, Awaitable
-from enum import IntEnum, Enum, IntFlag
-from collections import defaultdict
-from dataclasses import asdict, dataclass, is_dataclass, field, fields, replace
-import uuid
-import logging
+
 import zmq, zmq.asyncio
-from neo4j import GraphDatabase, AsyncGraphDatabase
+import igraph as ig
+from redis.asyncio import Redis
+from neo4j import GraphDatabase
 from dask.distributed import Client as DaskClient
 from dask import delayed
 
-from structs import dataclass2dict
-from config import Config
-from service import get_redis, get_neo_driver, get_dask_client
-from utils import pickle_deserialize
+from utils import dataclass2dict
+from service.task_ops import TaskStatus, TaskNode, TaskEdge, ConditionFlag
+from service import get_redis, get_neo_driver
 
 
 def store_in_dask(client, obj, key):
@@ -198,394 +196,6 @@ async def consumer_redis(process_task: Callable, queue_key: str | list[str] = "m
         # finally:
         #     await redis.close()
     print("[Exit] Consumer loop ended.")
-
-
-class TaskStatus(Enum):
-    # "pending" | "ready" | "running" | "done" | "failed"
-    PENDING = "pending"  # 等待条件满足，（包含 created、inited、waiting）
-
-    READY = "ready"  # 条件满足，可以执行
-    IN_PROGRESS = "running"  # processing，retrying
-
-    COMPLETED = "done"  # completed
-    FAILED = "failed"  # error，timeout，这里不做细分
-
-    RECEIVED = "received"  # 客户接收数据，等待延时释放
-    CANCELLED = "cancelled"  # 手动取消,expired
-
-
-class TaskCommand(Enum):
-    GOTO = "goto"  # 跳转到指定节点
-    CALL = "call"  # 调用子工作流
-    RETURN = "return"  # 返回上级工作流
-    BREAK = "break"  # 跳出循环
-    CONTINUE = "continue"  # 继续下一轮循环
-    EXIT = "exit"  # 终止工作流
-
-
-@dataclass
-class TaskNode:
-    name: str  # task_id 任务名或别名
-    description: Optional[str] = None  # 任务描述 内容 content
-    # type: Optional[str] = None  # 'api', 'llm', 'script'
-    action: Optional[str] = None  # 可执行动作,任务用途(如脚本、注册名、函数名、脚本或引用的操作类型) strategies
-    function: Optional[Callable] = field(default=None)  # execute 激活函数任务的执行逻辑（可调用对象函数,绑定后的 partial(func, args)）
-    event: Optional[Dict[str, Any]] = None  # 触发标志（不处理依赖逻辑）事件是标识符，用于任务之间的触发,指示触发的事件类型和附加数据,外部触发信号
-    command: Dict[str, Any] = field(default_factory=dict)  # cmd 任务控制逻辑,节点执行函数动态跳转,goto,静态边走 TaskEdge，内部控制
-
-    status: TaskStatus = TaskStatus.PENDING
-    progress: float = 0  # 执行进度，适合长任务、流任务场景（0-100）
-    priority: int = 10  # bias 执行顺序控制，优先级
-    tags: List[str] = field(default_factory=list)  # channel,label 辅助标签，分类/搜索，索引、分组、过滤
-
-    start_time: float = field(default_factory=time.time)  # created_at
-    end_time: float = 0  # updated_at
-
-    data: Any = field(default_factory=dict)  # metadata,动态更新参数，自由定义不用明确结构，此处不限制，保持灵活性，Dict[str, Any]
-    params: Any = field(default_factory=dict)  # input payload,context,message 执行输入参数,dict/list[dict]
-    result: Any = field(default_factory=list)  # output 输出结果，允许 reason，error，此处不限制，不约束类型保持灵活性
-    count: int = 0  # 结果条目数量，自定义 result_count,event_count
-
-    @staticmethod
-    def default_node_attrs(task_id: str, **attributes):
-        auto_call = {"start_time", "end_time", "create_time"}
-        default_attrs = {
-            "name": task_id,
-            "status": TaskStatus.PENDING,
-            "start_time": time.time,
-            "event": None,
-            "action": None,
-            "function": None,
-            **attributes
-        }
-        return {k: v() if callable(v) and k in auto_call else v
-                for k, v in default_attrs.items()}
-
-    @property
-    def duration(self) -> float:
-        return (self.end_time - self.start_time) if self.end_time > self.start_time else 0.0
-
-    async def to_redis(self, redis_client, ex: int = 3600, key_prefix='task'):
-        key = f"{key_prefix}:{self.name}"
-        payload = dataclass2dict(self)
-        if self.function and (asyncio.iscoroutinefunction(self.function) or asyncio.iscoroutine(self.function)):
-            payload.pop("function", None)
-        # payload.pop("data", None) # pickle.dumps(payload["data"])
-        await redis_client.setex(key, ex, json.dumps(payload, ensure_ascii=False))
-
-    @classmethod
-    async def from_redis(cls, redis_client, task_id: str, ex: int = 0, key_prefix='task'):
-        key = f"{key_prefix}:{task_id}"
-        value = await redis_client.get(key)
-        if not value:
-            return None
-
-        if ex > 0:
-            await redis_client.expire(key, ex)
-        data = json.loads(value)
-        return cls.set_data(data)
-
-    @classmethod
-    def set_data(cls, data: dict):
-        if "status" in data and data["status"] is not None:
-            data["status"] = TaskStatus(data["status"])
-        if "params" in data:
-            data["params"] = pickle_deserialize(data["params"])
-        if "data" in data:
-            data["data"] = pickle_deserialize(data["data"])  # pickle.loads(data["data"])
-        if "function" in data:
-            data["function"] = pickle_deserialize(data["function"])
-
-        return cls(**data)
-
-    def copy_and_update(self, *args, **kwargs):
-        """
-        Copy the object and update it with the given Info
-        instance and/or other keyword arguments.
-        """
-        new_info = asdict(self)
-
-        for si in args:
-            if isinstance(si, TaskNode):
-                new_info.update({k: v for k, v in asdict(si).items() if v is not None})
-            elif isinstance(si, dict):
-                new_info.update({k: v for k, v in si.items() if v is not None})
-
-        if kwargs:
-            new_info.update(kwargs)
-
-        # for k, v in new_info.items():
-        #     setattr(self, k, v)
-        return replace(self, **new_info)  # 返回一个新的 TaskNode 实例
-
-
-class TaskManager:
-    Task_queue: dict[str, TaskNode] = {}  # task_map queue.Queue(maxsize=Config.MAX_TASKS)
-    Task_lock = asyncio.Lock()
-    key_prefix = 'task'
-
-    @classmethod
-    async def add_task(cls, task_id: str, task: TaskNode, redis_client=None, ex: int = 3600):
-        if redis_client:
-            await task.to_redis(redis_client, ex=ex, key_prefix=cls.key_prefix)
-
-        async with cls.Task_lock:
-            cls.Task_queue[task_id or task.name] = task
-
-    @classmethod
-    async def add(cls, redis=None, ex: int = 3600, **kwargs) -> tuple[str, TaskNode]:
-        task_id = kwargs.pop('name', str(uuid.uuid4()))
-        redis = redis or get_redis()
-        task_fields = TaskNode.default_node_attrs(task_id, **kwargs)
-        task = TaskNode(**task_fields)
-        await cls.add_task(task_id, task, redis_client=redis, ex=ex)
-        return task_id, task
-
-    @classmethod
-    async def remove_task(cls, task_id: str):
-        async with cls.Task_lock:
-            cls.Task_queue.pop(task_id, None)
-
-    @classmethod
-    async def get_task(cls, task_id: str, redis_client=None, ex: int = 0) -> TaskNode | None:
-        async with cls.Task_lock:
-            if task_id in cls.Task_queue:
-                return cls.Task_queue[task_id]
-
-        if redis_client:
-            task = await TaskNode.from_redis(redis_client, task_id, ex=ex, key_prefix=cls.key_prefix)
-            if task:
-                async with cls.Task_lock:
-                    cls.Task_queue[task_id] = task
-            return task
-
-        return None
-
-    @classmethod
-    async def get_task_status(cls, task_id: str, redis_client=None) -> TaskStatus | None:
-        task = await cls.get_task(task_id, redis_client)
-        if task:
-            return task.status
-        return None
-
-    @classmethod
-    async def set_task_status(cls, task: TaskNode, status: TaskStatus, progress: float = 0, redis_client=None):
-        async with cls.Task_lock:
-            task.status = status
-            if progress > 0:
-                task.progress = progress
-            cls.Task_queue[task.name] = task
-
-        if redis_client:
-            await task.to_redis(redis_client, key_prefix=cls.key_prefix)
-
-    @classmethod
-    async def put_task_result(cls, task: TaskNode, result, total: int = -1, status: TaskStatus = None,
-                              params: dict = None, redis_client=None) -> TaskNode:
-        async with cls.Task_lock:
-            task.result.append(result)
-            task.count = len(task.result)
-            if params is not None:
-                task.params = params
-
-            if total > 0:
-                task.progress = round(task.count * 100 / total, 2)
-                if task.count >= total:
-                    task.progress = 100.0
-            if status is not None:
-                task.status = status
-            else:
-                if task.count >= total > 0:
-                    task.status = TaskStatus.COMPLETED  # 标记完成,最终状态
-                else:
-                    task.status = TaskStatus.IN_PROGRESS  # 中间更新,-1 任务还没结束
-
-            task.end_time = time.time()
-            cls.Task_queue[task.name] = task
-
-        if redis_client:  # 把IO操作放到锁外
-            await task.to_redis(redis_client, key_prefix=cls.key_prefix)
-
-        return task
-
-    @classmethod
-    async def update_task_result(cls, task_id: str, result, status: TaskStatus = TaskStatus.COMPLETED,
-                                 redis_client=None):
-        task: TaskNode = await cls.get_task(task_id, redis_client)
-        if not task:
-            print(f"[update_task_result] Task {task_id} not found.")
-            return None
-
-        async with cls.Task_lock:
-            task.result = result
-            task.count = len(result) if isinstance(result, (list, set, tuple)) else 1 if result else 0
-            task.status = status
-            task.end_time = time.time()
-            if task.status in (TaskStatus.COMPLETED, TaskStatus.RECEIVED):
-                task.data = None
-                task.progress = 100
-            elif task.status == TaskStatus.FAILED:
-                print(f"Task failed: {dataclass2dict(task)}")
-
-        if redis_client:
-            await task.to_redis(redis_client, key_prefix=cls.key_prefix)
-
-        return task.result
-
-    @classmethod
-    async def clean_old_tasks(cls, timeout_received=3600, timeout=86400):
-        current_time = time.time()
-        task_ids_to_delete = []
-
-        for _id, task in cls.Task_queue.items():
-            if task.end_time and (current_time - task.end_time) > timeout_received:
-                if task.status == TaskStatus.RECEIVED:
-                    task_ids_to_delete.append(_id)
-                    print(f"Task {_id} has been marked for cleanup. Status: RECEIVED")
-            elif (current_time - task.start_time) > timeout:
-                task_ids_to_delete.append(_id)
-                print(f"Task {_id} has been marked for cleanup. Timeout exceeded")
-
-        if task_ids_to_delete:
-            async with cls.Task_lock:
-                for _id in task_ids_to_delete:
-                    cls.Task_queue.pop(_id, None)
-
-
-class ConditionFlag(IntFlag):
-    NONE = 0
-    STATUS_MATCH = 1 << 0
-    TIME_OK = 1 << 1
-    CUSTOM_OK = 1 << 2
-
-
-@dataclass
-class TaskEdge:
-    """定义任务依赖关系的有向边"""
-    relation: tuple[str, str]  # (source,target),依赖的起始任务ID,被触发的任务ID
-    # 边上的触发条件（与源任务的状态相关),["done",{"deadline": time.time() + 60}]
-    condition: Union[str, Dict[str, Any]]  # 触发条件，如 "done" 或 {"deadline": timestamp}，dependencies,lambda->rule
-
-    # 使用field提供默认值以避免可变默认值问题,absolute,relative,[None, {"relative": 5}]
-    trigger_time: Optional[Dict[str, Union[int, float]]] = field(
-        default=None,
-        metadata={"description": "时间触发配置，如 {'relative': 5}(秒) 或 {'absolute': 1680000000}(时间戳)"}
-    )
-    # 任务触发事件,None无依赖
-    trigger_event: Optional[str] = field(default=None, metadata={"description": "事件名称，如 'file_uploaded'"})
-    # 复杂条件,函数或复杂的逻辑判断
-    rule: Optional[Callable[..., bool]] = field(default=None,
-                                                metadata={"description": "自定义条件函数，接受上下文返回布尔值"})
-    map: Optional[dict] = field(default_factory=dict,
-                                metadata={"description": "挂载函数，对上游结果处理映射,参数变换逻辑"})
-
-    weight: float = 1.0  # 适用于图遍历/调度优先级；-1,0,1
-
-    def __post_init__(self):
-        """数据校验和转换"""
-        self._validate_condition()
-        self._normalize_trigger_time()
-
-    def as_dict(self) -> dict:
-        return dataclass2dict(self)
-
-    @classmethod
-    def set_data(cls, data: dict, rule_function: Optional[Callable] = None):
-        if "rule" in data:
-            rule_obj = pickle_deserialize(data["rule"])  # pickle.loads()
-            if rule_function and isinstance(rule_obj, str):
-                rule_obj = rule_function(rule_obj)  # 从注册表或动态导入恢复函数,用于从函数名等恢复为函数对象
-            data["rule"] = rule_obj
-
-        field_names = {f.name for f in fields(cls) if f.init}
-        attrs = {k: v for k, v in data.items() if k in field_names}  # cls.__annotations__
-        return cls(**attrs)
-
-    @classmethod
-    def get(cls, key):
-        return getattr(cls, key, None)
-
-    def _validate_condition(self):
-        """验证condition字段格式"""
-        condition = self.condition  # STR
-        if isinstance(condition, TaskStatus):
-            condition = condition.value
-        if isinstance(condition, str):
-            if self.condition not in ("done", "failed", "running"):
-                raise ValueError(f"Invalid condition string: {self.condition}")
-        elif isinstance(self.condition, dict):
-            deadline = self.condition.get("deadline")
-            if deadline is not None and not isinstance(deadline, (int, float)):
-                raise TypeError("Deadline must be numeric")
-
-    def _normalize_trigger_time(self):
-        """将相对时间转换为绝对时间戳"""
-        if self.trigger_time and "relative" in self.trigger_time:
-            self.trigger_time = {
-                "absolute": time.time() + self.trigger_time["relative"]
-            }
-
-    def _check_status_condition(self, source: dict) -> bool:
-        if self.condition is None:
-            return False
-
-        condition = self.condition  # STR
-        if isinstance(condition, TaskStatus):
-            condition = condition.value
-        source_status = source.get("status")
-        if isinstance(source_status, TaskStatus):
-            source_status = source_status.value
-
-        return source_status == condition
-
-    def should_trigger(self, context: Dict[str, Any]) -> bool:
-        """判断是否满足触发条件"""
-        # 1. 检查时间条件
-        if self.trigger_time and "absolute" in self.trigger_time:
-            if time.time() < self.trigger_time["absolute"]:
-                return False
-
-        # 2. 检查基础条件
-        if isinstance(self.condition, str):
-            if not self._check_status_condition(context):
-                return False
-        elif isinstance(self.condition, dict):
-            if "deadline" in self.condition:
-                if time.time() < self.condition["deadline"]:
-                    return False
-
-        # 3. 检查自定义规则
-        if self.rule and not self.rule(**context):
-            return False
-
-        return True
-
-    @staticmethod
-    def _evaluate_rule(rule, context: Dict[str, Any], conditions=[]):
-        """评估复杂规则对象"""
-        rule_type = rule.get("type", "and")
-
-        if rule_type == "and":
-            return all(c.should_trigger(context) for c in conditions)
-        elif rule_type == "or":
-            return any(c.should_trigger(context) for c in conditions)
-        elif rule_type == "not":
-            return not conditions[0].should_trigger(context)
-        elif rule_type == "compare":
-            left = context.get("left")
-            right = context.get("right")
-            op = rule["operator"]
-
-            if op == "==": return left == right
-            if op == "!=": return left != right
-            if op == ">": return left > right
-            if op == "<": return left < right
-            if op == ">=": return left >= right
-            if op == "<=": return left <= right
-            if op == "in": return left in right
-            if op == "not_in": return left not in right
-
-        return False
 
 
 class TaskGraphManager:
@@ -1422,223 +1032,6 @@ class MessageZeroMQ:
             print(f"Sent processed message back.")
 
 
-class TimeWheel:
-    def __init__(self, slots: int, tick_duration: int | float, name: str):
-        self.slots = slots
-        self.tick_duration = tick_duration
-        self.name = name
-        self.current_pos: int = 0
-        self.wheel = [[] for _ in range(slots)]
-        self.next_wheel = None
-
-        self._running = False
-        self._task: asyncio.Task | None = None
-        # self._timer = None
-
-    def set_next_wheel(self, next_wheel: "TimeWheel"):
-        self.next_wheel = next_wheel
-
-    def add_task(self, delay: float | int, task, *args, **kwargs):
-        ticks = int(delay // self.tick_duration)
-        rounds = ticks // self.slots
-        pos = int((self.current_pos + ticks) % self.slots)
-
-        wrapped_task = partial(task, *args, **kwargs)
-        self.wheel[pos].append((rounds, wrapped_task))
-
-    @property
-    def elapsed_time(self) -> float:
-        """当前时间轮已推进的秒数"""
-        return self.current_pos * self.tick_duration
-
-    async def tick_once(self) -> bool:
-        """
-        执行一次 tick（供外部手动控制）
-        如果触发了上层时间轮 tick，则返回 True，否则 False
-        """
-        tasks = self.wheel[self.current_pos]
-        remaining_tasks = []
-
-        for rounds, task in tasks:
-            if rounds > 0:
-                remaining_tasks.append((rounds - 1, task))
-            else:  # 执行到期任务
-                try:
-                    if asyncio.iscoroutinefunction(task):
-                        await task()
-                    else:
-                        await asyncio.to_thread(task)  # task() 支持普通函数
-                except Exception as e:
-                    print(f"[{self.name}] Task execution failed: {e}")
-
-        self.wheel[self.current_pos] = remaining_tasks  # 更新轮槽
-        self.current_pos = (self.current_pos + 1) % self.slots
-
-        # 级联上层任务,如果转完一圈，通知上层时间轮
-        if self.current_pos == 0 and self.next_wheel:
-            self.cascade_tasks()  # 将上层时间轮的任务降级到本层
-            return True  # 通知外部“我转完一圈”
-
-        return False
-
-    def cascade_tasks(self):
-        """把上层时间轮当前槽的任务下放到本层"""
-        if not self.next_wheel:
-            return
-
-        # 获取上层时间轮下一槽的所有任务
-        next_pos = int((self.next_wheel.current_pos + 1) % self.next_wheel.slots)
-        tasks = self.next_wheel.wheel[next_pos]
-
-        # 将这些任务重新添加到本层时间轮
-        for rounds, task in tasks:
-            new_rounds = int(rounds * (self.next_wheel.slots // self.slots))  # 计算在新层的rounds
-            delay = new_rounds * self.tick_duration
-            self.add_task(delay, task)
-
-        self.next_wheel.wheel[next_pos] = []  # 清空上层时间轮的这些任务
-
-    async def run(self):
-        """自动运行 tick 循环"""
-        self._running = True
-        print(f"[{self.name}] started (tick={self.tick_duration}s)")
-        try:
-            while self._running:
-                await self.tick_once()
-                await asyncio.sleep(self.tick_duration)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._running = False
-            print(f"[{self.name}] stopped")
-
-    def start(self, loop=None):
-        """启动自动循环"""
-        if not self._running:
-            loop = loop or asyncio.get_event_loop()
-            self._task = loop.create_task(self.run())
-
-        # def tick():
-        #     self.tick_once()
-        #
-        #     # 继续下一次tick
-        #     self._timer = threading.Timer(self.tick_duration, tick)
-        #     self._timer.start()
-        #
-        # tick()
-
-    def stop(self):
-        """停止自动循环"""
-        if self._task:
-            self._running = False
-            self._task.cancel()
-
-        # if self._timer:
-        #     self._timer.cancel()
-
-
-class HierarchicalTimeWheel:
-    def __init__(self):
-        # 初始化各层时间轮
-        self.second_wheel = TimeWheel(60, 1, "second")  # 60 slots, 1s per tick
-        self.minute_wheel = TimeWheel(60, 60, "minute")  # 60 slots, 60s per tick
-        self.hour_wheel = TimeWheel(24, 3600, "hour")  # 24 slots, 3600s per tick
-        self.day_wheel = TimeWheel(30, 86400, "day")  # 30 slots, 86400s per tick
-
-        # 连接各层时间轮
-        self.second_wheel.set_next_wheel(self.minute_wheel)
-        self.minute_wheel.set_next_wheel(self.hour_wheel)
-        self.hour_wheel.set_next_wheel(self.day_wheel)
-
-        self._loop = None
-
-    @property
-    def elapsed_time(self) -> float:
-        # get_estimated_time
-        total_seconds = (
-                self.second_wheel.elapsed_time +
-                self.minute_wheel.elapsed_time +
-                self.hour_wheel.elapsed_time +
-                self.day_wheel.elapsed_time
-        )
-        return total_seconds
-
-    def add_task(self, execute_time: datetime | float, task, *args, **kwargs):
-        """
-        添加定时任务，可传入 datetime 或时间戳
-        :param execute_time: 执行时间(datetime对象或时间戳)
-        :param task: 要执行的任务(函数)
-        """
-        if isinstance(execute_time, datetime):
-            execute_time = execute_time.timestamp()
-
-        delay = max(0.0, execute_time - time.time())
-        if delay <= 60:
-            self.second_wheel.add_task(delay, task, *args, **kwargs)
-        elif delay <= 3600:
-            self.minute_wheel.add_task(delay, task, *args, **kwargs)
-        elif delay <= 86400:
-            self.hour_wheel.add_task(delay, task, *args, **kwargs)
-        else:
-            self.day_wheel.add_task(delay, task, *args, **kwargs)
-
-    def add_daily_task(self, hour: int, minute: int, task, *args, **kwargs):
-        """每天固定时刻执行任务"""
-        now = datetime.now()
-        run_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if run_time < now:
-            run_time += timedelta(days=1)  # 今天的时间已过 → 明天执行
-
-        def wrapper():
-            if asyncio.iscoroutinefunction(task):  # 执行任务
-                asyncio.run_coroutine_threadsafe(task(*args, **kwargs), self._loop)
-            else:
-                task(*args, **kwargs)
-            self.add_daily_task(hour, minute, task, *args, **kwargs)  # 计算下一次运行时间并注册，重新注册下一次任务
-
-        self.add_task(run_time, wrapper)
-
-    async def tick(self, level: str = "second"):
-        mapping = {
-            "second": self.second_wheel,
-            "minute": self.minute_wheel,
-            "hour": self.hour_wheel,
-            "day": self.day_wheel,
-            "month": self.day_wheel,  # 暂时复用 day_wheel
-        }
-        wheel = mapping.get(level)
-        if not wheel:
-            print(f"[TimeWheel] Invalid level: {level}")
-            return False
-        return await wheel.tick_once()
-
-    def start(self):
-        if self._loop is not None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-            self._loop = loop
-            self.second_wheel.start(loop)  # 已经在异步上下文中
-        except RuntimeError:
-            # 没有运行中的事件循环 → 创建一个新的 独立线程方式
-            def loop_thread_background():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self._loop = loop
-                self.second_wheel.start(loop)  # 创建任务必须在 loop 中
-                loop.run_forever()
-
-            threading.Thread(target=loop_thread_background, daemon=True).start()  # 在独立线程中运行事件循环
-            while self._loop is None:
-                time.sleep(0.1)
-
-    def stop(self):
-        self.second_wheel.stop()
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._loop = None
-
-
 class AsyncCaller:
     """
     通过后台线程和队列将同步函数调用（如日志记录、网络请求）转换为异步执行,适合不关心返回值的场景
@@ -1863,10 +1256,10 @@ if __name__ == "__main__":
     # 等待所有任务完成
     caller.wait()
 
+    from service.task_ops import TimeWheel, HierarchicalTimeWheel
 
-    # async def print_time(msg):
-    #     await asyncio.sleep(1)  # 模拟耗时操作
-    #     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    print('test TimeWheel:')
+
 
     async def main():
         tw = TimeWheel(60, 1, "second")
@@ -1879,22 +1272,29 @@ if __name__ == "__main__":
         print("时间轮停止", tw.elapsed_time)
 
 
-    asyncio.run(main())
+    # asyncio.run(main())
 
-    ht = HierarchicalTimeWheel()
+    async def print_time(msg):
+        await asyncio.sleep(0.5)  # 模拟耗时操作
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+    htw = HierarchicalTimeWheel()
     now = datetime.now()
+    print('start at:{}'.format(now))
+    htw.add_task_absolute(now + timedelta(seconds=10), print_time, "10秒后执行")
+    htw.add_task_absolute(now + timedelta(minutes=2), print_time, "2分钟后执行")
+    htw.start(daemon=False)
 
-    ht.add_task(now + timedelta(seconds=10), lambda: print_time("10秒后执行"))
-    ht.add_task(now + timedelta(minutes=2), lambda: print_time("2分钟后执行"))
-    ht.start()
-
-    ht.add_task(time.time() + 5, lambda: print_time("5秒后"))
-    ht.add_daily_task(18, 0, lambda: print_time("每天18:00"))
+    htw.add_task_absolute(time.time() + 5, print_time, "5秒后")
+    htw.add_task(100, print_time, "100秒后")
+    htw.add_task_absolute(time.time() + 160, print_time, "160秒后")
+    htw.add_daily_task(18, 0, print_time, "每天18:00")
 
     try:
         input("按回车退出...\n")
-        print(ht.elapsed_time)
     except KeyboardInterrupt:
         print('KeyboardInterrupt')
     finally:
-        ht.stop()
+        print(f'stop:{htw.elapsed_time}')
+        htw.stop()

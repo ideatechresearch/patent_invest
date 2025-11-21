@@ -10,6 +10,7 @@ include CI
 # 包含目录及其所有内容
 recursive-include agents *
 recursive-include utils *
+recursive-include service *
 recursive-include script *
 recursive-include rime *
 recursive-include static *

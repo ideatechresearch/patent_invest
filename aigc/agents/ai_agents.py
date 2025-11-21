@@ -13,22 +13,7 @@ from functools import wraps, partial
 from abc import ABCMeta
 from griffe import Docstring, DocstringSectionKind  # 文档字符串解析器
 
-
-def load_class_from_string(class_path: str, path=None):
-    path_in_sys = False
-    if path:
-        if path not in sys.path:
-            path_in_sys = True
-            sys.path.insert(0, path)
-
-    try:
-        module_name, class_name = class_path.rsplit('.', 1)
-        module = importlib.import_module(module_name)
-        cls = getattr(module, class_name)
-        return cls
-    finally:
-        if path and path_in_sys:
-            sys.path.remove(path)
+from utils import load_class_from_string
 
 
 # 基于配置动态实例化对象，支持类或可调用对象

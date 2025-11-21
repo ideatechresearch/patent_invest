@@ -3,8 +3,11 @@ import logging
 import json
 import httpx
 import re, hashlib, time
+import pymysql
 import asyncio
 from enum import Enum
+from contextlib import contextmanager
+from functools import wraps
 
 try:
     from openai import OpenAI, AsyncOpenAI
@@ -193,13 +196,331 @@ def async_to_sync(coro_func, *args, **kwargs):
     return loop.run_until_complete(coro_func(*args, **kwargs))
 
 
+def run_togather(max_concurrent: int = 100, batch_size: int = -1, input_key: str = None, return_exceptions=True):
+    semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent > 0 else None
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, inputs: list = None, **kwargs):
+            _args = list(args)
+            if inputs is None and _args:
+                inputs = _args.pop(0)  # 允许 positional 方式传 list
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+
+            async def run_semaphore(x):
+                if input_key:
+                    coro = func(*_args, **{input_key: x}, **kwargs)
+                else:
+                    coro = func(x, *_args, **kwargs)
+                if semaphore:
+                    async with semaphore:
+                        return await coro
+                return await coro
+
+            if batch_size <= 0:
+                # 所有 input 独立请求
+                tasks = [run_semaphore(item) for item in inputs]
+            else:
+                tasks = [run_semaphore(inputs[i:i + batch_size]) for i in range(0, len(inputs), batch_size)]
+
+            return await asyncio.gather(*tasks, return_exceptions=return_exceptions)  # 确保任务取消时不会引发异常，并发执行多个异步任务
+
+        return wrapper
+
+    return decorator
+
+
+class BaseMysql:
+    def __init__(self, host: str, user: str, password: str, db_name: str,
+                 port: int = 3306, charset: str = "utf8mb4"):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.db_name = db_name
+        self.port = port
+        self.charset = charset
+
+    def close(self):
+        """同步实现中关闭连接；子类实现"""
+        raise NotImplementedError
+
+    async def close_pool(self):
+        """异步实现中关闭连接池；子类实现"""
+        raise NotImplementedError
+
+    def table_schema(self, table_name: str) -> tuple[str, tuple]:
+        if not table_name:
+            raise ValueError("[Schema] 表名不能为空")
+        sql = """
+                 SELECT column_name, data_type, is_nullable, column_type, column_comment
+                 FROM information_schema.columns
+                 WHERE table_schema = %s AND table_name = %s
+                 ORDER BY ordinal_position
+             """
+        params = (self.db_name, table_name)
+        return sql, params
+
+    @staticmethod
+    def format_value(value):
+        """
+        保留你原来的 format_value 行为（dict->json, list/tuple->\n\n if all str else json, set->; or json）
+        """
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)  # 处理字典类型 → JSON序列化, indent=2
+
+        if isinstance(value, (tuple, list)):
+            if all(isinstance(item, str) for item in value):
+                return "\n\n---\n\n".join(value)  # "\n\n"
+            return json.dumps(value, ensure_ascii=False)  # 非全字符串元素则JSON序列化
+
+        if isinstance(value, set):
+            if all(isinstance(item, str) for item in value):
+                return ";".join(sorted(value))
+            return json.dumps(list(value), ensure_ascii=False)
+
+        return str(value)  # 其他类型保持原样 (None等)
+
+    @staticmethod
+    def safe_dataframe(df, dumps: bool = True):
+        import numpy as np
+        import pandas as pd
+
+        df = df.replace({np.nan: None})  # df.where(pd.notnull(df), None)
+        if dumps:
+            df = df.map(lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)
+        for col in ['created_at', 'updated_at', 'completed_at']:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: x.to_pydatetime() if pd.notnull(x) else None)
+        return df  # .to_sql(table_name, con=engine, if_exists="append", index=False)
+
+    @staticmethod
+    def build_insert(table_name: str, params_data: dict, update_fields: list[str] | None = None,
+                     explode: bool = False, with_new: bool = True) -> tuple[str, tuple | list]:
+        """
+        生成插入 SQL（可选 ON DUPLICATE KEY UPDATE）
+
+        Args:
+            table_name: 表名
+            params_data: 数据字典 {"col1":[v1,v2], "col2":[v3,v4], ...} .to_dict(orient="list")
+            update_fields: 冲突时更新的字段，None 表示默认更新非主键字段
+            explode: True -> [(v1,v3), (v2,v4)] 每行 tuple,把字典的每列拆开, False -> ([v1,v2], [v3,v4])
+            with_new
+
+        Returns:
+            tuple: (sql, values)
+        """
+        if not params_data:
+            raise ValueError("params_data 不能为空")
+
+        fields = list(params_data.keys())
+        values = list(zip(*params_data.values())) if explode else tuple(params_data.values())
+        # [tuple(row[f] for f in fields) for row in params_data]
+        field_str = ', '.join(f"`{field}`" for field in fields)  # columns_str
+        placeholder_str = ', '.join(['%s'] * len(fields))
+        sql = f"INSERT INTO `{table_name}` ({field_str}) VALUES ({placeholder_str})"
+
+        if update_fields is None:
+            update_fields = [f for f in fields if f.lower() not in ("id", "batch_no", "created_at", "created_time")]
+
+        if update_fields:
+            if with_new:
+                sql += " AS new"
+                update_list = [f"`{field}` = new.`{field}`" for field in update_fields if field != "updated_at"]
+            else:
+                update_list = [f"`{field}` = VALUES(`{field}`)" for field in update_fields if field != "updated_at"]
+            update_str = ', '.join(update_list)
+            if "updated_at" not in fields and "updated_at" in update_fields:
+                update_str += ", `updated_at` = CURRENT_TIMESTAMP"
+            sql += f" ON DUPLICATE KEY UPDATE {update_str}"
+
+        return sql, values
+
+    @staticmethod
+    @contextmanager
+    def get_engine(db_config: dict):
+        from sqlalchemy import create_engine
+        url = f"mysql+pymysql://{db_config['user']}:{db_config['password']}@{db_config['host']}/{db_config['database']}?charset=utf8mb4"
+        engine = create_engine(url, pool_pre_ping=True)
+        try:
+            yield engine
+        finally:
+            engine.dispose()
+
+    @staticmethod
+    @contextmanager
+    def get_cursor(db_config: dict):
+        conn = pymysql.connect(**db_config)
+        try:
+            with conn.cursor() as cursor:
+                yield cursor
+            # conn.commit()
+        # except Exception:
+        #     conn.rollback()
+        #     raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def build_insert_dataframe(table_name: str, df, update_fields: list[str] | None = None,
+                               with_new: bool = True, dumps: bool = False) -> tuple[str, tuple | list]:
+        df = BaseMysql.safe_dataframe(df, dumps)
+        params_data = df.to_dict(orient="list")  # 转 dict {列名: [值, 值, 值]} df.values.tolist()
+        sql, values = BaseMysql.build_insert(table_name, params_data=params_data, update_fields=update_fields,
+                                             explode=True, with_new=with_new)
+        return sql, values
+
+    @staticmethod
+    def write(db_config: dict, sql: str, params: tuple | dict | list = None, conn=None) -> bool:
+        """
+        通用 SQL 执行器
+        """
+        should_release = False
+        try:
+            if not conn:
+                conn = pymysql.connect(**db_config)
+                should_release = True
+            with conn.cursor() as cursor:
+                if isinstance(params, list) and params:
+                    cursor.executemany(sql, params)  # 批量执行
+                else:
+                    cursor.execute(sql, params or ())  # 单条执行
+            conn.commit()
+            return True
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"[SQL Write ERROR]: {e},{sql}")
+            return False
+        finally:
+            if should_release and conn:
+                conn.close()
+
+    @staticmethod
+    def read(db_config: dict, sql: str, params: tuple | dict | str = None, conn=None):
+        import pandas as pd
+        if isinstance(params, str):
+            params = (params,)
+        should_release = False
+        try:
+            if not conn:
+                conn = pymysql.connect(**db_config)
+                should_release = True
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params or ())
+                rows = cursor.fetchall()
+                cols = [desc[0] for desc in cursor.description]
+                return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            print(f"[SQL Read ERROR]: {e},{sql}")
+            with BaseMysql.get_engine(db_config) as engine:
+                with engine.connect() as conn:
+                    return pd.read_sql(sql, conn, params=params)
+        finally:
+            if should_release and conn:
+                conn.close()
+
+    @staticmethod
+    def query_dataframe_process(cursor, sql: str, params: tuple | dict = None, process_chunk=None,
+                                chunk_size: int = 100000):
+        """
+        通用大表分页查询并处理每块数据。
+
+        Args:
+            cursor: 数据库连接对象（需支持 conn.cursor()）
+            sql (str): 原始 SQL 查询语句（不含 LIMIT 和 OFFSET）
+            process_chunk (Callable): 对每个批次的进行处理的函数
+            chunk_size (int): 每批次读取的记录数
+            params(tuple|dict|None): SQL 查询参数
+        Returns:
+            list | pd.DataFrame: 返回所有处理结果的列表
+        """
+        import pandas as pd
+
+        offset = 0
+        results = []
+        chunk_query = f"{sql} LIMIT %s OFFSET %s"
+
+        while True:
+            if isinstance(params, tuple):
+                query_params = (*params, chunk_size, offset)
+            elif isinstance(params, dict):
+                query_params = {**params, "limit": chunk_size, "offset": offset}
+            else:
+                query_params = (chunk_size, offset)
+
+            cursor.execute(chunk_query, query_params)
+            rows = cursor.fetchall()
+            if not rows:
+                break
+
+            if process_chunk:
+                data = process_chunk(rows)
+                if data:  # Only append non-empty results
+                    results.append(data)
+            else:
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    results.append(df)
+
+            offset += chunk_size
+
+        if not process_chunk:
+            return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
+        return results
+
+    @staticmethod
+    def query_batches(cursor, ids: list | tuple, index_key: str, table_name: str, fields: list = None,
+                      chunk_size: int = 10000, conditions: str = None) -> tuple[list[dict], list]:
+        """
+        await asyncio.to_thread
+        大批量 IN 查询，分批执行，避免 SQL 参数溢出。
+        Args:
+            cursor:
+            ids (list | tuple): 要查找的 ID 列表
+            index_key (str): 作为筛选条件的字段
+            table_name (str): 表名
+            fields (list): 返回的字段
+            chunk_size (int): 每次 IN 的最大数量<65535
+            conditions
+        Returns:
+            list[dict]: 查询结果列表
+        """
+        if not ids:
+            raise ValueError("ids 不能为空")
+
+        def chunks_iterable(lst, n: int):
+            """将大数据分成小块"""
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        field_str = ', '.join(f"`{field}`" for field in fields) if fields else '*'
+
+        result_rows = []
+        for batch in chunks_iterable(ids, chunk_size):
+            placeholders = ', '.join(['%s'] * len(batch))
+            sql = f"SELECT {field_str} FROM `{table_name}` WHERE `{index_key}` IN ({placeholders})"
+            if conditions:
+                sql += f" AND {conditions}"
+            cursor.execute(sql, tuple(batch))
+            result_rows.extend(cursor.fetchall())
+            # filtered_chunk = pd.read_sql_query(text(sql+'`{index_key}` in :ids'), conn, params={'ids': batch})
+            # df_chunk.to_sql(table_name, con=engine,chunksize=chunk_size, if_exists='append', index=False)
+        cols = [desc[0] for desc in cursor.description]
+        return result_rows, cols
+
+
 class OperationHttp:
     _client = None  # httpx.AsyncClient | aiohttp.ClientSession
     _is_httpx = False
     _is_sync = False
     _timeout = 100
 
-    def __init__(self, use_sync=False, time_out: int | float = 100.0):
+    def __init__(self, use_sync=False, timeout: int | float = 300.0):
         try:
             import httpx
             self.__class__._is_httpx = True
@@ -212,7 +533,7 @@ class OperationHttp:
                 self.__class__._is_sync = True
 
         self.__class__.is_sync = use_sync
-        self.__class__.timeout = time_out
+        self.__class__.timeout = timeout
 
     async def __aenter__(self):
         self.__class__.init_client()
@@ -274,44 +595,46 @@ class OperationHttp:
 
     @classmethod
     async def get(cls, url, headers=None, **kwargs):
+        timeout = kwargs.pop("timeout", cls._timeout) or cls._timeout
         if cls._is_sync:
             if cls._is_httpx:
-                resp = cls._client.get(url, headers=headers, **kwargs)  # params=data
+                resp = cls._client.get(url, headers=headers, timeout=timeout, **kwargs)  # params=data
             else:
-                resp = cls._client.get(url, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
+                resp = cls._client.get(url, headers=headers, timeout=(timeout, timeout), **kwargs)
             resp.raise_for_status()
             return resp.json()
-        else:
-            if cls._is_httpx:
-                resp = await cls._client.get(url, headers=headers, **kwargs)
-                resp.raise_for_status()  # 如果请求失败，则抛出异常
-                return resp.json()
-            else:
-                async with cls._client.get(url, headers=headers or {}, **kwargs) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()  # await resp.text()
+
+        if cls._is_httpx:
+            resp = await cls._client.get(url, headers=headers, timeout=timeout, **kwargs)
+            resp.raise_for_status()  # 如果请求失败，则抛出异常
+            return resp.json()
+
+        async with cls._client.get(url, headers=headers or {}, timeout=timeout, **kwargs) as resp:
+            resp.raise_for_status()
+            return await resp.json()  # await resp.text()
 
     @classmethod
     async def post(cls, url, json=None, headers=None, **kwargs):
+        timeout = kwargs.pop("timeout", cls._timeout) or cls._timeout
         if cls._is_sync:
             if cls._is_httpx:
-                resp = cls._client.post(url, json=json, headers=headers, **kwargs)
+                resp = cls._client.post(url, json=json, headers=headers, timeout=timeout, **kwargs)
             else:
-                resp = cls._client.post(url, json=json, headers=headers, timeout=(cls._timeout, cls._timeout), **kwargs)
+                resp = cls._client.post(url, json=json, headers=headers, timeout=(timeout, timeout), **kwargs)
             resp.raise_for_status()
             return resp.json()
-        else:
-            if cls._is_httpx:
-                resp = await cls._client.post(url, json=json, headers=headers, **kwargs)
-                resp.raise_for_status()  # 如果请求失败，则抛出异常
-                return resp.json()
-            else:
-                async with cls._client.post(url, json=json, headers=headers or {}, **kwargs) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
+
+        if cls._is_httpx:
+            resp = await cls._client.post(url, json=json, headers=headers, timeout=timeout, **kwargs)
+            resp.raise_for_status()  # 如果请求失败，则抛出异常
+            return resp.json()
+
+        async with cls._client.post(url, json=json, headers=headers or {}, timeout=timeout, **kwargs) as resp:
+            resp.raise_for_status()
+            return await resp.json()
 
     @classmethod
-    def _fallback_post(cls, url, json_payload, headers=None, stream=False):
+    def fallback_post(cls, url, json_payload, headers=None, stream=False):
         try:
             resp = requests.post(url, headers=headers, json=json_payload, timeout=(5, cls._timeout), stream=stream)
             if resp.status_code == 200:
@@ -323,7 +646,7 @@ class OperationHttp:
             return None
 
 
-class Local_Aigc(OperationHttp):
+class LocalAigc(OperationHttp):
     HOST = 'aigc'  # '47.110.156.41'
     AI_Models = [
         # https://platform.moonshot.cn/console/api-keys
@@ -337,7 +660,7 @@ class Local_Aigc(OperationHttp):
     _ai_client = None  # local aigc openai client
     _is_openai = False
 
-    def __init__(self, host=AIGC_HOST, use_sync=False, time_out: int | float = 100.0):
+    def __init__(self, host=AIGC_HOST, use_sync: bool = False, timeout: int | float = 600.0):
         self.__class__.HOST = host
         try:
             from openai import OpenAI, AsyncOpenAI
@@ -345,14 +668,14 @@ class Local_Aigc(OperationHttp):
         except ImportError:
             self.__class__._is_openai = False
 
-        super().__init__(use_sync, time_out)
+        super().__init__(use_sync, timeout)
 
     async def __aenter__(self):
         await self.__class__.init_clients()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.__class__.close_http_client()
+        await self.__class__.close_client()
 
     @classmethod
     async def init_clients(cls, api_key=''):
@@ -423,10 +746,10 @@ class Local_Aigc(OperationHttp):
         return None, None
 
     @classmethod
-    async def get_chat_payload(cls, messages: list[dict] = None, user_request: str = '', user: str = USER_ID,
-                               user_name: str = None, system: str = '',
-                               temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 2048,
-                               model='moonshot', model_id=0, images: list = None):
+    def get_chat_payload(cls, messages: list[dict] = None, user_request: str = '', system: str = '',
+                         user: str = USER_ID, user_name: str = None,
+                         temperature: float = 0.4, top_p: float = 0.8, max_tokens: int = 4096,
+                         model='moonshot', model_id=0, images: list = None):
 
         model_info, name = cls.find_model(model, model_id)
         if not name:
@@ -481,21 +804,21 @@ class Local_Aigc(OperationHttp):
 
     @classmethod
     async def ai_chat(cls, model_info: dict = None, payload: dict = None, get_content: bool = True,
-                      fallback: bool = True, **kwargs) -> str | dict:
+                      fallback: bool = True, timeout: int | float = None, **kwargs) -> str | dict:
         """
         模拟发送请求给AI模型并接收响应。
         :param model_info: 模型信息（如名称、ID、配置等）
         :param payload: 请求的负载，通常是对话或文本输入
         :param get_content: 返回模型响应类型
         :param fallback: <UNK>
+        :param timeout:
         :param kwargs: 其他额外参数
         :return: 返回模型的响应
         """
         if not (cls._client or cls._ai_client) or not any(model['model'] for model in cls.AI_Models):
             await cls.init_clients()
-
         if not payload:
-            model_info, payload = await cls.get_chat_payload(**kwargs)
+            model_info, payload = cls.get_chat_payload(**kwargs)
         else:
             payload.update(kwargs)  # {**payload, **kwargs}
 
@@ -504,9 +827,12 @@ class Local_Aigc(OperationHttp):
 
         if cls._is_openai and model_info["name"] == "aigc":
             if cls._is_sync:
-                completion = cls._ai_client.chat.completions.create(**payload)
+                completion = cls._ai_client.chat.completions.create(**payload, timeout=timeout or cls._timeout)
             else:
-                completion = await cls._ai_client.chat.completions.create(**payload)
+                completion = await cls._ai_client.chat.completions.create(**payload, timeout=timeout or cls._timeout)
+            if not completion.choices[0].message:
+                return f"error occurred: no message completion,{payload}" if get_content else {
+                    "error": "no message completion"}
             return completion.choices[0].message.content if get_content else completion.model_dump()
 
         url = model_info['url'] if model_info.get('url') else model_info['base_url'] + '/chat/completions'
@@ -520,21 +846,20 @@ class Local_Aigc(OperationHttp):
             headers["Authorization"] = f'Bearer {api_key}'
 
         # print(headers, payload, url)
-
         try:
-            data = await cls.post(url, headers=headers, json=payload)
-
+            data = await cls.post(url, headers=headers, json=payload, timeout=timeout or cls._timeout)
             if get_content:
                 result = data.get('choices', [{}])[0].get('message', {}).get('content')
                 if result:
                     return result
                 # print(response.text)
             return data
-
+        except TimeoutError:
+            raise Exception("timeout")
         except Exception as e:
             print(f"HTTP error occurred: {e}", model_info, url)  # can't start new thread
             if fallback:
-                data = cls._fallback_post(url, payload, headers, stream=False)
+                data = cls.fallback_post(url, payload, headers, stream=False)
                 if get_content:
                     result = data.get('choices', [{}])[0].get('message', {}).get('content')
                     if result:
@@ -548,6 +873,10 @@ class Local_Aigc(OperationHttp):
             }
 
     @classmethod
+    def chat(cls, **kwargs) -> str | dict:
+        return async_to_sync(cls.ai_chat, **kwargs)
+
+    @classmethod
     async def chat_run(cls, rows: list, system: str, model="qwen:qwen3-32b", max_concurrent: int = 100,
                        max_tries: int = 3, **kwargs) -> list:
         """
@@ -556,6 +885,8 @@ class Local_Aigc(OperationHttp):
         每条 row 可以是 dict（自动格式化为 key,value 拼接）或 str（直接作为 prompt），
         system prompt 通用传入，适用于 prompt 已在外部构造的情形。
         """
+        if not (cls._client or cls._ai_client):
+            await cls.init_clients()
 
         def format_user_request(row):
             if isinstance(row, dict):
@@ -563,67 +894,120 @@ class Local_Aigc(OperationHttp):
                     f"{k}:{v.strip() if isinstance(v, str) else v}" for k, v in row.items() if v is not None)
             return str(row)
 
-        async def limited_run(semaphore, row):
+        async def limited_run(row, i: int, semaphore):
             async with semaphore:
                 for attempt in range(1, max_tries + 1):
-                    result = await cls.ai_chat(model=model, system=system, user_request=format_user_request(row),
-                                               **kwargs)
-                    if isinstance(result, dict):
-                        content = result.get('choices', [{}])[0].get('message', {}).get('content')
-                    else:
-                        content = str(result) if result is not None else ''
+                    try:
+                        result = await cls.ai_chat(model=model, system=system, user_request=format_user_request(row),
+                                                   **kwargs)
+                        if isinstance(result, dict):
+                            content = result.get('choices', [{}])[0].get('message', {}).get('content')
+                        else:
+                            content = str(result or '')
 
-                    if 'Error code: 429' in content or 'error' in content.lower():
-                        print(f"[重试] 第 {attempt} 次失败，内容: {content}")
+                        if 'Error code: 429' in content or 'error' in content.lower():
+                            print(f"[重试] 第 {attempt} 次失败，序号：{i}，内容: {content}")
+                            await asyncio.sleep(2 * attempt)
+                            continue
+                    except asyncio.TimeoutError:
+                        print(f"[超时] 第 {attempt} 次超时，序号：{i}")
                         await asyncio.sleep(2 * attempt)
+                        continue
+                    except Exception as e:
+                        print(f"[重试] 第 {attempt} 次失败，序号：{i}，错误：{e}")
+                        result = f'error:{e}'
                         continue
 
                     return result
 
-                print("error: Failed after tries", f"row: {row}")
+                print("error: Failed after tries", f"index:{i},row:{row}")
                 return result
 
         semaphore = asyncio.Semaphore(max_concurrent)
-        tasks = [limited_run(semaphore, row) for row in rows]
+        tasks = [limited_run(row, i, semaphore) for i, row in enumerate(rows)]
         return await asyncio.gather(*tasks)
 
     @classmethod
-    async def model_test(cls, user_request: str, system: str, model_names: list = None, max_concurrent: int = 50,
-                         max_tries: int = 1, **kwargs) -> list:
+    async def model_test(cls, variable_name: str, variable_values: list,
+                         user_request: str, system: str = '', model: str = 'deepseek:deepseek-reasoner',
+                         max_concurrent: int = 100, max_tries: int = 2, timeout: int | float = None,
+                         get_content: bool = True, **kwargs) -> list:
+        if not (cls._client or cls._ai_client):
+            await cls.init_clients()
 
-        async def limited_run(semaphore, model):
-            async with semaphore:
-                for attempt in range(1, max_tries + 1):
-                    result = await cls.ai_chat(model=model, system=system, user_request=user_request,
-                                               **kwargs)
+        payload = {"user_request": user_request, "system": system, "model": model, **kwargs}
+
+        @run_togather(max_concurrent=max_concurrent, batch_size=-1, return_exceptions=True)
+        async def _run(item):
+            params = {**payload, variable_name: item}
+            result = {}
+            for attempt in range(1, max_tries + 1):
+                try:
+                    result = await cls.ai_chat(get_content=get_content, timeout=timeout, **params)
                     if isinstance(result, dict):
                         content = result.get('choices', [{}])[0].get('message', {}).get('content')
                     else:
-                        content = str(result) if result is not None else ''
-                        result = {'model': model, 'content': content}
-
-                    if 'Error code: 429' in content or 'error' in content.lower():
+                        content = str(result or '')
+                        result = {"content": content}
+                    if 'Error code: 429' in content or 'error' in content.lower() or 'error' in result:
                         print(f"[重试] 第 {attempt} 次失败，内容: {content}")
+                        result['error'] = content.lower()
                         await asyncio.sleep(2 * attempt)
                         continue
+                    return {**result, f"variable_{variable_name}": item}
+                except asyncio.TimeoutError:
+                    print(f"[超时] 第 {attempt} 次超时：{item}")
+                    result["error"] = 'timeout'
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                except Exception as e:
+                    print(f"[重试] 第 {attempt} 次失败，错误：{e}")
+                    result["error"] = str(e)
+                    continue
 
-                    return result
+            print("error: Failed after tries", f"{variable_name}: {item}")
+            result[f"variable_{variable_name}"] = item
+            if not "error" in result:
+                result["error"] = "Failed after tries"
+            return result
 
-                print("error: Failed after tries", f"model: {model}")
-                return result
+        if variable_name == 'model' and not variable_values:
+            variable_values = next((m['model'] for m in cls.AI_Models if m['name'] == "aigc"), [])
 
-        if not model_names:
-            for model in cls.AI_Models:
-                if model['name'] == "aigc":
-                    model_names = model['model']
+        results = await _run(inputs=variable_values)
+        return [{'id': i, 'error': str(r)} if isinstance(r, Exception) else {'id': i, **r}
+                for i, r in enumerate(results)]
 
-        semaphore = asyncio.Semaphore(max_concurrent)
-        tasks = [limited_run(semaphore, model) for model in model_names]
-        return await asyncio.gather(*tasks)
 
-    @classmethod
-    def chat(cls, **kwargs) -> str | dict:
-        return async_to_sync(cls.ai_chat, **kwargs)
+def extract_json_struct(input_data: str | dict) -> dict | None:
+    if isinstance(input_data, dict):
+        return input_data
+
+    # Markdown JSON 格式：```json\n{...}\n```
+    md_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", input_data, re.DOTALL)
+    if md_match:
+        json_str = md_match.group(1)
+    else:
+        # 尝试提取最外层 JSON：匹配最先出现的大括号包裹段，但可能不处理嵌套的 JSON
+        brace_match = re.search(r"\{.*\}", input_data, re.DOTALL)
+        json_str = brace_match.group(0) if brace_match else input_data
+
+    try:
+        return json.loads(json_str.strip())
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}\n invalid json format: {input_data}")
+    return None
+
+
+def remove_markdown_block(text: str) -> str:
+    """
+    如果文本以 ```markdown 开头并以 ``` 结尾，则移除这两个标记，返回中间内容。
+    否则返回原始文本。
+    """
+    match = re.match(r"^```markdown\s*\n(.*?)\n?```$", text.strip(), re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text
 
 
 def request_aigc(history, question, system, model_name, agent='0', stream=False, host=AIGC_HOST, get_content=False,
@@ -1236,28 +1620,28 @@ if __name__ == '__main__':
         global AIGC_HOST
 
         # await Local_Aigc.init_clients()
-        async with Local_Aigc(host=AIGC_HOST) as client:
+        async with LocalAigc(host=AIGC_HOST) as client:
             print(await client.ai_chat(model="qwen:qwq-plus", user_request="你好"))
 
-        config = Local_Aigc(host=AIGC_HOST, use_sync=False)
+        config = LocalAigc(host=AIGC_HOST, use_sync=False)
         try:
-            res = await Local_Aigc.ai_chat(model='moonshot:moonshot-v1-8k', user_request='你好')
+            res = await LocalAigc.ai_chat(model='moonshot:moonshot-v1-8k', user_request='你好')
             print(res)
-            print(await Local_Aigc.ai_chat(model='qwen:qwq-plus', user_request='你好'))
-            print(Local_Aigc.AI_Models)
+            print(await LocalAigc.ai_chat(model='qwen:qwq-plus', user_request='你好'))
+            print(LocalAigc.AI_Models)
             res = await ai_chat_async(model='qwen:qwen3-32b', user_request='你好', host=AIGC_HOST)
             print(res)
         finally:
-            await Local_Aigc.close_http_client()
+            await LocalAigc.close_http_client()
 
 
     asyncio.run(main())
 
-    Local_Aigc(host=AIGC_HOST, time_out=300, use_sync=True)
+    LocalAigc(host=AIGC_HOST, timeout=300, use_sync=True)
 
-    print(Local_Aigc.chat(model='qwen:qwq-plus', user_request='你好啊，谢谢你'))
+    print(LocalAigc.chat(model='qwen:qwq-plus', user_request='你好啊，谢谢你'))
 
-    Local_Aigc.close()
+    LocalAigc.close()
 
-    with Local_Aigc(host=AIGC_HOST) as cx:
+    with LocalAigc(host=AIGC_HOST) as cx:
         print(cx.chat(model='qwen:qwq-plus', user_request='你好啊'))

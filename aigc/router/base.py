@@ -160,6 +160,27 @@ def md_data_script():
     '''
 
 
+def build_table_html(df_html, title: str, additional: str = None) -> str:
+    return f"""
+      <html>
+      <head>
+          <meta charset="utf-8">
+          <title>{title}</title>
+          <style>
+              table {{ border-collapse: collapse; width: 100%; }}
+              th, td {{ border: 1px solid #ddd; padding: 8px; }}
+              th {{ background-color: #f4f4f4; }}
+          </style>
+      </head>
+      <body>
+          <h2>{title}{additional or ''}</h2>
+          {df_html}
+          {md_data_script()}
+      </body>
+      </html>
+      """
+
+
 @index_router.post("/markdown/check")
 async def post_markdown_check(data: Any = Body(...)):
     from script.md_checker import run_all_checks

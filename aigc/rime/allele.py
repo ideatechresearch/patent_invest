@@ -4,61 +4,6 @@ import numpy as np
 from collections import defaultdict, Counter
 
 
-def dice_feature(dice: list | tuple) -> list:
-    """
-       分析三个骰子的数值特征。
-
-       参数:
-           dice: 包含三个整数（1-6）的列表或元组，代表骰子点数。
-
-       返回:
-           list: 一个包含特征字符串的列表。
-    for dice in itertools.combinations_with_replacement(range(1,7), r=3)：
-        f = dice_feature(dice)
-    """
-    a, b, c = sorted(dice)  # 排序便于判断连续和相同
-    features = []
-
-    # 1. 判断是否为顺子（连续）
-    if b - a == 1 and c - b == 1:
-        features.append("连续")
-    if c - a >= 5:
-        features.append("夸大")
-
-    # 2. 判断是否三同
-    if a == b == c:
-        features.append("全同")
-    # 3. 判断是否两同一异 (Pair)
-    elif a == b or b == c:
-        # 确定那个成对的数字和单独的数字
-        # pair_num = a if a == b else c
-        features.append("两同")
-
-    # 4. 判断是否为质数组合 (三个点数都是质数)
-    # 骰子中的质数面：2, 3, 5
-    prime_faces = {2, 3, 5}
-    if all(die in prime_faces for die in dice):
-        features.append("质升")
-
-    if all(die % 2 == 1 for die in dice):  # 全奇数
-        features.append("全奇")
-    elif all(die % 2 == 0 for die in dice):  # 全偶数
-        features.append("全偶")
-
-    # 和值大小 (例如，和值大于12算大)
-    sum_dice = sum(dice)
-    if sum_dice > 12:
-        features.append("大数")
-    elif sum_dice < 6:
-        features.append("小数")
-
-    # 如果没有显著特征，则标记为“杂色”
-    if not features:
-        features.append("杂花")
-
-    return features
-
-
 class AlleleBase:
     _expressed_cache = {}  # 缓存的懒加载类属性
 
@@ -212,12 +157,13 @@ class AlleleBase:
     @staticmethod
     def vector_to_binary(vector: tuple) -> int:
         """
-        将 one-hot 抗原向量转换为二进制数值编码（按 axes 顺序编码）。
+        将 one-hot 抗原向量转换为二进制数值编码（按 axes 顺序编码）。每一位只占 1 bit 的场景
         vector = (1, 0) -> 0b10 (即 2)
         vector = (0, 1) -> 0b01 (即 1)
         vector = (1, 1) -> 0b11 (即 3)
         vector = (0, 0) -> 0b00 (即 0)
         mask = (1 << len(cls.AXES)) - 1,0b11
+        (1, 0, 1) -> 0b101 (5)
         """
         # num_axes = len(vector)
         # binary = 0
@@ -225,6 +171,41 @@ class AlleleBase:
         #     if val != 0:
         #         binary |= 1 << (num_axes - 1 - i)  # 高位在左
         return sum(bit << (len(vector) - 1 - i) for i, bit in enumerate(vector) if bit)
+
+    @staticmethod
+    def states_encode(seq: list, mapping: dict) -> bytes:
+        """
+         :param seq: 例如 ["A", "B", "O"],元素代表多种可能状态
+         :param mapping: dict[str, int]
+                         每个符号对应一个整型状态值，例如:{"A":0, "B":1, "O":2, "AB":3}
+         """
+        import math
+        n_states = len(mapping)
+        bit_width = math.ceil(math.log2(n_states)) if n_states > 1 else 1
+        bits = 0  # bytearray(byte_length)
+        for i, sym in enumerate(seq):
+            bits = (bits << bit_width) | mapping[sym]
+
+        byte_length = (len(seq) * bit_width + 7) // 8  # 向上取整
+        return bits.to_bytes(byte_length, 'big')
+
+    @staticmethod
+    def states_decode(byte_data: bytes, length: int, mapping: dict) -> list:
+        """
+         将编码整数解码回符号序列。
+        """
+        import math
+        bits = int.from_bytes(byte_data, 'big')
+        n_states = len(mapping)
+        bit_width = math.ceil(math.log2(n_states)) if n_states > 1 else 1  # 2,len(cls.AXES)
+        mask = (1 << bit_width) - 1
+        inverse_mapping = {v: k for k, v in mapping.items()}
+        lst = []
+        for _ in range(length):
+            sym_val = bits & mask  # 取最低 bit_width 位, 0b11
+            lst.append(inverse_mapping[sym_val])
+            bits >>= bit_width
+        return lst[::-1]  # 高位先存，逆序恢复原顺序
 
     @staticmethod
     def equal_vectors(vecs: list[tuple], vector: tuple) -> bool:

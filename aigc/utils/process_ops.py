@@ -1,7 +1,6 @@
 import io, os, sys, socket
-import random
 import re, json
-import pickle, joblib
+import joblib
 import subprocess
 import platform
 import inspect, importlib, ast
@@ -11,7 +10,6 @@ import psutil  # 添加系统监控模块
 import tracemalloc
 from pathlib import Path
 from collections import deque
-import base64, hashlib
 from typing import Union, Iterable, Callable, AsyncGenerator, Any, get_origin, get_args
 import aiofiles, asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -196,10 +194,30 @@ def kill_process_tree(pid: int):
         os.kill(pid, signal.SIGKILL)
 
 
+def chunks_iterable(lst, n: int):
+    """将大数据分成小块"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def is_iterable(obj):
+    try:
+        iter(obj)
+        return not isinstance(obj, (str, bytes))
+    except TypeError:
+        return False
+
+
 def named_partial(name, func, *args, **kwargs):
     p = partial(func, *args, **kwargs)
     p.__name__ = name
     return p
+
+
+def merge_partial(task, *args, **kwargs):
+    if isinstance(task, partial):
+        return partial(task.func, *(task.args + args), **{**task.keywords, **kwargs})
+    return partial(task, *args, **kwargs)
 
 
 def is_empty_lambda(func):
@@ -212,12 +230,41 @@ def is_empty_lambda(func):
     return False
 
 
-def async_to_sync(func, *args, **kwargs):
-    # 异步代码转换为同步代码
-    return asyncio.run(func(*args, **kwargs))
+def async_to_sync(func: Callable, *args, **kwargs):
+    '''同步环境中调用异步函数，并且等待结果返回'''
+    coro = func(*args, **kwargs)
+    if not inspect.iscoroutine(coro):
+        raise TypeError("func must be an async function")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # 没在事件循环里 → 创建新循环执行
+
+    if loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()  # 提交到已有循环，阻塞等待结果
+
+    return loop.run_until_complete(coro)
 
 
-async def run_with_async(func, *args, **kwargs):
+def run_by_future(func: Callable, *args, **kwargs):
+    """
+    不等待结果，不阻塞调用者 fire-and-forget
+    """
+    coro = func(*args, **kwargs)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+        # if loop.is_running():
+        #    task = asyncio.ensure_future(coro)  # 已有事件循环.run_coroutine_threadsafe
+        # while not task.done():
+        #     time.sleep(0.05)  # 阻塞直到完成
+        # return task.result()
+    except RuntimeError:
+        asyncio.run(coro)  # 没有事件循环 → 创建新循环执行
+
+
+async def run_with_async(func: Callable, *args, **kwargs):
     """
     通用方法：根据函数是否为协程自动选择 await 或直接调用
     支持在异步上下文中统一处理同步/异步函数调用
@@ -234,16 +281,41 @@ async def run_with_async(func, *args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)  # 用 asyncio.to_thread 以避免阻塞, 等价于传统的 run_in_executor
 
 
-async def run_with_executor(func, *args, max_workers: int = 10):
-    # asyncio 中并发执行线程池任务
-    loop = asyncio.get_running_loop()
-    if max_workers <= 1:  # 单线程直接调用
-        return [await loop.run_in_executor(None, func, *args)]  # to_thread
-    results = []  # 多线程执行,使用自定义线程池
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        tasks = [loop.run_in_executor(pool, func, *args) for _ in range(max_workers)]
-        results = await asyncio.gather(*tasks)
+async def run_bound_tasks(bound_funcs: list):
+    """
+    并发执行任务（支持协程函数与普通函数）
+    """
+    if not bound_funcs:
+        return []
+
+    coro_tasks = []  # 生成 coroutine
+    for t in bound_funcs:
+        if asyncio.iscoroutinefunction(t.func):
+            coro_tasks.append(t())
+        else:  # task() 支持普通函数
+            coro_tasks.append(asyncio.to_thread(t))  # loop.run_in_executor(None, t))
+
+    results = await asyncio.gather(*coro_tasks, return_exceptions=True)
+    for t, res in zip(bound_funcs, results):
+        if isinstance(res, Exception):
+            print(f"Task {t.func.__name__} execution failed with error: {res}")
     return results
+
+
+async def run_with_executor(func, args_list: list[tuple], max_workers: int = 10):
+    """
+    异步线程池执行多个任务
+    :param func: 要执行的同步函数
+    :param args_list: 参数列表，每项是一个 tuple（传给 func）
+    :param max_workers: 最大线程数
+    """
+    loop = asyncio.get_running_loop()
+    if len(args_list) == 1:
+        return await loop.run_in_executor(None, func, *args_list[0])  # to_thread
+    # 多任务并发执行
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        tasks = [loop.run_in_executor(pool, func, *args) for args in args_list]
+        return await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def run_with_semaphore(func, *args, semaphore=None, **kwargs):
@@ -252,12 +324,6 @@ async def run_with_semaphore(func, *args, semaphore=None, **kwargs):
             return await func(*args, **kwargs)
     else:
         return await func(*args, **kwargs)
-
-
-def chunks_iterable(lst, n: int):
-    """将大数据分成小块"""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
 
 
 def run_togather(max_concurrent: int = 100, batch_size: int = -1, input_key: str = None, return_exceptions=True):
@@ -519,12 +585,12 @@ def class_property(attr_name: str):
 
 
 def chainable_method(func):
-    """装饰器，使方法支持链式调用"""
+    """装饰器，使方法支持链式调用，保留显式返回值"""
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
-        func(self, *args, **kwargs)
-        return self
+        result = func(self, *args, **kwargs)
+        return self if result is None else result
 
     return wrapper
 
@@ -551,10 +617,19 @@ def list_or_args_keys(keys: Union[_StringLikeT, Iterable[_StringLikeT]],
     return keys
 
 
-def get_function_parameters(func):
+def get_function_parameters(func) -> list:
+    """返回参数名列表"""
+    return list(inspect.signature(func).parameters.keys())
+
+
+def get_function_params(func) -> dict:
+    """只取可传递的参数 （排除 *args）"""
     signature = inspect.signature(func)
-    parameters = signature.parameters
-    return [param for param in parameters]
+    return {
+        k: (v.default if v.default is not inspect.Parameter.empty else None)
+        for k, v in signature.parameters.items()
+        if v.kind in (v.POSITIONAL_OR_KEYWORD, v.KEYWORD_ONLY)
+    }
 
 
 def remove_function_decorators(func) -> str:
@@ -704,7 +779,7 @@ class ClassMethodRegistry:
         return cls._instance
 
     @classmethod
-    def register_class(cls, target_class, exclude: list[str] = None):
+    def register(cls, target_class, exclude: list[str] = None):
         """注册一个类及其所有类方法"""
         if exclude is None:
             exclude = []
@@ -732,6 +807,7 @@ class ClassMethodRegistry:
                 }
 
         cls._registry[class_name] = class_info
+        print(f"Registered {class_name} with [{len(class_info['methods'])}] methods.")
         # print(f"Registered {class_name} with methods: {list(cls._registry[class_name]['methods'].keys())}")
         return target_class
 
@@ -841,7 +917,25 @@ class ClassMethodRegistry:
 
 def register_class(cls, exclude: list[str] = None):
     """装饰器，用于自动注册类"""
-    return ClassMethodRegistry.register_class(cls, exclude)
+    return ClassMethodRegistry.register(cls, exclude)
+
+
+def load_class_from_string(class_path: str, path=None):
+    """按字符串路径动态加载类 path="/plugins" """
+    path_in_sys = False
+    if path:
+        if path not in sys.path:
+            path_in_sys = True
+            sys.path.insert(0, path)  # 临时允许从自定义目录加载模块
+
+    try:
+        module_name, class_name = class_path.rsplit('.', 1)
+        module = importlib.import_module(module_name)
+        cls = getattr(module, class_name)
+        return cls
+    finally:
+        if path and path_in_sys:
+            sys.path.remove(path)  # 恢复原始导入环境
 
 
 def get_module_functions(module_name: str = None):
@@ -854,7 +948,7 @@ def get_module_functions(module_name: str = None):
     return local_funcs
 
 
-def functions_registry(functions_list: list, safe_path=True, module_name: str | list = None) -> dict:
+def functions_registry(functions_list: list, safe_path=True, module_name: str = None) -> dict:
     """
     根据函数名称列表,创建全局函数注册表,或者指定模块中动态加载
     1. 从当前全局作用域查找函数名；
@@ -863,39 +957,16 @@ def functions_registry(functions_list: list, safe_path=True, module_name: str | 
 
     :param functions_list: 需要注册的函数名列表
     :param safe_path: 取消不检查是否可调用。
-    :param module_name: 模块名称或者模块名称列表（字符串形式），适合从一个模块或多个模块中匹配加载多个函数。
+    :param module_name: 模块名称（字符串形式），适合从一个模块中匹配加载多个函数。
     :return: Dict[str, Callable[..., Any]]
     """
     if not safe_path:
-        module = importlib.import_module(module_name) if module_name else None
-        return {name: getattr(module, name) if module else globals().get(name) for name in functions_list}
+        module = importlib.import_module(module_name) if module_name else globals()
+        return {name: getattr(module, name)
+                for name in functions_list
+                if hasattr(module, name) and callable(getattr(module, name))}
 
-    if isinstance(module_name, list):
-        return function_registry_dynamic(functions_list, module_name)
     return functions_registry_safe(functions_list, module_name)
-    # get_function_parameters
-
-
-def function_registry_dynamic(functions_list: list, module_names: list):
-    """
-    动态加载模块并注册函数
-    :param functions_list: 需要注册的函数名列表
-    :param module_names: 模块名称列表（字符串形式）
-    :return: 函数注册表
-    """
-    registry = {}
-    for module_name in module_names:
-        try:
-            module = importlib.import_module(module_name)  # 动态加载模块
-            for name in functions_list:
-                if name in registry:  # 避免重复覆盖，只注册第一个找到的
-                    continue
-                func = getattr(module, name, None)
-                if func is not None and callable(func):
-                    registry[name] = func
-        except ModuleNotFoundError:
-            print(f"Module '{module_name}' not found.")
-    return registry
 
 
 def functions_registry_safe(functions_list: list, module_name: str = None) -> dict:
@@ -910,9 +981,16 @@ def functions_registry_safe(functions_list: list, module_name: str = None) -> di
     :return: Dict[str, Callable[..., Any]]
     """
     # 如果没有模块名，回退到全局作用域
-    module = importlib.import_module(module_name) if module_name else globals()
+    try:
+        module = importlib.import_module(module_name) if module_name else globals()
+    except ModuleNotFoundError:
+        print(f"Module '{module_name}' not found.")
+        module = globals()
+
     registry = {}
     for name in functions_list:
+        if name in registry:  # 避免重复覆盖，只注册第一个找到的
+            continue
         try:
             if ":" in name:
                 module_path, func_name = name.rsplit(":", 1)
@@ -928,13 +1006,13 @@ def functions_registry_safe(functions_list: list, module_name: str = None) -> di
             registry[name] = func_obj
 
         except ModuleNotFoundError:
-            registry[name] = None
             print(f"Module '{module_name}','{name}' not found.")
+            registry[name] = None
             # importlib.reload(module_path)
 
         except Exception as e:
-            registry[name] = None
             print(f"[⚠️] 加载函数失败: {name} → {type(e).__name__}: {e}")
+            registry[name] = None
 
     return registry
 
@@ -1384,27 +1462,19 @@ async def save_markdown(content: str, filename: str, folder="data/output"):
     return filepath
 
 
-def pickle_serialize(obj):
-    try:
-        json.dumps(obj)  # 测试是否可JSON序列化
-        return obj
-    except (TypeError, ValueError):  # 将不可JSON序列化的部分转为pickle的base64字符串
-        try:
-            data = pickle.dumps(obj)  # 返回 bytes 类型
-            return {'__pickle__': base64.b64encode(data).decode('utf-8')}  # 转为 ASCII-safe 字节串
-        except Exception as e:
-            print(f"Object cannot be pickled: {e}")
-            return obj
+async def read_markdown(filename: str, folder="data/output") -> str | None:
+    """异步读取Markdown文件并返回内容"""
+    if not filename.endswith('.md'):
+        filename += '.md'
 
+    filepath = os.path.join(folder, filename)
+    if not os.path.exists(filepath):
+        return None
 
-def pickle_deserialize(obj):
-    if isinstance(obj, dict):
-        if '__pickle__' in obj:
-            try:
-                return pickle.loads(base64.b64decode(obj['__pickle__'].encode('utf-8')))  # encoding='bytes' 避免自动导入模块
-            except Exception as e:
-                raise ValueError(f"Failed to decode pickle: {e}")
-    return obj
+    async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
+        content = await f.read()
+
+    return content
 
 
 if __name__ == "__main__":
@@ -1480,3 +1550,8 @@ if __name__ == "__main__":
     print(res)
 
     # main()
+
+    p = partial(single_item)
+    print(asyncio.iscoroutinefunction(p.func), asyncio.iscoroutinefunction(p))
+    p2 = partial(main)
+    print(asyncio.iscoroutinefunction(p2.func), asyncio.iscoroutinefunction(p2), asyncio.iscoroutine(p2))

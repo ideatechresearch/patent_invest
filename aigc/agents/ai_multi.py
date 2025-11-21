@@ -1,14 +1,14 @@
-import httpx, requests, asyncio
+import httpx, requests
 from http import HTTPStatus
 from PIL import Image
 import dashscope
 # import qianfan
 from dashscope.audio.tts import ResultCallback
 from dashscope.audio.asr import Recognition, Transcription, RecognitionCallback
-import time, base64, json, uuid
+import time, base64, json, uuid, io
 from urllib.parse import urlencode, urlparse, unquote
 
-from service import get_httpx_client
+from service import get_httpx_client, async_polling_check
 from secure import get_xfyun_signature, get_tencent_signature, get_xfyun_authorization, get_ark_signature, \
     get_baidu_access_token, get_aliyun_access_token, generate_hmac_signature
 from config import Config
@@ -718,7 +718,7 @@ def dashscope_image_call(prompt: str, negative_prompt: str = '', image_url: str 
 # https://help.aliyun.com/zh/model-studio/user-guide/cosplay-anime-character-generation?spm=0.0.0.i1
 # https://help.aliyun.com/zh/model-studio/developer-reference/portrait-style-redraw-api-reference?spm=a2c4g.11186623.help-menu-2400256.d_3_3_2_1.3e2f56e5BtF0ok
 async def wanx_image_generation(image_urls, style_name="复古漫画",
-                                api_key=Config.DashScope_Service_Key, max_retries=20):
+                                api_key=Config.DashScope_Service_Key, interval: int = 3, timeout: int = 60):
     # JPEG，PNG，JPG，BMP，WEB,不超过10M,不小于256*256，不超过5760*3240, 长宽比不超过2:1
     style_mapping = {
         "参考上传图像风格": -1,
@@ -775,43 +775,58 @@ async def wanx_image_generation(image_urls, style_name="复古漫画",
     response.raise_for_status()
     data = response.json()
     task_id = data["output"]["task_id"]
-    task_status = data["output"]["task_status"]
-    retries = 0
-    # 轮询任务进度
-    await asyncio.sleep(3)
-    while task_id is not None and retries < max_retries:
-        task_url = f'https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}'
-        task_response = await cx.get(task_url, headers=task_headers)
-        resp = task_response.json()
-        task_status = resp["output"]["task_status"]
-        # "task_status":"PENDING""RUNNING","SUCCEEDED"->"results", "FAILED"->"message"
-        if task_status == 'SUCCEEDED':
-            urls = [item['url'] for item in resp['output'].get('results', []) if 'url' in item]
-            result = {"urls": urls or [resp['output'].get('result_url')], 'id': task_id}
-            if urls:
-                image_response = await cx.get(urls[0])
-                return image_response.content, result
 
-            return None, result
+    polling_func = async_polling_check(interval=interval, timeout=timeout)(query_aliyun_task_once)
+    future, handle = await polling_func(cx, task_id, task_headers)
+    try:
+        result = await future  # 等待轮询完成
+    except TimeoutError:
+        return {"status": "timeout", "id": task_id}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "id": task_id}
+    finally:
+        handle['cancelled'] = True
 
-        if task_status == "FAILED":
-            print(resp['output']['message'])
-            break
+    return result
 
-        await asyncio.sleep(3)
-        retries += 1
 
-    return None, {"urls": [], 'id': task_id, 'status': task_status,
-                  'error': "Task did not succeed within the maximum retry limit."}
+async def query_aliyun_task_once(httpx_client, task_id: str, task_headers: dict, _future=None, _handle=None):
+    """
+    单次查询 Aliyun 任务状态
+    返回：
+        - dict -> 任务完成结果
+        - False -> 任务未完成，继续轮询
+        - dict(error=...) -> 任务失败或异常
+    """
+    task_url = f'https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}'
+    response = await httpx_client.get(task_url, headers=task_headers)
+    resp = response.json()
+    task_status = resp["output"]["task_status"]
+    # "task_status":"PENDING""RUNNING","SUCCEEDED"->"results", "FAILED"->"message"
+    if task_status == "SUCCEEDED":
+        urls = [item['url'] for item in resp['output'].get('results', []) if 'url' in item]
+        result = {"urls": urls or [resp['output'].get('result_url')], 'id': task_id, 'status': task_status.lower()}
+        if urls:
+            image_response = await httpx_client.get(urls[0])
+            return image_response.content, result
+        return None, result
+
+    if task_status == "FAILED":
+        error = resp['output'].get('message', 'Task failed')
+        print(error)
+        return None, {"urls": [], 'id': task_id, 'status': task_status.lower(), "error": error}
+
+    # 其他状态，如 PENDING / RUNNING
+    return False
 
 
 # https://nls-portal.console.aliyun.com/overview
-async def ali_speech_to_text(audio_data, format='pcm'):
+async def ali_speech_to_text(audio_data, format='pcm', rate=16000):
     """阿里云语音转文字"""
     params = {
         "appkey": Config.ALIYUN_nls_AppId,
         "format": format,  # 也可以传入其他格式，如 wav, mp3
-        "sample_rate": 16000,  # 音频采样率
+        "sample_rate": rate,  # 音频采样率
         "version": "4.0",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "SignatureMethod": "HMAC-SHA1",
@@ -848,18 +863,183 @@ async def ali_speech_to_text(audio_data, format='pcm'):
     return {"error": result.get('message')}
 
 
-# 1536: 适用于普通话输入法模型（支持简单的英文）。
-# 1537: 适用于普通话输入法模型（纯中文）。
-# 1737: 适用于英文。
-# 1936: 适用于粤语。
-# audio/pcm pcm（不压缩）、wav（不压缩，pcm编码）、amr（压缩格式）、m4a（压缩格式）
+# https://cloud.tencent.com/document/api/1093/37823
+async def tencent_speech_to_text(audio_data, audio_url: str = None, interval: int = 3, timeout: int = 300) -> dict:
+    '''
+    本接口支持音频 URL 、本地音频文件两种请求方式,音频 URL 时长不能大于5小时，文件大小不超过1GB；本地音频文件不能大于5MB
+    '''
+    url = 'https://asr.tencentcloudapi.com'
+    host = url.split("//")[-1]
+    payload = {
+        "ChannelNum": 1,
+        "EngineModelType": "16k_zh",  # 8k_zh_large：中文电话场景专用大模型引擎【大模型版】
+        "ResTextFormat": 0,  # 基础识别结果0-5
+        "SourceType": 1,  # 音频数据来源
+        # "CallbackUrl":#回调 URL
+    }
+    if audio_url:
+        payload['Url'] = audio_url
+        payload['SourceType'] = 0
+    else:
+        if isinstance(audio_data, bytes):
+            pass
+        elif isinstance(audio_data, io.BytesIO):
+            audio_data = audio_data.getvalue()  # await audio_data.read()  # 读取二进制数据
+        payload['Data'] = base64.b64encode(audio_data).decode("utf-8")
+
+    headers = get_tencent_signature('asr', host, body=payload, action='CreateRecTask',
+                                    secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
+                                    version='2019-06-14')
+    # payload = convert_keys_to_pascal_case(params)
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    data = response.json()
+    error = data["Response"].get("Error")
+    if error:
+        print(data)
+        return {"error": error}
+
+    response_data = data["Response"].get("Data")  # task_id,TaskId有效期为24小时
+    if not response_data:
+        return {"text": response_data, "error": 'no task_id'}
+
+    body = response_data.copy()
+    headers = get_tencent_signature('asr', host, body=body, action='DescribeTaskStatus',
+                                    secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
+                                    version='2019-06-14')
+    task_id = response_data['TaskId']
+
+    async def check_task_status(_future=None, _handle=None):
+        response = await cx.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        data = response.json()
+        error = data["Response"].get("Error")
+        if error:
+            return {"error": error, "task_id": task_id}
+
+        response_data = data["Response"].get("Data")
+        status = response_data['Status']
+
+        if status == 2:  # 完成
+            return {"text": response_data['Result'], "task_id": task_id}  # 最终文本结果字段
+
+        if status == 3:  # 失败
+            return {"error": response_data['ErrorMsg'], "task_id": task_id}
+
+        if interval <= 0:
+            return response_data
+        # 其他状态，任务未完成
+        return False
+
+    check_func = async_polling_check(interval=interval, timeout=timeout)(check_task_status)
+    future, handle = await check_func()
+
+    try:
+        result = await future
+    except TimeoutError:
+        result = {"error": "timeout", "task_id": task_id}
+    except Exception as e:
+        result = {"error": str(e), "task_id": task_id}
+    finally:
+        handle["cancelled"] = True
+
+    return result or response_data
+
+
+# https://github.com/TencentCloud/tencentcloud-sdk-python/blob/master/tencentcloud/asr/v20190614/asr_client.py
+def tencent_sdk_speech_to_text(audio_data, audio_url: str = None, poll_interval=3, timeout: int = 300):
+    '''
+    本接口支持音频 URL 、本地音频文件两种请求方式
+    • 返回时效：异步回调，非实时返回。最长3小时返回识别结果，**大多数情况下，1小时的音频1-3分钟即可完成识别**。请注意：上述返回时长不含音频下载时延，且30分钟内发送超过1000小时录音或2万条任务的情况除外
+    • 音频格式：wav、mp3、m4a、flv、mp4、wma、3gp、amr、aac、ogg-opus、flac
+    • 音频限制：音频 URL 时长不能大于5小时，文件大小不超过1GB；本地音频文件不能大于5MB
+    • 识别结果有效时间：识别结果在服务端保存24小时
+    '''
+    payload = {
+        "ChannelNum": 1,
+        "EngineModelType": "16k_zh",  # 8k_zh_large：中文电话场景专用大模型引擎【大模型版】
+        "ResTextFormat": 0,  # 基础识别结果0-5
+        "SourceType": 1,  # 音频数据来源
+        # "CallbackUrl":#回调 URL
+    }
+    if audio_url:
+        payload['Url'] = audio_url
+        payload['SourceType'] = 0
+    else:
+        if isinstance(audio_data, bytes):
+            pass
+        elif isinstance(audio_data, io.BytesIO):
+            audio_data = audio_data.getvalue()  # await audio_data.read()  # 读取二进制数据
+        payload['Data'] = base64.b64encode(audio_data).decode("utf-8")
+
+    from tencentcloud.common import credential
+    from tencentcloud.asr.v20190614 import models
+    from tencentcloud.asr.v20190614.asr_client import AsrClient
+    secret_id = Config.TENCENT_SecretId
+    secret_key = Config.TENCENT_Secret_Key
+    cred = credential.Credential(secret_id, secret_key)
+    client = AsrClient(cred, "ap-shanghai")
+
+    # 1) 创建任务
+    req = models.CreateRecTaskRequest()
+    req.from_json_string(json.dumps(payload))
+    resp = client.CreateRecTask(req)
+    task_id = resp.Data.TaskId
+
+    # 2) 轮询任务结果
+    status_req = models.DescribeTaskStatusRequest()
+    status_req.TaskId = task_id
+    start = time.time()
+    while True:
+        result = client.DescribeTaskStatus(status_req)
+
+        status = result.Data.Status  # 状态码
+        # 状态说明：
+        # 0 = 初始化
+        # 1 = 识别中
+        # 2 = 识别完成
+        # 3 = 识别失败
+        if status == 2:  # 完成
+            return {
+                "TaskId": task_id,
+                "Text": result.Data.Result,  # 最终文本结果字段
+                "Message": "Success"
+            }
+
+        if status == 3:  # 失败
+            return {
+                "TaskId": task_id,
+                "Error": result.Data.ErrorMsg,
+                "Message": "Failed"
+            }
+
+        if time.time() - start > timeout:
+            return {
+                "TaskId": task_id,
+                "Message": "Timeout"
+            }
+
+        time.sleep(poll_interval)  # 默认接口请求频率限制：50次/秒
+
+
 # https://console.bce.baidu.com/ai/#/ai/speech/overview/index
-async def baidu_speech_to_text(audio_data, format='pcm', dev_pid=1536):  #: io.BytesIO
+async def baidu_speech_to_text(audio_data, format='pcm', rate: int = 16000, dev_pid=1536):  #: io.BytesIO
+    """
+    dev_pid	语言	模型	是否有标点	备注
+    1537	普通话(纯中文识别)	语音近场识别模型	有标点	支持自定义词库，适合日常通用场景
+    1737	英语	英语模型	无标点	-
+    1637	粤语	粤语模型	有标点	-
+    1837	四川话	四川话模型	有标点	-
+    1536	普通话(支持简单英文)	搜索模型	无标点	支持自定义词库，更适合搜索类语句
+    1936	适用于粤语	远场模型	有标点	适用于远场拾音设备
+    audio/pcm pcm（不压缩）、wav（不压缩，pcm编码）、amr（压缩格式）、m4a（压缩格式）
+    """
     url = "https://vop.baidu.com/server_api"  # 'https://vop.baidu.com/pro_api'
     access_token = get_baidu_access_token(Config.BAIDU_speech_API_Key, Config.BAIDU_speech_Secret_Key)
     # Config.BAIDU_speech_AppId
     url = f"{url}?dev_pid={dev_pid}&cuid={Config.DEVICE_ID}&token={access_token}"
-    headers = {'Content-Type': f'audio/{format}; rate=16000'}
+    headers = {'Content-Type': f'audio/{format}; rate={rate}'}
 
     cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
     response = await cx.post(url, headers=headers, data=audio_data.getvalue())
@@ -874,8 +1054,8 @@ async def baidu_speech_to_text(audio_data, format='pcm', dev_pid=1536):  #: io.B
 # 对语音识别结果返回的即时性有严格要求的实时场景，如实时会议记录、实时直播字幕、电话客服等。
 # 对音视频文件中语音内容的识别，从而进行内容理解分析、字幕生成等。
 # 对电话客服呼叫中心录音进行识别，从而进行客服质检等
-async def dashscope_speech_to_text(audio_path, format='wav', language: list[str] = ['zh', 'en']):
-    recognition = Recognition(model='paraformer-realtime-v2', format=format, sample_rate=16000,
+async def dashscope_speech_to_text(audio_path, format='wav', language: list[str] = ['zh', 'en'], rate=16000):
+    recognition = Recognition(model='paraformer-realtime-v2', format=format, sample_rate=rate,
                               language_hints=language, callback=RecognitionCallback())  # None
     result = await asyncio.to_thread(recognition.call, audio_path)  # recognition.call(audio_path)
     if result.status_code == 200:
@@ -888,7 +1068,8 @@ async def dashscope_speech_to_text(audio_path, format='wav', language: list[str]
 # SenseVoice语音识别大模型专注于高精度多语言语音识别、情感辨识和音频事件检测，支持超过50种语言的识别，整体效果优于Whisper模型，中文与粤语识别准确率相对提升在50%以上。
 # SenseVoice语音识别提供的文件转写API，能够对常见的音频或音视频文件进行语音识别，并将结果返回给调用者。
 # SenseVoice语音识别返回较为丰富的结果供调用者选择使用，包括全文级文字、句子级文字、词、时间戳、语音情绪和音频事件等。模型默认进行标点符号预测和逆文本正则化。
-async def dashscope_speech_to_text_url(file_urls, model='paraformer-v1', language: list[str] = ['zh', 'en']):
+async def dashscope_speech_to_text_url(file_urls: list[str], model='paraformer-v1',
+                                       language: list[str] = ['zh', 'en']) -> list:
     task_response = Transcription.async_call(
         model=model,  # paraformer-8k-v1, paraformer-mtl-v1
         file_urls=file_urls, language_hints=language)
@@ -904,18 +1085,20 @@ async def dashscope_speech_to_text_url(file_urls, model='paraformer-v1', languag
                 if len(transcription_data["transcripts"]) > 0:
                     transcription_texts.append({"file_url": transcription_data["file_url"],
                                                 "transcripts": transcription_data["transcripts"][0]['text']
-                                                })  # transcription_data["transcripts"][0]["sentences"][0]["text"]
+                                                })
+                    # transcription_data["transcripts"][0]["sentences"][0]["text"]
                 else:
                     print(f"No transcription text found in the response.Transcription Result: {response.text}")
             else:
                 print(f"Failed to fetch transcription. Status code: {response.status_code}")
         else:
-            print(f"Subtask status: {r['subtask_status']}")
+            print(f"Subtask status: {r['subtask_status']},id: {task_response.output.task_id}")
+            transcription_texts.append(r['subtask_status'].get('results', [])[0])
 
     if len(file_urls) != len(transcription_texts):
         print(json.dumps(transcribe_response.output, indent=4, ensure_ascii=False))
 
-    return transcription_texts, task_response.output.task_id
+    return transcription_texts
 
 
 # 非流式合成
@@ -936,7 +1119,8 @@ if __name__ == "__main__":
     # https://nls-portal-service.aliyun.com/ptts?p=eyJleHBpcmF0aW9uIjoiMjAyNC0wOS0wNlQwOToxNjoyNy42MDRaIiwiY29uZGl0aW9ucyI6W1sic3RhcnRzLXdpdGgiLCIka2V5IiwidHRwLzEzODE0NTkxNjIwMDc4MjIiXV19&s=k4sDIZ4lCmUiQ%2BV%2FcTEnFteey54%3D&e=1725614187&d=ttp%2F1381459162007822&a=LTAIiIg37IN8xeMa&h=https%3A%2F%2Ftuatara-cn-shanghai.oss-cn-shanghai.aliyuncs.com&u=qnKV1N8muiAIFiL22JTrgdYExxHS%2BPSxccg9VPiL0Nc%3D
     fileLink = "https://gw.alipayobjects.com/os/bmw-prod/0574ee2e-f494-45a5-820f-63aee583045a.wav"
     import asyncio
-    import io
+
+    Config.load('../config.yaml')
 
     dashscope.api_key = Config.DashScope_Service_Key
     file_urls = ['https://dashscope.oss-cn-beijing.aliyuncs.com/samples/audio/paraformer/hello_world_female.wav',
@@ -977,8 +1161,22 @@ if __name__ == "__main__":
     #         print(f"Subtask status: {r['subtask_status']}")
 
     async def test():
-        audio_file = 'data/nls-sample-16k.wav'
-        with open(audio_file, 'rb') as f:
-            audio_data = io.BytesIO(f.read())
+        # audio_file = 'data/nls-sample-16k.wav'
+        # with open(audio_file, 'rb') as f:
+        #     audio_data = io.BytesIO(f.read())
+        # result = await  baidu_speech_to_text(audio_data, 'wav')  # ali_speech_to_text(audio_data,'wav')
+        url = 'https://idea-aigc-images.oss-cn-hangzhou.aliyuncs.com/upload%2F11389284145.mp3?OSSAccessKeyId=LTAI5tGtSJt2pLhof7xj2qjM&Expires=1762846727&Signature=Wyu4tmTwKI3HkhIj4aZxPO%2Fvc%2FA%3D'
+        result = await tencent_speech_to_text(None, url)
+        print(result)
 
-        result = await  baidu_speech_to_text(audio_data, 'wav')  # ali_speech_to_text(audio_data,'wav')
+
+    asyncio.run(test())
+
+
+    def test_speech():
+        url = 'https://idea-aigc-images.oss-cn-hangzhou.aliyuncs.com/upload%2F11389284145.mp3?OSSAccessKeyId=LTAI5tGtSJt2pLhof7xj2qjM&Expires=1762846727&Signature=Wyu4tmTwKI3HkhIj4aZxPO%2Fvc%2FA%3D'
+        result = tencent_sdk_speech_to_text(None, url)
+        print(result)
+        # {'TaskId': 13539536533, 'Text': '[0:1.980,0:3.200]  嗯。\n[0:5.800,0:30.080]  哎哎，好，可以了，听得到吗？听得到听得到吗？听得到，今天是2025年9月11号，现在是来做那个云南创投会网络科技有限公司经开分公司的上门核实，我是昆明东海营业部小学，很容一。\n[1:32.560,1:35.680]  这里是他们的临时办公室。\n[1:41.240,1:53.160]  啊，我们现在是跟这个云南汕头这彩网络科技有限公司，金山分公司的王冠林王总，还有我们的财务人员一起做一个上门的核实。\n[1:53.380,1:55.980]  先看一下身份证。\n[1:59.800,2:8.700]  有效期是正常的，然后这个是昆明市公安局西山分局的一个签发机关。\n[2:10.100,2:13.320]  看一下他们的这个营业执照。\n[2:13.800,2:15.800]  你看。\n[2:15.800,2:17.160]  好。\n[2:23.620,2:46.180]  王总，我们现在先跟您做一个上面的核实。首先的话，因为你们这个分公司，这一次是打算在我们曲靖市商业银行昆民分行开一个基本账户是吗？对，然后公司呢，是呃，我看是8月份成立的，然后基于你的这个这个公司，它主要的一个经营一块是什么呢？\n[2:46.180,3:46.500]  嗯，其实我们分公司当时打算成立，就是想成立在这个汽配城这边。呃，因为我们有一些上下游的关系都在这一边，所以到时候我们分公司等这个组织健全了以后的话，开始运作，主要的是运作汽配这一块的生意，所以做这一个打算，所以设立也设立在这一边，就主要这个分公司是想用来做这个汽配的。对对对，现在的话呢，又因为有一些变化，我看现在是要全部又要换来现在现的新的这个位置，就是采用北队这边啊呃是基于什么考虑呢？呃因为那边的呃呃总公司的那边的场地有一些这个场地，还有这个租租租用方面的一些呃变动吧，所以就打算总公司也搬到这边来。那么既然都在一起了，我们就打算把它整合在一起了啊那这一块场地请问一下你。\n[3:46.500,4:14.520]  是租的还是买房租租的租的是吗？啊，然后就是指外围的这一，我现在我们在的这个位置的这一块嘛，我们是租了他们的一部分，就是一部分连他们的那个呃呃这个维修的那一块，我看是还在的是吧？对对对，还是未来他们也还会在对，未来也在我们只租了这一个大的院子里面的一部分，就租了院子的一半这个样子啊啊啊。\n[4:14.940,5:6.440]  那这个呃这个分公司，他现在因为8月份才呃注册的，他有开展业务吗？还没有就是是呃业务是都还没有开展，也就是说他还没有一个收益，没有没有啊，那后续你开了这个红的话，呃你们是未来是有没有什么业务储备？嗯有啊有啊，就是我们现在整个第一次的整个业务的话，我们就要分出来了，分出来了，拿几块就给分公司来做啊。嗯，不是现在还在一个整合的过程，对对对，因为我们相当于做的也是我们原来总公司的这些业务储备，他不用他自己去拓展新的业务，到底有以后可能可能总公司这边有新业务拓展的话，有可能会交交一部分给到分公司这边去拓展。嗯，是这样的，那这边的人员配置有配置起来吗？\n[5:6.440,6:6.900]  嗯，还没有还没有是吧？有就目目前来说，就是暂时主要管理的就是你们两个人是吗？嗯，对对对，可以这样说啊，那这个我看到有提供一个这个这个这个这个水的发水电费的，水电费的发票是一个是水费的，这个是电费的。嗯，然后就是这个称就是这家公司的，他们签租赁合同的这家公司的瑞思的田汽车控股就是这个位置的嘛，对对，就是这个地址啊。然后这个营业执照的这个原件现在没有拿到，是原件，因为都放在老公司那边，要没说要拿的话，今天就没拿。然后就是你们的这个呃开户的话，是经办人过去办理是吗？对对对，是的是我们这个呃总公司。\n[6:6.900,6:26.780]  公司的一个经理罗总刘丽宇啊，然后这个分公司现在就相当于他也没有什么资产了，这一辈子是没有什么。\n[6:40.320,7:40.800]  好，给您宣读一下我们的风险提示，自2024年12月1日起，银行汴金社区的市级级以上公安机关，这了非法买卖出租借银行账户支付账户的3个以上或三次以上，或者为上诉卡账户账号提供实名求证。八助三张以上或三次以上的单位个人和相关组织者，假冒他人身份或者虚构代理关系开立银行账户、支付账户等等，将纳入电信网络诈骗严重失信主体名单，共享至全国信用信息共享平台，并通过信用中国网站对严重失信主体信息进行公示。惩戒对象信息纳入金融信用信息基础数据库，并限制惩戒对象名下银行账户的非固定业务，暂停了其新泰币支付账户，实施电信网络诈骗及其关联犯罪被追究刑事责任的，惩戒期限为3年。惩戒对象在惩戒期限内被多次惩戒的，惩戒期限累计执行。\n[7:40.800,8:1.980]  的信息现不能超里面。以上内容是账户相关法律责任和惩戒措施，请您依法依规司核使用清楚了。杨老师这边还有什么问题吗？我这边能下去看一下他实际的那个经营场所吗？可以的。\n[8:2.000,8:9.180]  我们再下去补录一下，嗯，就法人老师这边还有问题吗？没有了。\n[8:9.720,8:12.240]  好的谢谢王总啊嗯。\n[8:14.340,8:15.460]  嗯。\n[8:17.060,8:19.740]  从这个5万元。\n[8:19.740,8:21.060]  好。\n[8:29.340,8:30.580]  关于。\n[8:43.880,8:48.020]  那个老师们可以采访一下员工吗？\n[8:51.980,8:55.120]  这边是还在装修着。\n[8:55.700,9:1.800]  这个就是他们还在装修的那边，只是临时的一个办公场所。\n[9:1.800,9:6.480]  那个老师，你们可以采访一下他们的员工吗？\n[9:6.480,9:19.860]  老师有点听不清楚，因为这边在打地砖，是说什么是那个这边可以采访一下他们的员工吗？员工是吗？好的，我们拿过去给他们员工稍等一下。\n[9:20.760,9:26.000]  那个是的。\n[9:32.960,9:34.620]  接着。\n[9:34.620,9:53.820]  老师好像没在呀，他们因为这个蓝色的那个就是穿蓝色衣服的那个，不是他们的员工吗？这个是隔壁的这个维修的，他们这里有一个维修。\n[9:54.900,9:59.420]  就是说他们其实不是维修的这个对吧。\n[9:59.420,10:2.140]  对，他们是卖汽配的。\n[10:4.020,10:14.260]  就这一边，相当于他们刚刚有说到他们租的话，他们只是租了一部分，然后他们这个这个是别克吧，还是哪一家的？\n[10:14.280,10:17.020]  这是他们之前。\n[10:17.020,10:27.000]  嗯，之前这个的名字可以看一下吗？就是那个挂牌那里是不是这个公司的名字哦？我看一下啊，这边是不是的？\n[10:34.140,10:40.360]  这边是另一个门进来的，这里是他们的后门，应该不是一家公司的。\n[10:40.360,10:48.220]  那看一下这个，因为我们他们刚刚也有也有跟我们说的，这边不是他们的。\n[10:56.300,10:59.380]  哎呀，这边这边都没有。\n[10:59.380,11:1.080]  没有门头。\n[11:1.080,11:10.740]  好，那转回去看一下，刚才那个来的时候，就是来的时候那个口，然后有他们挂牌的地方，我看有我看是有一个那个金黄色的挂牌。\n[11:10.740,11:18.400]  哦，那个不是那个只是个保险公司的挂牌，说的是这里是那个保险的点。\n[11:18.460,11:20.820]  嗯，好，我知道了。\n[11:26.240,11:32.480]  于老师，听得到吗？是不是卡住了？我在装修，所有的牌子都没有见到。\n[11:33.200,11:36.600]  就门口的那个牌子也是拿掉的。\n[11:36.740,11:40.540]  最早有一个那个一汽丰田的那个。\n[11:40.700,11:48.340]  那个问一下别克那个他说的那个货架是他们的这两个。\n[11:51.580,11:57.680]  老师，你们是这个维修站的这个员工是吗？\n[12:0.140,12:9.900]  问货架是王总的这个的吗？这个货架这些是王总他们的吧？对哦。\n[12:9.900,12:20.460]  这个货架，是那个王总他们的，这个工作人员说了，是这个这一层上面还有吗？上面还有要上去看吗？\n[12:20.680,12:26.120]  嗯，看一下吧，看一下好。\n[12:33.020,12:37.660]  啊，这边也有哦，这边上面也有是吧。\n[12:42.740,12:46.620]  嗯，他们搭了一个这个货架在这边。\n[12:47.300,12:52.600]  老师，能问一下他们的那个就是这个工作人员他们公司的名称吗？\n[12:52.960,12:56.580]  就是他们自己搜名称啊。\n[12:56.580,13:13.060]  老师，你们这边是这个呃维修站的是叫什么维修站呀？呃，我们这是别克、别克、凯迪拉克还有丰田哦。他们是那个品4S店品牌的这个维修站是吗？哦，那有没有全称就是公司的全称。\n[13:13.280,13:21.380]  有没有公司的全称？有有的叫什么？大概呃。\n[13:36.180,13:48.160]  稍等啊，他开一下钉钉，嗯，好的，第3个哦，3个。\n[13:48.200,13:52.180]  老师，能近距离看一下吗？\n[13:53.720,13:56.060]  好，可以。\n[13:56.060,14:8.620]  啊，可以了，没有什么问题了。好好，那老师再见。嗯，因为这个楼梯有点陡，哎哟，好，可以结束了，老师啊。\n', 'Message': 'Success'}
+
+    # test_speech()

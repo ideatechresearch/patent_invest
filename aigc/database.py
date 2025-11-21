@@ -1,52 +1,34 @@
-from sqlalchemy import create_engine, select, JSON, Column, ForeignKey, String, Integer, BigInteger, Boolean, Float, \
-    DateTime, Index, TEXT
+from sqlalchemy import Engine, create_engine, select, JSON, Column, ForeignKey, String, Integer, BigInteger, Boolean, \
+    Float, DateTime, Index, TEXT
 from sqlalchemy import func, or_, and_, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import sessionmaker, declarative_base, mapped_column, Mapped, Session
 from sqlalchemy.schema import FetchedValue
 # from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-# from sqlalchemy.pool import NullPool, QueuePool
-from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from contextlib import asynccontextmanager, contextmanager
 import hashlib, secrets, uuid
 import time, json, copy
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Union, ClassVar, AsyncGenerator
+from typing import List, Dict, Optional, Union, ClassVar, Generator, AsyncGenerator
 from collections import defaultdict
 from pydantic import BaseModel
 
 from utils import cut_chat_history
 from config import Config
-from service import BaseMysql, AsyncMysql, OperationMysql, AsyncBatchAdd
+from service.mysql_ops import BaseMysql, AsyncMysql, OperationMysql
+from service.service import AsyncBatchAdd
 
 Base = declarative_base()  # ORM 模型继承基类
-
-engine = create_engine(Config.SQLALCHEMY_DATABASE_URI, pool_recycle=14400, pool_size=3, max_overflow=Config.DB_MAX_SIZE,
-                       pool_pre_ping=True)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)  # isolation_level='SERIALIZABLE'
-# echo=True 仅用于调试
-# poolclass=QueuePool,多线程安全的连接池，复用连接,poolclass=NullPool,每次请求都新建连接，用完就断，不缓存
+# poolclass=QueuePool,多线程安全的连接池，复用连接
 async_engine = create_async_engine(Config.ASYNC_SQLALCHEMY_DATABASE_URI,
                                    pool_size=4,  # 最大连接数
                                    max_overflow=Config.DB_MAX_SIZE,  # 额外允许溢出的连接 20
                                    pool_timeout=30,  # 获取连接超时时间（秒）
                                    pool_recycle=3600,  # 连接回收时间，1h 回收，避免空闲断连
                                    future=True)
-AsyncSessionLocal = sessionmaker(bind=async_engine, class_=AsyncSession, autocommit=False, autoflush=False,
-                                 expire_on_commit=False)
-
-
-def get_db():
-    """同步依赖"""
-    db = SessionLocal()
-    try:
-        yield db
-    # except Exception:
-    #     db.rollback()
-    #     raise
-    finally:
-        db.close()
+AsyncSessionLocal = async_sessionmaker(bind=async_engine, class_=AsyncSession, autocommit=False, autoflush=False,
+                                       expire_on_commit=False)
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
@@ -60,15 +42,158 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 @asynccontextmanager
 async def get_session_context():
     """手动控制事务的 async 上下文"""
-    async with AsyncSessionLocal() as session:
+    session: AsyncSession = AsyncSessionLocal()
+    try:
+        yield session
+        # await session.commit()  # 自动提交
+    except Exception:
+        await session.rollback()
+        raise
+    finally:
+        await session.close()
+
+
+class DatabaseManager:
+    """Database connection and session manager."""
+
+    def __init__(self, default_url: str, **kwargs):
+        """Initialize database manager."""
+        self.engine: Optional[Engine] = None
+        self.SessionLocal = None
+        self.initialize(default_url, db_config=kwargs)
+
+    @staticmethod
+    def build_db_url(default_url: str = None, db_config: dict = None) -> str:
+        """
+        根据 db_config 动态生成数据库连接 URL。
+        优先级：
+            1. db_config["url"]
+            2. 手动拼接 MySQL URL
+            3. default_url
+        """
+        if not db_config:
+            if not default_url:
+                raise ValueError("必须提供 db_config 或 default_url")
+            return default_url
+
+        # 优先使用完整的 url
+        if "url" in db_config and db_config["url"]:
+            return db_config["url"]
+
+        # 拼接 MySQL URL
+        user = db_config.get("user", "root")
+        password = db_config.get("password", "")
+        host = db_config.get("host", "localhost")
+        port = db_config.get("port", 3306)
+        database = db_config.get("database")
+        charset = db_config.get("charset", "utf8mb4")
+
+        if not database:
+            raise ValueError("db_config 必须包含 'database' 字段")
+
+        return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset={charset}"
+
+    def initialize(self, default_url: str, db_config: dict = None) -> Engine | None:
+        """Initialize database engine."""
+        from sqlalchemy.pool import NullPool, StaticPool, QueuePool
+        # SQLite specific configuration
+        url = self.build_db_url(default_url, db_config)
+        if url.startswith("sqlite"):
+            connect_args = {"check_same_thread": False, "timeout": 20, }
+            self.engine = create_engine(
+                url,
+                connect_args=connect_args,
+                poolclass=StaticPool if ":memory:" in url else NullPool,
+            )
+        else:
+            # poolclass=NullPool,每次请求都新建连接，用完就断，不缓存
+            self.engine = create_engine(
+                url,
+                # pool_size=3, max_overflow=10,
+                poolclass=NullPool,  # 每次新建连接
+                pool_recycle=14400,
+                pool_pre_ping=True)
+
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        # isolation_level='SERIALIZABLE',echo=True 仅用于调试
+        return self.engine
+
+    def get_engine(self) -> Engine:
+        """Get database engine."""
+        return self.engine
+
+    def dispose(self):
+        if self.engine:
+            self.engine.dispose()
+
+    @contextmanager
+    def get_conn(self):
+        """上下文管理方式获取数据库连接"""
+        with self.engine.connect() as conn:
+            yield conn
+
+    def __enter__(self) -> Session:
+        """Get a new database session."""
+        self.session = self.SessionLocal()
+        return self.session
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.session.close()
+
+    def get_db_session(self) -> Generator[Session, None, None]:
+        """同步依赖 Get database session for dependency injection."""
+        db = self.SessionLocal()
         try:
-            yield session
-            # await session.commit()  # 自动提交
-        except Exception:
-            await session.rollback()
-            raise
+            yield db
+            # db.commit()
+        # except Exception:
+        #     db.rollback()
+        #     raise
         finally:
-            await session.close()
+            db.close()
+
+    def create_tables(self) -> None:
+        """Create all tables defined in models."""
+        if not self.engine:
+            raise RuntimeError("Database engine not initialized.")
+        Base.metadata.create_all(bind=self.engine)
+        # async with async_engine.begin() as conn:
+        #     await conn.run_sync(Base.metadata.create_all)
+
+    def drop_tables(self) -> None:
+        """Drop all tables."""
+        if not self.engine:
+            raise RuntimeError("Database engine not initialized.")
+        Base.metadata.drop_all(bind=self.engine)
+
+    @staticmethod
+    async def read(session, sql: str, **kwargs) -> list[dict]:
+        import asyncio
+        sql = text(sql)
+        params = kwargs or {}
+        if asyncio.iscoroutinefunction(session.execute):
+            result = await session.execute(sql, params)  # AsyncSession
+        else:
+            result = session.execute(sql, params)  # Session
+
+        return result.mappings().all()  # 字典列表
+
+
+_db_manager: Optional[DatabaseManager] = None
+
+
+def get_database_manager() -> DatabaseManager:
+    """Get global database manager instance."""
+    global _db_manager
+    if _db_manager is None:
+        _db_manager = DatabaseManager(default_url=Config.SQLALCHEMY_DATABASE_URI)
+    return _db_manager
+
+
+def get_db():
+    """同步依赖"""
+    db_manager = get_database_manager()
+    yield from db_manager.get_db_session()
 
 
 def get_db_connection(db_config: dict, dictionary=True):
@@ -94,18 +219,6 @@ def get_db_connection(db_config: dict, dictionary=True):
     except Exception as e:
         print(f"Error connecting to MySQL: {e}")
         return None
-
-
-async def search_from_database(session, sql: str, **kwargs):
-    import asyncio
-    sql = text(sql)
-    params = kwargs or {}
-    if asyncio.iscoroutinefunction(session.execute):
-        result = await session.execute(sql, params)  # AsyncSession
-    else:
-        result = session.execute(sql, params)  # Session
-
-    return result.mappings().all()
 
 
 async def patent_search(patent_id, limit=10):
@@ -169,9 +282,9 @@ async def company_search(co_name, search_type='invest', limit=10):
 
 
 class IntentMemory:
-    def __init__(self, max_his=5, redis=None, prefix="intent_history"):
+    def __init__(self, max_his: int = 5, redis=None, prefix="intent_history"):
         # 使用 defaultdict 来存储用户和机器人的意图历史,deque(maxlen=max_his)
-        self.history = defaultdict(lambda: defaultdict(list))  # {robot_id: {user_id: [intent_history]}}
+        self.history = defaultdict(lambda: defaultdict(list))  # memory {robot_id: {user_id: [intent_history]}}
         self.max_his = max_his
         self.redis = redis
         self.prefix = prefix
@@ -238,20 +351,39 @@ class IntentMemory:
         """获取指定用户和机器人的最近意图"""
         return self.history[robot_id][user_id][-1] if self.history[robot_id][user_id] else None
 
-    def get_history(self, robot_id, user_id):
+    def get_history(self, robot_id, user_id, recent_n: int = None) -> list:
         """获取指定用户和机器人的意图"""
-        return self.history.get(robot_id, {}).get(user_id, [])
+        memory = self.history.get(robot_id, {}).get(user_id, [])
+        recent_n = recent_n or self.max_his
+        return memory[-recent_n:]
 
-    def export_all(self):
+    def delete(self, robot_id, user_id, index: Union[List, int]) -> None:
+        memory = self.history.get(robot_id, {}).get(user_id, [])
+        if not memory:
+            return
+        if isinstance(index, int):
+            del memory[index]
+        else:
+            for i in index:
+                del memory[i]
+
+    def export_all(self) -> List[dict]:
         """导出为列表结构便于写入数据库"""
         records = []
         for robot_id, users in self.history.items():
             for user_id, intents in users.items():
                 for idx, intent in enumerate(intents):
+                    data = intent
+                    if isinstance(intent, str):
+                        pass
+                    elif isinstance(intent, BaseModel):
+                        data = intent.model_dump()
+                    else:
+                        data = json.dumps(intent)
                     records.append({
                         "robot_id": robot_id,
                         "user_id": user_id,
-                        "intent": intent,
+                        "intent": data,
                         "index": idx
                     })
         return records
@@ -293,29 +425,6 @@ class User(Base):
     def is_primary_account(self):
         return self.parent_id is None
 
-    def update(self, db: Session, eth_address: Optional[str] = None, public_key: Optional[str] = None,
-               expires_day: Optional[int] = 0, **kwargs):
-        update_data = {}
-        if eth_address:
-            update_data['eth_address'] = eth_address
-        if public_key:
-            update_data['public_key'] = public_key
-        if expires_day:
-            update_data['expires_at'] = int((datetime.now(timezone.utc) + timedelta(days=expires_day)).timestamp())
-        update_data["updated_at"] = datetime.now(timezone.utc)
-
-        for key, value in kwargs.items():
-            if hasattr(self, key):  # in cls.__mapper__.c:
-                update_data[key] = value
-
-        if update_data:
-            db.query(User).filter_by(id=self.id).update(update_data)
-            db.commit()
-            db.refresh(self)
-            return self
-
-        return None
-
     @classmethod
     def create_user(cls, db: Session, username: str, password: str, role: str = 'user', group: str = '0',
                     eth_address: Optional[str] = None, public_key: Optional[str] = None):
@@ -352,6 +461,55 @@ class User(Base):
         return None
 
     @classmethod
+    async def async_get_user(cls, session: AsyncSession, priority: bool = False, **kwargs):
+        allowed_priority = ['username', 'user_id', 'api_key', 'eth_address', 'public_key']
+        if not kwargs or not set(kwargs.keys()).issubset(set(allowed_priority)):
+            return None
+
+        stmt = select(cls)
+        if priority:  # 按优先级匹配第一个非空字段
+            filter_cond = None
+            for field in allowed_priority:
+                value = kwargs.get(field)
+                if value:
+                    filter_cond = getattr(cls, field) == value
+                    break
+            if not filter_cond:
+                return None
+            stmt = stmt.where(filter_cond)
+        else:  # 多字段同时匹配
+            filters = [getattr(cls, key) == value for key, value in kwargs.items() if value]
+            if not filters:
+                return None
+            stmt = stmt.where(and_(*filters))
+
+        result = await session.execute(stmt)
+        return result.scalars().first()
+
+    def update(self, db: Session, eth_address: Optional[str] = None, public_key: Optional[str] = None,
+               expires_day: Optional[int] = 0, **kwargs):
+        update_data = {}
+        if eth_address:
+            update_data['eth_address'] = eth_address
+        if public_key:
+            update_data['public_key'] = public_key
+        if expires_day:
+            update_data['expires_at'] = int((datetime.now(timezone.utc) + timedelta(days=expires_day)).timestamp())
+        update_data["updated_at"] = datetime.now(timezone.utc)
+
+        for key, value in kwargs.items():
+            if hasattr(self, key):  # in cls.__mapper__.c:
+                update_data[key] = value
+
+        if not update_data:
+            return None
+
+        db.query(User).filter_by(id=self.id).update(update_data)
+        db.commit()
+        db.refresh(self)
+        return self
+
+    @classmethod
     def update_user(cls, db: Session, _id: int, eth_address: Optional[str] = None, public_key: Optional[str] = None,
                     expires_day: Optional[int] = 0, **kwargs):
         user = db.query(cls).filter_by(id=_id).first()
@@ -376,20 +534,18 @@ class User(Base):
         return api_key, secret_key
 
     @classmethod
-    def get_api_keys(cls, db: Session, _id: Optional[int] = None) -> dict[str, str]:
-        query = db.query(cls.api_key, cls.secret_key)
-        if _id is not None:
-            query = query.filter(cls.id == _id)
-        api_keys = query.all()
-        return {api_key: secret_key for api_key, secret_key in api_keys}
-
-    @classmethod
-    async def refresh_api_keys(cls, session: AsyncSession, redis=None, ex: int = 300) -> dict[str, str]:
+    async def get_api_keys(cls, session: AsyncSession, _id: Optional[int] = None,
+                           redis=None, ex: int = 300) -> dict[str, str]:
         stmt = select(cls.api_key, cls.secret_key)
+        if _id is not None:
+            stmt = stmt.where(cls.id == _id)
         result = await session.execute(stmt)
         api_keys = {api_key: secret_key for api_key, secret_key in result.all()}
-        if redis:
-            await redis.setex("active_api_keys", ex, json.dumps(api_keys))
+        if redis and api_keys:
+            await redis.hset("active_api_keys", mapping=api_keys)
+            if ex > 0:
+                await redis.expire("active_api_keys", ex)
+            # await redis.setex("active_api_keys", ex, json.dumps(api_keys))
         return api_keys
 
     @classmethod
@@ -398,15 +554,13 @@ class User(Base):
         优先从 Redis 读取，否则刷新。
         """
         if redis:
-            data = await redis.get("active_api_keys")
-            if data:
-                return json.loads(data)
-
+            return await redis.hgetall("active_api_keys")
+            # data = await redis.get("active_api_keys")
+            # if data:
+            #     return json.loads(data)
         if session:
-            return await cls.refresh_api_keys(session, redis=redis, ex=ex)
-        async with AsyncSessionLocal() as session:
-            api_keys = await cls.refresh_api_keys(session, redis=redis, ex=ex)
-            return api_keys
+            return await cls.get_api_keys(session, redis=redis, ex=ex)  # refresh_api_keys
+        return {}
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -419,8 +573,10 @@ class User(Base):
         return hashlib.sha256(input_password.encode()).hexdigest() == stored_password
 
     @classmethod
-    def validate_credentials(cls, username: str, password: str, db: Session):
-        user = db.query(cls).filter_by(username=username).first()
+    async def validate_credentials(cls, username: str, password: str, session: AsyncSession):
+        stmt = select(cls).where(cls.username == username)
+        result = await session.execute(stmt)
+        user = result.scalars().first()
         if user and cls.verify_password(password, str(user.password)):
             return user
 
@@ -445,8 +601,7 @@ class BaseChatHistory(Base):
     reference: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
     transform: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
 
-    # prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
-    # completion_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    usage: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default=FetchedValue())
@@ -463,7 +618,8 @@ class BaseChatHistory(Base):
     # chat_cache_lock: ClassVar[Lock] = Lock()
 
     def __init__(self, role: str, content: str, user: str, name: str = None, robot_id: str = None, model: str = None,
-                 agent: str = None, index: int = 0, reference=None, transform=None, timestamp: int = 0):
+                 agent: str = None, index: int = 0, reference=None, transform=None, usage: dict = None,
+                 timestamp: int = 0):
         self.role = role or 'user'
         self.content = content or ''
         self.name = name
@@ -473,14 +629,17 @@ class BaseChatHistory(Base):
         self.model = model
         self.agent = agent
         self.index = index or 0
-        self.reference = reference
-        self.transform = transform
-        self.timestamp = timestamp or int(time.time())
+
+        self.reference = json.dumps(reference, ensure_ascii=False, default=str) if reference else None
+        self.transform = json.dumps(transform, ensure_ascii=False, default=str) if transform else None
+        self.usage = usage or {}
+        self.timestamp = timestamp or int(time.time())  # datetime.utcnow().timestamp()
+        self.created_at = datetime.fromtimestamp(timestamp, tz=timezone.utc) if timestamp else datetime.now(
+            timezone.utc)
         # self.content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest() 由数据库自动生成
-        # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
 
     @classmethod
-    async def initialize(cls, get_session_func):
+    async def initialize(cls, get_session_func=get_session_context):
         """初始化批量处理器"""
         if cls._batch_processor is None:
             cls._batch_processor = AsyncBatchAdd(
@@ -504,7 +663,7 @@ class BaseChatHistory(Base):
         if cls._batch_processor is None:
             raise RuntimeError("Batch processor not initialized. Call initialize_processor first.")
         if isinstance(history_data, dict):
-            await cls._batch_processor.put_nowait(history_data)
+            await cls._batch_processor.enqueue(history_data)
             return 1
         elif isinstance(history_data, list):
             return cls._batch_processor.put_many_nowait(history_data)
@@ -515,6 +674,10 @@ class BaseChatHistory(Base):
 
     def display(self):
         print(f"Role: {self.role}, Content: {self.content}, Name: {self.name},Timestamp: {self.timestamp}")
+
+    @classmethod
+    def size(cls):
+        return len(cls.Chat_History_Cache)
 
     @classmethod
     def history_insert(cls, new_history, db: Session):
@@ -579,7 +742,7 @@ class BaseChatHistory(Base):
             stmt = stmt.where(cls.agent == agent)
 
         result = await session.execute(stmt)
-        records = result.scalars().all()
+        records = result.scalars().all()  # 简单值列表
 
         if all_payload:
             return [record.asdict() for record in records]
@@ -648,16 +811,14 @@ class BaseChatHistory(Base):
     @classmethod
     def flush_cache(cls, user=None):
         """一次性把类级缓存落库"""
-        if len(cls.Chat_History_Cache):
-            session = SessionLocal()
-            try:
-                cls.sequential_insert(session, user=user)
-            finally:
-                session.close()
+        if not cls.size():
+            return
+        with get_database_manager() as db:
+            cls.sequential_insert(db, user=user)
 
     def save_cache(self):
-        """保存当前实例缓存到数据库"""
-        with SessionLocal() as session:
+        """保存当前实例缓存到数据库 """
+        with get_database_manager().SessionLocal() as session:
             self.sequential_insert(session, user=self.user, robot_id=self.robot_id)
 
     def get_cache(self, filter_time: float = 0):
@@ -712,7 +873,8 @@ def build_chat_history(user_request: str, user: str, name: Optional[str], robot_
 def save_chat_history(user_request: str, bot_response: str,
                       user: str, name: Optional[str], robot_id: Optional[str],
                       agent: Optional[str], hist_size: int, model: str, timestamp: float,
-                      db: Session, refer: List[str], transform=None, session_uid: Optional[str] = None):
+                      db: Session, refer: List[str], transform=None, usage: dict = None,
+                      session_uid: Optional[str] = None):
     if not user_request or not bot_response:
         return
     uid = name or session_uid
@@ -723,8 +885,7 @@ def save_chat_history(user_request: str, bot_response: str,
          'agent': agent, 'index': hist_size + 1, 'timestamp': timestamp},
         {'role': 'assistant', 'content': bot_response, 'name': uid, 'robot_id': robot_id, 'user': user,
          'agent': agent, 'index': hist_size + 2, 'model': model,  # 'timestamp': time.time(),
-         'reference': json.dumps(refer, ensure_ascii=False) if refer else None,  # '\n'.join(refer)
-         'transform': json.dumps(transform, ensure_ascii=False) if transform else None}
+         'reference': refer, 'transform': transform, 'usage': usage},  # '\n'.join(refer)
     ]
     # 保存聊天记录到数据库，或者保存到内存中当数据库不可用时。
     BaseChatHistory.history_save(new_history, user, db)
@@ -797,8 +958,8 @@ class ChatHistory(BaseChatHistory):
 
         return history
 
-    @classmethod
-    def rebuild(cls, user_request: str, history: List[dict] = None):
+    @staticmethod
+    def rebuild(user_request: str, history: List[dict] = None):
         # 创建message副本
         user_history = copy.deepcopy(history)
         if user_history and user_history[-1]["role"] == 'user':
@@ -806,18 +967,11 @@ class ChatHistory(BaseChatHistory):
         return user_history
 
     async def save(self, bot_response: str, refer: Union[List, Dict] = None, transform=None,
-                   user_request: str = None, model: str = None, session: AsyncSession = None):
+                   user_request: str = None, model: str = None, usage: dict = None, session: AsyncSession = None):
         """
         为了方便成对取出记录，'user','robot_id','name','agent'保持一致并成对保存
         模型可以得到多条回复，为了方便存储，暂时只记录一条
         user 建议用唯一标识,如果未提供,为匿名用户,不保存数据库
-        :param bot_response:
-        :param refer:
-        :param transform:
-        :param user_request:
-        :param model:
-        :param session:
-        :return:
         """
         user_request = user_request or self.user_request
         if not user_request or not bot_response:
@@ -835,8 +989,7 @@ class ChatHistory(BaseChatHistory):
             {'role': 'assistant', 'content': bot_response, 'name': self.uid,
              'user': self.user, 'robot_id': self.robot_id, 'agent': self.agent,
              'index': current_max + 2, 'model': model or self.model,
-             'reference': json.dumps(refer, ensure_ascii=False, default=str) if refer else None,  # '\n'.join(refer)
-             'transform': json.dumps(transform, ensure_ascii=False, default=str) if transform else None
+             'reference': refer, 'transform': transform, 'usage': usage
              # 'timestamp': time.time(),
              }
         ]
@@ -873,6 +1026,9 @@ class BaseReBot(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
 
+    prompt_cache_hit_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+    completion_reasoning_tokens: Mapped[int] = mapped_column(Integer, nullable=True, default=0)
+
     timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.utc_timestamp(),
@@ -900,16 +1056,19 @@ class BaseReBot(Base):
         self.model = model
         self.msg_id = kwargs.get('msg_id', 0)
 
-        self.reference = kwargs.get('reference', None)  # 参考信息,rag,tools,context
-        self.transform = kwargs.get('transform', None)
+        self.reference = BaseMysql.format_value(kwargs.get('reference', None))  # 参考信息,rag,tools,context
+        self.transform = BaseMysql.format_value(kwargs.get('transform', None))
         self.reasoning_content = kwargs.get('reasoning_content', None)  # 背景信息,intent,analysis,summary,title
 
         self.prompt_tokens = kwargs.get('prompt_tokens', 0)
         self.completion_tokens = kwargs.get('completion_tokens', 0)
+        self.prompt_cache_hit_tokens = kwargs.get('prompt_cache_hit_tokens', 0)
+        self.completion_reasoning_tokens = kwargs.get('completion_reasoning_tokens', 0)
+
         self.timestamp = kwargs.get('timestamp', int(time.time()))
         self.created_at = kwargs.get('created_at', datetime.now(timezone.utc))
         self.updated_at = kwargs.get('updated_at', datetime.now(timezone.utc))
-        # datetime.utcfromtimestamp(timestamp) datetime.utcnow().timestamp()
+        # datetime.utcfromtimestamp(timestamp)
 
     def asdict(self) -> dict:
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
@@ -981,8 +1140,8 @@ class BaseReBot(Base):
         return history
 
     @staticmethod
-    def before(messages: list[dict | BaseModel]):
-        data = {}
+    def before(messages: list[dict | BaseModel], data: dict = None):
+        data = data or {}
         if messages and isinstance(messages, list):
             if isinstance(messages[0], BaseModel):
                 messages = [msg.model_dump() for msg in messages]
@@ -1003,16 +1162,15 @@ class BaseReBot(Base):
             if not data.get("reference"):
                 reference = next((msg.get("content") for msg in reversed(messages) if msg.get("role") == "system"),
                                  None)  # [{"type": "text", "text": str(text)} for text in refer]
-                if reference and isinstance(reference, (list, dict, set, tuple)):
-                    data["reference"] = BaseMysql.format_value(reference)
+                data["reference"] = BaseMysql.format_value(reference)
         return data
 
     @staticmethod
-    def after(model_response: dict | str | BaseModel, assistant_content: str = ''):
+    def after(model_response: dict | str | BaseModel, data: dict = None):
         if not model_response:
             return {}
 
-        data = {}
+        data = data or {}
         if isinstance(model_response, BaseModel):
             model_response = model_response.model_dump()
         if isinstance(model_response, str):
@@ -1025,8 +1183,8 @@ class BaseReBot(Base):
             choice = model_response.get('choices', [{}])
             if choice:
                 choice = choice[0]
-                data["assistant_content"] = assistant_content or choice.get('message', {}).get('content') or choice.get(
-                    'text')
+                data["assistant_content"] = data.get('assistant_content', '') or choice.get('message', {}).get(
+                    'content') or choice.get('text')
                 if not data["assistant_content"]:
                     tool_calls = choice.get('message', {}).get('tool_calls', [])
                     if tool_calls:
@@ -1040,9 +1198,12 @@ class BaseReBot(Base):
             data["timestamp"] = model_response.get("created") or data.get("timestamp", int(time.time()))
 
             usage = model_response.get('usage', {}) or {}
-            data["prompt_tokens"] = usage.get('prompt_tokens', 0)
-            data["completion_tokens"] = usage.get('completion_tokens', 0)
-
+            if usage:
+                data["prompt_tokens"] = usage.get('prompt_tokens', 0)  # 2/10^6
+                data["completion_tokens"] = usage.get('completion_tokens', 0)  # 3/10^6
+                data["prompt_cache_hit_tokens"] = usage.get('prompt_cache_hit_tokens', 0)  # 0.2/10^6
+                completion_tokens_details = usage.get('completion_tokens_details', {}) or {}
+                data["completion_reasoning_tokens"] = completion_tokens_details.get('reasoning_tokens', 0)
         return data
 
     @classmethod
@@ -1061,11 +1222,14 @@ class BaseReBot(Base):
         else:
             data = cls(user=user, robot_id=robot_id, **kwargs).asdict()
 
-        if messages:
-            data.update(cls.before(messages=messages))
+        try:
+            if messages:
+                data = cls.before(messages=messages, data=data)
 
-        if model_response:
-            data.update(cls.after(model_response=model_response, assistant_content=data.get('assistant_content', '')))
+            if model_response:
+                data = cls.after(model_response=model_response, data=data)
+        except Exception as e:
+            print(f'[BaseReBot]:{e}')
 
         final_data = {k: v for k, v in data.items() if v is not None}
         return final_data
@@ -1103,7 +1267,6 @@ class BaseReBot(Base):
             return await dbpool.async_insert(table_name=cls.__tablename__, params_data=data)
 
         else:
-            # async with MysqlData(async_mode=True) as dbop:
             with OperationMysql() as session:
                 return session.insert(table_name=cls.__tablename__, params=data)
 
@@ -1149,6 +1312,107 @@ class BaseReBot(Base):
         if user_content:
             history.append({"role": "user", "content": user_content, 'name': name})
         return history
+
+
+class RegistryMetadata(Base):
+    __tablename__ = "agent_registry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=False, index=True)
+    type: Mapped[Optional[str]] = mapped_column(String(32))
+    description: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    code: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    user: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    callback: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    metadata_: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=func.utc_timestamp(), onupdate=func.utc_timestamp())
+    expires_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+
+    def __repr__(self):
+        return f"<Registry name={self.name} type={self.type} code={self.code}>"
+
+    def __init__(self, metadata: dict, hash_key: str, name: str = None,
+                 user: str = None, model: str = None, **kwargs):
+        self.metadata_ = metadata,
+        self.hash = hash_key
+        self.name = name or metadata.get("function", {}).get("name")
+        self.description = kwargs.get('description') or metadata.get("function", {}).get("description")
+        self.user = user or 'local'
+        self.type = kwargs.get('type', "python").lower()
+        self.code = kwargs.get('code')
+        self.model = model
+        self.callback = kwargs.get('callback', {})
+        self.created_at = func.utc_timestamp()
+        self.updated_at = func.utc_timestamp()
+        self.expires_at = kwargs.get('expires_at', None)
+
+    @classmethod
+    async def add(cls, session: AsyncSession, req, metadata: dict, cache_key: str, name: str = None):
+        """新增一条注册记录"""
+        entry = cls(
+            name=name,
+            hash_key=cache_key,
+            metadata=metadata,
+            type=req.code_type,
+            model=req.model,
+            code=req.function_code,
+            description=req.description,
+            user=req.user,
+            callback=req.callback.model_dump() if getattr(req, "callback", None) else {},
+            created_at=datetime.now(timezone.utc),
+            expires_at=int(time.time()) + req.cache_sec if getattr(req, "cache_sec", 0) and req.cache_sec > 0 else None,
+        )
+        session.add(entry)
+        await session.commit()
+        await session.refresh(entry)
+        return entry
+
+    def asdict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+    def to_dict(self):
+        """将 ORM 实例转为普通 dict"""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "code": self.code,
+            "hash": self.hash,
+            "user": self.user,
+            "description": self.description,
+            "callback": self.callback,
+            "metadata": self.metadata_,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "expires_at": self.expires_at,
+        }
+
+    @classmethod
+    async def get(cls, session: AsyncSession, cache_key: str):
+        """按哈希键查询"""
+        stmt = select(cls).where(cls.hash == cache_key)
+        result = await session.execute(stmt)
+        record = result.scalars().one_or_none()
+        return record.to_dict() if record else None
+
+    @classmethod
+    async def get_by_user(cls, session: AsyncSession, user: str) -> list[dict]:
+        stmt = select(cls).where(cls.user == user)
+        result = await session.execute(stmt)
+        records = result.scalars().all()
+        return [record.asdict() for record in records]
+
+    @classmethod
+    async def get_metadata(cls, session: AsyncSession, user: str) -> list[dict]:
+        """按用户查询"""
+        stmt = select(cls.metadata_).where(cls.user == user)
+        result = await session.execute(stmt)
+        rows = result.mappings().all()
+        return [row['metadata_'] for row in rows]
 
 
 # from agents.ai_tasks import TaskStatus

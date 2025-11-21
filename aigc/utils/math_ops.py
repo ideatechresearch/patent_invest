@@ -311,3 +311,9 @@ def math_solver(input_str=None, math_expr=None, operation="evaluate", values=Non
 
     except Exception as e:
         return f"解析失败：{e}"
+
+def fibonacci_generator(n):
+    a, b = 0, 1
+    for _ in range(n):
+        yield a
+        a, b = b, a + b

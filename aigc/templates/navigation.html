@@ -155,6 +155,26 @@
     }
 
 
+    textarea {
+      width: 95%;
+      height: 250px;
+      min-height: 50px;
+      padding: 15px;
+      border: 1px solid #ddd;
+      border-color: #3b82f6;
+      border-radius: 5px;
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      resize: vertical;
+      transition: border-color 0.3s;
+    }
+
+    textarea:focus {
+      outline: none;
+      border-color: #4a6fa5;
+      box-shadow: 0 0 0 2px rgba(74, 111, 165, 0.2);
+    }
+
 
     @media (max-width: 768px) {
       .container {
@@ -210,26 +230,32 @@
         <textarea id="markdown-input" placeholder="请输入 Markdown 文本"></textarea>
         <div style="display:flex; margin:10px 0;">
           <button id="toggle-btn">转换</button>
+          <button id="escape-btn">转义</button>
           <button id="check-btn">检查</button>
           <button id="export-btn" style="display:none;">导出</button>
+          <button id="copy-btn" style="display:none;">复制</button>
         </div>
+        <textarea id="output-text" style="display:none;" readonly></textarea>
         <div id="markdown-output"></div>
         <!-- 渲染结果显示在这里 -->
-
       </div>
     </main>
   </div>
   <script>
-    const input = document.getElementById('markdown-input');
-    const output = document.getElementById('markdown-output');
-    const toggleBtn = document.getElementById('toggle-btn');
-    const exportBtn = document.getElementById('export-btn');
-    const checkBtn = document.getElementById('check-btn');
-    const loginLink = document.getElementById('login-link');
+    const el = id => document.getElementById(id);
+    const input = el('markdown-input');
+    const output = el('markdown-output');
+    const outputText = el('output-text');
+    const toggleBtn = el('toggle-btn');
+    const escapeBtn = el('escape-btn');
+    const exportBtn = el('export-btn');
+    const copyBtn = el('copy-btn');
+    const checkBtn = el('check-btn');
+    const loginLink = el('login-link');
 
-    const sidebar = document.getElementById('sidebar');
-    const mainContent = document.getElementById('main-content');
-    const menuToggle = document.getElementById('menu-toggle');
+    const sidebar = el('sidebar');
+    const mainContent = el('main-content');
+    const menuToggle = el('menu-toggle');
 
     let showInput = true;
 
@@ -237,10 +263,10 @@
       if (showInput) {
         const rawText = input.value.trim();
         if (!rawText) {
-          output.innerHTML = "<em>请输入内容后再转换</em>";
+          outputText.value = "请输入内容后再转换";
+          outputText.style.display = 'block';
           return;
         }
-
 
         let bodyData;
         try {
@@ -270,8 +296,11 @@
           output.innerHTML = html;
           input.style.display = 'none';
           output.style.display = 'block';
+          outputText.style.display = 'none';
           exportBtn.style.display = 'inline-block';
+          copyBtn.style.display = 'none';
           checkBtn.style.display = 'none';
+          escapeBtn.style.display = 'none';
           toggleBtn.textContent = '编辑';
         } catch (err) {
           output.innerHTML = `<span style="color:red;">${err}</span>`;
@@ -279,8 +308,11 @@
       } else {
         input.style.display = 'block';
         output.style.display = 'none';
+        outputText.style.display = 'none';
         exportBtn.style.display = 'none';
+        copyBtn.style.display = 'none';
         checkBtn.style.display = 'inline-block';
+        escapeBtn.style.display = 'inline-block';
         toggleBtn.textContent = '转换';
         input.focus();
       }
@@ -290,7 +322,8 @@
     checkBtn.addEventListener('click', async () => {
       const rawText = input.value.trim();
       if (!rawText) {
-        output.innerHTML = "<em>请输入内容后再检查</em>";
+        outputText.value = "请输入内容后再检查";
+        outputText.style.display = 'block';
         return;
       }
       let bodyData;
@@ -298,15 +331,12 @@
         // 尝试解析成 JSON
         const parsed = JSON.parse(rawText);
         if (typeof parsed === 'object' && parsed !== null) {
-          // JSON 对象或数组 → 结构化对象
-          bodyData = parsed;
+          bodyData = parsed;  // JSON 对象或数组 → 结构化对象
         } else {
-          // 其他类型 → 作为普通文本 Markdown
-          bodyData = { text: rawText };
+          bodyData = { text: rawText };  // 其他类型 → 作为普通文本 Markdown
         }
       } catch {
-        // 解析失败 → 普通 Markdown
-        bodyData = { text: rawText };
+        bodyData = { text: rawText }; // 解析失败 → 普通 Markdown
       }
 
       try {
@@ -318,15 +348,53 @@
         if (!res.ok) throw new Error(`检查失败: ${res.status}`);
         const issues = await res.json();
         if (issues.length === 0) {
-          output.innerHTML = "<em>没有发现问题</em>";
+          outputText.value = "没有发现问题";
         }
         else {
-          output.innerHTML = `<pre>${JSON.stringify(issues, null, 2)}</pre>`;
+          //output.innerHTML = `<pre>${JSON.stringify(issues, null, 2)}</pre>`;
+          outputText.value = JSON.stringify(issues, null, 2);
         }
-        output.style.display = 'block';
       } catch (err) {
-        output.innerHTML = `<span style="color:red;">${err}</span>`;
+        //output.innerHTML = `<span style="color:red;">${err}</span>`;
+        outputText.value = err;
       }
+      outputText.style.display = 'block';
+    });
+
+    function escapeText(text) {
+      return text
+        .replace(/\\/g, '\\\\')  // 反斜杠
+        .replace(/"/g, '\\"')    // 双引号
+        .replace(/\n/g, '\\n')   // 换行符
+        .replace(/\t/g, '\\t')   // 制表符
+        .replace(/\r/g, '\\r');  // 回车符
+    }
+
+    escapeBtn.addEventListener('click', function () {
+      const rawText = input.value.trim();
+      if (!rawText) {
+        outputText.value = "请输入内容后再转义";
+        outputText.style.display = 'block';
+        return;
+      }
+
+      const escapedText = escapeText(rawText);
+      outputText.value = escapedText;
+      outputText.style.display = 'block';
+      copyBtn.style.display = 'inline-block';
+      checkBtn.style.display = 'none';
+    });
+
+    copyBtn.addEventListener('click', () => {
+      outputText.select();
+      document.execCommand('copy');
+
+      // 显示复制成功提示
+      const originalText = copyBtn.textContent;
+      copyBtn.textContent = '已复制!';
+      setTimeout(() => {
+        copyBtn.textContent = originalText;
+      }, 2000);
     });
 
     exportBtn.addEventListener('click', () => {

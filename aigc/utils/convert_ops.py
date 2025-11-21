@@ -1,4 +1,4 @@
-import ast, re, json
+import ast
 import markdown2
 import yaml
 from functools import partial
@@ -337,6 +337,25 @@ def extract_yaml_data(text):
             parsed_data.append(None)  # 解析失败则返回 None
 
     return parsed_data
+
+
+def extract_transcription_segments(text: str) -> str:
+    core = text.strip()  # 第二部分就是我们要的识别内容
+    lines = []
+    last_line = None
+    for line in core.splitlines():
+        line = line.strip()  # 可选：去掉多余空行
+        if not line:
+            continue
+        # 去掉每行的 "[xxs - xxs]"
+        line = re.sub(r"^\[[^\]]+\]\s*", "", line)
+        # 合并和上一行重复的内容
+        if line == last_line:
+            continue
+        lines.append(line)
+        last_line = line
+
+    return "\n".join(lines)
 
 
 def extract_list_data(text) -> list[str]:

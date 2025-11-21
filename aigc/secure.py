@@ -232,13 +232,13 @@ def md5_sign(content: str) -> str:
 
 
 # sha256 非对称加密
-def hmac_sha256(key: bytes, content: str):
+def hmac_sha256(key: bytes, content: str) -> bytes:
     """生成 HMAC-SHA256 签名"""
     return hmac.new(key, content.encode("utf-8"), digestmod=hashlib.sha256).digest()
 
 
 # sha256 hash
-def hash_sha256(content: str):
+def hash_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
@@ -474,6 +474,7 @@ def get_ark_signature(action: str, service: str, host: str = None, region: str =
 def get_tencent_signature(service, host=None, body=None, action='ChatCompletions',
                           secret_id: str = Config.TENCENT_SecretId, secret_key: str = Config.TENCENT_Secret_Key,
                           timestamp: int = None, region: str = "ap-shanghai", version='2023-09-01'):
+    # https://cloud.tencent.com/document/api/1093/35641
     if not host:
         host = f"{service}.tencentcloudapi.com"  # url.split("//")[-1]
     if not timestamp:
@@ -501,35 +502,37 @@ def get_tencent_signature(service, host=None, body=None, action='ChatCompletions
         return params
 
     algorithm = "TC3-HMAC-SHA256"  # 使用签名方法 v3
-    date = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
+    date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")  # UTC+0
 
     # ************* 步骤 1：拼接规范请求串 *************
     http_request_method = "POST"
     canonical_uri = "/"
     canonical_querystring = ""
     ct = "application/json; charset=utf-8"
-    canonical_headers = f"content-type:{ct}\nhost:{host}\nx-tc-action:{action.lower()}\n"
-    signed_headers = "content-type;host;x-tc-action"
-
-    payload = json.dumps(body)
-    hashed_request_payload = hash_sha256(payload)
+    canonical_headers = (
+        f"content-type:{ct}\n"
+        f"host:{host}\n"
+        f"x-tc-action:{action.lower()}\n"
+    )
+    signed_headers = "content-type;host;x-tc-action"  # content-type 和 host 为必选头部,以分号（;）分隔
+    hashed_request_payload = hash_sha256(
+        "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False))
+    # Lowercase(HexEncode(Hash.SHA256(RequestPayload)))
     canonical_request = "\n".join([http_request_method, canonical_uri, canonical_querystring,
                                    canonical_headers, signed_headers, hashed_request_payload])
 
     # ************* 步骤 2：拼接待签名字符串 *************
-    credential_scope = f"{date}/{service}/tc3_request"
-    hashed_canonical_request = hash_sha256(canonical_request)
-    string_to_sign = (algorithm + "\n" +
-                      str(timestamp) + "\n" +
-                      credential_scope + "\n" +
-                      hashed_canonical_request)
+    credential_scope = f"{date}/{service}/tc3_request"  # 待签名字符串
+    hashed_canonical_request = hash_sha256(canonical_request)  # Lowercase(HexEncode(Hash.SHA256(CanonicalRequest)))
+    string_to_sign = "\n".join([algorithm, str(timestamp), credential_scope, hashed_canonical_request])
 
     # ************* 步骤 3：计算签名 *************
     secret_date = hmac_sha256(("TC3" + secret_key).encode("utf-8"), date)
     secret_service = hmac_sha256(secret_date, service)
     secret_signing = hmac_sha256(secret_service, "tc3_request")
-    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
+    signature = hmac_sha256(secret_signing, string_to_sign).hex()
+    # Signature = HexEncode(HMAC_SHA256(SecretSigning, StringToSign))
+    # signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     # ************* 步骤 4：拼接 Authorization *************
     authorization = (algorithm + " " +
                      "Credential=" + secret_id + "/" + credential_scope + ", " +
@@ -540,9 +543,9 @@ def get_tencent_signature(service, host=None, body=None, action='ChatCompletions
     # 公共参数需要统一放到 HTTP Header 请求头部
     headers = {
         "Authorization": authorization,  # "<认证信息>"
-        "Content-Type": ct,  # "application/json"
-        "Host": host,  # "hunyuan.tencentcloudapi.com","tmt.tencentcloudapi.com"
-        "X-TC-Action": action,  # "ChatCompletions","TextTranslate"
+        "Content-Type": ct,  # Content-Type "application/json"
+        "Host": host,  # 主机名 "hunyuan.tencentcloudapi.com","tmt.tencentcloudapi.com"
+        "X-TC-Action": action,  # 请求接口名 "ChatCompletions","TextTranslate"
         # 这里还需要添加一些认证相关的Header
         "X-TC-Timestamp": str(timestamp),
         "X-TC-Version": version,  # "<API版本号>"

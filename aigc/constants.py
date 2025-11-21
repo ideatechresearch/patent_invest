@@ -28,4 +28,5 @@ class Constants:
 
 Title_Map: Final[dict] = {'question': '问题', 'reference': '参考', 'refer': '参考', 'answer': '回答', 'content': '内容',
                           'transform': '转换', 'reason': '原因', 'suggest': '建议', 'title': '标题',
-                          "result": "结果","error": "错误"}
+                          "result": "结果", "error": "错误",
+                          "created_at": "创建时间", "updated_at": "更新时间", "completed_at": "完成时间"}

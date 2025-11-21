@@ -1,9 +1,8 @@
-import re, json, io, os, threading, time
-import  aiofiles, asyncio
+import os
+import aiofiles, asyncio
 from itertools import groupby
 from pathlib import Path
 from difflib import get_close_matches, SequenceMatcher
-from collections import Counter, deque, defaultdict
 from pypinyin import lazy_pinyin
 from utils.base import *
 
@@ -357,7 +356,16 @@ def build_prompt(messages: list, use_role=False) -> str:
     return "\n\n".join(msg["content"].strip() for msg in messages)
 
 
-def alternate_chat_history(messages: list):
+def create_analyze_messages(system_prompt: str | None, user_request: str | dict) -> list[dict]:
+    if not isinstance(user_request, str):
+        user_request = f"```json\n{json.dumps(user_request, ensure_ascii=False)}```"
+    messages = [{"role": "user", "content": user_request}]
+    if system_prompt:
+        messages.insert(0, {"role": "system", "content": system_prompt})
+    return messages
+
+
+def alternate_chat_history(messages: list[dict]) -> list[dict]:
     # 确保 user 和 assistant 消息交替出现，插入默认消息或删除多余消息
     i = 0
     while i < len(messages) - 1:

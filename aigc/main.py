@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import datetime
 import os, copy
 import tempfile
@@ -8,19 +9,10 @@ from typing import AsyncGenerator, Generator
 from fastapi import FastAPI, Request, Header, Depends, Query, Body, File, UploadFile, BackgroundTasks, Form, \
     WebSocket, WebSocketDisconnect, HTTPException, status
 from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, HTMLResponse, RedirectResponse
-# from starlette.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-# from fastmcp import FastMCP
 from starlette.middleware.sessions import SessionMiddleware
 from sse_starlette.sse import EventSourceResponse
-# from apscheduler.schedulers.background import BackgroundScheduler
-# from apscheduler.executors.pool import ThreadPoolExecutor
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.executors.asyncio import AsyncIOExecutor
-from apscheduler.jobstores.memory import MemoryJobStore
-from apscheduler.jobstores.redis import RedisJobStore
-# from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 from collections.abc import AsyncIterator
 from passlib.context import CryptContext
@@ -35,8 +27,8 @@ from database import *
 from generates import *
 from router import *
 from utils import configure_event_loop
+from rime.allele import Allele
 
-setup_logging(file_name="app.log")
 configure_event_loop()
 
 mcp_app = mcp.http_app(transport="streamable-http", path="/mcp")
@@ -47,58 +39,58 @@ mcp_app = mcp.http_app(transport="streamable-http", path="/mcp")
 async def lifespan(app: FastAPI):
     try:
         print("Starting up.")
-        Base.metadata.create_all(bind=engine)
+        get_database_manager().create_tables()
         # if not w3.is_connected():
         #     print("Failed to connect to Ethereum node")
 
         app.state.redis = await get_redis_connection()
-        app.state.collector = CollectorMysql(instance=DB_Client, max_wait_seconds=1.0)
-        await app.state.collector.init_pool(minsize=2, maxsize=Config.DB_MAX_SIZE)
+        await DB_Client.init_pool(minsize=2, maxsize=Config.DB_MAX_SIZE)
+        app.state.collector = CollectorMysql.from_instance(instance=DB_Client, max_wait_seconds=1.0)
         await app.state.collector.start()
         await BaseChatHistory.initialize(get_session_context)
         app.state.httpx_client = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
-        app.state.logger = logging.getLogger(__name__)
+        app.state.logger = logger
 
         app.state.worker_id = get_worker_identity()
         app.state.worker_num = int(os.environ.get("UVICORN_WORKERS") or os.environ.get("GUNICORN_WORKERS", 1))
         app.state.is_debug = Config.get('IS_DEBUG', False)
         if app.state.is_debug:
+            print('Config:', Config.get_config_data())
             tracemalloc.start()
 
         await init_ai_clients(AI_Models)
         await ModelList.set(redis=app.state.redis, worker_id=app.state.worker_id, ai_models=AI_Models)
 
+        app.state.scheduler = get_scheduler(redis_host=Config.REDIS_HOST)
+        app.state.ai_scheduler = TaskGraphManager(dask_client=None)
         app.state.is_main = await is_main_worker(worker_id=app.state.worker_id, redis=app.state.redis)
         if app.state.is_main:
+            TaskManager.htw.add_daily_task(18, 18, run_adjustment_sync_tasks, concurrent=False)
             print("Main worker started. Do once-only init. Total workers:", app.state.worker_num)
             # app.state.dask_client = get_dask_client()
-            print(Config.get_config_data())
-            # print( json.dumps(AI_Models, indent=4))
+            print('AI Client:', AI_Client.keys(), ModelList.owners)
         else:
             pass
             # app.state.dask_client = get_dask_client(Config.DASK_Cluster)
 
-        app.state.ai_scheduler = TaskGraphManager(dask_client=None)
-        app.state.ht = HierarchicalTimeWheel()  # app.state.ht.start()
-        app.state.tick_time: datetime = None
-        t = asyncio.create_task(handle_minute())  # asyncio.create_task(async_tick())
+        t = asyncio.create_task(handle_minute())
         app.state.cron_tasks = [t]
-        if not scheduler.get_job("hour_job"):
-            scheduler.add_job(handle_hour, 'interval', id="hour_job", seconds=3600, misfire_grace_time=60,
-                              jobstore='memory', executor='default')  # , max_instances=3
+        if not app.state.scheduler.get_job("hour_job"):
+            app.state.scheduler.add_job(handle_hour, 'interval', id="hour_job", seconds=3600, misfire_grace_time=60,
+                                        jobstore='memory', executor='default')  # , max_instances=3
 
         app.state.func_manager = get_func_manager()
-        if not scheduler.get_job("metadata_job"):
-            scheduler.add_job(app.state.func_manager.generate_tools_metadata, 'cron', id="metadata_job", hour=5,
-                              minute=20,
-                              misfire_grace_time=300,
-                              kwargs={"model_name": Config.DEFAULT_MODEL_METADATA}, jobstore='memory',  # 'redis',
-                              max_instances=1, replace_existing=True)
-
-        if not scheduler.running:
-            scheduler.start()
+        app.state.func_manager.class_method.register(Allele, None)  # ClassMethodRegistry.register(Allele)
+        if not app.state.scheduler.get_job("metadata_job"):
+            app.state.scheduler.add_job(app.state.func_manager.generate_tools_metadata,
+                                        'cron', id="metadata_job", hour=5, minute=20,
+                                        misfire_grace_time=300,
+                                        kwargs={"model_name": Config.DEFAULT_MODEL_METADATA}, jobstore='memory',
+                                        # 'redis',
+                                        max_instances=1, replace_existing=True)
 
         print(app.state.worker_id, "inited.")
+        # message_zero_mq = MessageZeroMQ()
         # task1 = asyncio.create_task(message_zero_mq.start())
         # global_function_registry()
         # if Config.get('WORKERS',0) == 1:
@@ -113,26 +105,25 @@ async def lifespan(app: FastAPI):
         logging.error(f"生命周期异常: {e}")
         # asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     finally:
+        print("Shutting down.")
         for t in app.state.cron_tasks:
             t.cancel()
         await asyncio.gather(*app.state.cron_tasks, return_exceptions=True)
-        print("Shutting down.")
-        scheduler.shutdown()
-        engine.dispose()
-        # await async_engine.dispose()
-        # MysqlData().close()
+        app.state.scheduler.shutdown()
+        get_database_manager().dispose()
         await BaseChatHistory.shutdown()
+        await async_engine.dispose()
         await app.state.collector.stop(flush=True)
-        await app.state.collector.close_pool()
+        await DB_Client.close_pool()
 
         await shutdown_httpx()
         await shutdown_redis()
 
         close_dask_client()
+        # if app.state.is_main:
+        #     ModelList.save()
         if app.state.is_debug:
             tracemalloc.stop()
-    # task1.cancel()
-    # await asyncio.gather(task1, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -141,18 +132,6 @@ async def combined_lifespan(app: FastAPI):
         async with mcp_app.lifespan(app):
             yield
 
-
-# executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
-# scheduler = BackgroundScheduler(jobstores={'default': SQLAlchemyJobStore(engine=engine), 'memory': MemoryJobStore()},
-#                                 executors={'default': ThreadPoolExecutor(4)}, timezone='Asia/Shanghai')  # 设置线程池大小
-scheduler = AsyncIOScheduler(executors={'default': AsyncIOExecutor()},
-                             jobstores={'memory': MemoryJobStore(),
-                                        'redis': RedisJobStore(jobs_key='apscheduler.jobs',
-                                                               run_times_key='apscheduler.run_times',
-                                                               host=Config.REDIS_HOST, port=Config.REDIS_PORT, db=0)},
-                             timezone='Asia/Shanghai')  # 异步调度器
-
-# message_zero_mq = MessageZeroMQ()
 
 app = FastAPI(title="AIGC API", lifespan=lifespan)  # combined_lifespan
 app.add_middleware(SessionMiddleware, secret_key=Config.SECRET_KEY)
@@ -178,28 +157,20 @@ app.include_router(chat_router, prefix="/chat")
 
 # model_config['protected_namespaces'] = ()
 
-# @async_timer_cron(interval=1)
-# async def async_tick():
-#     await app.state.ht.tick(level="second")  # 推动时间轮每秒执行一次
-
 @async_timer_cron(interval=60)
 async def handle_minute():
     tick_now = datetime.now()
-    if not app.state.tick_time or app.state.tick_time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
-        app.state.tick_time = tick_now.replace(second=0, microsecond=0)
-        # print(f'Async Tick! The time is: {time.time()}, {app.state.tick_time.strftime("%Y-%m-%d %H:%M:%S")}')
-        await app.state.ht.tick(level="minute")  # 推动分钟轮
-        if len(TaskManager.Task_queue):
-            await TaskManager.clean_old_tasks(3600)
-
+    if not TaskManager.htw.tick_time or TaskManager.htw.tick_time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
+        await TaskManager.htw.tick(level="minute", tick_time=tick_now.replace(second=0, microsecond=0))  # 推动分钟轮
+        await TaskManager.clean_old_tasks(3600, redis_client=app.state.redis)
         cleanup_old_tempfiles(min_age=600, prefix="tmp_")
+        # print(f"Tick new minute! The time is: {TaskManager.htw.tick_time_str}")
 
 
 async def handle_hour():
-    if app.state.tick_time:
-        print(f"Tick new bar! The time is: {app.state.tick_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    if app.state.tick_time.hour == 18:
-        if app.state.is_main:
+    print(f"Tick new bar! The time is: {TaskManager.htw.tick_time_str}")
+    if app.state.is_main:
+        if TaskManager.htw.tick_time.hour == 23 and TaskManager.htw.tick_time.weekday() == 6:
             res = await run_adjustment_sync_tasks(concurrent=False)
             print(f'[adjustment_sync]:{res}')
 
@@ -309,7 +280,7 @@ async def register_user(request: Registration, db: Session = Depends(get_db)):
 
 
 @app.post("/authenticate", response_model=Token)
-async def authenticate_user(request: AuthRequest, response: Response, db: Session = Depends(get_db)):
+async def authenticate_user(request: AuthRequest, response: Response, session: AsyncSession = Depends(get_db_session)):
     '''
     登录路由，颁发访问令牌和刷新令牌,令牌生成 login_for_access_token,
     如果 eth_address 或 public_key 认证成功，通过公钥验证签名则不需要密码。
@@ -328,21 +299,21 @@ async def authenticate_user(request: AuthRequest, response: Response, db: Sessio
             if recovered_address.lower() != eth_address.lower():
                 raise HTTPException(status_code=400, detail="Authentication failed")
 
-            db_user = User.get_user(db=db, eth_address=request.eth_address)
+            db_user = await User.async_get_user(session, eth_address=request.eth_address)
             is_verified = 1 << 0
 
         if public_key:
             if not verify_ecdsa_signature(public_key, original_message, signed_message):
                 raise HTTPException(status_code=400, detail="Public key authentication failed")
 
-            db_user = User.get_user(db=db, public_key=public_key)
+            db_user = await User.async_get_user(session, public_key=public_key)
             is_verified |= 1 << 1
 
         if is_verified and db_user:
             return issue_access_token(response, db_user, Config.ACCESS_TOKEN_EXPIRE_MINUTES)
 
     if username:
-        db_user = User.get_user(db=db, username=username)  # user_id=request.uuid ,User.validate_credentials(
+        db_user = await User.async_get_user(session, username=username)  # User.validate_credentials(
         if not db_user:
             raise HTTPException(status_code=400, detail="User not found")
 
@@ -375,17 +346,18 @@ async def refresh_token(token: str = Form(...)):
 
 
 @app.post("/secure")
-async def secure_route(request: Request, db: Session = Depends(get_db)):
+async def secure_route(request: Request, session: AsyncSession = Depends(get_db_session)):
     """防止伪造 API Key,防止请求内容被篡改,防止重放攻击（时间戳）,避免签名泄露,HMAC 使用安全算法（SHA256）"""
     # User.update_user( db,1, public_key='83e2c687a44f839f6b3414d63e1a54ad32d8dbe4706cdd58dc6bd4233a592f78367ee1bff0e081ba678a5dfdf068d4b4c72f03085aa6ba5f0678e157fc15d305')
     username = get_access_user(request)
     api_keys = {}
     if username:
-        user = User.get_user(db=db, username=username)
+        user = await User.async_get_user(session=session, username=username)
         if user and not user.disabled:
-            api_keys = User.get_api_keys(db, _id=user.id)
+            api_keys = await User.get_api_keys(session=session, _id=user.id, redis=app.state.redis,
+                                               ex=Config.VERIFY_TIMEOUT_SEC)
     if not api_keys:
-        api_keys = await User.get_active_api_keys(redis=app.state.redis, ex=Config.VERIFY_TIMEOUT_SEC)
+        api_keys = await User.get_active_api_keys(session=session, redis=app.state.redis, ex=Config.VERIFY_TIMEOUT_SEC)
     await verify_request_signature(request, api_keys, time_out=Config.VERIFY_TIMEOUT_SEC)
     return {"status": "success", "message": "Request authenticated successfully"}
 
@@ -413,9 +385,10 @@ def issue_access_token(response: Response, user: User,
 
 
 # 检查该用户是否在数据库中有效或是否具备某些标志位, 严格依赖
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+async def get_current_user(token: str = Depends(oauth2_scheme),
+                           session: AsyncSession = Depends(get_db_session)) -> User:
     username = verify_access_token(token)
-    user = User.get_user(db, username=username, user_id=username)
+    user = await User.async_get_user(session, username=username, user_id=username)
     if not user:
         raise HTTPException(status_code=404, detail="Access forbidden,Invalid credentials,User not found")
     if user.disabled:
@@ -441,11 +414,12 @@ async def get_apikey(user: User = Depends(get_current_user), db: Session = Depen
 
 
 @app.post("/api/login", response_model=Token)
-async def login_with_apikey(api_key: str = Form(...), response: Response = None, db: Session = Depends(get_db)):
+async def login_with_apikey(api_key: str = Form(...), response: Response = None,
+                            session: AsyncSession = Depends(get_db_session)):
     """
     通过 API Key 登录，验证后返回 JWT Token 并写入 Cookie。
     """
-    user = User.get_user(db=db, api_key=api_key)
+    user = await User.async_get_user(session, api_key=api_key)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return issue_access_token(response, user)
@@ -467,20 +441,20 @@ async def logout(request: Request, response: Response):
 async def admin(user: User = Depends(get_current_user)):
     if user.username == 'admin' and user.role == 'admin':
         return JSONResponse(
-            content={'history': BaseChatHistory.Chat_History_Cache, 'task': dataclass2dict(TaskManager.Task_queue),
+            content={'history': BaseChatHistory.Chat_History_Cache, 'task': dataclass2dict(TaskManager.Task_map),
                      'task_nodes': app.state.ai_scheduler.export_nodes(),
                      'task_edges': app.state.ai_scheduler.export_adjacency_list(),
-                     'job': get_job_list(scheduler)})
+                     'job': get_job_list(app.state.scheduler)})
     return {"message": "Access denied: Admin privileges required"}
 
 
 @app.get('/user/')
-async def user(request: Request, db: Session = Depends(get_db)):
+async def user(request: Request, session: AsyncSession = Depends(get_db_session)):
     '''尝试使用 optional token（header/cookie/query)'''
     username = get_access_user(request)
     if username:
-        # 没 token -> 如果 session 中有 user_id 就认为是匿名用户
-        user = User.get_user(db, username=username, user_id=username)  # user=get_current_user(token=token, db=db)
+        # 没 token -> 如果 session 中有 user_id 就认为是匿名用户,get_current_user(token=token, db=db)
+        user = await User.async_get_user(session, username=username, user_id=username)
         if not user:
             return {"error": "User not found"}
         if user.disabled:
@@ -498,11 +472,12 @@ async def user(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/status/")
 async def system_status():
+    import threading
     thread_count = threading.active_count()
     task_count = len(asyncio.all_tasks())  # asyncio 任务数
 
     redis_info = await app.state.redis.info()
-    pool = engine.pool
+    pool = async_engine.pool
 
     return JSONResponse(content={
         "system": platform.system(),
@@ -515,7 +490,7 @@ async def system_status():
         "pid": os.getpid(),
         "threads": thread_count,
         "asyncio_task_count": task_count,
-        "job_count": len(scheduler.get_jobs()),
+        "job_count": len(app.state.scheduler.get_jobs()),
         "memory_mb": round(get_memory_info(), 2),
         "cpu_time_sec": round(get_cpu_time(), 2),
         "open_fd_count": get_open_fds_count(),  # socket连接数 (打开的文件描述符数量)
@@ -525,10 +500,12 @@ async def system_status():
         "db_connections_total": pool.size(),
         "db_connections_in_use": pool.checkedout(),
         "db_connections_idle": pool.checkedin(),
-        "task_queue_count": len(TaskManager.Task_queue),
-        'history_cache_count': len(BaseChatHistory.Chat_History_Cache),
+        "task_manager_count": TaskManager.size(),
+        'history_cache_count': BaseChatHistory.size(),
+        "timewheel_task_count": TaskManager.htw.task_count,
+        "timewheel_elapsed_time": TaskManager.htw.elapsed_time,
+        "tick_time": TaskManager.htw.tick_time_str,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "tick_time": app.state.tick_time.strftime('%Y-%m-%d %H:%M:%S')
     })
 
 
@@ -540,6 +517,11 @@ async def get_logs_info(lines: int = 100):
 @app.get("/status/routes")
 def list_routes():
     return [{"path": r.path, "name": r.name} for r in app.routes]
+
+
+@app.get("/status/files")
+async def list_upload_files(max_pages: int = 1):
+    return await asyncio.to_thread(oss_list_files, AliyunBucket, prefix='upload/', max_pages=max_pages)
 
 
 @require_api_key
@@ -564,6 +546,7 @@ async def read_redis_value(key: str = 'funcmeta:*'):
         return {"result": result}
 
     except Exception as e:
+        app.state.logger.error(e)
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
 
@@ -964,7 +947,7 @@ async def generate_prompts(request: PromptRequest):
 
 
 @app.post("/tools")
-async def get_tools(request: ToolRequest):
+async def get_tools(request: ToolRequest, session: AsyncSession = Depends(get_db_session)):
     """
     返回 OpenAI 兼容的 tools 定义，并调用模型接口后解析执行结果。
     如果 request.tools 为空且 request.user 存在，则从 Redis 获取用户缓存的 tools。否则调用 AI 自动生成 tool 元数据。
@@ -974,22 +957,23 @@ async def get_tools(request: ToolRequest):
         request.messages = create_analyze_messages(System_content.get('31'), request.prompt)
     tools_metadata = request.tools
     if not request.tools:
-        if request.user:
-            tools_metadata = await scan_from_redis(app.state.redis, "registry_meta", user=request.user)
+        if request.user:  # get_access_user(request)
+            tools_metadata = await RegistryMetadata.get_metadata(session, request.user)
         else:
-            tools_metadata = AI_Tools + await app.state.func_manager.get_registered_tools_metadata(
-                model_name=request.model_metadata)
+            tools_metadata = AI_Tools + await app.state.func_manager.tools_metadata(
+                model_name=request.model_metadata, registered=True)
             # print(tools_metadata)
 
     if not request.model_name:
         return JSONResponse(tools_metadata)
 
     if not tools_metadata:
-        tools_metadata = await app.state.func_manager.get_tools_metadata(func_list=[])
+        tools_metadata = await app.state.func_manager.get_tools_metadata(func_list=[], redis=app.state.redis)
 
     completion, _ = await ai_client_completions(messages=request.messages, client=None, model=request.model_name,
                                                 get_content=False, tools=tools_metadata or AI_Tools,
-                                                top_p=request.top_p, temperature=request.temperature)
+                                                top_p=request.top_p, temperature=request.temperature,
+                                                dbpool=app.state.collector)
 
     tool_messages = completion.choices[0].message
     if not tool_messages:
@@ -1009,25 +993,22 @@ async def get_mcp_tool():
     return JSONResponse(content={k: v.to_mcp_tool().model_dump() for k, v in mcp_tools.items()})
 
 
-from rime.allele import Allele
-
-ClassMethodRegistry.register_class(Allele)
-
-
-@app.get('/classes/{class_name}')
+@app.get('/tools/classes/{class_name}')
 async def get_class_info(class_name: str):
     """获取特定类的详细信息"""
     try:
-        return ClassMethodRegistry.get_class_info(class_name)
+        return app.state.func_manager.class_method.get_class_info(class_name)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@app.post('/call/<class_name>/<method_name>')
-async def call_registered_method(class_name: str, method_name: str, request: FunctionCallItem):
+@app.post('/tools/call/<class_name>')
+async def call_registered_method(class_name: str, request: FunctionCallItem):
     """调用注册的类方法"""
     try:
-        result = ClassMethodRegistry.call_method(class_name, method_name, *request.args, **request.kwargs)
+        method_name = request.function
+        result = app.state.func_manager.class_method.call_method(class_name, method_name, *request.args,
+                                                                 **request.kwargs)
         return JSONResponse({"result": dataclass2dict(result), "class": class_name, "method": method_name})
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1037,66 +1018,52 @@ async def call_registered_method(class_name: str, method_name: str, request: Fun
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/metadata")
-async def generate_metadata_from_code(req: MetadataRequest):
+@app.post("/tools/metadata/")
+async def generate_metadata_from_code(req: MetadataRequest, session: AsyncSession = Depends(get_db_session)):
     cache_key = generate_hash_key(req.metadata, req.function_code, req.description)
-    redis = app.state.redis or get_redis()
-    key_meta = f"registry_meta:{req.user}:{cache_key}"
-    cached_metadata = await redis.get(key_meta)
+    cached_metadata = await RegistryMetadata.get(session, cache_key)
     if cached_metadata:
-        metadata = json.loads(cached_metadata)
-        func_name = metadata.get('function', {}).get('name')
-        print(f"Metadata already cached for function: {func_name}")
-        key = f"registry:{func_name}"
-        return {"metadata": metadata, 'key_meta': key_meta, "key": key}
+        metadata = cached_metadata.get("metadata")
+        func_name = cached_metadata.get("name")  # metadata.get('function', {}).get('name')
+        # print(f"Metadata already cached for function: {func_name}")
+        return {"metadata": metadata, "name": func_name, "id": cache_key}
 
     metadata = await ai_generate_metadata(
-        req.function_code, req.metadata, req.model_name,
+        req.function_code, req.metadata, req.model,
         description=req.description, code_type=req.code_type or "Python",
-        dbpool=app.state.collector
-    )
+        dbpool=app.state.collector)
 
     registry = metadata.get("function", {}).copy()
     func_name = registry.get("name")
     if not func_name:
         raise HTTPException(status_code=400, detail="函数名未能从模型生成结果中提取")
-
-    if req.callback:  # 如果不是本地函数，生成远程调用 URL
-        registry["x-url"] = req.callback.model_dump()
-        # {
-        #     "url": 'http://remote-system.com/api/function/{func_name}',
-        #     "method": "POST",
-        #     "headers": {
-        #         "Authorization": "Bearer xxx"
-        #     }
-        # }
-    registry["x-type"] = req.code_type.lower()
-    registry["x-code"] = req.function_code
-    registry["x-hash"] = cache_key
+    await RegistryMetadata.add(session, req, metadata, cache_key, func_name)
+    if req.callback:
+        registry['callback'] = req.callback.model_dump()
     registry["x-user"] = req.user
-    key = f"registry:{func_name}"
-    await redis.setex(key, req.cache_sec or Config.REDIS_CACHE_SEC, json.dumps(registry, ensure_ascii=False))
-    await redis.setex(key_meta, req.cache_sec or Config.REDIS_CACHE_SEC, json.dumps(metadata, ensure_ascii=False))
-
+    await FunctionManager.set_metadata_to_cache(registry, cache_key, func_name, redis=app.state.redis, ex=req.cache_sec)
     return {
         "metadata": metadata,
         "registry": registry,
-        "key": key,
-        'key_meta': key_meta,
+        "name": func_name,
+        "id": cache_key
     }
 
 
 @app.post("/agent/")
 async def agent_run(request: AgentRequest):
-    metadata = await app.state.func_manager.get_tools_metadata()
+    redis = app.state.redis or get_redis()
+    metadata = await app.state.func_manager.get_tools_metadata(redis=redis)
     description = request.messages[-1].content
     messages = [msg.dict() for msg in request.messages]
 
-    task_id, smart_task = await TaskManager.add(action='ai_client_completions', function=ai_client_completions,
+    task_id, smart_task = await TaskManager.add(redis=redis, action='ai_client_completions',
+                                                function=ai_client_completions,
                                                 description=description,
                                                 params={'messages': messages, 'model': request.model})
 
-    task_id, extract_task = await TaskManager.add(action='extract_json_struct', function=extract_json_struct,
+    task_id, extract_task = await TaskManager.add(redis=redis, action='extract_json_struct',
+                                                  function=extract_json_struct,
                                                   description='extract_json')
 
     graph_node = await app.state.ai_scheduler.set_node(smart_task)
@@ -1213,30 +1180,18 @@ async def generate_batch_text(request: CompletionParams,
 
     if use_task:
         redis = app.state.redis or get_redis()
-        task_id, task = await TaskManager.add(redis=redis,
-                                              description=prompt,
-                                              action='llm',
-                                              params=request.model_dump(),  # CompletionParams
-                                              data={
-                                                  "questions": questions,  # list[str]
-                                              })
 
-        async def process_task():
-            await TaskManager.set_task_status(task, TaskStatus.IN_PROGRESS, 10, redis)
-            results = await process_func(
-                inputs=[(sub_q, idx) for idx, sub_q in enumerate(questions)])  # 这会得到 List[dict]
-            status = TaskStatus.COMPLETED if all(isinstance(r, dict) for r in results) else TaskStatus.FAILED
-            await TaskManager.update_task_result(task_id, result=[r for r in results if isinstance(r, dict)],
-                                                 status=status, redis_client=redis)
-
+        @TaskManager.task_node(action="llm", redis=redis, description=prompt, params=request.model_dump(),
+                               data={"questions": questions})
+        async def process_task(sub_q_list: list):
+            results = await process_func(inputs=sub_q_list)  # 这会得到 List[dict]
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     app.state.logger.error(f"[任务 {i} 异常] {r}")
 
-            return results
+            return [r for r in results if isinstance(r, dict)]
 
-        asyncio.create_task(process_task())
-
+        task_id = await process_task(sub_q_list=[(sub_q, idx) for idx, sub_q in enumerate(questions)])
         return JSONResponse(content={'task_id': task_id, 'url': f'{Config.WEBUI_URL}/task/{task_id}',
                                      'result': f'{Config.WEBUI_URL}/get/{TaskManager.key_prefix}:{task_id}',
                                      'html': f'{Config.WEBUI_URL}/task/{task_id}?platform=html',
@@ -1299,16 +1254,18 @@ async def generate_message(request: ChatCompletionRequest,
             yield f'data: {last_data}\n\n'
             yield 'data: [DONE]\n\n'
 
-            await chat_history.save(assistant_content, refer, transform, model=payload['model'], session=session)
+            await chat_history.save(assistant_content, refer, transform, model=payload['model'],
+                                    usage=completion.get('usage', {}), session=session)
             if request.callback and request.callback.url:
                 result = {'answer': assistant_content, 'reference': refer, 'transform': transform}
                 await send_callback(request.callback.model_dump(), transform if isinstance(transform, dict) else result)
 
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
     else:
-        assistant_content = await ai_chat(model_info, payload)
+        assistant_content, completion = await ai_chat(model_info, payload)
         transform = extract_string(assistant_content, extract)
-        await chat_history.save(assistant_content, refer, transform, model=payload['model'], session=session)
+        await chat_history.save(assistant_content, refer, transform, model=payload['model'],
+                                usage=completion.get('usage', {}), session=session)
 
         result = {'answer': assistant_content, 'reference': refer, 'transform': transform}
         if request.callback and request.callback.url:
@@ -1376,8 +1333,8 @@ async def chat_completions(request: OpenAIRequestMessage):
 
         return StreamingResponse(fake_stream_response(), media_type="text/event-stream")
 
-    completion = await ai_chat(model_info=None, messages=messages, user_request=None, system=None,
-                               model_name=request.model, model_id=0, get_content=False, **kwargs)
+    content, completion = await ai_chat(model_info=None, messages=messages, user_request=None, system=None,
+                                        model_name=request.model, model_id=0, **kwargs)
 
     await instance.async_save(user=request.user, messages=messages, model_response=completion,
                               dbpool=app.state.collector, instance=instance)
@@ -1400,9 +1357,7 @@ async def get_models_list(model_type: Literal["model", "embedding", "reranker"] 
                                                                                         description=f"custom models/embedding/reranker.")):
     if model_type == "model":
         return JSONResponse(content=ModelList.models)
-    extracted_data = extract_ai_model(model_type, AI_Models)
-    models = [f"{owner}:{val}" if val else owner for owner, values in extracted_data for val in values]
-    return JSONResponse(content=models)
+    return JSONResponse(content=ModelList.extract_models(model_type, AI_Models))
 
 
 @app.websocket("/ws/chat")
@@ -1470,7 +1425,7 @@ async def websocket_chat(websocket: WebSocket):
                     await websocket.send_text(stream_chunk)
 
             else:  # 非流式响应处理
-                assistant_content = await ai_chat(model_info, payload)
+                assistant_content, completion = await ai_chat(model_info, payload)
                 transform = extract_string(assistant_content, extract)
 
                 # 保存聊天记录
@@ -1627,7 +1582,7 @@ async def get_messages(request: Request, user: str = Query(""), robot_id: Option
 @app.post("/message/submit")
 async def submit_messages(request: Request, body: SubmitMessagesRequest,
                           session: AsyncSession = Depends(get_db_session)):
-    if len(TaskManager.Task_queue) > Config.MAX_TASKS:
+    if TaskManager.size() > Config.MAX_TASKS:
         return JSONResponse(status_code=400, content={'task_id': '', "error": "任务队列已满"})
     if not body.messages and not body.params:
         return JSONResponse(status_code=400,
@@ -1656,7 +1611,7 @@ async def submit_messages(request: Request, body: SubmitMessagesRequest,
         return JSONResponse(content={'task_id': task_id, 'url': f'{Config.WEBUI_URL}/message/{task_id}'})
     if not task:
         return JSONResponse(status_code=400,
-                            content={'task_id': task_id, 'error': '[process_task_ai] Task not found in Task_queue.'})
+                            content={'task_id': task_id, 'error': '[process_task_ai] Task not found in Task_map.'})
 
     async def process_task_ai(task: TaskNode):
         await TaskManager.set_task_status(task, TaskStatus.IN_PROGRESS, 0, redis)
@@ -1679,12 +1634,12 @@ async def submit_messages(request: Request, body: SubmitMessagesRequest,
             model_info, payload, refer = await get_chat_payload(messages=user_history, user_request=param.question,
                                                                 system=system_prompt, **param.payload())
             # **param.asdict(),payload=param.payload()
-            assistant_content = await ai_chat(model_info, payload)
+            assistant_content, completion = await ai_chat(model_info, payload)
             transform = extract_string(assistant_content, param.extract)
 
-            chat_history.model = param.model_name
             chat_history.agent = param.agent
-            await chat_history.save(assistant_content, refer, transform, param.question, model=payload['model'])
+            await chat_history.save(assistant_content, refer, transform, param.question,
+                                    model=payload.get('model', param.model_name), usage=completion.get('usage', {}))
 
             if param.extract == 'wechat':
                 if chat_history.name and chat_history.robot_id:
@@ -1825,7 +1780,7 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
             yield 'data: [DONE]\n\n'
 
             await chat_history.save(assistant_content, refer, transform, user_request=param.question,
-                                    model=payload['model'], session=session)
+                                    model=payload['model'], usage=completion.get('usage', {}), session=session)
 
             result = {'answer': assistant_content, 'reference': refer, 'transform': transform, 'id': 0}
             await TaskManager.update_task_result(task_id, result=[result], status=TaskStatus.RECEIVED,
@@ -1833,15 +1788,14 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    assistant_content = await ai_chat(model_info, payload)
+    assistant_content, completion = await ai_chat(model_info, payload)
     transform = extract_string(assistant_content, param.extract)
 
     await chat_history.save(assistant_content, refer, transform, user_request=param.question,
-                            model=payload['model'], session=session)
+                            model=payload['model'], usage=completion.get('usage', {}), session=session)
 
     result = {'answer': assistant_content, 'reference': refer, 'transform': transform, 'id': 0}
     await TaskManager.update_task_result(task_id, result=[result], status=TaskStatus.RECEIVED, redis_client=redis)
-    # del Task_queue[task_id]
     return JSONResponse(content=result)
 
 
@@ -1898,7 +1852,7 @@ async def get_task_status(task_id: str, platform: Literal['json', 'file', 'html'
 
     return JSONResponse(
         content={"status": status.value, "action": task.action, "params": dataclass2dict(task.params),
-                 "result": task.result, "count": task.count, "progress": task.progress})
+                 "result": dataclass2dict(task.result), "count": task.count, "progress": task.progress})
 
 
 # return [{"task_id": v["name"], "description": v["description"], "status": v["status"], 'action': v['action']} for v in Task_graph.vs]
@@ -1940,16 +1894,16 @@ async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
     if not os.path.exists(Config.DATA_FOLDER):
         Path(Config.DATA_FOLDER).mkdir(parents=True, exist_ok=True)  # 确保目标文件夹存在
 
-    file_path = Path(Config.DATA_FOLDER) / file.filename
-    async with aiofiles.open(file_path, "wb") as f:
-        await f.write(await file.read())
-        url = f"{Config.WEBUI_URL}/files/{file.filename}"
-
+    raw_bytes = await file.read()
     if oss_expires != 0:
         object_name = f"upload/{file.filename}"
-        with open(file_path, 'rb') as file_obj:
-            url = upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=oss_expires)
-        os.remove(file_path)
+        file_obj = io.BytesIO(raw_bytes)
+        url, _ = await asyncio.to_thread(upload_file_to_oss, AliyunBucket, file_obj, object_name, expires=oss_expires)
+    else:
+        file_path = Path(Config.DATA_FOLDER) / file.filename
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(raw_bytes)
+        url = f"{Config.WEBUI_URL}/files/{file.filename}"
 
     return {"url": url}
 
@@ -2002,17 +1956,18 @@ async def send_wechat_scheduler(request: Request, file: UploadFile = File(None))
         object_name = file.filename
         oss_expires = int(max(0, tigger_sec)) + 86400
         file_obj = io.BytesIO(await file.read())
-        url = upload_file_to_oss(AliyunBucket, file_obj, f"upload/{file.filename}", expires=oss_expires)
+        url, _ = upload_file_to_oss(AliyunBucket, file_obj, f"upload/{file.filename}", expires=oss_expires)
 
     if tigger_sec > 0:
         job_id = f"to_wechat_{generate_hash_key(user_name, context, url)}"
-        if scheduler.get_job(job_id):
+        if app.state.scheduler.get_job(job_id):
             print(f'job_existing and replaced: {job_id} | {form_data}')  # job.remove()
         else:
             print(f'job_created: {job_id} | scheduled at {send_time}')
 
-        scheduler.add_job(send_to_wechat, 'date', id=job_id, run_date=send_time, misfire_grace_time=50,
-                          args=[user_name, context, url, object_name], replace_existing=True, jobstore='redis')
+        app.state.scheduler.add_job(send_to_wechat, 'date', id=job_id, run_date=send_time, misfire_grace_time=50,
+                                    args=[user_name, context, url, object_name], replace_existing=True,
+                                    jobstore='redis')
     else:
         await send_to_wechat(user_name, context, url, object_name)
 
@@ -2199,7 +2154,7 @@ async def generate_image(file: UploadFile = File(None), image_urls: List[str] = 
         if not image_urls and file:
             file_obj = io.BytesIO(image_data)
             object_name = f"webimg/{file.filename}"
-            image_urls = [upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=3600)]
+            image_urls = [upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=3600)[0]]
 
         if model_id == 2:
             image_decode, result = await wanx_image_generation(image_urls, style_name=style_name)
@@ -2229,29 +2184,51 @@ async def generate_image(file: UploadFile = File(None), image_urls: List[str] = 
 
 @app.post("/asr")
 async def speech_to_text(file: UploadFile = File(None), file_urls: List[str] = Form(None),
-                         platform: PlatformEnum = PlatformEnum.baidu):  # File(...）
+                         platform: PlatformEnum = PlatformEnum.baidu, rate: int = 16000):  # File(...）
     # 获取音频数据
     if file:
         try:
             audio_data = io.BytesIO(await file.read())
-            format = file.content_type.split('/')[1] if file.content_type.startswith('audio/') else 'pcm'
+            if file.content_type and file.content_type.startswith('audio/'):
+                detected_format = file.content_type.split('/')[1]
+            elif file.filename:
+                detected_format = os.path.splitext(file.filename)[1].lower().lstrip('.')  # 'mpeg'
+            else:
+                detected_format = 'pcm'
+            format_mapping = {
+                'mpeg': 'mp3',
+                'mp3': 'mp3',
+                'x-mpeg': 'mp3',
+                'mp4': 'm4a',
+                'x-m4a': 'm4a',
+                'aac': 'aac',
+                'wav': 'wav',
+                'x-wav': 'wav',
+                'wave': 'wav',
+                'flac': 'flac',
+                'ogg': 'ogg',
+                'oga': 'ogg'
+            }  # wav、mp3、m4a、flv、mp4、wma、3gp、amr、aac、ogg-opus、flac
+            format = format_mapping.get(detected_format, detected_format)
+            print(format)
         except Exception as e:
             return {"error": f"Failed to process the uploaded file:{e}"}
 
         if platform == PlatformEnum.baidu:
-            return await baidu_speech_to_text(audio_data, format)
+            return await baidu_speech_to_text(audio_data, format, rate)
         elif platform == PlatformEnum.ali:
-            return await ali_speech_to_text(audio_data, format)
+            return await ali_speech_to_text(audio_data, format, rate)
+        elif platform == PlatformEnum.tencent:
+            return await tencent_speech_to_text(audio_data)
         elif platform == PlatformEnum.dashscope:
-            if file:
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{format}')
-                try:
-                    temp_file.write(audio_data.getvalue())  # await file.read()
-                    temp_file.close()
-                    result = await dashscope_speech_to_text(temp_file.name, format=format)
-                finally:
-                    os.remove(temp_file.name)
-                return result
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{format}')
+            try:
+                temp_file.write(audio_data.getvalue())  # await file.read()
+                temp_file.close()
+                result = await dashscope_speech_to_text(temp_file.name, format=format, rate=rate)
+            finally:
+                os.remove(temp_file.name)
+            return result
 
     elif file_urls:
         if isinstance(file_urls, list) and len(file_urls) == 1:
@@ -2260,7 +2237,8 @@ async def speech_to_text(file: UploadFile = File(None), file_urls: List[str] = F
             file_urls = file_urls.split(',')
 
         file_urls = [url.strip(" '\"") for url in file_urls]
-
+        if platform == PlatformEnum.tencent:
+            return await tencent_speech_to_text(None, file_urls[0])
         result = await dashscope_speech_to_text_url(file_urls)
         return JSONResponse(content={"transcriptions": result})
 
@@ -2321,7 +2299,7 @@ async def image_understanding(request: Optional[CompletionParams] = None, files:
     for file in files:
         file_obj = io.BytesIO(await file.read())
         object_name = f"webimg/{file.filename}"
-        url = upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=86400)
+        url, _ = upload_file_to_oss(AliyunBucket, file_obj, object_name, expires=86400)
         urls.append(url)
 
     system_prompt = request.prompt or System_content.get(request.agent, '')
@@ -2330,7 +2308,7 @@ async def image_understanding(request: Optional[CompletionParams] = None, files:
         **{k: v for k, v in request.payload().items() if k not in {"images", "tools"}})
 
     # print(payload)
-    assistant_content = await ai_chat(model_info, payload)
+    assistant_content, completion = await ai_chat(model_info, payload)
     transform = extract_string(assistant_content, request.extract)
     return JSONResponse({'answer': assistant_content, 'reference': refer, 'transform': transform, "urls": urls})
 

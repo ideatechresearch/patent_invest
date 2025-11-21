@@ -1,6 +1,6 @@
 import asyncio
 import httpx, requests, logging
-import random, json, os, time
+import random, json, time
 import uuid, base64
 from typing import List, Dict, Literal
 
@@ -9,6 +9,7 @@ from utils import convert_to_pinyin
 from secure import md5_sign, get_baidu_access_token, get_xfyun_authorization, get_tencent_signature
 from service import get_httpx_client, async_error_logger
 from config import Config
+
 
 # if os.getenv('AIGC_DEBUG', '0').lower() in ('1', 'true', 'yes'):
 # Config.load('../config.yaml')
@@ -1113,7 +1114,8 @@ if __name__ == "__main__":
 
         r = await  brave_search('季度业绩报告')  # r.keys(),
         print(r)
-
+        result = await web_search_async('易得融信是什么公司')
+        print(result)
         paper = await  arxiv_search(query='', arxiv_id="1706.03762")
         print(paper)
         # [{'title': 'Attention Is All You Need', 'summary': 'The dominant sequence transduction models are based on complex recurrent or\nconvolutional neural networks in an encoder-decoder configuration. The best\nperforming models also connect the encoder and decoder through an attention\nmechanism. We propose a new simple network architecture, the Transformer, based\nsolely on attention mechanisms, dispensing with recurrence and convolutions\nentirely. Experiments on two machine translation tasks show these models to be\nsuperior in quality while being more parallelizable and requiring significantly\nless time to train. Our model achieves 28.4 BLEU on the WMT 2014\nEnglish-to-German translation task, improving over the existing best results,\nincluding ensembles by over 2 BLEU. On the WMT 2014 English-to-French\ntranslation task, our model establishes a new single-model state-of-the-art\nBLEU score of 41.8 after training for 3.5 days on eight GPUs, a small fraction\nof the training costs of the best models from the literature. We show that the\nTransformer generalizes well to other tasks by applying it successfully to\nEnglish constituency parsing both with large and limited training data.', 'authors': ['Ashish Vaswani', 'Noam Shazeer', 'Niki Parmar', 'Jakob Uszkoreit', 'Llion Jones', 'Aidan N. Gomez', 'Lukasz Kaiser', 'Illia Polosukhin'], 'published': '2017-06-12T17:57:34Z', 'updated': '2023-08-02T00:41:18Z', 'arxiv_id': '1706.03762v7', 'primary_category': 'cs.CL', 'categories': ['cs.CL', 'cs.LG'], 'pdf_url': 'http://arxiv.org/pdf/1706.03762v7'}]

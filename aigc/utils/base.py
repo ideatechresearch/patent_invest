@@ -1,9 +1,13 @@
-import json, re, random
-from enum import Enum
+import json, re, pickle, random
+from enum import Enum, IntEnum
+from pydantic import BaseModel
 import base64, hashlib
 from collections import defaultdict
+from collections.abc import Callable as IsCallable
+from dataclasses import is_dataclass
 from urllib.parse import urlparse, urlencode, parse_qs, unquote_plus
 from langdetect import detect, detect_langs
+from datetime import datetime
 
 _tokenizer_cache = {}
 
@@ -240,6 +244,108 @@ def get_origin_fild(index: int, data: dict[str, list | str] | list[tuple[str, li
         if index < count:
             return k
     return None
+
+
+def transform_fields(data: dict | BaseModel, eng_mapping: dict, reverse=False) -> dict:
+    """
+    当 reverse 为 False 时，将输入数据中的英文字段名转换为对应的中文字段名；
+    当 reverse 为 True 时，则将中文字段名转换为对应的英文字段名。
+    """
+    if isinstance(data, BaseModel):
+        data = data.model_dump()
+    mapping = {v: k for k, v in eng_mapping.items()} if reverse else eng_mapping
+    return {mapping.get(k, k): v for k, v in data.items()}
+
+
+def pickle_serialize(obj):
+    try:
+        json.dumps(obj)  # 测试是否可JSON序列化
+        return obj
+    except (TypeError, ValueError):  # 将不可JSON序列化的部分转为pickle的base64字符串
+        try:
+            data = pickle.dumps(obj)  # 返回 bytes 类型
+            return {'__pickle__': base64.b64encode(data).decode('utf-8')}  # 转为 ASCII-safe 字节串
+        except Exception as e:
+            print(f"Object cannot be pickled: {e}")
+            return None
+
+
+def pickle_deserialize(obj):
+    if isinstance(obj, dict):
+        if '__pickle__' in obj:
+            try:
+                return pickle.loads(base64.b64decode(obj['__pickle__'].encode('utf-8')))  # encoding='bytes' 避免自动导入模块
+            except Exception as e:
+                raise ValueError(f"Failed to decode pickle: {e}")
+    return obj
+
+
+def dataclass2dict(data):
+    """
+    通用的递归转换函数，支持 dataclass、BaseModel、Enum、datetime、列表、字典等嵌套结构。serialize
+    """
+
+    def convert_key(key):
+        if isinstance(key, (str, int, float, bool, type(None))):
+            return key
+        if isinstance(key, (set, frozenset)):
+            return f"{{{','.join(map(str, sorted(key)))}}}"
+        elif isinstance(key, tuple):
+            return f"({','.join(map(str, key))})"
+        return str(key)
+
+    def convert(obj):
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Enum):
+            return obj.value
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, BaseModel):
+            return obj.model_dump()
+        elif is_dataclass(obj):
+            return {k: convert(getattr(obj, k)) for k in obj.__dataclass_fields__}  # asdict(obj)
+        elif isinstance(obj, dict):
+            return {convert_key(k): convert(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            return [convert(v) for v in obj]  # list(obj)
+        elif isinstance(obj, IsCallable):  # 用于运行时判断
+            return pickle_serialize(obj)
+        elif hasattr(obj, "model_dump") and callable(obj.model_dump):  # 兼容 Pydantic v2 的 BaseMode
+            return obj.model_dump()
+        elif hasattr(obj, "dict") and callable(obj.dict):  # 兼容 Pydantic v1 或其他自定义对象实现的 .dict() 方法
+            return obj.dict()  # convert(obj.dict())
+        elif hasattr(obj, "__dict__"):  # 通用对象（包含 __dict__）
+            return {k: convert(v) for k, v in vars(obj).items() if not k.startswith("_")}
+        else:
+            return pickle_serialize(obj)
+
+    return convert(data)
+
+
+def variables2dict(variables) -> dict[str, str]:
+    """
+    Convert variables to a dictionary.
+
+    Args:
+        variables (Optional[Union[Dict[str, str], BaseModel, Any]]):
+            Variables to convert.
+
+    Returns:
+        Dict[str, str]: The converted dictionary.
+
+    Raises:
+        ValueError: If the variables type is unsupported.Dict[str, str]
+    """
+    if variables is None:
+        return {}
+    if isinstance(variables, BaseModel):
+        return variables.dict()
+    if is_dataclass(variables):
+        return dataclass2dict(variables)
+    if isinstance(variables, dict):
+        return variables
+    raise ValueError('Unsupported variables type.')
 
 
 def make_hashable(obj):

@@ -1,25 +1,19 @@
 from pydantic import BaseModel, Field, AnyUrl, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from abc import ABC, abstractmethod
-from collections.abc import Callable as IsCallable
-from enum import IntEnum, Enum
-from dataclasses import asdict, dataclass, is_dataclass, field
-from datetime import datetime
-import random, time, asyncio, json
+from enum import  Enum
+import random
 
-from utils import pickle_serialize
-from service import ModelList
+from service.service import ModelList
 
 MODEL_LIST = ModelList()
 
+# from config import Config
 _KB = 1 << 10
 _MB = 1 << 20
 _GB = 1 << 30
 _T = 1e12
 SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
-
-from typing import Protocol, runtime_checkable
-
 
 class DataProcessor(ABC):
     @abstractmethod
@@ -64,84 +58,6 @@ class BaseTool(ABC, BaseModel):
             },
         }
 
-
-def dataclass2dict(data):
-    """
-    通用的递归转换函数，支持 dataclass、BaseModel、Enum、datetime、列表、字典等嵌套结构。serialize
-    """
-
-    def convert_key(key):
-        if isinstance(key, (str, int, float, bool, type(None))):
-            return key
-        if isinstance(key, (set, frozenset)):
-            return f"{{{','.join(map(str, sorted(key)))}}}"
-        elif isinstance(key, tuple):
-            return f"({','.join(map(str, key))})"
-        return str(key)
-
-    def convert(obj):
-        if isinstance(obj, (str, int, float, bool)):
-            return obj
-        if isinstance(obj, Enum):
-            return obj.value
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        elif isinstance(obj, BaseModel):
-            return obj.model_dump()
-        elif is_dataclass(obj):
-            return {k: convert(getattr(obj, k)) for k in obj.__dataclass_fields__}  # asdict(obj)
-        elif isinstance(obj, dict):
-            return {convert_key(k): convert(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple, set, frozenset)):
-            return [convert(v) for v in obj]  # list(obj)
-        elif isinstance(obj, IsCallable):  # 用于运行时判断
-            return pickle_serialize(obj)
-        elif hasattr(obj, "model_dump") and callable(obj.model_dump):  # 兼容 Pydantic v2 的 BaseMode
-            return obj.model_dump()
-        elif hasattr(obj, "dict") and callable(obj.dict):  # 兼容 Pydantic v1 或其他自定义对象实现的 .dict() 方法
-            return obj.dict()  # convert(obj.dict())
-        elif hasattr(obj, "__dict__"):  # 通用对象（包含 __dict__）
-            return {k: convert(v) for k, v in vars(obj).items() if not k.startswith("_")}
-        else:
-            return pickle_serialize(obj)
-
-    return convert(data)
-
-
-def variables2dict(variables: Optional[Union[Dict[str, str], BaseModel, Any]]) -> Dict[str, str]:
-    """
-    Convert variables to a dictionary.
-
-    Args:
-        variables (Optional[Union[Dict[str, str], BaseModel, Any]]):
-            Variables to convert.
-
-    Returns:
-        Dict[str, str]: The converted dictionary.
-
-    Raises:
-        ValueError: If the variables type is unsupported.Dict[str, str]
-    """
-    if variables is None:
-        return {}
-    if isinstance(variables, BaseModel):
-        return variables.dict()
-    if is_dataclass(variables):
-        return dataclass2dict(variables)
-    if isinstance(variables, dict):
-        return variables
-    raise ValueError('Unsupported variables type.')
-
-
-def transform_fields(data: dict | BaseModel, eng_mapping: dict, reverse=False) -> dict:
-    """
-    当 reverse 为 False 时，将输入数据中的英文字段名转换为对应的中文字段名；
-    当 reverse 为 True 时，则将中文字段名转换为对应的英文字段名。
-    """
-    if isinstance(data, BaseModel):
-        data = data.model_dump()
-    mapping = {v: k for k, v in eng_mapping.items()} if reverse else eng_mapping
-    return {mapping.get(k, k): v for k, v in data.items()}
 
 
 class GeneratorWithReturn:
@@ -625,6 +541,7 @@ class PlatformEnum(str, Enum):
     baidu = "baidu"
     ali = "ali"
     dashscope = "dashscope"
+    tencent = "tencent"
 
 
 class ToolRequest(BaseModel):
@@ -690,17 +607,17 @@ class AssistantRequest(BaseModel):
 
 class FunctionCallItem(BaseModel):
     function: Optional[str] = None
-    args: Optional[List[Any]] = Field(None)
-    kwargs: Optional[Dict[str, Any]] = None
-    env: Optional[Dict[str, Any]] = None
+    args: Optional[List[Any]] = Field(default_factory=list)
+    kwargs: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    env: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
-    @model_validator(mode="before")
-    @classmethod
-    def set_default_value(cls, values):
-        values["args"] = values.get("args", [])
-        values["kwargs"] = values.get("kwargs", {})
-        values["env"] = values.get("env", {})
-        return values
+    # @model_validator(mode="before")
+    # @classmethod
+    # def set_default_value(cls, values):
+    #     values["args"] = values.get("args", [])
+    #     values["kwargs"] = values.get("kwargs", {})
+    #     values["env"] = values.get("env", {})
+    #     return values
 
 
 class CallbackUrl(BaseModel):
@@ -725,8 +642,8 @@ class CallbackUrl(BaseModel):
 class MetadataRequest(BaseModel):
     function_code: str = Field(..., description="函数源码")
     user: str = Field(default='test', description="用户ID")
-    metadata: Optional[Dict[str, Any]] = Field(default=None, description="预设元数据结构")
-    model_name: Optional[str] = Field(default='qwen:qwen-coder-plus', description="使用的大模型名称")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="预设元数据结构")
+    model: Optional[str] = Field(default='qwen:qwen-coder-plus', description="使用的大模型名称")
     description: Optional[str] = Field(default=None, description="函数功能描述")
     callback: Optional[CallbackUrl] = Field(default=None, description="外部函数调用信息")
     code_type: Optional[str] = Field(default="Python", description="代码类型")
@@ -734,6 +651,21 @@ class MetadataRequest(BaseModel):
 
     class Config:
         protected_namespaces = ()
+        json_schema_extra = {
+            "example": {
+                "function_code": "async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc: str = None,\n                     model: str = 'deepseek-reasoner', max_tokens: int = 4096, temperature: float = 0.2,\n                     dbpool=None, **kwargs):\n    user_request = results if isinstance(results, str) else f\"```json\\n{json.dumps(results, ensure_ascii=False)}```\"\n    if desc:\n        user_request = f\"{desc}:\\n{user_request}\"\n\n    messages = create_analyze_messages(system_prompt, user_request)\n    content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,\n                                             max_tokens=max_tokens, temperature=temperature, dbpool=dbpool, **kwargs)\n    logging.info(f'</{desc}>: {content}')\n    return content.split(\"</think>\")[-1]",
+                "user": "test",
+                "metadata": {},
+                "model": "qwen:qwen-coder-plus",
+                "description": "使用AI模型对给定的结果进行分析，并返回分析结果。结果可以是字典、列表或字符串格式。",
+                "callback": {
+                    "format": "json",
+                    "url": "http://127.0.0.1:7000/callback"
+                },
+                "code_type": "Python",
+                "cache_sec": 0
+            }
+        }
 
 
 class AgentRequest(BaseModel):
@@ -823,7 +755,7 @@ class CompletionParams(BaseModel):
                     "top_p": 0.8,
                     "model_name": "silicon",
                     "model_id": 0,
-                    "extract": "code.python",
+                    "extract": "raw",
                     "max_tokens": 4000,
                     "keywords": ["AI智能"],
                     "tools": [],
