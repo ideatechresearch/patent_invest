@@ -670,8 +670,7 @@
                 if (j.stream_id) { streamId = j.stream_id; console.log("stream_id =", streamId); if (!j.role) continue; }
                 if (j.role === 'reference') { reference = j.content || reference; }
                 else if (j.role === 'assistant') { acc = j.content || acc; transform = j.transform || transform; }
-                else if (j.choices && j.choices[0]?.delta?.content) { acc += j.choices[0].delta.content; }
-                else if (j.choices && j.choices[0]?.delta?.reasoning_content) { acc += j.choices[0].delta.reasoning_content; }
+                else if (j.choices && j.choices[0]?.delta) { acc += j.choices[0].delta.content ?? j.choices[0].delta.reasoning_content ?? ""; }
                 else { console.warn('parse raw JSON', line); } // 未知格式，忽略
               } catch { acc += line; }// 只拼纯文本块 （增量）
               render();

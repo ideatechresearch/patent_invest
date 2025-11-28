@@ -8,15 +8,15 @@
   <style>
     /* 全屏布局，去除页面左右空白 */
     :root {
-      --bg-0: #0b0f14;
+      --bg-0: #1b1c1f;
       /* 页面主背景 */
-      --bg-1: #071018;
+      --bg-1: #232428;
       /* 次要深色 */
-      --panel: #061015;
+      --panel: #2b2c31;
       /* 面板背景 */
-      --muted: rgba(230, 238, 248, 0.65);
-      --text: #e6eef8;
-      --border-weak: rgba(255, 255, 255, 0.04);
+      --muted: rgba(226, 232, 240, 0.55);
+      --text: #f1f5f9;
+      --border-weak: rgba(255, 255, 255, 0.08);
       --accent: #10a37f;
       /* 主色，可换成蓝色#2563eb */
     }
@@ -47,10 +47,12 @@
       background: var(--bg-0);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial;
+      -webkit-font-smoothing: antialiased;
+      /* font-smooth: always; */
     }
 
     .app {
-      height: 100vh;
+      height: 100dvh;
       width: 100vw;
       display: grid;
       grid-template-rows: 60px 1fr auto;
@@ -111,9 +113,9 @@
       max-width: 78%;
       padding: 8px 10px;
       border-radius: 12px;
-      line-height: 1.35;
+      line-height: 1.45;
       white-space: pre-wrap;
-      font-size: 13px;
+      font-size: 14px;
       color: var(--text);
     }
 
@@ -124,15 +126,16 @@
 
     .bubble.assistant {
       background: transparent;
-      /* 深蓝灰 */
-      border-bottom-left-radius: 6px;
+      border: none !important;
+      box-shadow: none !important;
+      padding: 2px 0;
     }
 
     /* Markdown 渲染容器 */
     .bubble.markdown {
-      font-size: 13px;
+      font-size: 14px;
       /* 字体大小 */
-      line-height: 1.25;
+      line-height: 1.35;
       /* 控制行高 */
       letter-spacing: normal;
       /* 字间距恢复正常 */
@@ -191,13 +194,13 @@
 
     /* 代码块 */
     .bubble.markdown pre {
-      padding: 0.2em 0.3em;
+      padding: 0.3em 0.4em;
       font-family: monospace;
       font-size: 12px;
       line-height: 1.25;
-      background: #07101a;
+      background: #2d2f33;
       overflow-x: auto;
-      border-radius: 3px;
+      border-radius: 4px;
     }
 
     .bubble.assistant.markdown pre code {
