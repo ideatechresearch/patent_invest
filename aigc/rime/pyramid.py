@@ -8,6 +8,7 @@ class PYRAMID:
         self.max_layers: int = max_layers
         self.bands: list[CircularBand] = []
         self.total = 0
+        # activation=None activation_rule
 
     @chainable_method
     def build(self, gen_iter):
@@ -18,12 +19,84 @@ class PYRAMID:
         return self
 
     def to_matrix(self, fill_center_with=('O', 'O')):
+        # 完整 19×19 展开
         return CircularBand.to_square_projection(self.bands, start_batch=8, center_value=fill_center_with)
 
     def to_3d_matrix(self, fill_center_with=('O', 'O')):
+        # 旋转对称映射,可逆变换,四个 face Face→RotateFace
         m = self.to_matrix(fill_center_with=fill_center_with)
         blocks = CircularBand.split_matrix_rotational(m)
         return np.stack(blocks, axis=0)
+
+
+class PyramidNN:
+    """
+    Transformer + GNN 混合结构,递增环 + 旋转内对称结构.
+    从 face[i] 预测 face[i+1]（旋转前）或从 band[k] 预测 band[k+1]=> 下一层由当前层“生长出来”
+    """
+
+    def __init__(self, dim=24, hidden=48, activation=None):
+        self.dim = dim
+        # MLP 1: per-element local transform
+        self.W1 = np.random.randn(dim, hidden) * 0.1  # out_dim, in_dim
+        self.b1 = np.zeros(hidden)
+
+        # MLP 2: aggregation transform
+        self.W2 = np.random.randn(hidden * 3, dim) * 0.1
+        self.b2 = np.zeros(dim)
+
+        self.W_inter = np.random.randn(dim, dim) * 0.1  # 层间传播矩阵
+
+        self.activation = activation
+
+    @staticmethod
+    def relu(x):
+        return np.maximum(0, x)
+
+    def forward_layer(self, band: np.ndarray) -> np.ndarray:
+        """
+        层内环状传播 band: (L, dim)
+        """
+        L, dim = band.shape
+
+        # 1) per-element transform
+        h = self.relu(band @ self.W1 + self.b1)  # (L, hidden)
+
+        # 2) neighborhood aggregation (circular)
+        agg = []
+        for i in range(L):
+            left = h[(i - 1) % L]
+            mid = h[i]
+            right = h[(i + 1) % L]
+            merged = np.concatenate([left, mid, right])  # (3*hidden,)
+            out = self.relu(merged @ self.W2 + self.b2)  # (dim,)
+            agg.append(out)
+
+        return np.array(agg)  # (L, dim) MLP → 层内特征流动
+
+    def cross_attention(self, prev_h, cur_h):
+        """
+        层间传播
+        prev_h shape: (L1, d)
+        cur_h  shape: (L2, d)
+        """
+        scores = cur_h @ prev_h.T / np.sqrt(self.dim)
+        weights = np.exp(scores) / np.exp(scores).sum(axis=1, keepdims=True)  # softmax(scores, axis=1)
+        return weights @ prev_h  # (L2, d)
+
+    def forward_pyramid(self, pyramid: PYRAMID, mapping_embed: dict) -> list[np.ndarray]:
+        prev_h = None
+        outputs = []
+        for band in pyramid.bands:
+            h = np.array(band.encode(mapping_embed))  # (L, dim)
+            h = self.forward_layer(h)
+            if prev_h is not None:
+                inter = self.cross_attention(prev_h, h)
+                h = h + inter @ self.W_inter  # 融合上一层
+            prev_h = h
+            outputs.append(h)  # out
+
+        return outputs
 
 
 if __name__ == "__main__":

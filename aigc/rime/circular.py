@@ -229,6 +229,9 @@ class CircularBand:
     def __repr__(self):
         return f"CircularBand(data={self.data}, cursor={self.cursor}, maxlen={self.maxlen})"
 
+    def encode(self, mapping: dict):
+        return [mapping.get(x) for x in self.data]
+
     def to_list(self, start_from_current=True):
         """
         将环形数据转换为列表
@@ -247,6 +250,7 @@ class CircularBand:
         最后返回按行的矩阵（rows x cols）。
         transpose: 是否返回转置后的矩阵
         要求 len(data) % block_size == 0（否则最后一列会被补 None）。
+        to_matrix(block_size=19, transpose=True)==transpose(block_size=19).to_matrix(block_size=19)
         """
         import math
         n = len(self.data)

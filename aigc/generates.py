@@ -716,7 +716,7 @@ async def ai_chat(model_info: Optional[Dict[str, Any]], payload: dict = None, **
         return error_message, fake_response
 
 
-async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, **kwargs):
+async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, stream_id: str = None, **kwargs):
     if not payload:
         model_info, payload, _ = await get_chat_payload(**kwargs)
     else:
@@ -725,7 +725,7 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, **k
 
     client = AI_Client.get(model_info['name'], None)
     if client:
-        async for item in stream_chat_completion(client, payload):
+        async for item in stream_chat_completion(client, payload, stream_id):
             yield item
 
         # with client.chat.completions.with_streaming_response.create(**payload) as response:

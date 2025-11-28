@@ -74,7 +74,7 @@
       display: flex;
       flex-direction: column;
       max-width: 100%;
-      height: 80vh;
+      height: 90vh;
       max-height: 100vh
     }
 
@@ -334,7 +334,7 @@
 
       <div class="row">
         <label for="stream">流式输出</label>
-        <div class="field"><input id="stream" type="checkbox" /></div>
+        <div class="field"><input id="stream" type="checkbox" checked /></div>
       </div>
 
       <div class="row">
@@ -391,6 +391,8 @@
     // show who
     const UID = '{{ user_id }}' || localStorage.getItem('user_id');
     el('who').textContent = localStorage.getItem('username') || UID || '';
+
+    let streamId = null;
 
     // load settings from localStorage
     function loadSettings() {
@@ -536,12 +538,11 @@
 
     // --------- send handlers (non-blocking, keep original capabilities) ---------
     el('send').addEventListener('click', sendMessageHandler);
-    el('chat-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendMessageHandler(); }
-    });
+    el('chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessageHandler(); } });
 
     async function sendMessageHandler() {
       // prevent double send
+      if (streamId) { await abortStream(); return; }
       if (el('loading-bar').style.display === 'block') return alert('正在接收消息...');
       const input = el('chat-input'); const text = input.value.trim(); if (!text) return;
       addMessage(text, 'user'); input.value = '';
@@ -598,6 +599,7 @@
     // streaming version (supports SSE task_id or fetch streaming)
     async function chunkMessage(params, task_id = null, user_params = {}) {
       el('loading-bar').style.display = 'block';
+      el('send').innerText = "Abort";
       const chatBox = el('chat-box');
       const msgEl = document.createElement('div'); msgEl.className = 'message ai'; msgEl.dataset.timestamp = Date.now();
       chatBox.appendChild(msgEl); chatBox.scrollTop = chatBox.scrollHeight;
@@ -609,7 +611,6 @@
       let done = false;
 
       function render() {
-
         const show = acc || 'No response';
         if (!show) { msgEl.innerHTML = ''; chatBox.scrollTop = chatBox.scrollHeight; return; }
         if (done) {
@@ -634,20 +635,22 @@
         const url = `/message/${task_id}?${new URLSearchParams(params)}`;
         const es = new EventSource(url);
         es.onmessage = (e) => {
-          if (e.data === '[DONE]') { done = true; render(); el('loading-bar').style.display = 'none'; es.close(); return; }
+          if (e.data === '[DONE]') { done = true; streamId = null; render(); el('loading-bar').style.display = 'none'; el('send').innerText = "Send"; es.close(); return; }
           try {
             const p = JSON.parse(e.data);
-            if (p.role === 'reference') { reference = p.content || reference; msgEl.title = reference; }
+            if (p.stream_id) { streamId = p.stream_id; console.log("stream_id =", streamId); if (!p.role) return; }
+            if (p.role === 'reference') { reference = p.content || reference; }
             else if (p.role === 'assistant') { acc = p.content || acc; transform = p.transform || transform; }
             else if (p.choices && p.choices[0]?.delta?.content) acc += p.choices[0].delta.content;
-            else { acc += data; }
+            else { acc += e.data; }
           } catch { acc += e.data; }
 
           render();
         };
-        es.onerror = (err) => { console.error('SSE', err); el('loading-bar').style.display = 'none'; es.close(); };
+        es.onerror = (err) => { console.error('SSE', err); el('loading-bar').style.display = 'none'; el('send').innerText = "Send"; es.close(); };
       } else {
         // fetch + stream
+
         try {
           const resp = await fetch('/message/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...params, ...user_params }) });
           if (!resp.body) { el('loading-bar').style.display = 'none'; throw new Error('no stream'); }
@@ -657,17 +660,20 @@
             // naive split by \n\n (SSE-like)
             const parts = buf.split(/\n\n/); buf = parts.pop();
             for (const p of parts) {
-              let line = p;
-              if (line.startsWith('data:')) line = line.replace(/^data:\s*/, '');
+              let line = p.trim();
               if (!line) continue;
-              if (line === '[DONE]') { done = true; break; }
+              if (line.startsWith('data:')) line = line.replace(/^data:\s*/, '').trim();
+              if (line === '[DONE]') { done = true; streamId = null; break; }
+
               try {
-                const j = JSON.parse(line);
-                if (j.role === 'reference') { reference = j.content || reference; msgEl.title = reference; }
+                const j = JSON.parse(line); // 正常处理 JSON
+                if (j.stream_id) { streamId = j.stream_id; console.log("stream_id =", streamId); if (!j.role) continue; }
+                if (j.role === 'reference') { reference = j.content || reference; }
                 else if (j.role === 'assistant') { acc = j.content || acc; transform = j.transform || transform; }
-                else if (j.choices && j.choices[0]?.delta?.content) acc += j.choices[0].delta.content;
-                else acc += data; // 纯文本块（增量）
-              } catch { acc += line; }
+                else if (j.choices && j.choices[0]?.delta?.content) { acc += j.choices[0].delta.content; }
+                else if (j.choices && j.choices[0]?.delta?.reasoning_content) { acc += j.choices[0].delta.reasoning_content; }
+                else { console.warn('parse raw JSON', line); } // 未知格式，忽略
+              } catch { acc += line; }// 只拼纯文本块 （增量）
               render();
             }
           }
@@ -677,9 +683,23 @@
           addMessage('流式请求出错: ' + err.message, 'ai');
         } finally {
           el('loading-bar').style.display = 'none';
+          el('send').innerText = "Send";
+          streamId = null;
         }
       }
     }
+    async function abortStream() {
+      if (!streamId) { console.warn("No streamId yet."); return; }
+      try {
+        const resp = await fetch(`/message/abort/${streamId}`, { method: "POST" });
+        const result = await resp.json();
+        if (result.stopped) streamId = null;
+        console.log("Abort result:", result);
+      } catch (err) {
+        console.error("Abort error:", err);
+      }
+    }
+
     // init
     (async () => {
       await Promise.all([

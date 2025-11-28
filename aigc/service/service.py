@@ -786,7 +786,7 @@ class ModelList:
         return list(dict.fromkeys(flattened_list)), owners
 
     @classmethod
-    async def set(cls, redis=None, worker_id: str = None, ai_models: list = AI_Models):
+    async def load(cls, redis=None, worker_id: str = None, ai_models: list = AI_Models):
         """更新 MODEL_LIST,并保存到 Redis"""
         cls.ai_models = ai_models or AI_Models
         cls.models, cls.owners = cls.extract()
@@ -834,7 +834,7 @@ class ModelList:
             if data:
                 return json.loads(data)
         if not cls.models and updated:
-            await cls.set()
+            await cls.load()
             print("model_list updated:", cls.models)
 
         return cls.models

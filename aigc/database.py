@@ -975,7 +975,7 @@ class ChatHistory(BaseChatHistory):
         """
         user_request = user_request or self.user_request
         if not user_request or not bot_response:
-            print('no content to save')
+            print('[ChatHistory] no content to save')
             return
         if not (self.user or self.uid):
             return

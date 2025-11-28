@@ -1274,12 +1274,14 @@ if __name__ == "__main__":
 
     # asyncio.run(main())
 
+    htw = HierarchicalTimeWheel()
+
+
     async def print_time(msg):
         await asyncio.sleep(0.5)  # 模拟耗时操作
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{htw.tick_time_str}]{msg}")
 
 
-    htw = HierarchicalTimeWheel()
     now = datetime.now()
     print('start at:{}'.format(now))
     htw.add_task_absolute(now + timedelta(seconds=10), print_time, "10秒后执行")
@@ -1289,8 +1291,14 @@ if __name__ == "__main__":
     htw.add_task_absolute(time.time() + 5, print_time, "5秒后")
     htw.add_task(100, print_time, "100秒后")
     htw.add_task_absolute(time.time() + 160, print_time, "160秒后")
+    htw.add_task(1000, print_time, "1000秒后")
+    htw.add_task(3600, print_time, "一小时后")
+    htw.add_task(3600 * 3, print_time, "3小时后")
+    htw.add_task(28800, print_time, "8小时后")
     htw.add_daily_task(18, 0, print_time, "每天18:00")
 
+    # xx = asyncio.run(htw.super_tick(30000, 30, yield_every=100))
+    # print(xx)
     try:
         input("按回车退出...\n")
     except KeyboardInterrupt:

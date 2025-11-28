@@ -1,19 +1,14 @@
 from pydantic import BaseModel, Field, AnyUrl, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from abc import ABC, abstractmethod
-from enum import  Enum
+from enum import Enum
 import random
 
 from service.service import ModelList
 
 MODEL_LIST = ModelList()
-
-# from config import Config
-_KB = 1 << 10
-_MB = 1 << 20
-_GB = 1 << 30
-_T = 1e12
 SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
+# from config import Config
 
 class DataProcessor(ABC):
     @abstractmethod
@@ -57,7 +52,6 @@ class BaseTool(ABC, BaseModel):
                 "parameters": self.parameters,
             },
         }
-
 
 
 class GeneratorWithReturn:
@@ -235,6 +229,7 @@ class OpenAIRequestMessage(BaseModel):
     store: Optional[bool] = False
 
     tools: Optional[List[dict]] = None  # 工具参数,在生成过程中调用外部工具
+    audio: Optional[dict] = None  # 生成 TTS 音频 {"voice","format","max_output_tokens"}
     stop: Optional[Union[str, List[str]]] = None  # 停止词，用于控制生成的停止条件 ["\n"],
     presence_penalty: Optional[float] = 0.0  # 避免生成重复内容 condecimal(ge=-2.0, le=2.0)
     frequency_penalty: Optional[float] = 0.0  # 避免过于频繁的内容 condecimal(ge=-2.0, le=2.0)
@@ -246,7 +241,8 @@ class OpenAIRequestMessage(BaseModel):
     prediction: Optional[dict] = None  # 预测输出,减少模型响应的延迟
     stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
     extra_body: Optional[dict] = None
-    extra_query: Optional[Dict[str, Any]] = None
+    # extra_query: Optional[Dict[str, Any]] = None
+    # extra_headers: Optional[dict] = None
     metadata: Optional[Dict[str, str]] = None  # 可选，附加的元数据
 
     # file =

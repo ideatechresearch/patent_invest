@@ -7,13 +7,45 @@
   <title>OpenAI — 聊天</title>
   <style>
     /* 全屏布局，去除页面左右空白 */
+    :root {
+      --bg-0: #0b0f14;
+      /* 页面主背景 */
+      --bg-1: #071018;
+      /* 次要深色 */
+      --panel: #061015;
+      /* 面板背景 */
+      --muted: rgba(230, 238, 248, 0.65);
+      --text: #e6eef8;
+      --border-weak: rgba(255, 255, 255, 0.04);
+      --accent: #10a37f;
+      /* 主色，可换成蓝色#2563eb */
+    }
+
+    ::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+
     html,
     body {
       height: 100%;
       width: 100%;
       margin: 0;
       padding: 0;
-      background: #f3f4f6;
+      background: var(--bg-0);
+      color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial;
     }
 
@@ -31,8 +63,8 @@
       align-items: center;
       gap: 12px;
       padding: 12px 18px;
-      background: #fff;
-      border-bottom: 1px solid #e6e7eb
+      background: transparent;
+      border-bottom: 1px solid var(--border-weak);
     }
 
     header h1 {
@@ -54,7 +86,7 @@
       flex-direction: column;
       gap: 6px;
       width: 100%;
-      background: linear-gradient(#fbfcff, #fff);
+      background: linear-gradient(var(--bg-1), var(--bg-0));
       box-sizing: border-box;
     }
 
@@ -81,23 +113,112 @@
       border-radius: 12px;
       line-height: 1.35;
       white-space: pre-wrap;
-      font-size: 13px
+      font-size: 13px;
+      color: var(--text);
     }
 
     .bubble.user {
-      background: #d6eefc;
+      background: #004f99;
       border-bottom-right-radius: 6px
     }
 
     .bubble.assistant {
-      background: #e9f7e9;
-      border-bottom-left-radius: 6px
+      background: transparent;
+      /* 深蓝灰 */
+      border-bottom-left-radius: 6px;
+    }
+
+    /* Markdown 渲染容器 */
+    .bubble.markdown {
+      font-size: 13px;
+      /* 字体大小 */
+      line-height: 1.25;
+      /* 控制行高 */
+      letter-spacing: normal;
+      /* 字间距恢复正常 */
+      word-break: break-word;
+      /* 防止长词撑开 */
+      margin: 0;
+      padding: 0;
+    }
+
+    .bubble.assistant.markdown h1,
+    .bubble.assistant.markdown h2,
+    .bubble.assistant.markdown h3,
+    .bubble.assistant.markdown h4,
+    .bubble.assistant.markdown h5,
+    .bubble.assistant.markdown h6 {
+      margin: 0.1em 0;
+      font-weight: bold;
+      line-height: 1.2;
+    }
+
+    /* 段落 */
+    .bubble.assistant.markdown p,
+    .bubble.assistant.markdown li,
+    .bubble.assistant.markdown li p {
+      margin: 0;
+    }
+
+    /* 水平线 */
+    .bubble.assistant.markdown hr {
+      margin: 0.05em 0;
+      border: none;
+      border-top: 1px solid #ccc;
+    }
+
+    /* 列表 */
+    .bubble.assistant.markdown ul,
+    .bubble.assistant.markdown ol {
+      margin: 0.05em 0;
+      padding-left: 1.2em;
+    }
+
+    /* 表格 */
+    .bubble.assistant.markdown table {
+      margin: 0.15em 0;
+      border-collapse: collapse;
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .bubble.assistant.markdown th,
+    .bubble.assistant.markdown td {
+      padding: 0.2em 0.4em;
+      border: 1px solid #ddd;
+      text-align: left;
+    }
+
+    /* 代码块 */
+    .bubble.markdown pre {
+      padding: 0.2em 0.3em;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.25;
+      background: #07101a;
+      overflow-x: auto;
+      border-radius: 3px;
+    }
+
+    .bubble.assistant.markdown pre code {
+      font-family: inherit;
+      font-size: inherit;
+      line-height: inherit;
+      margin: 0;
+      padding: 0;
+      background: none;
     }
 
     .meta {
       font-size: 11px;
-      color: #7b7f86;
+      color: var(--muted);
       margin-left: 4px
+    }
+
+    /* small helpers */
+    .muted {
+      color: var(--muted);
+      font-size: 12px
     }
 
     footer {
@@ -105,7 +226,8 @@
       gap: 12px;
       padding: 12px 16px;
       border-top: 1px solid #e6e7eb;
-      background: #fff
+      background: transparent;
+      border-top: 1px solid var(--border-weak);
     }
 
     .left-compose {
@@ -133,6 +255,16 @@
       font-size: 14px
     }
 
+    textarea#input,
+    select,
+    input[type=file],
+    .system-item textarea {
+      background: var(--bg-1);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      color: var(--text);
+    }
+
+
     .compose-row {
       display: flex;
       gap: 8px;
@@ -146,7 +278,7 @@
     }
 
     .btn {
-      background: #2563eb;
+      background: var(--accent);
       color: #fff;
       border: 0;
       padding: 8px 12px;
@@ -155,8 +287,8 @@
     }
 
     .btn.secondary {
-      background: #f3f4f6;
-      color: #111
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text)
     }
 
     .small {
@@ -186,7 +318,7 @@
 
     .tool-title {
       font-size: 13px;
-      color: #333
+      color: #cbd5e1;
     }
 
     .model-select {
@@ -233,6 +365,7 @@
       width: 100%;
       height: 100%;
       background: rgba(0, 0, 0, 0.35);
+      /* 不透明遮罩 */
       display: none;
       align-items: center;
       justify-content: center;
@@ -240,16 +373,21 @@
     }
 
     .modal {
-      background: #fff;
+      background: var(--panel);
+      box-shadow: 0 10px 30px rgba(2, 6, 23, 0.75);
+      color: var(--text);
       border-radius: 8px;
       padding: 16px;
       width: 520px;
       max-width: 95%;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15)
     }
 
     .modal h3 {
       margin: 0 0 8px 0
+    }
+
+    .modal hr {
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
     }
 
     .modal .row {
@@ -262,7 +400,23 @@
     .modal .row label {
       min-width: 110px;
       font-size: 13px;
-      color: #333
+      color: var(--text);
+    }
+
+    .modal input,
+    .modal textarea,
+    .modal select {
+      background: var(--bg-1);
+      color: var(--text);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 6px;
+    }
+
+    .modal input:focus,
+    .modal textarea:focus,
+    .modal select:focus {
+      border-color: #3b82f6;
+      outline: none;
     }
 
     .modal .actions {
@@ -275,10 +429,11 @@
     .system-list {
       max-height: 220px;
       overflow: auto;
-      border: 1px solid #eee;
       padding: 8px;
       border-radius: 6px;
-      background: #fafafa
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--text);
     }
 
     .system-item {
@@ -286,6 +441,8 @@
       gap: 8px;
       align-items: flex-start;
       padding: 6px;
+      background: var(--bg-2);
+      border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 6px;
       margin-bottom: 6px
     }
@@ -329,15 +486,8 @@
     .loading-bar .progress {
       width: 0;
       height: 100%;
-      background: #0366d6;
+      background: var(--accent);
       transition: width 300ms linear
-    }
-
-
-    /* small helpers */
-    .muted {
-      color: #7b7f86;
-      font-size: 12px
     }
   </style>
 </head>
@@ -377,6 +527,7 @@
           <div class="tools-row">
             <label><input id="websearch-checkbox" type="checkbox"> 网页搜索</label>
             <label><input id="thinking-checkbox" type="checkbox"> 思考</label>
+            <label><input id="markdown-checkbox" type="checkbox" checked> 渲染</label>
             <label class="small">文件：<input id="file-input" type="file" multiple></label>
             <label class="tool-title">模型：<select id="model-select" class="model-select"></select></label>
           </div>
@@ -400,7 +551,8 @@
       <div class="row"><label>温度系数（temperature）</label><input id="cfg-temp" type="number" min="0" max="1" step="0.01"
           value="0.4"></div>
       <div class="row"><label>备用模型（model）</label><select id="cfg-model" class="model-select"
-          style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px"></select><button id="reload-models" class="btn small">刷新</button></div>   
+          style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px"></select><button id="reload-models"
+          class="btn small">刷新</button></div>
       <div class="row"><label>流式输出（stream）</label><input id="cfg-stream" type="checkbox" checked></div>
 
       <hr>
@@ -430,6 +582,7 @@
     const sendBtn = el('send-btn');
     const websearchCheckbox = el('websearch-checkbox');
     const thinkingCheckbox = el('thinking-checkbox');
+    const MarkdownCheckbox = el('markdown-checkbox');
     const fileInput = el('file-input');
     const modelSelect = el('model-select');
     const clearBtn = el('clear-chat');
@@ -458,6 +611,7 @@
 
     let chatHistory = []; // {role, content, time}
     let lastAssistantPlaceholder = null;
+    let streamFinished = false;
     let sseBuffer = '';
     let settings = {
       model: defaultModel, // cfg-model fallback default -> gpt-4o as requested
@@ -481,7 +635,8 @@
         row.className = 'msg-row ' + (m.role === 'user' ? 'user' : (m.role === 'assistant' ? 'assistant' : ''));
         const bubble = document.createElement('div');
         bubble.className = 'bubble ' + (m.role === 'user' ? 'user' : 'assistant');
-        bubble.innerHTML = escapeHtml(m.content);
+        bubble.innerHTML = m.markdownhtml ?? escapeHtml(m.content);
+        if (m.markdownhtml) bubble.className += ' markdown';
         row.appendChild(bubble);
         const meta = document.createElement('div');
         meta.className = 'meta';
@@ -492,11 +647,56 @@
       chatArea.scrollTop = chatArea.scrollHeight;
     }
 
-    function addMessage(role, content) { const item = { role, content, time: Date.now() }; chatHistory.push(item); renderChat(); return item; }
+    function scheduleRender() {
+      if (pendingRender) return;
+      pendingRender = true;
+      setTimeout(async () => {
+        if (lastAssistantPlaceholder) {
+          lastAssistantPlaceholder.markdownhtml = await renderMarkdown(lastAssistantPlaceholder.content);
+          renderChat(); // 不需要传参数，renderChat 会用 markdownHtml
+        }
+        pendingRender = false;
+      }, 50); // 每 50ms 批量渲染一次
+    }
+
+    function addMessage(role, content, markdownhtml = null) { const item = { role, content, time: Date.now(), markdownhtml }; chatHistory.push(item); renderChat(); return item; }
 
     async function fileToBase64(file) {
       console.log('[chat] fileToBase64 start', file.name, file.size);
       return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = reject; r.readAsDataURL(file); });
+    }
+    async function renderMarkdown(rawText) {
+      let bodyData = { text: rawText, html: false };
+      try {
+        // 尝试解析成 JSON
+        const parsed = JSON.parse(rawText);
+        if (typeof parsed === 'object' && parsed !== null) {
+          // JSON 对象或数组 → 结构化对象
+          bodyData = parsed;
+        }
+      } catch {
+        // 解析失败 → 普通 Markdown
+      }
+
+      try {
+        let res = await fetch("/markdown/", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(bodyData),
+        });
+
+        if (!res.ok)
+          res = await fetch(`/markdown/?text=${encodeURIComponent(rawText)}`);
+
+        if (!res.ok)
+          throw new Error(`Markdown 转换失败: ${res.status}`);
+
+        let html = await res.text();
+        return html.replace(/\n{2,}/g, '\n'); // 多个换行压缩为 1 个
+      } catch (e) {
+        console.warn('Markdown 渲染失败：', e);
+        return escapeHtml(rawText);
+      }
     }
 
     async function collectTools() {
@@ -527,7 +727,7 @@
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') {
           // stream finished indicator
-          finalizeAssistant();
+          streamFinished = true; //finalizeAssistant();
           continue;
         }
         try {
@@ -551,7 +751,7 @@
           // append to last assistant placeholder
           if (lastAssistantPlaceholder) {
             lastAssistantPlaceholder.content += piece;
-            renderChat();
+            renderChat();//scheduleRender(); // 流式更新界面
           } else {
             // 没有占位，则新建一条 assistant 并追加
             lastAssistantPlaceholder = addMessage('assistant', piece);
@@ -559,7 +759,7 @@
         }
         // 如果逻辑中 finish_reason === 'stop'，则认为结束
         if (ch.finish_reason === 'stop') {
-          finalizeAssistant();
+          streamFinished = true;
         }
       }
     }
@@ -609,11 +809,13 @@
 
         if (stream) {
           if (!res.body) { // fallback: not streamed
-            const data = await res.json(); const ai = data.choices?.[0]?.message?.content ?? JSON.stringify(data); lastAssistantPlaceholder.content = ai; finalizeAssistant(); renderChat(); return;
+            const data = await res.json(); const ai = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
+            lastAssistantPlaceholder.content = ai; finalizeAssistant(); renderChat(); return;
           }
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let done = false;
+          streamFinished = false;
           while (!done) {
             const { value, done: d } = await reader.read();
             done = d;
@@ -622,13 +824,18 @@
               // 解析 SSE 样式的 data: ...
               processSSETextChunk(chunk);
             }
+            if (streamFinished) {
+              if (lastAssistantPlaceholder && MarkdownCheckbox.checked) lastAssistantPlaceholder.markdownhtml = await renderMarkdown(lastAssistantPlaceholder.content);
+              finalizeAssistant();
+              break;
+            }
           }
           // 流结束
-          finalizeAssistant();
+          finalizeAssistant(); renderChat();
         } else {
           const data = await res.json();
           const ai = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
-          if (lastAssistantPlaceholder) { lastAssistantPlaceholder.content = ai; }
+          if (lastAssistantPlaceholder) { lastAssistantPlaceholder.content = ai; if (MarkdownCheckbox.checked) lastAssistantPlaceholder.markdownhtml = await renderMarkdown(ai); }
           finalizeAssistant(); renderChat();
         }
       } catch (err) {

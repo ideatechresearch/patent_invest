@@ -170,7 +170,8 @@ def get_access_user(request: Request) -> str | None:
             username = verify_access_token(token_from_request)
             return username
         except HTTPException as e:
-            print(f"Error getting access token from request,{e.detail}")
+            # print(f"Error getting access token from request,{e.detail}")
+            pass
 
     return None
 

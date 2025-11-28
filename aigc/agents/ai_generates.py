@@ -8,8 +8,8 @@ import numpy as np
 from agents.ai_prompt import System_content
 from utils import build_prompt, create_analyze_messages, deduplicate_functions_by_name, run_togather, get_tokenizer, \
     lang_token_size, generate_hash_key, extract_json_struct, normalize_embeddings, cosine_similarity_np
-from service import AI_Client, DB_Client, AliyunBucket, BaseMysql, logger, get_redis, get_httpx_client, \
-    post_aiohttp_stream, upload_file_to_oss, find_ai_model, async_error_logger, async_polling_check
+from service import AI_Client, DB_Client, AliyunBucket, BaseMysql, AsyncAbortController, logger, get_redis, \
+    get_httpx_client, post_aiohttp_stream, upload_file_to_oss, find_ai_model, async_error_logger, async_polling_check
 from database import BaseReBot
 from config import Config
 
@@ -147,13 +147,14 @@ async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc
     return content.split("</think>")[-1]
 
 
-async def ai_files_messages(files: List[str], question: str = None, model_name: str = 'qwen-long',
-                            max_tokens: int = 4096, dbpool=None, **kwargs):
+async def ai_files_messages(files: List[str], question: str = None, messages: list = None,
+                            model_name: str = 'qwen-long', max_tokens: int = 4096, dbpool=None, **kwargs):
     """
     处理文件并生成 AI 模型的对话结果。
 
     :param files: 文件路径列表
     :param question:问题提取
+    :param messages
     :param model_name: 模型名称
     :param max_tokens
     :param dbpool
@@ -161,7 +162,7 @@ async def ai_files_messages(files: List[str], question: str = None, model_name: 
     """
     model_info, name = find_ai_model(model_name, -1)
     client = AI_Client.get(model_info['name'], None)
-    messages = []
+    messages = messages or []
     for file_path in files:
         file_path_obj = Path(file_path)
         if not file_path_obj.exists():  # .is_file()
@@ -257,7 +258,10 @@ async def ai_speech_analyze(file_obj, audio_url: str = None, results: dict = Non
     return data
 
 
-async def stream_chat_completion(client: AsyncOpenAI, payload: dict):
+Active_Stream_Events = AsyncAbortController(redis_client=None)
+
+
+async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: str = None):
     payload["stream"] = True
     set_usage = payload.get("stream_options", {}).get("include_usage", False)
     if not set_usage:
@@ -267,6 +271,7 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict):
 
     # print(payload, client)
     try:
+        abort_event = await Active_Stream_Events.set_abort_event(stream_id)
         stream = await client.chat.completions.create(**payload)
         if not stream:
             raise ValueError("OpenAI API returned an empty response")
@@ -281,6 +286,12 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict):
                 continue
 
             completion_chunk = chunk
+            if abort_event and abort_event.is_set():  # 被 poll_abort 触发 or should_abort_async
+                yield '[DONE]', chunk.model_dump_json()
+                await stream.close()
+                logger.warning(f"检测到中断信号，已停止流: {stream_id}")
+                break  # return
+
             # 若 choices 为空但包含 usage，说明是 stream 末尾数据,qwen
             if not chunk.choices:
                 if set_usage:
@@ -309,8 +320,8 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict):
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": ''.join(assistant_content),
-                                    "reasoning_content": reasoning_content},
-                        "finish_reason": "stop",
+                                    "0": reasoning_content},
+                        "finish_reason": "stop",  # "length"
                         # "metadata": {"reasoning": reasoning}  # .split("</think>")[-1]
                     }
                 ],
@@ -326,6 +337,10 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict):
             "choices": [{"index": 0, "delta": {"content": error_message}, "finish_reason": "stop"}],
         }
         yield error_message, json.dumps(fake_response)
+
+    finally:
+        if stream_id:
+            await Active_Stream_Events.delete(stream_id)
 
 
 async def ai_try(client: AsyncOpenAI, payload: dict, e: Exception) -> Tuple[str, Dict]:
@@ -902,6 +917,60 @@ async def find_closest_matches_embeddings(querys: List[str], tokens: List[str],
     return matches
 
 
+async def process_llm_stream(llm_responses_stream, token_size=20, model_name="gpt-3.5-turbo"):
+    """
+    处理大模型返回的文本流，并按标点符号分割交给 TTS 朗读。
+    :param llm_responses_stream: 大模型返回的文本流
+    :param token_size: 标点不足时，允许的最小缓冲区长度
+    :param  model_name: tokenizer model
+    """
+    from utils.utils import find_last_punctuation, get_string_no_punctuation_or_emoji
+    response_message = []
+    text_index = 0
+    processed_chars = 0
+    tokenizer = get_tokenizer(model_name)
+    async for content in llm_responses_stream:
+        response_message.append(content)
+        if Active_Stream_Events.should_abort(stream_id='LLM_Controller'):  # 实时检查是否终止
+            break
+
+        # 获取当前未处理的文本
+        full_text = "".join(response_message)
+        current_text = full_text[processed_chars:]
+
+        # 查找最后一个有效标点
+        last_punct_pos = find_last_punctuation(current_text)
+        if last_punct_pos != -1 or lang_token_size(current_text, tokenizer) > token_size:
+            split_pos = last_punct_pos if last_punct_pos != -1 else token_size  # 选取最合适的切割点
+            segment_text_raw = current_text[:split_pos + 1]
+            segment_text = get_string_no_punctuation_or_emoji(segment_text_raw)  # 处理无效字符
+            if segment_text:
+                text_index += 1
+                yield segment_text, text_index
+                processed_chars += len(segment_text_raw)  # 更新已处理字符位置
+
+    # 处理剩余未分割的文本
+    remaining_text = "".join(response_message)[processed_chars:]
+    if remaining_text:
+        segment_text = get_string_no_punctuation_or_emoji(remaining_text)
+        if segment_text:
+            text_index += 1
+            yield segment_text, text_index
+
+    yield response_message, -1  # finish_task
+
+
+async def start_llm_stream(new_llm_stream):
+    """复位终止信号，并重新启动大模型流"""
+    abort_event = Active_Stream_Events.get_abort_event(stream_id='LLM_Controller')
+    if not abort_event:
+        abort_event = await Active_Stream_Events.set_abort_event(stream_id='LLM_Controller')
+    abort_event.clear()  # 重新启动前复位
+    async for text, idx in process_llm_stream(new_llm_stream):
+        if idx > 0:
+            print(f"🔊 朗读: {text}")
+
+
 async def call_ollama(prompt: str | list[str] = None, messages: list[dict] = None, model_name="mistral",
                       host='localhost', time_out: float = 100, stream=True, tools: list[dict] = None,
                       embed: bool = False, **kwargs):
@@ -1012,7 +1081,8 @@ __all__ = ['ai_analyze', 'ai_batch', 'ai_batch_result', 'ai_batch_run', 'ai_clie
            'ai_files_messages', 'ai_generate_metadata', 'ai_reranker', 'ai_try', 'call_ollama', 'ai_speech_analyze',
            'dashscope_file_upload', 'find_closest_matches_embeddings', 'get_embedding_from_cache',
            'get_similar_embeddings', 'get_similar_words',
-           'openai_ollama_chat_completions', 'similarity_score_embeddings', 'stream_chat_completion']
+           'openai_ollama_chat_completions', 'similarity_score_embeddings', 'stream_chat_completion',
+           'Active_Stream_Events']
 
 if __name__ == "__main__":
     from utils import get_module_functions

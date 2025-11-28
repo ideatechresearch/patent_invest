@@ -30,3 +30,8 @@ Title_Map: Final[dict] = {'question': '问题', 'reference': '参考', 'refer': 
                           'transform': '转换', 'reason': '原因', 'suggest': '建议', 'title': '标题',
                           "result": "结果", "error": "错误",
                           "created_at": "创建时间", "updated_at": "更新时间", "completed_at": "完成时间"}
+
+_KB = 1 << 10
+_MB = 1 << 20
+_GB = 1 << 30
+_T = 1e12

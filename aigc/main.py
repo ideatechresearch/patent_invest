@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
             tracemalloc.start()
 
         await init_ai_clients(AI_Models)
-        await ModelList.set(redis=app.state.redis, worker_id=app.state.worker_id, ai_models=AI_Models)
+        await ModelList.load(redis=app.state.redis, worker_id=app.state.worker_id, ai_models=AI_Models)
 
         app.state.scheduler = get_scheduler(redis_host=Config.REDIS_HOST)
         app.state.ai_scheduler = TaskGraphManager(dask_client=None)
@@ -160,15 +160,17 @@ app.include_router(chat_router, prefix="/chat")
 @async_timer_cron(interval=60)
 async def handle_minute():
     tick_now = datetime.now()
-    if not TaskManager.htw.tick_time or TaskManager.htw.tick_time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
-        await TaskManager.htw.tick(level="minute", tick_time=tick_now.replace(second=0, microsecond=0))  # 推动分钟轮
+    htw_time = TaskManager.htw.tick_time or tick_now
+    if htw_time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
+        finished = await TaskManager.htw.tick(level="minute")  # 推动分钟轮
         await TaskManager.clean_old_tasks(3600, redis_client=app.state.redis)
         cleanup_old_tempfiles(min_age=600, prefix="tmp_")
-        # print(f"Tick new minute! The time is: {TaskManager.htw.tick_time_str}")
+        if len(finished) > 1:
+            print(f"[{TaskManager.htw.tick_time_str}] Tick new minute! finished levels:{finished}")
 
 
 async def handle_hour():
-    print(f"Tick new bar! The time is: {TaskManager.htw.tick_time_str}")
+    print(f"[{TaskManager.htw.tick_time_str}] Tick new bar!")
     if app.state.is_main:
         if TaskManager.htw.tick_time.hour == 23 and TaskManager.htw.tick_time.weekday() == 6:
             res = await run_adjustment_sync_tasks(concurrent=False)
@@ -913,7 +915,6 @@ async def generate_prompts(request: PromptRequest):
         reason, prompt = extract_tagged_split(content, tag="reasoning")
         first = {'reason': reason, 'prompt': prompt, 'depth': 0}
         yield json.dumps(first, ensure_ascii=False) + "\n"
-        await asyncio.sleep(0.03)
         to_do = next(depth_iter, None)
         if to_do:
             messages = [
@@ -931,7 +932,7 @@ async def generate_prompts(request: PromptRequest):
                     reason, prompt = extract_tagged_split(content, tag="reasoning")
                     item = {'reason': reason, 'prompt': prompt, 'depth': i}
                     yield json.dumps(item, ensure_ascii=False) + "\n"
-                    await asyncio.sleep(0.03)
+                    await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
                     messages[0] = {"role": "system", "content": System_content.get(to_do)}
                     messages.extend([{"role": "assistant", "content": content},
@@ -1169,8 +1170,8 @@ async def generate_batch_text(request: CompletionParams,
                                "__aiter__"), f"process_one did not return async generator, got {type(stream_fn)}"
                 async for chunk in stream_fn:
                     yield chunk
-                    await asyncio.sleep(0.01)  # Token 逐步返回的延迟
-                await asyncio.sleep(0.03)
+                    await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)  # Token 逐步返回的延迟
+                await asyncio.sleep(0.1)
 
                 # media_type="text/plain",纯文本数据
 
@@ -1211,9 +1212,8 @@ async def generate_message(request: ChatCompletionRequest,
                             content={'answer': 'error',
                                      'error': 'Please provide messages or a question to process.'})
 
-    agent = request.agent
     extract = request.extract
-    chat_history = ChatHistory(request.user, request.name, request.robot_id, agent, request.model_name,
+    chat_history = ChatHistory(request.user, request.name, request.robot_id, request.agent, request.model_name,
                                timestamp=time.time(), session_uid=request.request_id)
 
     if not extract:
@@ -1224,32 +1224,36 @@ async def generate_message(request: ChatCompletionRequest,
             '5': 'code.sql',
             '6': 'header',
         }
-        extract = agent_format.get(agent, request.extract)
+        extract = agent_format.get(request.agent, request.extract)
 
     history = await chat_history.build(request.question, request.messages or [], request.use_hist,
                                        request.filter_limit, request.filter_time, session=session)
 
-    system_prompt = request.prompt or System_content.get(agent, System_content['0'])  # system_instruction
+    system_prompt = request.prompt or System_content.get(request.agent, System_content['0'])  # system_instruction
 
     model_info, payload, refer = await get_chat_payload(
         messages=history, user_request=chat_history.user_request, system=system_prompt, **request.payload())
 
     if request.stream:
         async def generate_stream() -> AsyncGenerator[str, None]:
+            stream_id = generate_hash_key(request.user, request.name, request.robot_id, request.request_id,
+                                          request.agent, request.model_name, request.question)
+            first_data = {'role': None, 'stream_id': stream_id}
             if refer:
-                first_data = json.dumps({'role': 'reference', 'content': refer}, ensure_ascii=False)
-                yield f'data: {first_data}\n\n'
-
-            async for content, data in ai_chat_stream(model_info, payload):
-                # yield f'data: {data}\n\n'
-                if content and content.strip():
-                    yield f'data: {content}\n\n'
-                await asyncio.sleep(0.01)
+                first_data.update({'role': 'reference', 'content': refer})
+            first_data = json.dumps(first_data, ensure_ascii=False)
+            yield f'data: {first_data}\n\n'
+            async for content, data in ai_chat_stream(model_info, payload, stream_id):
+                if content:
+                    yield f'data: {data}\n\n'
+                await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
             completion = json.loads(data)
-            assistant_content = completion.get('choices', [{}])[0].get('message', {}).get('content')
+            assistant_message = completion.get('choices', [{}])[0].get('message', {})
+            assistant_content = assistant_message.get('content')
             transform = extract_string(assistant_content, extract)
-            last_data = json.dumps({'role': 'assistant', 'content': assistant_content, 'transform': transform},
+            last_data = json.dumps({'role': 'assistant', 'content': assistant_content, 'transform': transform,
+                                    'reasoning_content': assistant_message.get('reasoning_content')},
                                    ensure_ascii=False)  # 转换字节流数据
             yield f'data: {last_data}\n\n'
             yield 'data: [DONE]\n\n'
@@ -1274,6 +1278,12 @@ async def generate_message(request: ChatCompletionRequest,
         return JSONResponse(result)
 
 
+@app.post("/message/abort/{stream_id}")
+async def abort_stream(stream_id: str):
+    success = await Active_Stream_Events.abort(stream_id)
+    return {"stopped": success}
+
+
 @app.post("/v1/embeddings")
 async def get_embeddings(request: OpenAIEmbeddingRequest):
     kwargs = request.model_dump(exclude_unset=True, exclude={'input', 'model'})
@@ -1293,7 +1303,7 @@ async def completions(request: OpenAIRequest, session: AsyncSession = Depends(ge
                                           model_name=request.model, stream=True, get_content=False, **kwargs)
             async for chunk in stream_fn:
                 yield f"data: {chunk}\n\n"
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
             yield 'data: [DONE]\n\n'
 
@@ -1325,7 +1335,7 @@ async def chat_completions(request: OpenAIRequestMessage):
             async for content, data in ai_chat_stream(model_info=None, messages=messages, user_request=None,
                                                       system=None, model_name=request.model, **kwargs):
                 yield f"data: {data}\n\n"
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
             yield 'data: [DONE]\n\n'
             await instance.async_save(user=request.user, messages=messages, model_response=data,
@@ -1379,6 +1389,11 @@ async def websocket_chat(websocket: WebSocket):
             user = request.get('user')
             robot_id = request.get('robot_id')
             current_timestamp = time.time()
+            # 生成系统提示和模型请求
+            system_prompt = request.get('prompt') or System_content.get(agent, '')
+            if system_prompt.lower() == "bye":
+                await websocket.send_text("Closing connection")
+                break
 
             # 构建聊天历史记录
             history, user_request, hist_size = build_chat_history(
@@ -1387,9 +1402,6 @@ async def websocket_chat(websocket: WebSocket):
                 filter_limit=request.get('filter_limit', -500), filter_time=request.get('filter_time', 0.0),
                 agent=agent, session_uid=request.get('session_uid')
             )
-
-            # 生成系统提示和模型请求
-            system_prompt = request.get('prompt') or System_content.get(agent, '')
 
             model_info, payload, refer = await get_chat_payload(
                 messages=history, user_request=user_request,
@@ -1404,7 +1416,7 @@ async def websocket_chat(websocket: WebSocket):
                     async for content, data in ai_chat_stream(model_info, payload):
                         if content and content.strip():
                             yield f'data: {content}\n\n'
-                        await asyncio.sleep(0.01)
+                            await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
                     completion = json.loads(data)
                     assistant_content = completion.get('choices', [{}])[0].get('message', {}).get('content')
@@ -1437,16 +1449,12 @@ async def websocket_chat(websocket: WebSocket):
 
                 await websocket.send_text(
                     json.dumps({'answer': assistant_content, 'reference': refer, 'transform': transform}))
-                # await asyncio.sleep(0.1)
-
-            if system_prompt.lower() == "bye":
-                await websocket.send_text("Closing connection")
-                break
+                await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
     except WebSocketDisconnect:
         print("Client disconnected")
     except Exception as e:
-        print(f"Connection error: {e}")
+        logger.error(f"Connection error: {e}")
     finally:
         await websocket.close()
         db.close()
@@ -1762,19 +1770,24 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
 
     if param.stream:
         async def generate():
+            stream_id = generate_hash_key(task.data.get('user'), task.data.get('name'), task.data.get('robot_id'),
+                                          task.data.get('session_uid'), param.agent, param.model_name, param.question)
+            first_data = {'role': None, 'stream_id': stream_id}
             if refer:
-                first_data = json.dumps({'role': 'reference', 'content': refer}, ensure_ascii=False)
-                yield f'data: {first_data}\n\n'
-
-            async for content, data in ai_chat_stream(model_info, payload):
+                first_data.update({'role': 'reference', 'content': refer})
+            first_data = json.dumps(first_data, ensure_ascii=False)
+            yield f'data: {first_data}\n\n'
+            async for content, data in ai_chat_stream(model_info, payload, stream_id):
                 if content and content.strip():
                     yield f'data: {content}\n\n'
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 
             completion = json.loads(data)
-            assistant_content = completion.get('choices', [{}])[0].get('message', {}).get('content')
+            assistant_message = completion.get('choices', [{}])[0].get('message', {})
+            assistant_content = assistant_message.get('content')
             transform = extract_string(assistant_content, param.extract)
-            last_data = json.dumps({'role': 'assistant', 'content': assistant_content, 'transform': transform},
+            last_data = json.dumps({'role': 'assistant', 'content': assistant_content, 'transform': transform,
+                                    'reasoning_content': assistant_message.get('reasoning_content')},
                                    ensure_ascii=False)
             yield f'data: {last_data}\n\n'
             yield 'data: [DONE]\n\n'
@@ -1898,13 +1911,14 @@ async def upload_file(file: UploadFile = File(...), oss_expires: int = 86400):
     if oss_expires != 0:
         object_name = f"upload/{file.filename}"
         file_obj = io.BytesIO(raw_bytes)
-        url, _ = await asyncio.to_thread(upload_file_to_oss, AliyunBucket, file_obj, object_name, expires=oss_expires)
-    else:
-        file_path = Path(Config.DATA_FOLDER) / file.filename
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(raw_bytes)
-        url = f"{Config.WEBUI_URL}/files/{file.filename}"
+        url, path = await asyncio.to_thread(upload_file_to_oss, AliyunBucket, file_obj, object_name,
+                                            expires=oss_expires)
+        return {"url": url, 'path': path}
 
+    file_path = Path(Config.DATA_FOLDER) / file.filename
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(raw_bytes)
+    url = f"{Config.WEBUI_URL}/files/{file.filename}"
     return {"url": url}
 
 
@@ -2331,8 +2345,8 @@ async def files_process(files: List[UploadFile], question: str = None, model_nam
             f.write(await file.read())
         saved_file_paths.append(str(file_path))
 
-    return JSONResponse(await ai_files_messages(saved_file_paths, question, model_name, max_tokens=max_tokens,
-                                                dbpool=app.state.collector))
+    return JSONResponse(await ai_files_messages(saved_file_paths, question, None, model_name,
+                                                max_tokens=max_tokens, dbpool=app.state.collector))
 
 
 @app.get("/ppt")

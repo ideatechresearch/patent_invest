@@ -1,5 +1,5 @@
 from enum import Enum, IntFlag
-import json, time, uuid
+import json, time, uuid, math, random
 from typing import Dict, List, Union, Callable, Optional
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta
@@ -404,9 +404,8 @@ class TimeWheel:
         if delay < 0:
             delay = 0.0
 
-        remaining_delay = delay - self.wheel_span
-        if remaining_delay > 0 and self.next_wheel:  # 超过本层 span，上放到上层轮
-            return self.next_wheel.add_task(remaining_delay, task, *args, **kwargs)
+        if delay > self.wheel_span and self.next_wheel:  # 超过本层 span，上放到上层轮
+            return self.next_wheel.add_task(delay, task, *args, **kwargs)
 
         ticks = int(delay // self.tick_duration)
         rounds = ticks // self.slots  # 当前层内轮数
@@ -422,6 +421,30 @@ class TimeWheel:
         #       f'{delay:.1f}->{rounds},{pos},{wait:.1f}s')
         return delay_sec
 
+    def add_tasks(self, delay: float | int, tasks: list[tuple[Callable, tuple, dict]], window: float | int = None):
+        """
+        批量添加任务，并在 [base_delay - window, base_delay + window] 区间内平摊任务。
+
+        :param delay:  基准延迟（秒） base_delay
+        :param window: 扩散窗口（秒），总区间 = 2*window
+        :param tasks: 列表，每个元素为 (task, args, kwargs)
+                      如 [(func1, (a,b), {}), (func2, (), {}), ...]
+        """
+        batch_size = len(tasks)
+        if batch_size == 0:
+            return []
+        if window is None:
+            window = self.tick_duration * max(1.0, math.log(batch_size))
+
+        step = (window * 2.0) / batch_size  # 等间隔步长
+        delays = []
+        for i, (task, args, kwargs) in enumerate(tasks):
+            final_delay = delay - window + i * step
+            delay_sec = self.add_task(final_delay, task, *args, **kwargs)
+            delays.append(delay_sec)
+
+        return delays
+
     @property
     def elapsed_time(self) -> float:
         """当前时间轮已推进的秒数（相对本层）"""
@@ -434,7 +457,7 @@ class TimeWheel:
 
     @property
     def task_count(self) -> int:
-        return sum(len(slot) for slot in self.wheel)
+        return sum(len(slot) for slot in self.wheel)  # O(n) 扫描
 
     def slots_delay(self, rounds: int, pos: int) -> int:
         """
@@ -455,7 +478,7 @@ class TimeWheel:
         self.current_pos = 0
         return tasks
 
-    async def tick_once(self) -> bool:
+    async def tick_once(self) -> list:
         """
         执行一次 tick（供外部手动控制）
         如果触发了上层时间轮 tick，则返回 True，否则 False
@@ -477,27 +500,35 @@ class TimeWheel:
         if exec_tasks:  # 到期任务
             asyncio.create_task(run_bound_tasks(exec_tasks))
 
-        # 级联上层任务,如果转完一圈，通知上层时间轮
-        if self.current_pos == 0 and self.next_wheel:
-            await self.next_wheel.tick_once()
-            return True  # 通知外部“我转完一圈”
+        finished_levels = []
+        if self.current_pos == 0:
+            finished_levels.append(self.name)
+            if self.next_wheel:  # 级联上层任务,如果转完一圈，通知上层时间轮
+                finished_circle = await self.next_wheel.tick_once()
+                finished_levels.extend(finished_circle)
+                self.cascade_tasks(offset=0)  # 将上层时间轮的任务降级到本层,当前槽（current_pos）tick 结束时才执行
+        return finished_levels  # 通知外部“转完一圈”,根据列表触发任意 handler
 
-        return False
-
-    def cascade_tasks(self, pos: int = None):
+    def cascade_tasks(self, offset: int = None) -> int:
         """把上层时间轮当前槽的任务下放到本层"""
         if not self.next_wheel:
-            return
-        # next_pos = int((self.next_wheel.current_pos+1) % self.next_wheel.slots) #tick_once 已经做过 +1
-        pos = int(pos % self.next_wheel.slots) if pos else self.next_wheel.current_pos
+            return 0
+        if offset:  # next_pos = self.next_wheel.current_pos+1 #tick_once 已经做过 +1
+            pos = int((self.next_wheel.current_pos + offset) % self.next_wheel.slots)
+        else:
+            pos = self.next_wheel.current_pos
         with self.next_wheel._lock:
             tasks = self.next_wheel.wheel[pos]  # 获取上层时间轮下一槽的所有任务
             self.next_wheel.wheel[pos] = []  # 清空上层时间轮的这些任务
-        # 将这些任务重新添加到本层时间轮
+
         span = self.next_wheel.wheel_span
-        for rounds, wait, task in tasks:
-            remaining_delay = rounds * span + wait
+        for rounds, wait, task in tasks:  # 将这些任务重新添加到本层时间轮
+            if offset:
+                remaining_delay = self.next_wheel.slots_delay(rounds, pos) + wait
+            else:
+                remaining_delay = rounds * span + wait
             self.add_task(remaining_delay, task)
+        return len(tasks)
 
     def move_to_upper(self):
         if not self.next_wheel:
@@ -513,7 +544,19 @@ class TimeWheel:
 
             slot.clear()  # 清空本层
 
-    async def run(self):
+    async def accelerate(self, tick_steps: int = 1, after_tick: Callable = None):
+        if tick_steps <= 0:
+            raise ValueError("steps must be > 0")
+
+        advanced = 0.0
+        for i in range(int(tick_steps)):
+            finished = await self.tick_once()
+            if callable(after_tick):
+                after_tick(self)
+            advanced += self.tick_duration
+            yield i, advanced, finished
+
+    async def run(self, after_tick: Callable = None):
         """自动运行 tick 循环"""
         if self._running:
             return
@@ -526,9 +569,9 @@ class TimeWheel:
             while self._running:
                 missed = max(1, int((loop.time() - next_tick) / self.tick_duration) + 1)
                 for _ in range(missed):
-                    finished_circle = await self.tick_once()
-                    if finished_circle:
-                        self.cascade_tasks()  # 将上层时间轮的任务降级到本层,当前槽（current_pos）tick 结束时才执行
+                    finished = await self.tick_once()
+                    if callable(after_tick):
+                        after_tick(self)
                 next_tick += missed * self.tick_duration
                 sleep_time = max(0.0001, next_tick - loop.time())
                 await asyncio.sleep(sleep_time)
@@ -539,12 +582,12 @@ class TimeWheel:
             self._running = False
             print(f"[{self.name}] stopped")
 
-    def start(self, loop=None):
+    def start(self, loop=None, after_tick: Callable = None):
         """启动自动循环"""
         if self._running:
             return
         loop = loop or asyncio.get_event_loop()
-        self._task = loop.create_task(self.run())
+        self._task = loop.create_task(self.run(after_tick))
 
         # def tick():
         #     self.tick_once()
@@ -569,6 +612,7 @@ class TimeWheel:
 class HierarchicalTimeWheel:
     def __init__(self):
         # 初始化各层时间轮
+        # self.ms_wheel = TimeWheel(20, 0.05, "ms")
         self.second_wheel = TimeWheel(60, 1, "second")  # 60 slots, 1s per tick
         self.minute_wheel = TimeWheel(60, 60, "minute")  # 60 slots, 60s per tick
         self.hour_wheel = TimeWheel(24, 3600, "hour")  # 24 slots, 3600s per tick
@@ -579,12 +623,28 @@ class HierarchicalTimeWheel:
         self.minute_wheel.set_next_wheel(self.hour_wheel)
         self.hour_wheel.set_next_wheel(self.day_wheel)
 
+        self.levels = {
+            self.second_wheel.name: self.second_wheel,  # 60
+            self.minute_wheel.name: self.minute_wheel,  # 3600
+            self.hour_wheel.name: self.hour_wheel,  # 86400
+            self.day_wheel.name: self.day_wheel
+        }
+
         self.tick_time: datetime = datetime.now()
         self._loop = None
 
     @property
+    def now(self) -> float:
+        '''避免时间倒退,加速模式当前虚拟时间 tick_time'''
+        return max(self.tick_time.timestamp(), time.time())
+
+    @property
     def tick_time_str(self) -> str:
         return self.tick_time.strftime('%Y-%m-%d %H:%M:%S')
+
+    def after_tick(self, wheel):
+        self.tick_time += timedelta(seconds=wheel.tick_duration)
+        return self.tick_time
 
     def delay_sec(self, execute_time: datetime) -> float:
         return (execute_time - self.tick_time).total_seconds()
@@ -611,21 +671,21 @@ class HierarchicalTimeWheel:
         )
         return total
 
-    def add_task(self, delay: float | int, task: Callable, *args, **kwargs) -> int:
+    def add_task(self, delay: float | int, task: Callable, *args, jitter_percent: float | None = None, **kwargs) -> int:
         """
         添加定时任务，可传入 datetime 或时间戳,有精度丢失问题
         :param delay: 执行时间(datetime对象或时间戳)
         :param task: 要执行的任务(函数)
+        :param jitter_percent:百分比 Jitter,-5% ～ +5% 的对称抖动
         """
-        if delay <= self.second_wheel.wheel_span:  # 60
-            new_delay = self.second_wheel.add_task(delay, task, *args, **kwargs)
-        elif delay <= self.minute_wheel.wheel_span:  # 3600
-            new_delay = self.minute_wheel.add_task(delay, task, *args, **kwargs)
-        elif delay <= self.hour_wheel.wheel_span:  # 86400
-            new_delay = self.hour_wheel.add_task(delay, task, *args, **kwargs)
-        else:
-            new_delay = self.day_wheel.add_task(delay, task, *args, **kwargs)
-        return new_delay
+        if jitter_percent:
+            jitter_percent = max(0.0, min(1.0, jitter_percent))
+            jitter = delay * (random.random() * (2 * jitter_percent) - jitter_percent)  # 0.05:±5 %
+            delay += jitter
+        for name, w in self.levels.items():
+            if delay <= w.wheel_span:
+                return w.add_task(delay, task, *args, **kwargs)
+        return self.day_wheel.add_task(delay, task, *args, **kwargs)
 
     def add_task_absolute(self, execute_time: datetime | float, task, *args, **kwargs):
         """
@@ -636,7 +696,7 @@ class HierarchicalTimeWheel:
         if isinstance(execute_time, datetime):
             execute_time = execute_time.timestamp()
 
-        delay = max(0.0, execute_time - time.time())
+        delay = max(0.0, execute_time - self.now)
         self.add_task(delay, task, *args, **kwargs)
 
     def add_daily_task(self, hour: int, minute: int, task, *args, **kwargs):
@@ -646,16 +706,14 @@ class HierarchicalTimeWheel:
         async def wrapper():
             if handle["cancel"]:
                 return
-
             await run_with_async(task, *args, **kwargs)
             # 注册下一次执行
-            next_run = wrapper.next_run
-            next_run += timedelta(days=1)
+            next_run = wrapper.next_run + timedelta(days=1)
             print(f'daily task:{task.__name__} run_time={wrapper.next_run} next_run={next_run}')
             wrapper.next_run = next_run
             self.add_task_absolute(next_run, wrapper)
 
-        now = datetime.now()
+        now = max(self.tick_time, datetime.now())
         run_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if run_time < now:
             run_time += timedelta(days=1)  # 今天的时间已过 → 明天执行
@@ -665,16 +723,24 @@ class HierarchicalTimeWheel:
         return handle
 
     def add_periodic_task(self, interval: int, task, *args, **kwargs):
-        """周期任务"""
+        """周期任务，  在虚拟时间上周期触发，不与 tick 步长绑定
+        interval < tick_duration 不补 N 次执行
+        interval > tick_duration 时，下一次运行依旧严格间隔 interval,不会受 tick 步长影响
+        """
         handle = {"cancel": False}  # 用于外部取消 h = add_periodic_task,h["cancel"] = True 停止循环
 
         async def wrapper():
             if handle["cancel"]:
                 return
-
             await run_with_async(task, *args, **kwargs)
-            self.add_task(interval, wrapper)  # 重新注册
+            now = self.now
+            if wrapper.next_run < now:
+                wrapper.next_run = now
+            wrapper.next_run += interval
+            delay = max(wrapper.next_run - now, 0)
+            self.add_task(delay, wrapper)  # 重新注册
 
+        wrapper.next_run = self.now + interval
         self.add_task(interval, wrapper)
         return handle
 
@@ -702,41 +768,84 @@ class HierarchicalTimeWheel:
         self.add_task(0, wrapper)  # 第一次注册轮询任务，interval<=0 直接执行一次
         return polling.future, polling
 
-    async def tick(self, level: str = "second", tick_time=None) -> bool:
-        mapping = {
-            self.second_wheel.name: self.second_wheel,
-            self.minute_wheel.name: self.minute_wheel,
-            self.hour_wheel.name: self.hour_wheel,
-            self.day_wheel.name: self.day_wheel
-        }
-        wheel = mapping.get(level)
+    async def tick(self, level: str = "second") -> list:
+        wheel = self.levels.get(level)
         if not wheel:
             print(f"[TimeWheel] Invalid level: {level}")
-            return False
+            return []
 
-        self.tick_time = tick_time or datetime.now()
-        for name, w in mapping.items():
-            if w is wheel:
-                break  # 到达当前级别停止
-            w.move_to_upper()
+        delta = time.time() - self.tick_time.timestamp()  # 虚拟时间 vs 真实时间（避免时间倒退）
+        if delta < 0:
+            logging.warning(f"[TimeWheel] super tick,last:{self.tick_time_str}")
+            return []
 
-        finished = await wheel.tick_once()
-        if finished and wheel.next_wheel:
-            wheel.cascade_tasks()
-        return finished
+        missed = int(delta // wheel.tick_duration)
+        if missed > 1:
+            # self.tick_time = datetime.now().replace(microsecond=0, **levels)
+            logging.warning(f"[TimeWheel] (missed={missed}),last:{self.tick_time_str}")
+
+        finished_all = []
+        for _ in range(missed):
+            for name, w in self.levels.items():
+                if w is wheel:
+                    break  # 到达当前级别停止
+                w.move_to_upper()  # 下层上移
+
+            finished = await wheel.tick_once()  # 当前层 tick
+            self.after_tick(wheel)  # 推进全局虚拟时间
+            finished_all.extend(finished)
+
+        return finished_all
+
+    async def super_tick(self, virtual_seconds: float, real_seconds: float, level: str = "second",
+                         yield_every: int = 100):
+        """
+        手动以指定速度推进若干 tick。
+        手动加速时间推进,以受控速率推进虚拟时间（virtual_seconds）：
+        - virtual_seconds: 要推进的虚拟未来时间（秒）, future_range:steps * tick_duration
+        - real_seconds: 希望在现实中花费的时间（秒）:virtual_seconds / speed
+        - tick_steps: 要推进的 tick 次数（正整数）:virtual_seconds // tick_duration
+        - speed_factor: 加速倍率（float, >0）。每个虚拟 tick 在真实时间中消耗 tick_duration / speed 秒。tick加速1000倍
+        """
+        if virtual_seconds <= 0 or real_seconds <= 0:
+            raise ValueError("virtual_seconds and real_seconds must be > 0")
+        wheel = self.levels.get(level)
+        if wheel is None:
+            raise ValueError(f"invalid level: {level}")
+        total_ticks = int(virtual_seconds / wheel.tick_duration)  # 每次推进一次 tick（代表 tick_duration 时间）
+        tick_sleep = real_seconds / total_ticks  # 每个虚拟 tick 对应真实 sleep 秒
+        advanced_virtual: float = 0.0  # 虚拟时间累积,virtual_executed
+        start_real = time.monotonic()  # base_time
+        async for i, advanced, finished in wheel.accelerate(total_ticks, after_tick=self.after_tick):
+            advanced_virtual = advanced
+            expected_next = start_real + (i + 1) * tick_sleep
+            to_sleep = expected_next - time.monotonic()
+            if to_sleep > 0.001:
+                await asyncio.sleep(to_sleep)  # 若需要更高精度可用 busy sleep，但一般不建议阻塞事件循环
+            else:
+                if yield_every and (i + 1) % yield_every == 0:  # 若等待小于 1ms，直接让出一次事件循环，避免长时间占用
+                    await asyncio.sleep(0)
+
+        return {
+            "virtual_advanced": advanced_virtual,
+            "real_used": time.monotonic() - start_real,
+            "speed_factor": virtual_seconds / real_seconds,  # 计算倍率,虚拟秒 / 真实秒，比如一周推进到1小时
+            "virtual_elapsed": self.elapsed_time,
+            "virtual_time": self.tick_time
+        }
 
     @async_timer_cron(interval=1)
     async def tick_start(self):
-        tick_time = datetime.now().replace(microsecond=0)
-        await self.tick(level="second", tick_time=tick_time)  # 推动时间轮每秒执行一次
+        await self.tick(level="second")  # 推动时间轮每秒执行一次
 
     def start(self, daemon=True):
         if self._loop is not None:
             return self._loop
+        self.tick_time = datetime.now()
         try:
             loop = asyncio.get_running_loop()
             self._loop = loop
-            self.second_wheel.start(loop)  # 已经在异步上下文中
+            self.second_wheel.start(loop, after_tick=self.after_tick)  # 已经在异步上下文中
         except RuntimeError:
             # 没有运行中的事件循环 → 创建一个新的 独立线程方式
             ready = threading.Event()
@@ -745,8 +854,8 @@ class HierarchicalTimeWheel:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 self._loop = loop
-                self.second_wheel.start(loop)  # 创建任务必须在 loop 中
-                # loop.create_task(self.second_wheel.run())
+                self.second_wheel.start(loop, after_tick=self.after_tick)  # 创建任务必须在 loop 中
+                # loop.create_task(self.second_wheel.run()) loop.run_until_complete
                 ready.set()
                 loop.run_forever()
 
@@ -760,7 +869,7 @@ class HierarchicalTimeWheel:
         self.second_wheel.stop()
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
-            print(f'[TimeWheel] stopped (elapsed={self.elapsed_time}s)')
+            print(f'[TimeWheel] stopped at {self.tick_time_str}(elapsed={self.elapsed_time}s)')
         self._loop = None
 
 
@@ -966,6 +1075,124 @@ class TaskManager:
         if task_ids_to_delete:
             await cls.delete_tasks(task_ids_to_delete, redis_client=redis_client)
             print(f"[cleanup] Deleted {len(task_ids_to_delete)} tasks.")
+
+
+class AsyncAbortController:
+    map_key = 'abort_map'
+
+    def __init__(self, redis_client=None):
+        self.Active_Events: Dict[str, asyncio.Event] = {}  # threading.Event()
+        self._lock = asyncio.Lock()
+        self.redis = redis_client
+
+    @property
+    def active_events(self):
+        """无阻塞获取当前事件快照"""
+        return {k: e.is_set() for k, e in self.Active_Events.items()}
+
+    def should_abort(self, stream_id: str) -> bool:
+        """查询是否已触发终止信号,实时检查是否终止,同步获取事件（只读，无锁）"""
+        evt = self.Active_Events.get(stream_id)
+        return evt.is_set() if evt else True
+
+    def get_abort_event(self, stream_id: str) -> asyncio.Event | None:
+        if not stream_id:
+            return None
+        return self.Active_Events.get(stream_id)
+
+    async def set_abort_event(self, stream_id: str) -> asyncio.Event | None:
+        if not stream_id:
+            return None
+        async with self._lock:
+            if stream_id in self.Active_Events:
+                self.Active_Events[stream_id].set()  # 先中断已有的
+            abort_event = asyncio.Event()
+            self.Active_Events[stream_id] = abort_event
+
+        if self.redis:
+            await self.redis.hset(self.map_key, stream_id, int(time.time()))
+        return abort_event
+
+    async def delete(self, stream_id: str):
+        if not stream_id:
+            return
+        async with self._lock:
+            self.Active_Events.pop(stream_id, None)
+        if self.redis:
+            await self.redis.hdel(self.map_key, stream_id)
+
+    async def reset(self, stream_id: str):
+        """清除终止信号，为下一轮任务做准备,重新启动前复位,可多轮复用"""
+        async with self._lock:
+            evt = self.Active_Events.get(stream_id)
+            if evt:
+                evt.clear()
+        if self.redis:
+            await self.redis.hset(self.map_key, stream_id, int(time.time()))
+
+    async def abort(self, stream_id: str) -> bool:
+        """外部触发终止信号,触发终止,是否提前终止,供外部触发,异步中断指定流"""
+        if not stream_id:
+            return False
+        if self.redis:  # Redis 写入 abort 标记
+            await self.redis.hset(self.map_key, stream_id, 0)
+
+        async with self._lock:
+            evt = self.Active_Events.get(stream_id)
+            if evt:
+                evt.set()  # set（存在的 Event）
+        logging.warning(f"已发送异步中断信号给流: {stream_id}")
+        return True
+
+    async def poll_abort(self, expire_seconds: int = 300):
+        if not self.redis:
+            raise RuntimeError(f"{self.__class__.__name__}.poll_abort 需要 Redis，但 redis 未初始化")
+        entries = await self.redis.hgetall(self.map_key)
+        now = int(time.time())
+        for sid, ts in entries.items():
+            ts = int(ts)
+            if ts == 0:
+                evt = self.Active_Events.get(sid)
+                if evt:
+                    evt.set()  # 本地 Event 被触发
+                else:
+                    pass
+            elif now - ts > expire_seconds:
+                await self.redis.hdel(self.map_key, sid)
+
+    async def poll_start(self, interval: float = 1, expire_seconds: int = 300, redis_client=None):
+        if redis_client:
+            self.redis = redis_client
+        loop_func = async_timer_cron(interval)(self.poll_abort)
+        return asyncio.create_task(loop_func(expire_seconds))
+
+    async def should_abort_async(self, stream_id: str) -> bool:
+        """跨进程检查是否应该终止"""
+        if not stream_id:
+            return False
+        evt = self.Active_Events.get(stream_id)
+        if evt and evt.is_set():
+            return True
+
+        if not self.redis:
+            return False
+        status = await self.redis.hget(self.map_key, stream_id)
+        if not status or int(status) != 0:
+            return False
+
+        async with self._lock:
+            evt = self.Active_Events.get(stream_id)
+            if not evt:  # 若本地 event 不存在，则补创建一个已终止的 event
+                evt = asyncio.Event()
+                self.Active_Events[stream_id] = evt
+            evt.set()  # set（同步本地 Event）
+        return True
+
+    async def wait_abort(self, stream_id: str):
+        """等待终止信号（可用于并发 await）,可 await 等待中断"""
+        abort_event = self.get_abort_event(stream_id)
+        if abort_event:
+            await abort_event.wait()
 
 
 class AsyncTaskQueue:
