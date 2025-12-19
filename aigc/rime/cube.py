@@ -170,10 +170,17 @@ class CubeBase:
         return corners
 
     @staticmethod
+    def center_layers(n: int) -> list:
+        mid, c = divmod(n, 2)
+        if c == 1:
+            return list(range(-mid, mid + 1))  # 奇数阶：中心在 0
+        return [i for i in range(-mid, mid + 1) if i != 0]  # 偶数阶：无中心层
+
+    @staticmethod
     def layer_index(layer: int, n: int) -> int:
-        mid = n // 2
+        mid, c = divmod(n, 2)
         layer_idx = layer + mid
-        if n % 2 == 0 and layer >= mid:
+        if c == 0 and layer >= mid:
             layer_idx -= 1
         return layer_idx
 
@@ -209,33 +216,37 @@ class CubeBase:
     @classmethod
     def face_basis(cls, face: str):
         """
-        确定局部行列方向
-        返回与 face_rc_to_xyz 完全一致的面内基
-        row_dir, col_dir
+        带法向的面内正交基
+        确定局部行列方向,纯几何面内坐标系
+        约定：
+        - u_dir：面内向右（对应 col 正方向）
+        - v_dir：面内向上（对应 row 减小）
+        - normal：面外法向
         """
         normal = cls.face_normal[face].astype(float)
         up = cls.FACE_UP[face].astype(float)
 
-        row_dir = np.cross(up, normal)
-        row_dir /= np.linalg.norm(row_dir)
-        col_dir = np.cross(normal, row_dir)
-        col_dir /= np.linalg.norm(col_dir)
+        u_dir = np.cross(up, normal)
+        u_dir /= np.linalg.norm(u_dir)
+        v_dir = np.cross(normal, u_dir)
+        v_dir /= np.linalg.norm(v_dir)
 
-        return normal, row_dir, col_dir
+        return normal, u_dir, v_dir
 
     @staticmethod
-    def sticker_pos(normal, row_dir, col_dir, r: int, c: int, n: int) -> np.ndarray:
+    def sticker_pos(normal, u_dir, v_dir, r: int, c: int, n: int) -> np.ndarray:
         """
          返回贴纸中心在世界坐标系中的 (x, y, z), world 连续浮点坐标
+         与 face_rc_to_xyz 一致的面内基
          - 立方体中心在原点，坐标范围 [-center, center]
          - r, c: 从 0 到 n-1
          """
         center = (n - 1) / 2.0
         face_center = normal * center
         # 局部坐标映射到中心坐标 [-center, center]
-        s_row = center - r  # right
-        s_col = c - center  # up2
-        pos_rel = col_dir * s_row + row_dir * s_col  # row_dir * s_row + col_dir * s_col
+        s_u = c - center  # col → right
+        s_v = center - r  # row → up
+        pos_rel = u_dir * s_u + v_dir * s_v
         return face_center + pos_rel
 
     @classmethod
@@ -247,13 +258,13 @@ class CubeBase:
         face_stickers = defaultdict(list)
         axis_vec = cls.AXIS_VEC[axis]
         for face in cls.AXIS_STRIP[axis]:
-            normal, row_dir, col_dir = cls.face_basis(face)
+            normal, u_dir, v_dir = cls.face_basis(face)
             # layer 轴 ⟂ face，才可能出 strip
             if abs(np.dot(normal, axis_vec)) > 1e-6:
                 continue  # 整个面或不在该 layer
             for r in range(n):
                 for c in range(n):
-                    xyz = cls.sticker_pos(normal, row_dir, col_dir, r, c, n)
+                    xyz = cls.sticker_pos(normal, u_dir, v_dir, r, c, n)
                     if np.isclose(xyz[axis], layer):  # abs(xyz[axis] - layer) < 1e-6:  # 中心坐标
                         face_stickers[face].append((r, c, xyz))
 
@@ -526,9 +537,7 @@ class RubiksCube(CubeBase):
 
     @property
     def center_layers(self) -> list:
-        if self.n % 2 == 1:
-            return list(range(-self.mid, self.mid + 1))  # 奇数阶：中心在 0
-        return [i for i in range(-self.mid, self.mid + 1) if i != 0]  # 偶数阶：无中心层
+        return CubeBase.center_layers(self.n)
 
     @classmethod
     def cube_state(cls, cube_color: dict) -> np.ndarray:
