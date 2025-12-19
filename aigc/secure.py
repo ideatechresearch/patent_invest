@@ -472,9 +472,9 @@ def get_ark_signature(action: str, service: str, host: str = None, region: str =
     return headers, url
 
 
-def get_tencent_signature(service, host=None, body=None, action='ChatCompletions',
+def get_tencent_signature(service, host: str = None, body: dict = None, action: str = 'ChatCompletions',
                           secret_id: str = Config.TENCENT_SecretId, secret_key: str = Config.TENCENT_Secret_Key,
-                          timestamp: int = None, region: str = "ap-shanghai", version='2023-09-01'):
+                          timestamp: int = None, region: str | None = "ap-shanghai", version='2023-09-01'):
     # https://cloud.tencent.com/document/api/1093/35641
     if not host:
         host = f"{service}.tencentcloudapi.com"  # url.split("//")[-1]
@@ -550,8 +550,9 @@ def get_tencent_signature(service, host=None, body=None, action='ChatCompletions
         # 这里还需要添加一些认证相关的Header
         "X-TC-Timestamp": str(timestamp),
         "X-TC-Version": version,  # "<API版本号>"
-        "X-TC-Region": region  # region,"<区域>",
     }
+    if region:
+        headers["X-TC-Region"] = region  # "<区域>",
     return headers
 
 

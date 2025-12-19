@@ -8,8 +8,9 @@ import numpy as np
 from agents.ai_prompt import System_content
 from utils import build_prompt, create_analyze_messages, deduplicate_functions_by_name, run_togather, get_tokenizer, \
     lang_token_size, generate_hash_key, extract_json_struct, normalize_embeddings, cosine_similarity_np
-from service import AI_Client, DB_Client, AliyunBucket, BaseMysql, AsyncAbortController, logger, get_redis, \
-    get_httpx_client, post_aiohttp_stream, upload_file_to_oss, find_ai_model, async_error_logger, async_polling_check
+from service import AI_Client, DB_Client, AliyunBucket, BaseMysql, AsyncAbortController, LRUCache, logger, get_redis, \
+    get_httpx_client, post_aiohttp_stream, upload_file_to_oss, upload_file_to_oss_from_file, find_ai_model, \
+    async_error_logger, async_polling_check
 from database import BaseReBot
 from config import Config
 
@@ -320,7 +321,7 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": ''.join(assistant_content),
-                                    "0": reasoning_content},
+                                    "reasoning_content": reasoning_content},
                         "finish_reason": "stop",  # "length"
                         # "metadata": {"reasoning": reasoning}  # .split("</think>")[-1]
                     }
@@ -538,45 +539,16 @@ async def ai_batch_result(batch_id: str, task_id: str, client_name: str,
         result["batch_id"] = batch.id or batch_id
         if oss_expires != 0:
             object_name = f"upload/{output_filename}"
-            async with aiofiles.open(output_file_path, 'rb') as f:
-                data = await f.read()
-                result["output_file_url"], _ = await asyncio.to_thread(upload_file_to_oss, AliyunBucket, data,
-                                                                       object_name, expires=oss_expires)
+            result["output_file_url"], _ = await asyncio.to_thread(
+                upload_file_to_oss_from_file,
+                AliyunBucket,
+                output_file_path, object_name, oss_expires)
             # os.remove(output_file_path)
 
     return result
 
 
-Embedding_Cache = {}
-
-
-async def get_embedding_from_cache(inputs: Union[str, List[str], Tuple[str]], model_name=Config.DEFAULT_MODEL_EMBEDDING,
-                                   arg_list: list = None, redis=None):
-    """检查缓存，如果没有就计算嵌入"""
-    global Embedding_Cache
-    cache_key = generate_hash_key(inputs, model_name, arg_list)
-
-    try:
-        if redis:
-            cached_embedding = await redis.get(f"embedding:{cache_key}")
-            await redis.expire(f"embedding:{cache_key}", Config.REDIS_CACHE_SEC)
-        else:
-            raise Exception
-    except:
-        cached_embedding = Embedding_Cache.get(cache_key, [])
-
-    if cached_embedding:
-        embedding = json.loads(cached_embedding) if isinstance(cached_embedding, str) else cached_embedding
-        if isinstance(embedding, list) and all(isinstance(vec, list) for vec in embedding):
-            return cache_key, embedding
-    return cache_key, []
-
-    # if cache_key in Embedding_Cache:
-    #     print(cache_key)
-    #     return Embedding_Cache[cache_key]
-    # embedding = ai_embeddings(inputs, model_name, model_id, **kwargs)
-    # Embedding_Cache[cache_key] = embedding
-    # return embedding
+Embedding_Cache = LRUCache(1000, redis=get_redis(), prefix="embedding", expire_sec=Config.REDIS_CACHE_SEC)
 
 
 # https://www.openaidoc.com.cn/docs/guides/embeddings
@@ -586,6 +558,7 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
                         **kwargs) -> Union[List[List[float]], Dict]:
     """
     text = text.replace("\n", " ")
+    检查缓存，如果没有就计算嵌入
     从远程服务获取嵌入，支持批量处理和缓存和多模型处理。
     :param inputs: 输入文本或文本列表
     :param model_name: 模型名称
@@ -603,11 +576,12 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
         return []
 
     redis = get_redis()
-    cache_key, embedding = await get_embedding_from_cache(inputs, model_name, [model_id, get_embedding, normalize],
-                                                          redis=redis)
+    cache_key, embedding = await Embedding_Cache.get_cache(args=[model_name, model_id, get_embedding, normalize],
+                                                           redis=redis, default=[], inputs=inputs)
     if embedding:
         # print(f"Embedding already cached for key: {cache_key}")
-        return embedding
+        if isinstance(embedding, list) and all(isinstance(vec, list) for vec in embedding):
+            return embedding
 
     try:
         model_info, name = find_ai_model(model_name, model_id, 'embedding')
@@ -668,12 +642,7 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
             embeddings = normalize_embeddings(embeddings, to_list=True)
 
         if not has_error:  # and len(embeddings) > batch_size
-            if redis:
-                try:
-                    await redis.setex(f"embedding:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(embeddings))
-                except Exception as e:
-                    print(e)
-            Embedding_Cache[cache_key] = embeddings
+            await Embedding_Cache.set_cache(cache_key, embeddings, redis=redis)
 
         return embeddings
 
@@ -713,12 +682,7 @@ async def ai_embeddings(inputs: Union[str, List[str], Tuple[str], List[Dict[str,
         embeddings = normalize_embeddings(embeddings, to_list=True)
 
     if not has_error:
-        if redis:
-            try:
-                await redis.setex(f"embedding:{cache_key}", Config.REDIS_CACHE_SEC, json.dumps(embeddings))
-            except Exception as e:
-                print(e)
-        Embedding_Cache[cache_key] = embeddings
+        await Embedding_Cache.set_cache(cache_key, embeddings, redis=redis)
 
     return embeddings
 
@@ -1079,7 +1043,7 @@ async def openai_ollama_chat_completions(messages: list, model_name="qwen3:14b",
 
 __all__ = ['ai_analyze', 'ai_batch', 'ai_batch_result', 'ai_batch_run', 'ai_client_completions', 'ai_embeddings',
            'ai_files_messages', 'ai_generate_metadata', 'ai_reranker', 'ai_try', 'call_ollama', 'ai_speech_analyze',
-           'dashscope_file_upload', 'find_closest_matches_embeddings', 'get_embedding_from_cache',
+           'dashscope_file_upload', 'find_closest_matches_embeddings',
            'get_similar_embeddings', 'get_similar_words',
            'openai_ollama_chat_completions', 'similarity_score_embeddings', 'stream_chat_completion',
            'Active_Stream_Events']

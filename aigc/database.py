@@ -11,7 +11,6 @@ import hashlib, secrets, uuid
 import time, json, copy
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Union, ClassVar, Generator, AsyncGenerator
-from collections import defaultdict
 from pydantic import BaseModel
 
 from utils import cut_chat_history
@@ -279,119 +278,6 @@ async def company_search(co_name, search_type='invest', limit=10):
                 if isinstance(value, datetime):
                     item[key] = value.isoformat()  # 转换为ISO 8601格式
         return results
-
-
-class IntentMemory:
-    def __init__(self, max_his: int = 5, redis=None, prefix="intent_history"):
-        # 使用 defaultdict 来存储用户和机器人的意图历史,deque(maxlen=max_his)
-        self.history = defaultdict(lambda: defaultdict(list))  # memory {robot_id: {user_id: [intent_history]}}
-        self.max_his = max_his
-        self.redis = redis
-        self.prefix = prefix
-
-    def _generate_key(self, robot_id, user_id):
-        return f"{self.prefix}:{robot_id}:{user_id}"
-
-    async def loads_data(self):
-        """从Redis加载所有历史记录到内存"""
-        if self.redis:
-            try:
-                # 获取所有匹配的键
-                keys = await self.redis.keys(f"{self.prefix}:*")
-                if keys:
-                    # 批量获取对应的值
-                    cached_values = await self.redis.mget(*keys)
-                    for key, value in zip(keys, cached_values):
-                        if value:
-                            key_str = key.decode() if isinstance(key, bytes) else key
-                            parts = key_str.split(":")
-                            if len(parts) == 3:
-                                _, robot_id, user_id = parts
-                                intents = json.loads(value)
-                                self.history[robot_id][user_id] = intents[-self.max_his:]  # 截断最大数量
-            except Exception as e:
-                print(f"Redis loads error: {e}")
-
-    async def _load_data(self, robot_id, user_id):
-        """从Redis载入某个用户历史"""
-        if self.redis:
-            key = self._generate_key(robot_id, user_id)
-            try:
-                data = await self.redis.get(key)
-                if data:
-                    intents = json.loads(data)
-                    self.history[robot_id][user_id] = intents[-self.max_his:]  # 截断
-            except Exception as e:
-                print(f"Redis load error: {e}")
-
-    async def _save_data(self, robot_id, user_id, day: int = 7):
-        """将某个用户的历史保存到Redis"""
-        if self.redis:
-            his = self.history[robot_id][user_id]
-            # index = len(his) - 1  # 当前记录位置
-            key = self._generate_key(robot_id, user_id)
-            try:
-                await self.redis.setex(key, day * 24 * 3600, json.dumps(his))  # 保存7天
-            except Exception as e:
-                print(f"Redis save error: {e}")
-
-    async def append(self, robot_id, user_id, intent, day: int = 7):
-        """添加用户的意图到历史记录"""
-        if not robot_id or not user_id or not intent:
-            return
-        self.history[robot_id][user_id].append(intent)
-
-        # 保持每个用户历史记录最多为 5 条，避免历史记录过长
-        if len(self.history[robot_id][user_id]) > self.max_his:
-            self.history[robot_id][user_id].pop(0)
-
-        await self._save_data(robot_id, user_id, day)
-
-    def get_last(self, robot_id, user_id):
-        """获取指定用户和机器人的最近意图"""
-        return self.history[robot_id][user_id][-1] if self.history[robot_id][user_id] else None
-
-    def get_history(self, robot_id, user_id, recent_n: int = None) -> list:
-        """获取指定用户和机器人的意图"""
-        memory = self.history.get(robot_id, {}).get(user_id, [])
-        recent_n = recent_n or self.max_his
-        return memory[-recent_n:]
-
-    def delete(self, robot_id, user_id, index: Union[List, int]) -> None:
-        memory = self.history.get(robot_id, {}).get(user_id, [])
-        if not memory:
-            return
-        if isinstance(index, int):
-            del memory[index]
-        else:
-            for i in index:
-                del memory[i]
-
-    def export_all(self) -> List[dict]:
-        """导出为列表结构便于写入数据库"""
-        records = []
-        for robot_id, users in self.history.items():
-            for user_id, intents in users.items():
-                for idx, intent in enumerate(intents):
-                    data = intent
-                    if isinstance(intent, str):
-                        pass
-                    elif isinstance(intent, BaseModel):
-                        data = intent.model_dump()
-                    else:
-                        data = json.dumps(intent)
-                    records.append({
-                        "robot_id": robot_id,
-                        "user_id": user_id,
-                        "intent": data,
-                        "index": idx
-                    })
-        return records
-
-        # if self.redis:
-        #     results = await self.redis.lrange(self.redis_key, 0, -1)
-        #     return [item.decode('utf-8') for item in results]
-        # return list(self.history)
 
 
 class User(Base):
@@ -731,13 +617,13 @@ class BaseChatHistory(Base):
     async def async_user_history(cls, session: AsyncSession, user: str, name: str = None, robot_id: str = None,
                                  agent: str = None, filter_time: float = 0, all_payload: bool = True):
         """查询用户历史记录"""
-        stmt = select(cls).where(
-            cls.user == user,
-            or_(cls.name == name, name is None),
-            or_(cls.robot_id == robot_id, robot_id is None)
-        )
+        stmt = select(cls).where(cls.user == user)
         if filter_time > 0:
             stmt = stmt.where(cls.timestamp >= filter_time)
+        if robot_id is not None:
+            stmt = stmt.where(cls.robot_id == robot_id)
+        if name is not None:
+            stmt = stmt.where(cls.name == name)
         if agent:
             stmt = stmt.where(cls.agent == agent)
 
@@ -1109,7 +995,7 @@ class BaseReBot(Base):
             return False
 
     @classmethod
-    def get(cls, db: Session, name: str, user: str, robot_id: str, limit: int = 10) -> list[dict]:
+    def get(cls, db: Session, user: str, name: str, robot_id: str, limit: int = 10) -> list[dict]:
         """
         获取某用户的历史对话记录
         :param db: SQLAlchemy Session
@@ -1121,9 +1007,9 @@ class BaseReBot(Base):
         history = []
         try:
             records = db.query(cls).filter(
-                cls.name == name,
                 cls.user == user,
-                cls.robot_id == robot_id
+                or_(cls.name == name, name is None),
+                or_(cls.robot_id == robot_id, robot_id is None)
             ).order_by(cls.timestamp.desc()).limit(limit).all()
 
             for rec in reversed(records):  # 倒序，保持时间先后
@@ -1162,7 +1048,8 @@ class BaseReBot(Base):
             if not data.get("reference"):
                 reference = next((msg.get("content") for msg in reversed(messages) if msg.get("role") == "system"),
                                  None)  # [{"type": "text", "text": str(text)} for text in refer]
-                data["reference"] = BaseMysql.format_value(reference)
+                if reference and reference != data.get("system_content"):
+                    data["reference"] = BaseMysql.format_value(reference)
         return data
 
     @staticmethod
@@ -1201,7 +1088,9 @@ class BaseReBot(Base):
             if usage:
                 data["prompt_tokens"] = usage.get('prompt_tokens', 0)  # 2/10^6
                 data["completion_tokens"] = usage.get('completion_tokens', 0)  # 3/10^6
-                data["prompt_cache_hit_tokens"] = usage.get('prompt_cache_hit_tokens', 0)  # 0.2/10^6
+                prompt_tokens_details = usage.get('prompt_tokens_details', {}) or {}  # 0.2/10^6
+                data["prompt_cache_hit_tokens"] = prompt_tokens_details.get('cached_tokens',
+                                                                            usage.get('prompt_cache_hit_tokens', 0))
                 completion_tokens_details = usage.get('completion_tokens_details', {}) or {}
                 data["completion_reasoning_tokens"] = completion_tokens_details.get('reasoning_tokens', 0)
         return data
@@ -1271,22 +1160,33 @@ class BaseReBot(Base):
                 return session.insert(table_name=cls.__tablename__, params=data)
 
     @classmethod
-    async def history(cls, user, robot_id, name, system_content=None, user_content=None, agent='chat', filter_day=None,
-                      limit: int = 10, dbpool: OperationMysql = None):
+    async def history(cls, user: str, name: str, robot_id: str = None, agent='chat', filter_time: str = None,
+                      limit: int = 10, system_content=None, user_content=None, dbpool: OperationMysql = None):
         """组装hsistory"""
-        if not filter_day:
-            filter_day = datetime.today().strftime('%Y-%m-%d')
+        if not filter_time:
+            filter_time = datetime.today().strftime('%Y-%m-%d')
+        params = [filter_time, user]
+        conditions = ''
+        if robot_id is not None:
+            conditions += " AND robot_id = %s"
+            params.append(robot_id)
+
+        if name is not None:
+            conditions += " AND name = %s"
+            params.append(name)
+
+        if agent is not None:
+            conditions += " AND agent = %s"
+            params.append(agent)
+
         sql = f"""
-             SELECT user_content, assistant_content, system_content, reference, transform, reasoning_content, robot_id, name
+             SELECT user_content, assistant_content, system_content, reasoning_content, reference, transform, robot_id, name
              FROM {cls.__tablename__}
              WHERE created_at >= %s
-                AND agent = %s 
-                AND user = %s 
-                AND robot_id = %s
-                AND name = %s 
+                AND user = %s {conditions}
              ORDER BY timestamp ASC LIMIT {limit}
          """
-        params = (filter_day, agent, user, robot_id, name)
+        params = tuple(params)
         result = []
         if dbpool:
             result = await dbpool.async_run(sql, params)
@@ -1295,9 +1195,8 @@ class BaseReBot(Base):
                 result = session.search(sql, params)
 
         history = []
-
         for item in result:
-            system = item.get('system_content') or item.get('reasoning_content')  # 系统提示
+            system = item.get('system_content')  # 系统提示
             if system:
                 history.append({"role": "system", "content": system, 'name': "system"})
             question = item['user_content'] or item.get('reference')
@@ -1305,7 +1204,8 @@ class BaseReBot(Base):
                 history.append({"role": "user", "content": question, 'name': item.get('name', name)})
             answer = item.get('assistant_content') or item.get('transform')  # 答复信息
             if answer:
-                history.append({"role": "assistant", "content": answer, 'name': item.get('robot_id', robot_id)})
+                history.append({"role": "assistant", "content": answer, 'name': item.get('robot_id', robot_id),
+                                'reasoning_content': item.get('reasoning_content')})
 
         if system_content:
             history.append({"role": "system", "content": system_content, 'name': "system"})

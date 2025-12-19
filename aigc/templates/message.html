@@ -611,15 +611,15 @@
       let done = false;
 
       function render() {
-        const show = acc || 'No response';
-        if (!show) { msgEl.innerHTML = ''; chatBox.scrollTop = chatBox.scrollHeight; return; }
+        const show = acc;
         if (done) {
-          if (params.extract == 'raw') msgEl.textContent = show;
-          else msgEl.innerHTML = transform ? transform : show;
+          if (params.extract == 'raw') msgEl.textContent = show || 'No response';
+          else msgEl.innerHTML = transform || show || 'No response';
           // console.info('reference', reference);
           // console.info('transform', transform);
         }
         else {
+          if (!show) { msgEl.innerHTML = ''; chatBox.scrollTop = chatBox.scrollHeight; return; }
           const now = Date.now();
           if (now - lastUpdate >= 30) {
             if (params.extract == 'raw') msgEl.textContent = show;// 原样输出

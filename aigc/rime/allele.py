@@ -3,7 +3,6 @@ import random
 import numpy as np
 from collections import defaultdict, Counter
 
-
 class AlleleBase:
     _expressed_cache = {}  # 缓存的懒加载类属性
 
@@ -1597,5 +1596,13 @@ if __name__ == "__main__":
     print(Allele.get_vars())
 
     print('repr', Allele.__repr__)
+
+    Allele.rebuild_constants(axes=['X', 'Y', 'Z'], outer='')
+    print(Allele.system(), Allele.alleles())
+    print('axes', Allele.get_axes_by_allele_vector(Allele.allele_vector_mapping()))
+    genotype_map = Allele.genotype_to_phenotype_mapping()
+    print('genotype_to_phenotype', genotype_map)
+    genotype_db = Allele.phenotype_to_genotypes_mapping()
+    print('phenotype_to_genotypes', genotype_db)
 
     genotypes_iter = Allele.genotype_iter_by_freq(1000, 360)

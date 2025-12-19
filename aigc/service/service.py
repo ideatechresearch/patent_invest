@@ -1,5 +1,6 @@
 import httpx
 import json, os, io, time, uuid
+from pathlib import Path
 from datetime import datetime
 from typing import Optional, Type, Dict, List, Tuple, Any, Union, Literal
 from contextlib import asynccontextmanager, contextmanager
@@ -17,7 +18,6 @@ import oss2
 
 from .base import *
 from .mysql_ops import OperationMysql
-from .task_ops import HierarchicalTimeWheel
 from utils import async_to_sync, generate_hash_key, is_port_open, chunks_iterable, get_file_type_wx
 from config import Config, AI_Models, model_api_keys
 
@@ -463,11 +463,11 @@ def get_w3():
     return None
 
 
-def upload_file_to_oss(bucket, file_obj, object_name=None, expires: int = 604800, total_size: int = 0):
+def upload_file_to_oss(bucket, file_obj, object_name: str = None, expires: int = 604800, total_size: int = 0):
     """
       上传文件到 OSS 支持 `io` 对象。
       :param bucket: OSS bucket 实例
-      :param file_obj: 文件对象，可以是 `io.BytesIO` 或 `io.BufferedReader`
+      :param file_obj: 文件对象，可以是 `io.BytesIO` 或 `io.BufferedReader` InputStream
       :param object_name: OSS 中的对象名
       :param expires: 签名有效期，默认一周（秒）
       :param total_size
@@ -502,7 +502,6 @@ def upload_file_to_oss(bucket, file_obj, object_name=None, expires: int = 604800
     else:
         # OSS 上的存储路径, 本地图片路径
         bucket.put_object(object_name, file_obj)
-        # bucket.put_object_from_file(object_name, str(file_path))
 
     if 0 < expires <= 604800:  # 如果签名signed_URL
         url = bucket.sign_url("GET", object_name, expires=expires)
@@ -512,6 +511,63 @@ def upload_file_to_oss(bucket, file_obj, object_name=None, expires: int = 604800
     # 获取文件对象
     # result = bucket.get_object(object_name)
     # result.read()获取文件的二进制内容,result.headers元数据（头部信息）
+    return url, object_name
+
+
+def upload_file_to_oss_from_file(bucket, file_path, object_name: str = None, expires: int = 604800):
+    """
+    从本地文件路径上传文件到 OSS。
+    支持大文件自动分片，小文件直接上传。
+    :param bucket: OSS bucket 实例
+    :param file_path: 本地文件路径
+    :param object_name: OSS 中对象名
+    :param expires: 签名有效期（默认 7 天）
+    """
+    if isinstance(file_path, Path):
+        file_path = str(file_path)
+
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    total_size = os.path.getsize(file_path)
+
+    # 自动命名
+    if not object_name:
+        base_name = os.path.basename(file_path)
+        object_name = f"upload/{base_name}"
+
+    # 大文件：分片上传（>16MB）
+    if total_size > 1024 * 1024 * 16:
+        part_size = oss2.determine_part_size(total_size, preferred_size=128 * 1024)
+        upload_id = bucket.init_multipart_upload(object_name).upload_id
+        parts = []
+
+        with open(file_path, "rb") as f:
+            part_number = 1
+            offset = 0
+
+            while offset < total_size:
+                size_to_upload = min(part_size, total_size - offset)
+                result = bucket.upload_part(object_name, upload_id, part_number,
+                                            oss2.SizedFileAdapter(f, size_to_upload))
+                parts.append(oss2.models.PartInfo(part_number, result.etag, size=size_to_upload, part_crc=result.crc))
+
+                offset += size_to_upload
+                part_number += 1
+
+        # 完成分片上传
+        bucket.complete_multipart_upload(object_name, upload_id, parts)
+
+    else:
+        # 小文件直接上传
+        bucket.put_object_from_file(object_name, file_path)
+
+    # 生成访问 URL
+    if 0 < expires <= 604800:
+        url = bucket.sign_url("GET", object_name, expires=expires)
+    else:
+        url = f"{Config.ALIYUN_Bucket_Domain}/{object_name}"
+
     return url, object_name
 
 

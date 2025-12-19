@@ -426,15 +426,50 @@ def clean_json_string(json_str):
     # 3. 替换 HTML 标签、伪标签、非法换行符
     json_str = json_str.replace('<br>', '\n')  # 替换 HTML 标签或伪标签
     json_str = json_str.replace('<', '《').replace('>', '》')  # 修复 <ucam.xxx> 造成的错误
-    json_str = json_str.replace('\\"', '"')  # 修复被转义的双引号（如 \\"）
-
+    json_str = clean_json_whitespace(json_str)
     json_str = re.sub(r'"(reason|suggest)":\s*"([^"]+?)(?=\n\s*")', lambda m: f'"{m.group(1)}": "{m.group(2).strip()}"',
                       json_str)  # 尝试补全 "reason": "... \n  "suggest"
 
     return json_str
 
 
-def clean_escaped_string(text: str, force_str: bool = True, decode_unicode: bool = False) -> str:
+def clean_json_whitespace(text: str) -> str:
+    """
+    对文本中 引号内的换行进行转义（\n），
+    对引号外的空白字符进行压缩和清理。
+    """
+    result = []
+    in_quotes = False
+    escaped = False
+
+    for c in text:
+        if escaped:
+            result.append(c)
+            escaped = False
+        elif c == '\\' and in_quotes:
+            result.append(c)
+            escaped = True
+        elif c == '"':
+            result.append(c)
+            in_quotes = not in_quotes
+        elif in_quotes and (c == '\n' or c == '\r'):
+            result.append('\\n')  # 引号内换行转义
+        elif in_quotes:
+            result.append(c)
+        else:
+            # 引号外字符：跳过控制字符，压缩空格
+            if c in '\n\r\t':
+                continue
+            elif c.isspace():
+                if len(result) > 0 and result[-1] != ' ':
+                    result.append(' ')
+            else:
+                result.append(c)
+
+    return ''.join(result).strip()
+
+
+def decode_escaped_string(text: str, force_str: bool = True, decode_unicode: bool = False) -> str:
     """
     尝试去除外层引号，并反转义，返回字符串。
     force_str=True 时，非字符串结果也会转成 str。

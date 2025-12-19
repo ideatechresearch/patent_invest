@@ -4,7 +4,7 @@ from fastapi.responses import Response, HTMLResponse, JSONResponse
 from urllib.parse import quote
 from typing import Any
 import uuid, json
-from utils import format_for_html, clean_escaped_string, format_summary_text
+from utils import format_for_html, decode_escaped_string, format_summary_text
 
 templates = Jinja2Templates(directory="templates")
 
@@ -40,7 +40,7 @@ async def api_user_page(request: Request):
 
 @index_router.get("/markdown/", response_class=HTMLResponse)
 async def get_markdown(text: str = Query(default="hello,word!")):
-    text = clean_escaped_string(text)
+    text = decode_escaped_string(text)
     return HTMLResponse(format_for_html(text, True), status_code=200)
 
 
@@ -72,11 +72,11 @@ async def post_markdown(data: Any = Body(...)):
      """
     for_html = True
     if isinstance(data, str):  # 处理纯文本 string body
-        text = clean_escaped_string(data)
+        text = decode_escaped_string(data)
     elif isinstance(data, dict):
         for_html = bool(data.pop("html", True))
         if isinstance(data.get("text", None), str):
-            text = clean_escaped_string(data["text"])
+            text = decode_escaped_string(data["text"])
         else:
             text = format_summary_text(data)
     elif isinstance(data, list):
@@ -185,7 +185,7 @@ def build_table_html(df_html, title: str, additional: str = None) -> str:
 async def post_markdown_check(data: Any = Body(...)):
     from script.md_checker import run_all_checks
     if isinstance(data, str):  # 处理纯文本 string body
-        text = clean_escaped_string(data)
+        text = decode_escaped_string(data)
     elif isinstance(data, dict) and isinstance(data.get("text", None), str):
         text = data["text"]
     elif isinstance(data, (dict, list)):

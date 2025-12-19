@@ -34,7 +34,7 @@ class FunctionManager:
         if not self.__class__.global_registry:
             for m, f in Registry_Module.items():
                 self.set_registry_global(functions_list=f, module_name=m)
-            print('Function_Registry:', len(self.__class__.global_registry))
+            print(f'Function_Registry with [{len(self.__class__.global_registry)}] methods.', )
 
         if copy:
             self.update_registry(self.__class__.global_registry)
@@ -255,13 +255,14 @@ class FunctionManager:
                 raise RuntimeError("Redis not available")
             cache_full_key = f"{cls.key_meta}:{cache_key}"
             cached_metadata = await get_redis_retry(redis, cache_full_key, retry=retry)
-            await redis.expire(cache_full_key, ex or Config.REDIS_CACHE_SEC)
-            await redis.expire(cls.key_reg_name, ex or Config.REDIS_CACHE_SEC)
             if cached_metadata:
+                await redis.expire(cache_full_key, ex or Config.REDIS_CACHE_SEC)
+                await redis.expire(cls.key_reg_name, ex or Config.REDIS_CACHE_SEC)
                 return json.loads(cached_metadata)
         except Exception:
             # Too many connections
-            return cls._meta_store.get(cache_key, {})
+            pass
+        return cls._meta_store.get(cache_key, {})
 
     @classmethod
     async def set_metadata_to_cache(cls, metadata: dict, cache_key: str, func_name: str, redis=None, ex: int = 0):
@@ -379,8 +380,8 @@ Registry_Module = {
     "utils": ["get_times_shift", "date_range_calculator", 'extract_json_struct', 'extract_json_array',
               "get_day_range", "get_week_range", "get_month_range", "lang_token_size",
               "get_quarter_range", "get_year_range", "get_half_year_range", "math_solver",
-              "extract_links", "extract_web_content", "remove_markdown", "extract_table_segments",
-              "save_markdown", "read_markdown"],
+              "decode_escaped_string", "extract_links", "extract_web_content", "remove_markdown",
+              "extract_table_segments","save_markdown", "read_markdown", "save_dictjson", "load_dictjson"],
     "agents.ai_multi": ['xunfei_ppt_create', 'tencent_generate_image'],
     "agents.ai_company": ['annual_report_info', 'base_account_record', 'case_filing', 'company_black_list',
                           'company_exception_list', 'company_out_investment', 'company_personnel_risk',

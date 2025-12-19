@@ -324,7 +324,7 @@ class TaskEdge:
 class PollingTask:
     def __init__(self, func: Callable, args=(), kwargs=None, interval=5, timeout=300):
         self.func = func
-        self.args = args
+        self.args = args or ()
         self.kwargs = kwargs or {}
         self.interval = interval
         self.timeout = timeout
@@ -382,8 +382,40 @@ class PollingTask:
         return None
 
 
+class TimeContext:
+    def __init__(self):
+        self.current: float = 0.0  # 全局秒时间
+        self.tick_time: datetime = datetime.now()
+
+    def tick(self, dt: float) -> float:
+        self.current += dt
+        self.tick_time += timedelta(seconds=dt)
+        return self.current
+
+    def after_tick(self, wheel: "TimeWheel"):
+        self.tick(wheel.tick_duration)
+        return self.tick_time
+
+    def clear(self):
+        self.current = 0.0
+        self.tick_time = datetime.now()
+
+    @property
+    def now(self) -> float:
+        '''避免时间倒退,加速模式当前虚拟时间 tick_time'''
+        return max(self.tick_time.timestamp(), time.time())
+
+    @property
+    def time_str(self) -> str:
+        return self.tick_time.strftime('%Y-%m-%d %H:%M:%S')
+
+    def delay_sec(self, execute_time: datetime) -> float:
+        return (execute_time - self.tick_time).total_seconds()
+
+
 class TimeWheel:
-    def __init__(self, slots: int, tick_duration: int | float, name: str = "tw", next_wheel: "TimeWheel" = None):
+    def __init__(self, slots: int, tick_duration: int | float, name: str = "tw",
+                 context: TimeContext = None, next_wheel: "TimeWheel" = None):
         assert slots > 0 and tick_duration > 0
         self.slots = slots
         self.tick_duration = tick_duration
@@ -391,6 +423,7 @@ class TimeWheel:
         self.current_pos: int = 0
         self.wheel = [[] for _ in range(slots)]
         self.next_wheel: Optional["TimeWheel"] = next_wheel
+        self.context: TimeContext = context or TimeContext()
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -400,50 +433,8 @@ class TimeWheel:
     def set_next_wheel(self, next_wheel: "TimeWheel"):
         self.next_wheel = next_wheel
 
-    def add_task(self, delay: float | int, task: Callable, *args, **kwargs) -> int:
-        if delay < 0:
-            delay = 0.0
-
-        if delay > self.wheel_span and self.next_wheel:  # 超过本层 span，上放到上层轮
-            return self.next_wheel.add_task(delay, task, *args, **kwargs)
-
-        ticks = int(delay // self.tick_duration)
-        rounds = ticks // self.slots  # 当前层内轮数
-        pos = int((self.current_pos + ticks) % self.slots)
-
-        delay_sec = self.slots_delay(rounds, pos)
-        wait = delay - delay_sec  # extra_delay,精度补偿值
-
-        wrapped_task = merge_partial(task, *args, **kwargs)  # bound_func
-        with self._lock:
-            self.wheel[pos].append((rounds, wait, wrapped_task))
-        # print(f'{self.__class__.__name__}.{self.name}[{wrapped_task.func.__name__}]:'
-        #       f'{delay:.1f}->{rounds},{pos},{wait:.1f}s')
-        return delay_sec
-
-    def add_tasks(self, delay: float | int, tasks: list[tuple[Callable, tuple, dict]], window: float | int = None):
-        """
-        批量添加任务，并在 [base_delay - window, base_delay + window] 区间内平摊任务。
-
-        :param delay:  基准延迟（秒） base_delay
-        :param window: 扩散窗口（秒），总区间 = 2*window
-        :param tasks: 列表，每个元素为 (task, args, kwargs)
-                      如 [(func1, (a,b), {}), (func2, (), {}), ...]
-        """
-        batch_size = len(tasks)
-        if batch_size == 0:
-            return []
-        if window is None:
-            window = self.tick_duration * max(1.0, math.log(batch_size))
-
-        step = (window * 2.0) / batch_size  # 等间隔步长
-        delays = []
-        for i, (task, args, kwargs) in enumerate(tasks):
-            final_delay = delay - window + i * step
-            delay_sec = self.add_task(final_delay, task, *args, **kwargs)
-            delays.append(delay_sec)
-
-        return delays
+    def __repr__(self):
+        return f"{self.__class__.__name__}.{self.name}"
 
     @property
     def elapsed_time(self) -> float:
@@ -478,20 +469,43 @@ class TimeWheel:
         self.current_pos = 0
         return tasks
 
+    def add_task(self, delay: float | int, task: Callable, *args, **kwargs) -> tuple[int, float]:
+        """多层图,时间轮是层级图（树 + 环）,任务是节点"""
+        if delay < 0:
+            delay = 0.0
+
+        if delay > self.wheel_span and self.next_wheel:  # 超过本层 span，上放到上层轮
+            return self.next_wheel.add_task(delay, task, *args, **kwargs)
+        target = self.context.current + delay  # execute_ts
+        ticks = int(delay // self.tick_duration)  # offset
+        rounds = ticks // self.slots  # 当前层内轮数
+        wrapped_task = merge_partial(task, *args, **kwargs)  # bound_func
+        with self._lock:
+            pos = int((self.current_pos + ticks) % self.slots)
+            self.wheel[pos].append((rounds, target, wrapped_task))
+        delay_sec = self.slots_delay(rounds, pos)
+        # extra_delay = delay - delay_sec  # 精度补偿值
+        # print(f'{self}[{wrapped_task.func.__name__}] add:{delay:.1f}->{rounds},{pos}->{delay_sec}+{extra_delay:.1f}s')
+        return delay_sec, target
+
     async def tick_once(self) -> list:
         """
         执行一次 tick（供外部手动控制）
         如果触发了上层时间轮 tick，则返回 True，否则 False
         """
-        tasks = self.wheel[self.current_pos]
         remaining_tasks = []
         exec_tasks = []
-
-        for rounds, wait, task in tasks:
-            if rounds > 0:
-                remaining_tasks.append((rounds - 1, wait, task))
+        tasks = self.wheel[self.current_pos]
+        now = self.context.current
+        for rounds, target, task in tasks:
+            remaining_delay = target - now
+            if rounds > 0:  # > wheel_span
+                remaining_tasks.append((rounds - 1, target, task))
+            elif remaining_delay > self.tick_duration:
+                self.add_task(remaining_delay, task)
             else:
                 exec_tasks.append(task)
+                # print(f'{self}[{task.func.__name__}] tick:{self.current_pos},{remaining_delay:.1f}s')
 
         with self._lock:
             self.wheel[self.current_pos] = remaining_tasks  # 更新轮槽
@@ -506,29 +520,33 @@ class TimeWheel:
             if self.next_wheel:  # 级联上层任务,如果转完一圈，通知上层时间轮
                 finished_circle = await self.next_wheel.tick_once()
                 finished_levels.extend(finished_circle)
-                self.cascade_tasks(offset=0)  # 将上层时间轮的任务降级到本层,当前槽（current_pos）tick 结束时才执行
+                self.cascade_tasks(offset=0)  # 将上层时间轮的任务降级到本层,只在触发层当前槽（current_pos）tick 结束时才执行
         return finished_levels  # 通知外部“转完一圈”,根据列表触发任意 handler
 
     def cascade_tasks(self, offset: int = None) -> int:
-        """把上层时间轮当前槽的任务下放到本层"""
+        """把上层时间轮当前槽的任务下放到本层,边传播,链路依赖"""
         if not self.next_wheel:
             return 0
-        if offset:  # next_pos = self.next_wheel.current_pos+1 #tick_once 已经做过 +1
-            pos = int((self.next_wheel.current_pos + offset) % self.next_wheel.slots)
-        else:
-            pos = self.next_wheel.current_pos
+
+        remaining_tasks = []
         with self.next_wheel._lock:
+            if offset:  # next_pos = self.next_wheel.current_pos+1,tick_once 已经做过 +1
+                pos = int((self.next_wheel.current_pos + offset) % self.next_wheel.slots)
+            else:
+                pos = self.next_wheel.current_pos
+            now = self.context.current
             tasks = self.next_wheel.wheel[pos]  # 获取上层时间轮下一槽的所有任务
+            for rounds, target, task in tasks:  # 将这些任务重新添加到本层时间轮
+                remaining_delay = target - now
+                remaining_tasks.append((remaining_delay, task))
+                # print(f'{self.next_wheel}->{self}[{task.func.__name__}] cascade:'
+                #       f'{rounds},{pos},{remaining_delay:.1f}')
             self.next_wheel.wheel[pos] = []  # 清空上层时间轮的这些任务
 
-        span = self.next_wheel.wheel_span
-        for rounds, wait, task in tasks:  # 将这些任务重新添加到本层时间轮
-            if offset:
-                remaining_delay = self.next_wheel.slots_delay(rounds, pos) + wait
-            else:
-                remaining_delay = rounds * span + wait
+        for remaining_delay, task in remaining_tasks:
             self.add_task(remaining_delay, task)
-        return len(tasks)
+
+        return len(remaining_tasks)
 
     def move_to_upper(self):
         if not self.next_wheel:
@@ -536,27 +554,26 @@ class TimeWheel:
         if not self.task_count:
             return
         # upper.wheel[upper.current_pos].extend(self.clear())  # 清空所有槽
+        now = self.context.current
         for slot_index, slot in enumerate(self.wheel):
-            for rounds, wait, task in slot:
+            for rounds, target, task in slot:
                 # 重新计算在上层轮子中的 rounds 和位置 剩余延迟 = 当前轮数 * 本轮整圈时间 + 当前槽偏移
-                remaining_delay = self.slots_delay(rounds, slot_index) + wait
+                remaining_delay = target - now  # self.slots_delay(rounds, slot_index)
                 self.next_wheel.add_task(remaining_delay, task)
 
             slot.clear()  # 清空本层
 
-    async def accelerate(self, tick_steps: int = 1, after_tick: Callable = None):
+    async def accelerate(self, tick_steps: int = 1):
         if tick_steps <= 0:
             raise ValueError("steps must be > 0")
 
-        advanced = 0.0
+        advanced = self.context.current
         for i in range(int(tick_steps)):
             finished = await self.tick_once()
-            if callable(after_tick):
-                after_tick(self)
-            advanced += self.tick_duration
-            yield i, advanced, finished
+            self.context.tick(self.tick_duration)
+            yield i, self.context.current - advanced, finished
 
-    async def run(self, after_tick: Callable = None):
+    async def run(self):
         """自动运行 tick 循环"""
         if self._running:
             return
@@ -570,8 +587,7 @@ class TimeWheel:
                 missed = max(1, int((loop.time() - next_tick) / self.tick_duration) + 1)
                 for _ in range(missed):
                     finished = await self.tick_once()
-                    if callable(after_tick):
-                        after_tick(self)
+                    self.context.tick(self.tick_duration)
                 next_tick += missed * self.tick_duration
                 sleep_time = max(0.0001, next_tick - loop.time())
                 await asyncio.sleep(sleep_time)
@@ -582,12 +598,12 @@ class TimeWheel:
             self._running = False
             print(f"[{self.name}] stopped")
 
-    def start(self, loop=None, after_tick: Callable = None):
+    def start(self, loop=None):
         """启动自动循环"""
         if self._running:
             return
         loop = loop or asyncio.get_event_loop()
-        self._task = loop.create_task(self.run(after_tick))
+        self._task = loop.create_task(self.run())
 
         # def tick():
         #     self.tick_once()
@@ -613,10 +629,12 @@ class HierarchicalTimeWheel:
     def __init__(self):
         # 初始化各层时间轮
         # self.ms_wheel = TimeWheel(20, 0.05, "ms")
-        self.second_wheel = TimeWheel(60, 1, "second")  # 60 slots, 1s per tick
-        self.minute_wheel = TimeWheel(60, 60, "minute")  # 60 slots, 60s per tick
-        self.hour_wheel = TimeWheel(24, 3600, "hour")  # 24 slots, 3600s per tick
-        self.day_wheel = TimeWheel(365, 86400, "day")  # 30 slots, 86400s per tick
+        self.context = TimeContext()
+        self.second_wheel = TimeWheel(60, 1, "second", context=self.context)  # 60 slots, 1s per tick
+        self.minute_wheel = TimeWheel(60, self.second_wheel.wheel_span, "minute", self.context)  # 60s per tick
+        self.hour_wheel = TimeWheel(24, self.minute_wheel.wheel_span, "hour", self.context)  # 3600s per tick
+        self.day_wheel = TimeWheel(365, self.hour_wheel.wheel_span, "day", self.context)  # 86400s per tick
+        # self.year_wheel = TimeWheel(100, self.day_wheel.wheel_span, "year")
 
         # 连接各层时间轮
         self.second_wheel.set_next_wheel(self.minute_wheel)
@@ -629,25 +647,35 @@ class HierarchicalTimeWheel:
             self.hour_wheel.name: self.hour_wheel,  # 86400
             self.day_wheel.name: self.day_wheel
         }
-
-        self.tick_time: datetime = datetime.now()
         self._loop = None
 
-    @property
-    def now(self) -> float:
-        '''避免时间倒退,加速模式当前虚拟时间 tick_time'''
-        return max(self.tick_time.timestamp(), time.time())
+        # w = self.second_wheel
+        # while True:
+        #     print(w, end='->')
+        #     if not w.next_wheel:
+        #         print('\n')
+        #         break
+        #     w = w.next_wheel
 
     @property
-    def tick_time_str(self) -> str:
-        return self.tick_time.strftime('%Y-%m-%d %H:%M:%S')
-
-    def after_tick(self, wheel):
-        self.tick_time += timedelta(seconds=wheel.tick_duration)
-        return self.tick_time
-
-    def delay_sec(self, execute_time: datetime) -> float:
-        return (execute_time - self.tick_time).total_seconds()
+    def clock(self) -> dict:
+        """
+        多层时间轮的全局相位（类似钟表指针联动,带下级偏移,每个 parent 的一圈 = child.slots 圈）
+        每层值范围在 [0,1)，已包含下层轮的偏移： minute += second/slots, hour += minute/slots ...
+        Transformers for Time,多尺度周期 time embedding,归一化到 [0,1) 连续相位,长序列建模
+        """
+        # 按轮总时长排序：从最细到最粗
+        levels = sorted(self.levels.items(), key=lambda item: item[1].wheel_span)
+        # 计算每层局部相位 local phase,elapsed_time / wheel_span
+        phase = {name: wheel.current_pos / wheel.slots for name, wheel in levels}
+        # child index i  注入到 parent index i+1 child_phase -> parent_phase
+        for i in range(len(levels) - 1):
+            child_name, _ = levels[i]
+            parent_name, parent_wheel = levels[i + 1]
+            phase[parent_name] += phase[child_name] / parent_wheel.slots
+        for k in phase:
+            phase[k] = phase[k] % 1.0
+        return phase
 
     @property
     def elapsed_time(self) -> float:
@@ -671,12 +699,13 @@ class HierarchicalTimeWheel:
         )
         return total
 
-    def add_task(self, delay: float | int, task: Callable, *args, jitter_percent: float | None = None, **kwargs) -> int:
+    def add_task(self, delay: float | int, task: Callable, *args, jitter_percent: float | None = None,
+                 **kwargs) -> tuple[int, float]:
         """
         添加定时任务，可传入 datetime 或时间戳,有精度丢失问题
         :param delay: 执行时间(datetime对象或时间戳)
         :param task: 要执行的任务(函数)
-        :param jitter_percent:百分比 Jitter,-5% ～ +5% 的对称抖动
+        :param jitter_percent:百分比 Jitter,-5% ～ +5% 的对称抖动,防 overfitting
         """
         if jitter_percent:
             jitter_percent = max(0.0, min(1.0, jitter_percent))
@@ -687,7 +716,34 @@ class HierarchicalTimeWheel:
                 return w.add_task(delay, task, *args, **kwargs)
         return self.day_wheel.add_task(delay, task, *args, **kwargs)
 
-    def add_task_absolute(self, execute_time: datetime | float, task, *args, **kwargs):
+    def add_tasks(self, delay: float | int, tasks: list[tuple[Callable, tuple, dict]], window: float | int = None,
+                  jitter_percent: float | None = None) -> list:
+        """
+        批量添加任务，并在 [base_delay - window, base_delay + window] 区间内平摊任务。
+
+        :param delay:  基准延迟（秒） base_delay
+        :param window: 扩散窗口（秒），总区间 = 2*window
+        :param jitter_percent:百分比 Jitter,-5% ～ +5% 的对称抖动
+        :param tasks: 列表，每个元素为 (task, args, kwargs)
+                      如 [(func1, (a,b), {}), (func2, (), {}), ...]
+
+        """
+        batch_size = len(tasks)
+        if batch_size == 0:
+            return []
+        if window is None:
+            window = delay * (1.0 - math.exp(-math.log(batch_size)))  # 指数衰减 [0, delay)
+
+        step = (window * 2.0) / batch_size  # 等间隔步长
+        targets = []
+        for i, (task, args, kwargs) in enumerate(tasks):
+            final_delay = delay - window + i * step
+            delay_sec, target = self.add_task(final_delay, task, *args, jitter_percent=jitter_percent, **kwargs)
+            targets.append(target)
+
+        return targets
+
+    def add_task_absolute(self, execute_time: datetime | float, task, *args, **kwargs) -> tuple[int, float]:
         """
         添加定时任务，可传入 datetime 或时间戳
         :param execute_time: 执行时间(datetime对象或时间戳)
@@ -696,8 +752,21 @@ class HierarchicalTimeWheel:
         if isinstance(execute_time, datetime):
             execute_time = execute_time.timestamp()
 
-        delay = max(0.0, execute_time - self.now)
-        self.add_task(delay, task, *args, **kwargs)
+        delay = max(0.0, execute_time - self.context.now)
+        return self.add_task(delay, task, *args, **kwargs)
+
+    def add_job(self, func, trigger=None, args: list | tuple = None, kwargs: dict = None, **trigger_args):
+        '''trigger:the alias name of the trigger (e.g. ``date``, ``interval`` or ``cron``)'''
+        args = args or ()
+        kwargs = kwargs or {}
+        final_kwargs = {**trigger_args, **kwargs}
+        dispatcher = {
+            'interval': self.add_periodic_task,
+            'cron': self.add_daily_task,
+            'date': self.add_task_absolute,
+        }
+        method = dispatcher.get(trigger, self.add_task)
+        return method(task=func, *args, **final_kwargs)
 
     def add_daily_task(self, hour: int, minute: int, task, *args, **kwargs):
         """每天固定时刻执行任务"""
@@ -709,11 +778,11 @@ class HierarchicalTimeWheel:
             await run_with_async(task, *args, **kwargs)
             # 注册下一次执行
             next_run = wrapper.next_run + timedelta(days=1)
-            print(f'daily task:{task.__name__} run_time={wrapper.next_run} next_run={next_run}')
             wrapper.next_run = next_run
             self.add_task_absolute(next_run, wrapper)
+            print(f'daily task:{task.__name__} run_time={self.context.time_str} next_run={next_run}')
 
-        now = max(self.tick_time, datetime.now())
+        now = max(self.context.tick_time, datetime.now())
         run_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if run_time < now:
             run_time += timedelta(days=1)  # 今天的时间已过 → 明天执行
@@ -733,14 +802,14 @@ class HierarchicalTimeWheel:
             if handle["cancel"]:
                 return
             await run_with_async(task, *args, **kwargs)
-            now = self.now
+            now = self.context.now
             if wrapper.next_run < now:
                 wrapper.next_run = now
             wrapper.next_run += interval
             delay = max(wrapper.next_run - now, 0)
             self.add_task(delay, wrapper)  # 重新注册
 
-        wrapper.next_run = self.now + interval
+        wrapper.next_run = self.context.now + interval
         self.add_task(interval, wrapper)
         return handle
 
@@ -774,15 +843,15 @@ class HierarchicalTimeWheel:
             print(f"[TimeWheel] Invalid level: {level}")
             return []
 
-        delta = time.time() - self.tick_time.timestamp()  # 虚拟时间 vs 真实时间（避免时间倒退）
+        delta = time.time() - self.context.tick_time.timestamp()  # 虚拟时间 vs 真实时间（避免时间倒退）
         if delta < 0:
-            logging.warning(f"[TimeWheel] super tick,last:{self.tick_time_str}")
+            logging.warning(f"[TimeWheel] super tick,last:{self.context.time_str}")
             return []
 
         missed = int(delta // wheel.tick_duration)
         if missed > 1:
-            # self.tick_time = datetime.now().replace(microsecond=0, **levels)
-            logging.warning(f"[TimeWheel] (missed={missed}),last:{self.tick_time_str}")
+            # tick_time = datetime.now().replace(microsecond=0, **levels)
+            logging.warning(f"[TimeWheel] (missed={missed}),last:{self.context.time_str}")
 
         finished_all = []
         for _ in range(missed):
@@ -792,7 +861,7 @@ class HierarchicalTimeWheel:
                 w.move_to_upper()  # 下层上移
 
             finished = await wheel.tick_once()  # 当前层 tick
-            self.after_tick(wheel)  # 推进全局虚拟时间
+            wheel.context.tick(wheel.tick_duration)  # 推进全局虚拟时间 self.after_tick(wheel)
             finished_all.extend(finished)
 
         return finished_all
@@ -816,7 +885,7 @@ class HierarchicalTimeWheel:
         tick_sleep = real_seconds / total_ticks  # 每个虚拟 tick 对应真实 sleep 秒
         advanced_virtual: float = 0.0  # 虚拟时间累积,virtual_executed
         start_real = time.monotonic()  # base_time
-        async for i, advanced, finished in wheel.accelerate(total_ticks, after_tick=self.after_tick):
+        async for i, advanced, finished in wheel.accelerate(total_ticks):
             advanced_virtual = advanced
             expected_next = start_real + (i + 1) * tick_sleep
             to_sleep = expected_next - time.monotonic()
@@ -830,8 +899,9 @@ class HierarchicalTimeWheel:
             "virtual_advanced": advanced_virtual,
             "real_used": time.monotonic() - start_real,
             "speed_factor": virtual_seconds / real_seconds,  # 计算倍率,虚拟秒 / 真实秒，比如一周推进到1小时
+            "virtual_tick": wheel.context.current,
             "virtual_elapsed": self.elapsed_time,
-            "virtual_time": self.tick_time
+            "virtual_time": self.context.tick_time
         }
 
     @async_timer_cron(interval=1)
@@ -841,11 +911,11 @@ class HierarchicalTimeWheel:
     def start(self, daemon=True):
         if self._loop is not None:
             return self._loop
-        self.tick_time = datetime.now()
+        self.context.clear()
         try:
             loop = asyncio.get_running_loop()
             self._loop = loop
-            self.second_wheel.start(loop, after_tick=self.after_tick)  # 已经在异步上下文中
+            self.second_wheel.start(loop)  # 已经在异步上下文中
         except RuntimeError:
             # 没有运行中的事件循环 → 创建一个新的 独立线程方式
             ready = threading.Event()
@@ -854,7 +924,7 @@ class HierarchicalTimeWheel:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 self._loop = loop
-                self.second_wheel.start(loop, after_tick=self.after_tick)  # 创建任务必须在 loop 中
+                self.second_wheel.start(loop)  # 创建任务必须在 loop 中
                 # loop.create_task(self.second_wheel.run()) loop.run_until_complete
                 ready.set()
                 loop.run_forever()
@@ -869,7 +939,7 @@ class HierarchicalTimeWheel:
         self.second_wheel.stop()
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
-            print(f'[TimeWheel] stopped at {self.tick_time_str}(elapsed={self.elapsed_time}s)')
+            print(f'[TimeWheel] stopped at {self.context.time_str}(elapsed={self.elapsed_time}s)')
         self._loop = None
 
 

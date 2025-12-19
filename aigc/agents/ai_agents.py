@@ -2,7 +2,7 @@ import re, json, sys
 import inspect, importlib
 from threading import Lock
 from enum import IntEnum
-from copy import deepcopy,copy
+from copy import deepcopy, copy
 from itertools import count, chain, repeat
 from typing import Any, Dict, List, Tuple, Callable, Generator, AsyncGenerator, Mapping, Iterable, Optional, Union, \
     get_args, get_origin
@@ -13,7 +13,7 @@ from functools import wraps, partial
 from abc import ABCMeta
 from griffe import Docstring, DocstringSectionKind  # 文档字符串解析器
 
-from utils import load_class_from_string
+from utils import load_class_from_string, RemovableHandle
 
 
 # 基于配置动态实例化对象，支持类或可调用对象
@@ -192,21 +192,6 @@ class DefaultAggregator:
         return system_intruction
 
 
-class RemovableHandle:
-    _id_iter = count(0)
-
-    def __init__(self, hooks_dict):
-        self.hooks_dict = hooks_dict
-        self.id = next(self._id_iter)
-
-    def remove(self):
-        """
-        Removes the hook associated with this handle from the hooks dictionary.
-        """
-        if self.id in self.hooks_dict:
-            del self.hooks_dict[self.id]
-
-
 class Hook:
     def before(self, agent, message: Tuple['AgentMessage'], session_id: int):
         """
@@ -243,8 +228,7 @@ class Agent:
         """
         Register a new hook and return a RemovableHandle that can be used to remove the hook.
         """
-        handle = RemovableHandle(self._hooks)
-        self._hooks[handle.id] = hook
+        handle = RemovableHandle(self._hooks, hook)
         return handle
 
     def before(self, *message: AgentMessage, session_id: int = 0):

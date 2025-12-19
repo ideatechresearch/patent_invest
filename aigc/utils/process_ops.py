@@ -4,6 +4,7 @@ import joblib
 import subprocess
 import platform
 import inspect, importlib, ast
+from itertools import count
 from functools import partial, wraps  # cache, lru_cache, partial, wraps
 import gc  # 添加垃圾回收模块
 import psutil  # 添加系统监控模块
@@ -766,6 +767,31 @@ def extract_function_metadata(func) -> dict:
         # "func": func,
     }
     return metadata
+
+
+class RemovableHandle:
+    _id_iter = count(0)
+
+    def __init__(self, hooks_dict, func: Callable):
+        """
+        Register a new hook and return a RemovableHandle that can be used to remove the hook.
+        """
+        self.hooks_dict = hooks_dict  # hooks: Dict[int, Hook] = OrderedDict()
+        self.id = next(self._id_iter)
+        self.hooks_dict[self.id] = func  # 自动注册 handle = RemovableHandle(hooks)
+
+    def remove(self):
+        """
+        Removes the hook associated with this handle from the hooks dictionary.
+        """
+        if self.id in self.hooks_dict:
+            del self.hooks_dict[self.id]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.remove()  # 支持上下文管理器
 
 
 class ClassMethodRegistry:

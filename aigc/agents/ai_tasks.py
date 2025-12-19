@@ -1279,14 +1279,14 @@ if __name__ == "__main__":
 
     async def print_time(msg):
         await asyncio.sleep(0.5)  # 模拟耗时操作
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{htw.tick_time_str}]{msg}")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{htw.context.time_str}]{msg}")
 
 
     now = datetime.now()
     print('start at:{}'.format(now))
     htw.add_task_absolute(now + timedelta(seconds=10), print_time, "10秒后执行")
     htw.add_task_absolute(now + timedelta(minutes=2), print_time, "2分钟后执行")
-    htw.start(daemon=False)
+    # htw.start(daemon=False)
 
     htw.add_task_absolute(time.time() + 5, print_time, "5秒后")
     htw.add_task(100, print_time, "100秒后")
@@ -1295,10 +1295,11 @@ if __name__ == "__main__":
     htw.add_task(3600, print_time, "一小时后")
     htw.add_task(3600 * 3, print_time, "3小时后")
     htw.add_task(28800, print_time, "8小时后")
-    htw.add_daily_task(18, 0, print_time, "每天18:00")
-
-    # xx = asyncio.run(htw.super_tick(30000, 30, yield_every=100))
-    # print(xx)
+    htw.add_daily_task(12, 1, print_time, "每天12:01")
+    htw.add_daily_task(18, 8, print_time, "每天18:08")
+    htw.add_daily_task(15, 0, print_time, "每天15:00")
+    xx = asyncio.run(htw.super_tick(30000 * 10, 30 * 10, yield_every=100))
+    print(xx)
     try:
         input("按回车退出...\n")
     except KeyboardInterrupt:

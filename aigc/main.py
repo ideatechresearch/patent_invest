@@ -160,19 +160,20 @@ app.include_router(chat_router, prefix="/chat")
 @async_timer_cron(interval=60)
 async def handle_minute():
     tick_now = datetime.now()
-    htw_time = TaskManager.htw.tick_time or tick_now
+    htw_time = TaskManager.htw.context.tick_time or tick_now
     if htw_time.minute != tick_now.minute:  # 每分钟只执行一次（忽略秒和微秒）
         finished = await TaskManager.htw.tick(level="minute")  # 推动分钟轮
         await TaskManager.clean_old_tasks(3600, redis_client=app.state.redis)
         cleanup_old_tempfiles(min_age=600, prefix="tmp_")
-        if len(finished) > 1:
-            print(f"[{TaskManager.htw.tick_time_str}] Tick new minute! finished levels:{finished}")
+        if finished:
+            print(f"[{TaskManager.htw.context.time_str}] Tick finished levels:{finished}")
 
 
 async def handle_hour():
-    print(f"[{TaskManager.htw.tick_time_str}] Tick new bar!")
+    print(f"[{TaskManager.htw.context.time_str}] Tick new bar!")
     if app.state.is_main:
-        if TaskManager.htw.tick_time.hour == 23 and TaskManager.htw.tick_time.weekday() == 6:
+        htw_time = TaskManager.htw.context.tick_time
+        if htw_time.hour == 23 and htw_time.weekday() == 6:
             res = await run_adjustment_sync_tasks(concurrent=False)
             print(f'[adjustment_sync]:{res}')
 
@@ -505,10 +506,14 @@ async def system_status():
         "task_manager_count": TaskManager.size(),
         'history_cache_count': BaseChatHistory.size(),
         "timewheel_task_count": TaskManager.htw.task_count,
-        "timewheel_elapsed_time": TaskManager.htw.elapsed_time,
-        "tick_time": TaskManager.htw.tick_time_str,
+        "tick_time": TaskManager.htw.context.time_str,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
+
+
+@app.get("/status/clock")
+async def timewheel_status():
+    return {'clock': TaskManager.htw.clock, "elapsed": TaskManager.htw.elapsed_time}
 
 
 @app.get("/status/logs")
@@ -637,7 +642,7 @@ async def healthcheck():
 
 @app.get('/retrieval/{text}')
 async def retrieval(text: str, platform: Literal[
-                                             'duckduckgo', 'tavily', 'serper', 'brave', 'firecrawl', 'exa', 'zhipu', 'arxiv', 'wiki', 'patent', 'invest', 'google', 'bing', 'baidu', 'yahoo', 'auto'] | None = None):
+                                             'duckduckgo', 'tavily', 'serper', 'brave', 'firecrawl', 'exa', 'zhipu', 'arxiv', 'wiki', 'patent', 'invest', 'google', 'bing', 'baidu', 'tencent', 'yahoo', 'auto'] | None = None):
     if platform == 'duckduckgo':
         results = await duckduckgo_search(text)
     elif platform == 'tavily':
@@ -654,6 +659,8 @@ async def retrieval(text: str, platform: Literal[
         results = await web_search_jina(text)
     elif platform in ('google', 'bing', "baidu", "yahoo"):
         results = await search_by_api(text, engine=platform)
+    elif platform == 'tencent':
+        results = await tencent_search(text)
     elif platform == 'zhipu':
         results = await web_search_async(text)
     elif platform == 'arxiv':
@@ -674,7 +681,7 @@ async def retrieval(text: str, platform: Literal[
 
 @app.get("/extract/")
 async def extract(text: str = Query(...), extract: str = Query(default='all')):
-    text = clean_escaped_string(text)  # 去除外层成对的引号（单引号或双引号）
+    text = decode_escaped_string(text)  # 去除外层成对的引号（单引号或双引号）
 
     if is_url(text):
         if extract == 'jina':
@@ -1778,7 +1785,7 @@ async def response_message(task_id: str, param: CompletionParams = Depends(get_a
             first_data = json.dumps(first_data, ensure_ascii=False)
             yield f'data: {first_data}\n\n'
             async for content, data in ai_chat_stream(model_info, payload, stream_id):
-                if content and content.strip():
+                if content is not None:
                     yield f'data: {content}\n\n'
                 await asyncio.sleep(Config.LLM_STREAM_INTERVAL_SEC)
 

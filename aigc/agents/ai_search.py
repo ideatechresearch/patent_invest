@@ -166,7 +166,6 @@ async def web_search_tavily(text: str, topic: Literal["general", "news"] = "gene
     response = await cx.post(url, headers=headers, json=payload)
     if response.status_code == 200:
         data = response.json()
-        # print(json.dumps(data, indent=4))  # 打印响应数据
         return data['results']  # "url,title,score,published_date,content
     else:
         logging.error(f"Error: {response.status_code}")
@@ -626,7 +625,7 @@ def bing_search(query, bing_api_key):
 
 
 # https://ziyuan.baidu.com/fastcrawl/index
-def baidu_search(query, baidu_api_key, baidu_secret_key):
+def baidu_search(query, baidu_api_key=Config.BAIDU_API_Key, baidu_secret_key=Config.BAIDU_Secret_Key):
     access_token = get_baidu_access_token(baidu_api_key, baidu_secret_key)
     search_url = "https://aip.baidubce.com/rest/2.0/knowledge/v1/search"  # https://aip.baidubce.com/rpc/2.0/unit/service/v3/chat
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -655,6 +654,44 @@ def baidu_search(query, baidu_api_key, baidu_secret_key):
         url = result.get('url')
         results.append((title, content, url))
     return results  # "\n".join([f"{i+1}. {title}: {content} ({url})" for i, (title, content, url) in enumerate(search_results[:5])])
+
+
+# https://cloud.tencent.com/document/product/1806/121811
+@async_error_logger(1)
+async def tencent_search(query: str, count: int = 10, site: str = None):
+    payload = {
+        "Query": query,
+        "Cnt": count,
+        "Mode": 0,
+    }
+    if site:
+        payload["Site"] = site
+    url = "https://wsa.tencentcloudapi.com"
+    host = url.split("//")[-1]
+    headers = get_tencent_signature(service="wsa", host=host, body=payload, action='SearchPro',
+                                    secret_id=Config.TENCENT_SecretId, secret_key=Config.TENCENT_Secret_Key,
+                                    version='2025-05-08', region=None)
+
+    cx = get_httpx_client(time_out=Config.HTTP_TIMEOUT_SEC)
+    response = await cx.post(url, headers=headers, json=payload)
+
+    # 检查响应状态码和内容
+    if response.status_code != 200:
+        logging.error(f"Error: Received status code {response.status_code},Response content: {response.text}")
+        return {'error': f'{response.status_code},Request failed'}
+
+    try:
+        data = response.json()
+    except Exception as e:
+        print(f"Failed to decode JSON: {e},Response text: {response.text}")
+        return {'error': f"Failed to decode JSON: {e},Response text: {response.text}"}
+
+    results = data.get('Response', {}).get('Pages', [])
+    if results and isinstance(results, list):
+        return [json.loads(r) for r in results]
+    else:
+        print(f"Unexpected response: {data}")
+        return {'error': f"Tencent API Error: {data.get('Response', 'Unknown error')}"}
 
 
 async def wikipedia_search(query: str) -> dict:
@@ -1096,7 +1133,7 @@ __all__ = ['arxiv_search', 'web_search_intent', 'baidu_search', 'baidu_translate
            'caiyun_translate', 'duckduckgo_search', 'exa_retrieved', 'exa_search', 'firecrawl_scrape',
            'firecrawl_search', 'get_amap_location', 'get_bmap_location', 'get_httpx_client', 'get_weather', 'is_city',
            'search_amap_location', 'search_bmap_location', 'search_by_api', 'segment_with_jina', 'serper_search',
-           'tencent_translate', 'tokenize_with_zhipu', 'web_extract_exa', 'web_extract_firecrawl',
+           'tencent_search', 'tencent_translate', 'tokenize_with_zhipu', 'web_extract_exa', 'web_extract_firecrawl',
            'web_extract_jina', 'web_extract_tavily', 'web_search_async', 'web_search_jina', 'web_search_tavily',
            'wikipedia_search', 'xunfei_translate']
 

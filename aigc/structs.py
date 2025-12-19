@@ -8,6 +8,8 @@ from service.service import ModelList
 
 MODEL_LIST = ModelList()
 SESSION_ID_MAX = 1 << 31 - 1  # 2147483647,2 ** 31
+
+
 # from config import Config
 
 class DataProcessor(ABC):
@@ -229,6 +231,7 @@ class OpenAIRequestMessage(BaseModel):
     store: Optional[bool] = False
 
     tools: Optional[List[dict]] = None  # 工具参数,在生成过程中调用外部工具
+    tool_choice: Optional[Union[str, dict]] = None  # auto,none
     audio: Optional[dict] = None  # 生成 TTS 音频 {"voice","format","max_output_tokens"}
     stop: Optional[Union[str, List[str]]] = None  # 停止词，用于控制生成的停止条件 ["\n"],
     presence_penalty: Optional[float] = 0.0  # 避免生成重复内容 condecimal(ge=-2.0, le=2.0)
