@@ -1,5 +1,5 @@
 from collections import deque
-from functools import wraps
+from rime.base import chainable_method
 import itertools
 import numpy as np
 import math
@@ -7,17 +7,6 @@ import math
 
 # import numba
 # @numba.jit(nopython=True, cache=True)
-
-def chainable_method(func):
-    """装饰器，使方法支持链式调用，保留显式返回值"""
-
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        result = func(self, *args, **kwargs)
-        return self if result is None else result
-
-    return wrapper
-
 
 class MatrixFace:
     @staticmethod
@@ -323,7 +312,6 @@ class MatrixFace:
             mat[c:n, 0:c] = np.fliplr(R4).T
 
         return mat
-
 
     @staticmethod
     def blocks_to_diagonal(blocks: tuple | list):

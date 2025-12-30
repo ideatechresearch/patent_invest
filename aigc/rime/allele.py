@@ -3,8 +3,8 @@ import random
 import numpy as np
 from collections import defaultdict, Counter
 
+
 class AlleleBase:
-    _expressed_cache = {}  # 缓存的懒加载类属性
 
     @staticmethod
     def generate_allele_vector_mapping(axes: list | tuple = ('A', 'B'), outer: str = 'O') -> dict:
@@ -41,95 +41,6 @@ class AlleleBase:
         axes = {allele for allele, vec in allele_vector_mapping.items()
                 if vec != (0,) * dim}  # != (0, 0)
         return tuple(sorted(axes))
-
-    @staticmethod
-    def class_property(attr_name: str):
-        """
-        缓存装饰器，支持首次调用生成值并缓存到类属性。
-        自定义缓存属性名，适合无参或固定参数的懒加载。
-        用于懒加载（lazy load）型类属性。仅检查当前类。
-        @AlleleBase.class_property("cached_value")
-        """
-
-        def decorator(func) -> classmethod:
-            def wrapper(cls, *args):
-                if not hasattr(cls, attr_name):
-                    setattr(cls, attr_name, func(cls, *args))
-                return getattr(cls, attr_name)
-
-            return classmethod(wrapper)
-
-        return decorator
-
-    @classmethod
-    def set_cache(cls, attr_name: str, factory, *args, **kwargs):
-        """
-        通用类属性缓存：若类属性不存在，则调用 factory() 生成并缓存。
-        factory 可以是可调用函数，也可以是直接的值。
-        实际写入属性的是 cls,当前调用的类对象,缓存绑定到 Sub 自身
-        """
-        if callable(factory):
-            value = factory(cls, *args, **kwargs)
-            src = factory.__name__
-        else:
-            value = factory
-            src = repr(factory)
-        if isinstance(value, list):
-            value = tuple(value)
-        elif isinstance(value, set):
-            value = frozenset(value)
-        # if isinstance(value, dict):
-        #     value = MappingProxyType(value)  # read_only
-        setattr(cls, attr_name, value)
-        cls._expressed_cache[attr_name] = src
-        return value
-
-    @classmethod
-    def re_cache(cls, attr_name: str, *, rebuild: bool = False):
-        """触发懒加载,重新构建"""
-        builder = cls._expressed_cache.get(attr_name)
-        if isinstance(builder, str):
-            builder = getattr(cls, builder, None)
-        if callable(builder):
-            if rebuild and hasattr(cls, attr_name):
-                delattr(cls, attr_name)
-            return builder()  # cls.set_cache(attr_name, builder)
-        return getattr(cls, attr_name, None)
-
-    @classmethod
-    def get_cache(cls, attr_name: str = None, key=None):
-        """
-        若 key 不为 None，则从缓存中取值（通常是 dict），不存在则抛 KeyError。
-        """
-        if attr_name is None:
-            return {name: getattr(cls, name, None) for name in cls._expressed_cache}
-        cache = getattr(cls, attr_name, None)
-        if cache is None:
-            return None
-        if key is None:
-            return cache
-        try:
-            return cache[key]
-        except (KeyError, TypeError):
-            raise KeyError(f"[{cls.__name__}] Key {key} not found in {attr_name} or invalid.")
-
-    @classmethod
-    def is_expressed(cls, name: str) -> bool:
-        return name in cls._expressed_cache or hasattr(cls, name)
-
-    @classmethod
-    def suppress_expressed(cls, names: list[str]):
-        """撤销表达"""
-        for attr in set(names):
-            if cls._expressed_cache.pop(attr, None) is not None:  # del cls._expressed_cache[attr]
-                if hasattr(cls, attr):
-                    delattr(cls, attr)
-
-    @classmethod
-    def get_vars(cls):
-        """获取类中的变量名"""
-        return [name for name, value in vars(cls).items() if
-                not (callable(value) or isinstance(value, (classmethod, staticmethod)) or name.startswith("_"))]
 
     @staticmethod
     def sorted_frozen(*args, unique: bool = False) -> tuple | frozenset:
@@ -304,6 +215,35 @@ class AlleleBase:
         return subsystem_dims, tuple(indices), amplitude  # f'|{q1}{q2}⟩'
 
     @staticmethod
+    def offspring_prob_vectorized(p1_vec, p2_vec) -> dict:
+        """
+        父代向量用 (0,1) 表示抗原存在与否
+        p1_vec, p2_vec: numpy array, one-hot 向量
+        """
+        combos = np.array(list(itertools.product(p1_vec, p2_vec)))  # shape (n_comb, 2, dim)
+        child_vectors = combos.sum(axis=1)  # shape (n_comb, dim) 每个组合向量和
+        # 统计频率
+        unique, counts = np.unique([tuple(vec) for vec in child_vectors], axis=0, return_counts=True)
+        probs = counts / counts.sum()
+        return dict(zip(map(tuple, unique), probs))
+
+    @staticmethod
+    def genotype_freq_vectorized(allele_freq: dict) -> dict:
+        alleles = list(allele_freq.keys())
+        probs = np.array([allele_freq[a] for a in alleles])
+        # 生成父母组合矩阵
+        p_matrix, q_matrix = np.meshgrid(probs, probs)
+        # 所有组合
+        genotype_pairs = list(itertools.product(alleles, repeat=2))
+        # 计算概率
+        freqs = (p_matrix * q_matrix).flatten()
+        # 聚合到排序后的 tuple
+        genotype_freq = defaultdict(float)
+        for g, f in zip(genotype_pairs, freqs):
+            genotype_freq[tuple(sorted(g))] += f
+        return {k: round(v, 6) for k, v in genotype_freq.items()}
+
+    @staticmethod
     def get_probability(data: list | tuple | dict, output_format: str = "probs", sort: bool = False) -> dict:
         """
         统计列表中的元素频率，并支持不同的输出格式。
@@ -360,86 +300,402 @@ class AlleleBase:
             raise ValueError("权重总和必须大于 0")
         return probabilities  # weights 相对权重,只需要是正数，相对大小决定了选择概率,会自动归一化
 
-    def __init_subclass__(cls, **kwargs):
+
+class AlleleSystem(AlleleBase):
+    def __init_subclass__(cls):
+        super().__init_subclass__()
+        cls._expressed_cache = {}  # 缓存的懒加载类属性,每个 system 独立
+        # cls.expr = staticmethod(AlleleSystem.class_property)
         cls.__doc__ = cls.__name__ + """:
-        'AXES', 'OUTER', 'ALLELES', 'GENOTYPES'
-        'Allele_Vector_Mapping', 
-        'Genotype_To_Phenotype_Mapping',
-        'Phenotype_To_Genotypes_Mapping', 
-        'Phenotype_To_Antigen_Mapping', 
-        'GENOTYPE_FREQ', 
-        'Genotype_To_Vector_Mapping', 
-        'Phenotype_Probs_Mapping', 
-        'Genotype_Transfusion_Mapping', 
-        'Allele_State_Mapping', 
-        'Allele_Binary_Mapping', 
-        'Vector_To_Antigen_Mapping', 
-        'Vector_To_Antibody_Mapping', 
-        'Phenotype_Transfusion_Mapping', 
-        
-        Allele_Vector_Mapping = {
-        'A': (1, 0),
-        'B': (0, 1),
-        'O': (0, 0)
-        }
-        血型系统是经典的孟德尔遗传，ABO血型由三个等位基因（IA、IB、i）控制，表现为共显性或隐性。
-        血型抗原抗体基础规则
-        IA（显性）、IB（显性）、i（隐性）构成复等位基因,核基因控制（位于第9号染色体）
-        利用血型的抗原和抗体规则构造输血兼容性矩阵
-        基础规则：
-         - A: 抗原：{'A'}，抗体：{'B'}
-         - B: 抗原：{'B'}，抗体：{'A'}
-         - O: 抗原：set()，抗体：{'A', 'B'}
-         - AB: 抗原：{'A', 'B'}，抗体：set()
-        
-        antigen_antibody = {
-        'A': {'antigens': {'A'}, 'antibodies': {'B'}},
-        'B': {'antigens': {'B'}, 'antibodies': {'A'}},
-        'O': {'antigens': set(), 'antibodies': {'A', 'B'}},
-        'AB': {'antigens': {'A', 'B'}, 'antibodies': set()}
-        }
-        输血相容性矩阵
-        Phenotype_Transfusion_Mapping = {
-        'O':  ['O', 'A', 'B', 'AB'],  # 万能供血者
-        'A':  ['A', 'AB'],
-        'B':  ['B', 'AB'],
-        'AB': ['AB']                 # 万能受血者
-        }
-        基因型到表现型转换,基因型决定表型,血型由 IA/IB/i 组合决定
-        Genotype_To_Phenotype_Mapping = {
-        'AA': 'A', 'AO': 'A',
-        'BB': 'B', 'BO': 'B',
-        'OO': 'O',
-        'AB': 'AB'
-        }
-        表现型到可能基因型的映射
-        Phenotype_To_Genotypes_Mapping = {
-        A: ['AO', 'AA']
-        O: ['OO']
-        B: ['BB', 'BO']
-        AB: ['AB']
-        }
-        #血型遗传规则
-        RULES = {
-        'A': [['A', 'O'], ['A', 'A']],
-        'B': [['B', 'O'], ['B', 'B']],
-        'O': [['O', 'O']],
-        'AB': [['A', 'B']]
-        }
-        Genotype = Allele × Allele 一个基因型由两个等位基因组成
-        Allele:str 单个字符或枚举值，基本基因型元素 allele->genotype
-        Genotype:tuple 二元组合，字符或枚举值，两个等位基因组成
-        Antigens:set 字符或枚举值 NOT OUTER. antigens->phenotype
-        Phenotype:str 表现型，基因表达决定,可观测特征
+            'AXES', 'OUTER', 'ALLELES', 'GENOTYPES'
+            'Allele_Vector_Mapping', 
+            'Genotype_To_Phenotype_Mapping',
+            'Phenotype_To_Genotypes_Mapping', 
+            'Phenotype_To_Antigen_Mapping', 
+            'GENOTYPE_FREQ', 
+            'Genotype_To_Vector_Mapping', 
+            'Phenotype_Probs_Mapping', 
+            'Genotype_Transfusion_Mapping', 
+            'Allele_State_Mapping', 
+            'Allele_Binary_Mapping', 
+            'Vector_To_Antigen_Mapping', 
+            'Vector_To_Antibody_Mapping', 
+            'Phenotype_Transfusion_Mapping', 
+
+            Allele_Vector_Mapping = {
+            'A': (1, 0),
+            'B': (0, 1),
+            'O': (0, 0)
+            }
+            血型系统是经典的孟德尔遗传，ABO血型由三个等位基因（IA、IB、i）控制，表现为共显性或隐性。
+            血型抗原抗体基础规则
+            IA（显性）、IB（显性）、i（隐性）构成复等位基因,核基因控制（位于第9号染色体）
+            利用血型的抗原和抗体规则构造输血兼容性矩阵
+            基础规则：
+             - A: 抗原：{'A'}，抗体：{'B'}
+             - B: 抗原：{'B'}，抗体：{'A'}
+             - O: 抗原：set()，抗体：{'A', 'B'}
+             - AB: 抗原：{'A', 'B'}，抗体：set()
+
+            antigen_antibody = {
+            'A': {'antigens': {'A'}, 'antibodies': {'B'}},
+            'B': {'antigens': {'B'}, 'antibodies': {'A'}},
+            'O': {'antigens': set(), 'antibodies': {'A', 'B'}},
+            'AB': {'antigens': {'A', 'B'}, 'antibodies': set()}
+            }
+            输血相容性矩阵
+            Phenotype_Transfusion_Mapping = {
+            'O':  ['O', 'A', 'B', 'AB'],  # 万能供血者
+            'A':  ['A', 'AB'],
+            'B':  ['B', 'AB'],
+            'AB': ['AB']                 # 万能受血者
+            }
+            基因型到表现型转换,基因型决定表型,血型由 IA/IB/i 组合决定
+            Genotype_To_Phenotype_Mapping = {
+            'AA': 'A', 'AO': 'A',
+            'BB': 'B', 'BO': 'B',
+            'OO': 'O',
+            'AB': 'AB'
+            }
+            表现型到可能基因型的映射
+            Phenotype_To_Genotypes_Mapping = {
+            A: ['AO', 'AA']
+            O: ['OO']
+            B: ['BB', 'BO']
+            AB: ['AB']
+            }
+            #血型遗传规则
+            RULES = {
+            'A': [['A', 'O'], ['A', 'A']],
+            'B': [['B', 'O'], ['B', 'B']],
+            'O': [['O', 'O']],
+            'AB': [['A', 'B']]
+            }
+            Genotype = Allele × Allele 一个基因型由两个等位基因组成
+            Allele:str 单个字符或枚举值，基本基因型元素 allele->genotype
+            Genotype:tuple 二元组合，字符或枚举值，两个等位基因组成
+            Antigens:set 字符或枚举值 NOT OUTER. antigens->phenotype
+            Phenotype:str 表现型，基因表达决定,可观测特征
+            """
+
+    @classmethod
+    def set_cache(cls, attr_name: str, factory, *args, **kwargs):
         """
-        super().__init_subclass__(**kwargs)
+        通用类属性缓存：若类属性不存在，则调用 factory() 生成并缓存。
+        factory 可以是可调用函数，也可以是直接的值。
+        实际写入属性的是 cls,当前调用的类对象,缓存绑定到 Sub 自身
+        """
+        if callable(factory):
+            value = factory(cls, *args, **kwargs)
+            src = factory.__name__
+        else:
+            value = factory
+            src = repr(factory)
+        if isinstance(value, list):
+            value = tuple(value)
+        elif isinstance(value, set):
+            value = frozenset(value)
+        # if isinstance(value, dict):
+        #     value = MappingProxyType(value)  # read_only
+        setattr(cls, attr_name, value)
+        cls._expressed_cache[attr_name] = src
+        return value
+
+    @classmethod
+    def re_cache(cls, attr_name: str, *, rebuild: bool = False):
+        """触发懒加载,重新构建"""
+        builder = cls._expressed_cache.get(attr_name)
+        if isinstance(builder, str):
+            builder = getattr(cls, builder, None)
+        if callable(builder):
+            if rebuild and hasattr(cls, attr_name):
+                delattr(cls, attr_name)
+            return builder()  # cls.set_cache(attr_name, builder)
+        return getattr(cls, attr_name, None)
+
+    @classmethod
+    def get_cache(cls, attr_name: str = None, key=None):
+        """
+        若 key 不为 None，则从缓存中取值（通常是 dict），不存在则抛 KeyError。
+        """
+        if attr_name is None:
+            return {name: getattr(cls, name, None) for name in cls._expressed_cache}
+        cache = getattr(cls, attr_name, None)
+        if cache is None:
+            return None
+        if key is None:
+            return cache
+        try:
+            return cache[key]
+        except (KeyError, TypeError):
+            raise KeyError(f"[{cls.__name__}] Key {key} not found in {attr_name} or invalid.")
+
+    @classmethod
+    def is_expressed(cls, name: str) -> bool:
+        return name in cls._expressed_cache or hasattr(cls, name)
+
+    @classmethod
+    def suppress_expressed(cls, names: list[str]):
+        """撤销表达"""
+        for attr in set(names):
+            if cls._expressed_cache.pop(attr, None) is not None:  # del cls._expressed_cache[attr]
+                if hasattr(cls, attr):
+                    delattr(cls, attr)
+
+    @classmethod
+    def get_vars(cls):
+        """获取类中的变量名"""
+        return [name for name, value in vars(cls).items() if
+                not (callable(value) or isinstance(value, (classmethod, staticmethod)) or name.startswith("_"))]
+
+    @staticmethod
+    def class_property(attr_name: str):
+        """
+        缓存装饰器，支持首次调用生成值并缓存到类属性。
+        自定义缓存属性名，适合无参或固定参数的懒加载。
+        用于懒加载（lazy load）型类属性。仅检查当前类。
+        @system_expr("cached_value")
+        """
+
+        def decorator(func) -> classmethod:
+            def wrapper(cls, *args):
+                if not cls.is_expressed(attr_name):
+                    print(f"{attr_name} -> {cls.__name__}.{func.__name__}")
+                    return cls.set_cache(attr_name, func, *args)
+                return cls.get_cache(attr_name)
+
+            return classmethod(wrapper)
+
+        return decorator
 
 
-class Allele(AlleleBase):
+system_expr = AlleleSystem.class_property
+
+
+class ABOSystem(AlleleSystem):
     AXES = ('A', 'B')  # 定义全局轴，表示所有正表达抗原的字母（顺序也就是向量各分量的定义顺序）
     OUTER = 'O'
-    DEFAULT_FREQ = {'A': 0.3, 'B': 0.1, 'O': 0.6}
+
     Allele_Vector_Mapping = AlleleBase.generate_allele_vector_mapping(AXES, OUTER)  # 等位基因 -> 向量映射
+
+    @classmethod
+    def system(cls):
+        return ''.join(cls.AXES) + cls.OUTER
+
+    @classmethod
+    def rebuild_constants(cls, axes: list | tuple = None, outer: str = None):
+        """
+        重建核心常量和缓存：
+        - 可传入新的 axes 和 outer
+        - 清空 _expressed_cache
+        - 重新生成 SYSTEM 和 Allele_Vector_Mapping
+        """
+        if axes is not None:
+            cls.AXES = tuple(axes)
+        if outer is not None:
+            cls.OUTER = outer
+
+        cls._expressed_cache.clear()
+
+        # 清空其他缓存懒加载属性
+        for attr, value in tuple(vars(cls).items()):
+            if attr not in ('AXES', 'OUTER', 'DEFAULT_FREQ', '_expressed_cache'):
+                if not (attr.startswith('_') or callable(value) or isinstance(value, (classmethod, staticmethod))):
+                    delattr(cls, attr)
+
+        cls.allele_vector_mapping()  # 'Allele_Vector_Mapping'
+        print(f"重建完成，SYSTEM={cls.system()}")
+
+    # ---映射函数 f()----
+    @system_expr('ALLELES')
+    def alleles(cls) -> tuple:
+        if hasattr(cls, 'Allele_Vector_Mapping'):
+            return tuple(sorted(cls.Allele_Vector_Mapping, key=cls.Allele_Vector_Mapping.get))
+        return *cls.AXES, cls.OUTER
+
+    @system_expr('Allele_Vector_Mapping')
+    def allele_vector_mapping(cls) -> dict:
+        return cls.generate_allele_vector_mapping(cls.AXES, cls.OUTER)
+
+    @system_expr('Allele_Binary_Mapping')
+    def allele_binary_mapping(cls) -> dict:
+        """
+        生成等位基因到二进制编码的映射（如 A->0b10, B->0b01,'O' → 0b00 (0)）
+        {'A': 2, 'B': 1, 'O': 0}
+        """
+        num_axes = len(cls.AXES)
+        # 每个抗原对应一个二进制位，axes顺序决定位权重,左移运算符实现位分配
+        mapping = {allele: 1 << (num_axes - 1 - i) for i, allele in enumerate(cls.AXES)}
+        if cls.OUTER:
+            mapping[cls.OUTER] = 0  # O型对应全0
+        return mapping
+
+    @system_expr('Allele_State_Mapping')
+    def allele_state_mapping(cls) -> dict:
+        """
+        将等位基因转换为量子态映射 ,生成等位基因的向量映射：
+        - `axes` 中的等位基因按单位基向量表示
+        - `outer` 代表的等位基因是所有 `axes` 叠加的归一化态
+        {'A': 基态 |0>, 'B': |1⟩, 'O': 均匀叠加态 (|0> + |1>)/sqrt(2)}, Qubit（2×2） / Qutrit（3×3）
+        {'A': array([1.+0.j, 0.+0.j]), 'B': array([0.+0.j, 1.+0.j]), 'O': array([0.70710678+0.j, 0.70710678+0.j])}
+        """
+        num_axes = len(cls.AXES)
+        mapping = {allele: np.array(np.eye(num_axes, dtype=complex)[i]) for i, allele in enumerate(cls.AXES)}
+        if cls.OUTER:
+            mapping[cls.OUTER] = np.full(num_axes, 1 / np.sqrt(num_axes), dtype=complex)  # 叠加态
+        return mapping
+
+    @classmethod
+    def antigens_to_vector(cls, antigens: set) -> tuple:
+        """
+        将抗原集合转换为二维向量，第一位表示 A, 第二位表示 B ,{'A'} 返回 (1, 0)，{'A','B'} 返回 (1, 1), {'O'} 返回 (0, 0)
+        int('A' in antigens), int('B' in antigens)
+        """
+        return tuple(int(axis in antigens) for axis in cls.AXES)  # AXES=get_axes_by_allele_vector
+
+    @classmethod
+    def vector_to_antigens(cls, vector: tuple | list) -> set:
+        """将二维向量转换为抗原集合 (1, 0):{'A'},(0, 1):{'B'},(0, 0):set(),(1, 1):{'A', 'B'}"""
+        # antigens = set()
+        # if vector[0]: antigens.add('A')
+        # if vector[1]: antigens.add('B')
+        # {key for key, value in cls.Allele_Vector_Mapping.items() if any(v and v == value[i] for i, v in enumerate(vector))}
+        return {cls.AXES[i] for i, val in enumerate(vector) if val}
+
+    @classmethod
+    def antigens_to_antibodies(cls, antigens: set) -> set:
+        """
+        利用抗原向量取反的方法：抗体向量 = (1 - v[0], 1 - v[1])，再转换为集合
+        """
+        vector = cls.antigens_to_vector(antigens)  # set(phenotype)
+        inverted = tuple(1 - v for v in vector)  # 按位取反+掩码 (~bin) & mask
+        return cls.vector_to_antigens(inverted)
+
+    @classmethod
+    def binary_to_antigens(cls, binary: int) -> set:
+        """将二进制编码转换为抗原集合,从高位到低位扫描"""
+        num_axes = len(cls.AXES)
+        return {cls.AXES[i] for i in range(num_axes) if binary & (1 << (num_axes - 1 - i))}
+
+    @classmethod
+    def binary_to_vector(cls, binary_value: int) -> tuple[int, ...]:
+        """
+        将二进制数值转换为抗原向量（按 axes 顺序解码,从高位到低位解析） 将二进制表示的等位基因转换为 one-hot 向量。
+        binary_value = 0b10, num_axes = 2 : (1, 0)
+        """
+        num_axes = len(cls.AXES)  # len(next(iter(cls.Allele_State_Mapping.values())))
+        return tuple((binary_value >> (num_axes - 1 - i)) & 1 for i in range(num_axes))
+
+    @classmethod
+    def state_to_vector(cls, state: np.ndarray) -> tuple:
+        num_axes = len(cls.AXES)
+        if np.allclose(state, 1 / np.sqrt(num_axes)):
+            return (0,) * num_axes
+        return tuple(int(np.isclose(val, 1)) for val in state)
+
+    @classmethod
+    def state_to_antigens(cls, state: np.ndarray) -> set:
+        """获取1分量对应的抗原"""
+        return {cls.AXES[i] for i, val in enumerate(state) if np.isclose(val, 1)}
+
+    @classmethod
+    def antigens_to_phenotype(cls, antigens: set) -> str:
+        """抗原集合 → 表现型"""
+        return ''.join(sorted(antigens)) if antigens else cls.OUTER
+
+    @classmethod
+    def vector_to_phenotype(cls, vector: tuple | list) -> str:
+        """
+        将向量推导表现型    (0, 0): 'O',(1, 0): 'A',(0, 1): 'B',(1, 1): 'AB'
+        """
+        return cls.antigens_to_phenotype(cls.vector_to_antigens(vector))
+
+    @classmethod
+    def state_to_phenotype(cls, state: np.ndarray) -> str:
+        """
+        将量子态转换为表现型名称（'A', 'B', 'AB', 'O'）。
+        """
+        return cls.antigens_to_phenotype(cls.state_to_antigens(state))
+
+    @classmethod
+    def binary_to_phenotype(cls, binary: int) -> str:
+        """将二进制编码转换为表现型名称"""
+        return cls.antigens_to_phenotype(cls.binary_to_antigens(binary))
+
+    # --- 基础映射接口 ---
+
+    @classmethod
+    def allele_vector(cls, allele: str) -> tuple:
+        """从映射中获取等位基因的二维向量表示 {'A': (1, 0), 'B': (0, 1), 'O': (0, 0)}"""
+        if hasattr(cls, 'Allele_Vector_Mapping'):
+            return cls.Allele_Vector_Mapping.get(allele)
+        return tuple(1 if allele == axis else 0 for axis in cls.AXES)  # one-hot
+
+    @classmethod
+    def allele_state(cls, allele: str) -> np.ndarray:
+        """从映射中获取等位基因的量子态表示"""
+        if hasattr(cls, 'Allele_State_Mapping'):
+            return cls.Allele_State_Mapping.get(allele)
+        return cls.vector_to_state(cls.allele_vector(allele))
+
+    @classmethod
+    def allele_binary(cls, allele: str) -> int:
+        """从映射中获取等位基因的二维向量表示,转换成二进制编码"""
+        if hasattr(cls, 'Allele_Binary_Mapping'):
+            return cls.Allele_Binary_Mapping.get(allele)
+        return cls.vector_to_binary(cls.allele_vector(allele))
+
+    # --- 向量操作 ---
+    @classmethod
+    def combine_vectors(cls, v1: tuple, v2: tuple) -> tuple:
+        """组合两个向量，按分量求（大于0则为取原始和，不超过 num_axes，否则0）"""
+        # x | y, tuple(int(x + y > 0) for x, y in zip(v1, v2))
+        # (min(v1[0] + v2[0], 1), min(v1[1] + v2[1], 1))
+        num_axes = len(cls.AXES)
+        return tuple(min(x + y, num_axes) for x, y in zip(v1, v2))
+
+    @classmethod
+    def combine_quantum(cls, v1: tuple, v2: tuple) -> np.ndarray:
+        """
+        将 one-hot 向量转换为量子态，量子态合并（叠加态）。
+        - O 仍然是叠加态,不会影响 A/B。array([0.707+0.j, 0.707+0.j])
+        - A 和 B 组合后应变成 AB 而非 O 的状态。
+         A+B=AB，A+O=A，O+O=O
+        state1 psi_0 = array([1.+0.j, 0.+0.j])
+        state2 psi_1 = array([0.+0.j, 1.+0.j])
+        combine_quantum(state1, state2) -> [1.+0.j 1.+0.j]
+        """
+        state1 = cls.vector_to_state(v1)
+        state2 = cls.vector_to_state(v2)
+        return np.maximum(state1, state2)  # 使用最大值合并,中间状态
+        # combined = state1 + state2
+        # norm = np.linalg.norm(combined)  # 向量相加计算范数
+        # return combined / norm if norm != 0 else combined # Hadamard 叠加
+
+    @classmethod
+    def combine_bitwise(cls, v1: tuple, v2: tuple) -> int:
+        """合并等位基因（显性遗传）按位或运算合并,合并后二进制编码: 0b11 (3)"""
+        bin1 = cls.vector_to_binary(v1)
+        bin2 = cls.vector_to_binary(v2)
+        return bin1 | bin2  # (bin1 << len(cls.AXES)) | bin2
+
+    @classmethod
+    def genotype_state(cls, allele1: str, allele2: str) -> np.ndarray:
+        """利用量子态表示构造个体的基因型（两个等位基因的张量积）,默认取实部进行比较"""
+        state1 = cls.allele_state(allele1)
+        state2 = cls.allele_state(allele2)
+        return np.maximum(state1, state2)
+
+    @classmethod
+    def allele_combine_vector(cls, allele1: str, allele2: str) -> tuple:
+        """根据两个等位基因生成抗原向量（如 'A' 和 'O' → (1,0)）。"""
+        vec1 = cls.allele_vector(allele1)
+        vec2 = cls.allele_vector(allele2)
+        return cls.combine_vectors(vec1, vec2)
+
+
+class Allele(ABOSystem):
+    DEFAULT_FREQ = {'A': 0.3, 'B': 0.1, 'O': 0.6}
 
     def __init__(self, name: str = None) -> None:
         # random.seed(seed)
@@ -501,200 +757,6 @@ class Allele(AlleleBase):
         return allele1.get_antigens().union(allele2.get_antigens())
 
     @classmethod
-    def rebuild_constants(cls, axes: list | tuple = None, outer: str = None):
-        """
-        重建核心常量和缓存：
-        - 可传入新的 axes 和 outer
-        - 清空 _expressed_cache
-        - 重新生成 SYSTEM 和 Allele_Vector_Mapping
-        """
-        if axes is not None:
-            cls.AXES = tuple(axes)
-        if outer is not None:
-            cls.OUTER = outer
-
-        cls._expressed_cache.clear()
-
-        # 清空其他缓存懒加载属性
-        for attr, value in tuple(vars(cls).items()):
-            if attr not in ('AXES', 'OUTER', 'DEFAULT_FREQ', '_expressed_cache'):
-                if not (attr.startswith('_') or callable(value) or isinstance(value, (classmethod, staticmethod))):
-                    delattr(cls, attr)
-
-        cls.allele_vector_mapping()  # 'Allele_Vector_Mapping'
-        print(f"重建完成，SYSTEM={cls.system()}")
-
-    @staticmethod
-    def class_property(attr_name: str):
-        """
-        缓存装饰器，支持首次调用生成值并缓存到类属性。
-        自定义缓存属性名，适合无参或固定参数的懒加载。
-        用于懒加载（lazy load）型类属性。仅检查当前类。
-        @class_property("cached_value")
-        """
-
-        def decorator(func) -> classmethod:
-            def wrapper(cls, *args):
-                if not cls.is_expressed(attr_name):
-                    print(f"{attr_name} -> {cls.__name__}.{func.__name__}")
-                    return cls.set_cache(attr_name, func, *args)
-                return cls.get_cache(attr_name)
-
-            return classmethod(wrapper)
-
-        return decorator
-
-    @class_property('ALLELES')
-    def alleles(cls) -> tuple:
-        if hasattr(cls, 'Allele_Vector_Mapping'):
-            return tuple(sorted(cls.Allele_Vector_Mapping, key=cls.Allele_Vector_Mapping.get))
-        return *cls.AXES, cls.OUTER
-
-    @classmethod
-    def system(cls):
-        return ''.join(cls.AXES) + cls.OUTER
-
-    # --- 基础映射接口 ---
-    @classmethod
-    def allele_vector(cls, allele: str) -> tuple:
-        """从映射中获取等位基因的二维向量表示 {'A': (1, 0), 'B': (0, 1), 'O': (0, 0)}"""
-        if hasattr(cls, 'Allele_Vector_Mapping'):
-            return cls.Allele_Vector_Mapping.get(allele)
-        return tuple(1 if allele == axis else 0 for axis in cls.AXES)  # one-hot
-
-    @classmethod
-    def allele_state(cls, allele: str) -> np.ndarray:
-        """从映射中获取等位基因的量子态表示"""
-        if hasattr(cls, 'Allele_State_Mapping'):
-            return cls.Allele_State_Mapping.get(allele)
-        return cls.vector_to_state(cls.allele_vector(allele))
-
-    @classmethod
-    def allele_binary(cls, allele: str) -> int:
-        """从映射中获取等位基因的二维向量表示,转换成二进制编码"""
-        if hasattr(cls, 'Allele_Binary_Mapping'):
-            return cls.Allele_Binary_Mapping.get(allele)
-        return cls.vector_to_binary(cls.allele_vector(allele))
-
-    # --- 向量操作 ---
-    @classmethod
-    def combine_vectors(cls, v1: tuple, v2: tuple) -> tuple:
-        """组合两个向量，按分量求（大于0则为取原始和，不超过 num_axes，否则0）"""
-        # x | y, tuple(int(x + y > 0) for x, y in zip(v1, v2))
-        # (min(v1[0] + v2[0], 1), min(v1[1] + v2[1], 1))
-        num_axes = len(cls.AXES)
-        return tuple(min(x + y, num_axes) for x, y in zip(v1, v2))
-
-    @classmethod
-    def combine_quantum(cls, v1: tuple, v2: tuple) -> np.ndarray:
-        """
-        将 one-hot 向量转换为量子态，量子态合并（叠加态）。
-        - O 仍然是叠加态,不会影响 A/B。array([0.707+0.j, 0.707+0.j])
-        - A 和 B 组合后应变成 AB 而非 O 的状态。
-         A+B=AB，A+O=A，O+O=O
-        state1 psi_0 = array([1.+0.j, 0.+0.j])
-        state2 psi_1 = array([0.+0.j, 1.+0.j])
-        combine_quantum(state1, state2) -> [1.+0.j 1.+0.j]
-        """
-        state1 = cls.vector_to_state(v1)
-        state2 = cls.vector_to_state(v2)
-        return np.maximum(state1, state2)  # 使用最大值合并,中间状态
-        # combined = state1 + state2
-        # norm = np.linalg.norm(combined)  # 向量相加计算范数
-        # return combined / norm if norm != 0 else combined # Hadamard 叠加
-
-    @classmethod
-    def combine_bitwise(cls, v1: tuple, v2: tuple) -> int:
-        """合并等位基因（显性遗传）按位或运算合并,合并后二进制编码: 0b11 (3)"""
-        bin1 = cls.vector_to_binary(v1)
-        bin2 = cls.vector_to_binary(v2)
-        return bin1 | bin2  # (bin1 << len(cls.AXES)) | bin2
-
-    @classmethod
-    def antigens_to_vector(cls, antigens: set) -> tuple:
-        """
-        将抗原集合转换为二维向量，第一位表示 A, 第二位表示 B ,{'A'} 返回 (1, 0)，{'A','B'} 返回 (1, 1), {'O'} 返回 (0, 0)
-        int('A' in antigens), int('B' in antigens)
-        """
-        return tuple(int(axis in antigens) for axis in cls.AXES)  # AXES=get_axes_by_allele_vector
-
-    @classmethod
-    def vector_to_antigens(cls, vector: tuple | list) -> set:
-        """将二维向量转换为抗原集合 (1, 0):{'A'},(0, 1):{'B'},(0, 0):set(),(1, 1):{'A', 'B'}"""
-        # antigens = set()
-        # if vector[0]: antigens.add('A')
-        # if vector[1]: antigens.add('B')
-        # {key for key, value in cls.Allele_Vector_Mapping.items() if any(v and v == value[i] for i, v in enumerate(vector))}
-        return {cls.AXES[i] for i, val in enumerate(vector) if val}
-
-    @classmethod
-    def antigens_to_antibodies(cls, antigens: set) -> set:
-        """
-        利用抗原向量取反的方法：抗体向量 = (1 - v[0], 1 - v[1])，再转换为集合
-        """
-        vector = cls.antigens_to_vector(antigens)  # set(phenotype)
-        inverted = tuple(1 - v for v in vector)  # 按位取反+掩码 (~bin) & mask
-        return cls.vector_to_antigens(inverted)
-
-    @classmethod
-    def binary_to_antigens(cls, binary: int) -> set:
-        """将二进制编码转换为抗原集合,从高位到低位扫描"""
-        num_axes = len(cls.AXES)
-        return {cls.AXES[i] for i in range(num_axes) if binary & (1 << (num_axes - 1 - i))}
-
-    @classmethod
-    def state_to_antigens(cls, state: np.ndarray) -> set:
-        """获取1分量对应的抗原"""
-        return {cls.AXES[i] for i, val in enumerate(state) if np.isclose(val, 1)}
-
-    @classmethod
-    def antigens_to_phenotype(cls, antigens: set) -> str:
-        """抗原集合 → 表现型"""
-        return ''.join(sorted(antigens)) if antigens else cls.OUTER
-
-    @classmethod
-    def vector_to_phenotype(cls, vector: tuple | list) -> str:
-        """
-        将向量推导表现型    (0, 0): 'O',(1, 0): 'A',(0, 1): 'B',(1, 1): 'AB'
-        """
-        return cls.antigens_to_phenotype(cls.vector_to_antigens(vector))
-
-    @classmethod
-    def state_to_phenotype(cls, state: np.ndarray) -> str:
-        """
-        将量子态转换为表现型名称（'A', 'B', 'AB', 'O'）。
-        """
-        return cls.antigens_to_phenotype(cls.state_to_antigens(state))
-
-    @classmethod
-    def binary_to_phenotype(cls, binary: int) -> str:
-        """将二进制编码转换为表现型名称"""
-        return cls.antigens_to_phenotype(cls.binary_to_antigens(binary))
-
-    @classmethod
-    def binary_to_vector(cls, binary_value: int) -> tuple[int, ...]:
-        """
-        将二进制数值转换为抗原向量（按 axes 顺序解码,从高位到低位解析） 将二进制表示的等位基因转换为 one-hot 向量。
-        binary_value = 0b10, num_axes = 2 : (1, 0)
-        """
-        num_axes = len(cls.AXES)  # len(next(iter(cls.Allele_State_Mapping.values())))
-        return tuple((binary_value >> (num_axes - 1 - i)) & 1 for i in range(num_axes))
-
-    @classmethod
-    def genotype_state(cls, allele1: str, allele2: str) -> np.ndarray:
-        """利用量子态表示构造个体的基因型（两个等位基因的张量积）,默认取实部进行比较"""
-        state1 = cls.allele_state(allele1)
-        state2 = cls.allele_state(allele2)
-        return np.maximum(state1, state2)
-
-    @classmethod
-    def allele_combine_vector(cls, allele1: str, allele2: str) -> tuple:
-        """根据两个等位基因生成抗原向量（如 'A' 和 'O' → (1,0)）。"""
-        vec1 = cls.allele_vector(allele1)
-        vec2 = cls.allele_vector(allele2)
-        return cls.combine_vectors(vec1, vec2)
-
-    @classmethod
     def allele_to_antigens_vector(cls, allele1: str, allele2: str) -> (set, tuple):
         """
         根据两个等位基因计算表现型向量。allele_to_antigens_vector('A','B')->{'A', 'B'}, (1, 1)
@@ -730,40 +792,7 @@ class Allele(AlleleBase):
         """表现型 → 抗原集合"""
         return cls.phenotype_to_antigen_mapping().get(''.join(sorted(phenotype)), set(phenotype) & set(cls.AXES))
 
-    # ---映射函数 f()----
-    @class_property('Allele_Binary_Mapping')
-    def allele_binary_mapping(cls) -> dict:
-        """
-        生成等位基因到二进制编码的映射（如 A->0b10, B->0b01,'O' → 0b00 (0)）
-        {'A': 2, 'B': 1, 'O': 0}
-        """
-        num_axes = len(cls.AXES)
-        # 每个抗原对应一个二进制位，axes顺序决定位权重,左移运算符实现位分配
-        mapping = {allele: 1 << (num_axes - 1 - i) for i, allele in enumerate(cls.AXES)}
-        if cls.OUTER:
-            mapping[cls.OUTER] = 0  # O型对应全0
-        return mapping
-
-    @class_property('Allele_State_Mapping')
-    def allele_state_mapping(cls) -> dict:
-        """
-        将等位基因转换为量子态映射 ,生成等位基因的向量映射：
-        - `axes` 中的等位基因按单位基向量表示
-        - `outer` 代表的等位基因是所有 `axes` 叠加的归一化态
-        {'A': 基态 |0>, 'B': |1⟩, 'O': 均匀叠加态 (|0> + |1>)/sqrt(2)}, Qubit（2×2） / Qutrit（3×3）
-        {'A': array([1.+0.j, 0.+0.j]), 'B': array([0.+0.j, 1.+0.j]), 'O': array([0.70710678+0.j, 0.70710678+0.j])}
-        """
-        num_axes = len(cls.AXES)
-        mapping = {allele: np.array(np.eye(num_axes, dtype=complex)[i]) for i, allele in enumerate(cls.AXES)}
-        if cls.OUTER:
-            mapping[cls.OUTER] = np.full(num_axes, 1 / np.sqrt(num_axes), dtype=complex)  # 叠加态
-        return mapping
-
-    @class_property('Allele_Vector_Mapping')
-    def allele_vector_mapping(cls) -> dict:
-        return cls.generate_allele_vector_mapping(cls.AXES, cls.OUTER)
-
-    @class_property('Genotype_To_Vector_Mapping')
+    @system_expr('Genotype_To_Vector_Mapping')
     def genotype_to_vector_mapping(cls) -> dict[tuple, tuple]:
         """
         生成所有唯一的基因型,每个基因型的抗原向量:
@@ -776,13 +805,13 @@ class Allele(AlleleBase):
         return {cls.sorted_frozen(gt): cls.allele_combine_vector(*gt) for gt in
                 itertools.combinations_with_replacement(cls.alleles(), r=2)}
 
-    @class_property('GENOTYPES')
+    @system_expr('GENOTYPES')
     def genotypes(cls) -> list[tuple]:
         """按 vector 排序  genotype → index 映射 """
         mapping = cls.genotype_to_vector_mapping()
         return sorted(mapping, key=mapping.get)
 
-    @class_property('Phenotype_To_Antigen_Mapping')
+    @system_expr('Phenotype_To_Antigen_Mapping')
     def phenotype_to_antigen_mapping(cls) -> dict[str, set]:
         """{'A': {'A'}, 'AB': {'A', 'B'}, 'B': {'B'}, 'O': set()}"""
         mapping = {}
@@ -793,12 +822,12 @@ class Allele(AlleleBase):
         return mapping
         # {cls.antigens_to_phenotype(antigens): antigens  for vec,antigens in cls.vector_to_antigen_mapping().items()}
 
-    @class_property('PHENOTYPES')
+    @system_expr('PHENOTYPES')
     def phenotypes(cls) -> list:
         # 'O', 'B', 'A', 'AB' phenotype_to_genotypes_mapping()
         return sorted(cls.phenotype_to_antigen_mapping().keys())
 
-    @class_property('Vector_To_Antigen_Mapping')
+    @system_expr('Vector_To_Antigen_Mapping')
     def vector_to_antigen_mapping(cls) -> dict[tuple, set]:
         """
         生成所有表现型:Phenotype 及其抗原向量
@@ -809,7 +838,7 @@ class Allele(AlleleBase):
         return {vec: antigens for p in itertools.combinations_with_replacement(cls.alleles(), r=2)
                 for antigens, vec in (cls.allele_to_antigens_vector(*p),)}
 
-    @class_property('Vector_To_Antibody_Mapping')
+    @system_expr('Vector_To_Antibody_Mapping')
     def vector_to_antibody_mapping(cls) -> dict[tuple, set]:
         """
         生成所有抗体向量 抗体向量 = 1 - 抗原向量
@@ -832,7 +861,7 @@ class Allele(AlleleBase):
             return {cls.sorted_frozen(gt) for gt in itertools.combinations_with_replacement(cls.alleles(), r=2)}
         return list(itertools.product(cls.alleles(), repeat=2))
 
-    @class_property('Genotype_To_Phenotype_Mapping')
+    @system_expr('Genotype_To_Phenotype_Mapping')
     def genotype_to_phenotype_mapping(cls) -> dict[tuple, str]:
         """
         自动枚举所有可能的基因型，并根据抗原贡献推导出表现型,genotype_to_phenotype,3+2+1
@@ -843,7 +872,7 @@ class Allele(AlleleBase):
         return {cls.sorted_frozen(gt): cls.allele_to_phenotype(*gt) for gt in
                 itertools.combinations_with_replacement(cls.alleles(), r=2)}
 
-    @class_property('Phenotype_To_Genotypes_Mapping')
+    @system_expr('Phenotype_To_Genotypes_Mapping')
     def phenotype_to_genotypes_mapping(cls) -> dict[str, dict]:
         """
         表现型到可能基因型的映射，反向构建表现型到所有可能基因型的映射, genotype_to_phenotype
@@ -910,7 +939,7 @@ class Allele(AlleleBase):
         recipient_antibodies = cls.antigens_to_antibodies(set(pheno_recipient))
         return donor_antigens.isdisjoint(recipient_antibodies)
 
-    @class_property('Genotype_Transfusion_Mapping')
+    @system_expr('Genotype_Transfusion_Mapping')
     def genotype_transfusion_mapping(cls):
         """
         生成基因型相容性矩阵,输血相容性逻辑：捐赠者的抗原如果出现在受血者的抗体中，则会被排斥。
@@ -935,7 +964,7 @@ class Allele(AlleleBase):
                     matrix[donor_gt].append(recipient_gt)
         return matrix
 
-    @class_property('Phenotype_Transfusion_Mapping')
+    @system_expr('Phenotype_Transfusion_Mapping')
     def phenotype_transfusion_mapping(cls):
         """
         输血相容性逻辑：捐赠者的抗原如果出现在受血者的抗体中，则会被排斥。关键原则：受血者的抗体不能与供血者的抗原发生反应。
@@ -993,7 +1022,7 @@ class Allele(AlleleBase):
             return cls.set_allele_freq()
         return getattr(cls, 'ALLELE_FREQ')
 
-    @class_property('GENOTYPE_FREQ')
+    @system_expr('GENOTYPE_FREQ')
     def genotype_freq(cls) -> dict:
         """
         基因型在人群中的分布频率,根据人群基因频率数据调整
@@ -1024,7 +1053,7 @@ class Allele(AlleleBase):
             genotype_freq[genotype] += freq
         return {k: round(v, 6) for k, v in genotype_freq.items()}
 
-    @class_property('PHENOTYPE_FREQ')
+    @system_expr('PHENOTYPE_FREQ')
     def phenotype_freq(cls) -> dict:
         """
         根据基因型频率 GENOTYPE_FREQ 来计算人群中表现型的分布频率, phenotype 概率 P(p)。
@@ -1067,7 +1096,7 @@ class Allele(AlleleBase):
         """
         return dict(Counter([tuple(sorted(gt)) for gt in itertools.product(parent1_genotype, parent2_genotype)]))
 
-    @class_property('Genotype_Probs_Mapping')
+    @system_expr('Genotype_Probs_Mapping')
     def genotype_probs_mapping(cls) -> dict[tuple, dict]:
         """
         ABO血型遗传概率矩阵(父母基因型→子代基因型概率)
@@ -1119,7 +1148,7 @@ class Allele(AlleleBase):
                 return False
         return True  # tuple(sorted(child_alleles)) in product_child_genotype_by_alleles(parent1_alleles,parent2_alleles)
 
-    @class_property('Phenotype_Probs_Mapping')
+    @system_expr('Phenotype_Probs_Mapping')
     def phenotype_probs_mapping(cls) -> dict[tuple, dict]:
         """
         计算所有父母表现型组合对应的子代表现型概率分布（无群体修正,基因型主导下的遗传分布投影） 计算子代血型概率。C(4,2)+4
@@ -1151,7 +1180,7 @@ class Allele(AlleleBase):
 
         return {k: cls.get_probability(v, output_format="probs", sort=True) for k, v in pheno_comb_probs.items()}
 
-    @class_property('Phenotype_Probs_Equal_Mapping')
+    @system_expr('Phenotype_Probs_Equal_Mapping')
     def phenotype_probs_equal_mapping(cls):
         '''等权平均所有可能父母基因型
         {('O', 'O'): {'O': 1.0},

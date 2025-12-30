@@ -1,3 +1,5 @@
+import time
+
 import numpy as np  # 导入 NumPy 库，用于数值计算和处理多维数组
 import pygame  # 导入 Pygame 库，用于游戏开发和图形界面设计
 import math
@@ -134,7 +136,6 @@ class RubiksCubeRenderer:
         'G': (0, 140, 60),  # Green
         'B': (0, 70, 200),  # Blue
     }
-    FACE_DEF = CubeBase.face_def
 
     # COLOR_MAP = {
     #     'W': (255, 255, 255),  # 白
@@ -182,35 +183,11 @@ class RubiksCubeRenderer:
         pygame.draw.polygon(self.screen, self.COLOR_MAP[color], pts)
         pygame.draw.polygon(self.screen, self.EDGE_COLOR, pts, 2)  # 黑色边框
 
-    # --- 生成某一面上的所有小方块的四边形坐标 ---
-    def face_quads(self, face_name):
-        """
-        返回给定面 U/D/F/B/L/R 上 n×n 个小方块的 3D quad 数组
-        """
-        n = self.n
-        normal, dx, dy = self.FACE_DEF[face_name]
-        origin = normal * (n / 2)
-
-        result = []
-        for i in range(n):
-            for j in range(n):
-                # 当前小贴纸左上角中心点
-                p = origin + dx * (j - n / 2 + 0.5) + dy * (i - n / 2 + 0.5)
-                # 小方块 4 个角
-                quad = [
-                    p + (-dx - dy) * 0.5,
-                    p + (dx - dy) * 0.5,
-                    p + (dx + dy) * 0.5,
-                    p + (-dx + dy) * 0.5,
-                ]
-                result.append(quad)
-        return result
-
     def compute_face_quads(self):
         # similar to previous helper: for each sticker produce its quad in model space
         # list of (face, i, j, quad_points)
         for face in self.cube.FACES:
-            quads = self.face_quads(face)
+            quads = CubeBase.face_quads(face, self.n)
             for idx, quad in enumerate(quads):
                 i = idx // self.n
                 j = idx % self.n
@@ -219,14 +196,14 @@ class RubiksCubeRenderer:
     # --- 绘制整个魔方 ---
     def draw_cube(self):
         R = CubeBase.rotation_matrix(self.angles)
-        cube_color = self.cube.color  # Face->二维颜色
+        cube_colors = self.cube.color  # Face->二维颜色
 
         # 根据 z 排序（从近到远）
         all_quads = []
         for face, i, j, quad in self.compute_face_quads():
             q = np.array([R @ v for v in quad])
             z_avg = np.mean(q[:, 2])
-            fcolor = cube_color[face]
+            fcolor = cube_colors[face]
             all_quads.append((z_avg, q, fcolor[i][j]))
 
         # 从远到近绘制
@@ -273,52 +250,48 @@ class RubiksCubeRenderer:
         self.draw_net(x, y, net_total)
 
     def draw(self):
+        '''局部动作 ⟶ 全局观察'''
         self.screen.fill(self.BG_COLOR)
 
         R = CubeBase.rotation_matrix(self.angles)
         quads = self.compute_face_quads()
-
+        colors = self.cube.color
         # build transformed quads and z depth, taking into account partial rotation
         draw_list = []
         for face, i, j, quad in quads:
             q = np.array(quad)
+            color = colors[face][i][j]
             # if partial affects these sticker positions, rotate them in model space
             if self.partial is not None:
                 axis, layer, ang = self.partial
-                center = q.mean(axis=0)
-                if abs(center[axis] - layer) < 0.5:
-                    q = CubeBase.rotate_around_layer(q, axis, layer, ang)
+                if CubeBase.should_rotate_by_sticker(face, i, j, axis, layer, self.n):
+                    # old_face, new_r, new_c = CubeBase.rotated_coord(q, axis, layer, self.n, ang)
+                    # color = colors[old_face][new_r][new_c]
+                    layer_geom = CubeBase.layer_to_geom(layer, self.n)
+                    q = CubeBase.rotate_around_layer(q, axis, layer_geom, ang)
 
             q2 = np.array([R @ v for v in q])
             z = q2[:, 2].mean()
-            draw_list.append((z, face, i, j, q2))
+
+            draw_list.append((z, face, q2, color))
 
         # painter's algorithm: draw from far to near
         draw_list.sort(key=lambda x: x[0])
-        colors = self.cube.color
-        for _, face, i, j, q2 in draw_list:
-            self.draw_face_quad(q2, color=colors[face][i][j])
+        for _, face, q2, color in draw_list:
+            self.draw_face_quad(q2, color=color)
 
-        # # 高亮上一次旋转的层（旋转结束后）
+        # 高亮上一次旋转的层（旋转结束后）
         # if self.last_rotated is not None and self.partial is None:
         #     axis, layer = self.last_rotated
-        #     for _, face, i, j, q2 in draw_list:
-        #         center = np.mean(q2, axis=0)
-        #         if abs(center[axis] - layer) < 0.5:
+        #     for _, face, q2, color in draw_list:
+        #         # center = np.mean(q2, axis=0)
+        #         # layer_coord = CubeBase.layer_to_logic(layer, self.n)
+        #         if CubeBase.should_rotate(q2, axis, layer, self.n):  # np.isclose(center[axis], layer_coord)
         #             pts = [self.project(p) for p in q2]
         #             pygame.draw.polygon(self.screen, self.HIGHLIGHT_COLOR, pts, 2)
 
         # draw a small 2D net in the lower-left for debugging
         # self.draw_net(20, self.HEIGHT - 220, 200)
-
-    # ---------------- helper geometry ----------------
-    def _is_in_rotating_layer(self, center: np.ndarray, axis: int, layer: int) -> bool:
-        # determine coordinates in model axes; stamp simple mapping: layer 0 is "min" side
-        mid = (self.n - 1) / 2
-        coord = center[axis]  # x/y/z
-        # layer 0 -> -mid, layer n-1 -> +mid
-        idx = round(coord + mid)  # 转为 0 ~ n-1
-        return idx == layer + mid
 
     # --- 主循环 ---
     @classmethod
@@ -362,8 +335,8 @@ class RubiksCubeDraw:
     ROT_DURATION = 0.22  # seconds per 90deg
 
     def __init__(self, cube: RubiksCube = None, auto_rotate: bool = True):
-        self.cube = cube if cube is not None else RubiksCube(3)
-        self.renderer = RubiksCubeRenderer(self.cube)
+        self.renderer = RubiksCubeRenderer(cube or RubiksCube(3))
+        self.cube = self.renderer.cube
 
         self.clock = pygame.time.Clock()
         self.pending = []  # list of (axis, layer, dir)
@@ -470,7 +443,7 @@ class RubiksCubeDraw:
         使用 cube.face_axis 统一映射，以保持与 rotate() 方向一致。
         """
         # 1. cube 内置 face → (axis, side) 映射（R/L → X轴, U/D → Y轴, F/B → Z轴）
-        axis, side = self.cube.face_axis[face]
+        axis, side = CubeBase.face_axis[face]
         # 2. 选择层：正侧 -> layer 0；反侧 -> layer N-1
         layer = 0 if side == 0 else self.cube.n - 1
         # 3. 从 dx/dy 推方向（简单版：哪边拖拽多就用那轴）

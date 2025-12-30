@@ -1058,7 +1058,7 @@ async def generate_metadata_from_code(req: MetadataRequest, session: AsyncSessio
     }
 
 
-@app.post("/agent/")
+@app.post("/agent/graph")
 async def agent_run(request: AgentRequest):
     redis = app.state.redis or get_redis()
     metadata = await app.state.func_manager.get_tools_metadata(redis=redis)
