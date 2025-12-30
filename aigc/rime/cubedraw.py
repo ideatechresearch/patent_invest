@@ -243,6 +243,8 @@ class RubiksCubeRenderer:
                     pygame.draw.rect(self.screen, self.EDGE_COLOR, rect, 1)  # 边框
 
     def draw_net_auto(self):
+        if self.n > 15:
+            return
         net_total = int(min(self.WIDTH, self.HEIGHT) * 0.24)  # 大小配置：屏幕短边的 24%
         padding = int(min(self.WIDTH, self.HEIGHT) * 0.03)  # 边距：屏幕短边的 3%
         x = padding
@@ -442,11 +444,12 @@ class RubiksCubeDraw:
         根据鼠标拖拽推断一个 primitive 层转。
         使用 cube.face_axis 统一映射，以保持与 rotate() 方向一致。
         """
+        mid = self.cube.n // 2
         # 1. cube 内置 face → (axis, side) 映射（R/L → X轴, U/D → Y轴, F/B → Z轴）
         axis, side = CubeBase.face_axis[face]
-        # 2. 选择层：正侧 -> layer 0；反侧 -> layer N-1
-        layer = 0 if side == 0 else self.cube.n - 1
-        # 3. 从 dx/dy 推方向（简单版：哪边拖拽多就用那轴）
+        # 2. 选择层
+        layer = -mid if side == 0 else mid
+        # 3. 从 dx/dy 推方向（哪边拖拽多就用那轴）
         major = dx if abs(dx) > abs(dy) else dy
         # 4. 方向统一使用 cube 的 rotate 规范：
         direction = 1 if major > 0 else -1
@@ -507,7 +510,7 @@ if __name__ == "__main__":
     # 如果脚本被直接运行，则执行主函数
     # CubeDraw.main()
 
-    cube = RubiksCube(n=5)  # 初始解法状态
+    cube = RubiksCube(n=15)  # 初始解法状态
     # mv = cube.scramble(20)
     # cube.apply(mv)
     # RubiksCubeRenderer.run(cube)

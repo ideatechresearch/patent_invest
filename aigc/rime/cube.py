@@ -1356,9 +1356,9 @@ class RubiksCube(CubeBase):
         if d == 0:
             return  # 旋转 0 次
 
-        print('rotate:', axis, layer, direction)
+        # print('rotate:', axis, layer, direction)
         assert 0 <= axis <= 2, f"unknown axis: {axis}"
-        assert -self.mid <= layer < self.mid + 1, f"layer out of range: {layer}"
+        assert -self.mid <= layer <= self.mid, f"layer out of range: {layer}"
 
         # 最外层需要旋转面本体
         if layer == self.mid:
