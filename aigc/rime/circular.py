@@ -343,6 +343,47 @@ class MatrixFace:
 
         return rotate_map
 
+    @staticmethod
+    def sinkhorn_basic(matrix: np.ndarray, max_iter: int = 300, tol: float = 1e-4, epsilon=1e-8):
+        """
+        基础Sinkhorn算法：将非负方阵转换为双随机矩阵
+
+        参数:
+            matrix: 输入的非负方阵 (n x n)
+            max_iter: 最大迭代次数
+            tol: 收敛容差（行/列和与1的最大允许偏差）
+            epsilon: 小常数，防止除零
+
+        返回:
+            P: 双随机矩阵
+            n_iter: 实际迭代次数
+            err: 最终误差
+        """
+        A = matrix.copy().astype(np.float64)
+
+        # 确保非负并添加小常数避免除零
+        A = np.maximum(A, 0) + epsilon
+
+        for i in range(max_iter):
+            # 行归一化
+            row_sums = A.sum(axis=1, keepdims=True)
+            A /= row_sums
+
+            # 列归一化
+            col_sums = A.sum(axis=0, keepdims=True)
+            A /= col_sums
+
+            # 检查收敛：计算行和与列和与1的最大偏差
+            row_err = np.max(np.abs(A.sum(axis=1) - 1))
+            col_err = np.max(np.abs(A.sum(axis=0) - 1))
+            err = max(row_err, col_err)
+
+            if err < tol:
+                return A, i + 1, err
+
+        print(f"警告：未在 {max_iter} 次迭代内收敛，最终误差: {err:.2e}")
+        return A, max_iter, err
+
 
 class CircularBand:
     def __init__(self, initial_data=None, capacity=None):

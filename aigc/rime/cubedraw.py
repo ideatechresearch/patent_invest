@@ -1,9 +1,8 @@
-import time
-
 import numpy as np  # 导入 NumPy 库，用于数值计算和处理多维数组
 import pygame  # 导入 Pygame 库，用于游戏开发和图形界面设计
 import math
-from rime.cube import RubiksCube, CubeBase
+from rime.cube import StickerCube, CubeBase
+from rime.cubie import CubieBase
 
 
 class CubeDraw:
@@ -120,10 +119,42 @@ class CubeDraw:
             pygame.display.flip()
 
 
-class RubiksCubeRenderer:
+class BaseCubeRenderer:
     WIDTH = 1000
     HEIGHT = 1000
 
+    def __init__(self, cube: StickerCube, scale: float = None):
+        self.cube = cube
+        self.n = cube.n
+        self.colors: dict = cube.color
+        self.partial = None
+        self.last_rotated = None
+
+        self.scale = scale
+        self.angles = np.array([0.8, 0.6, 0.2])  # 初始旋转角
+
+    def apply_partial_rotation(self, axis, layer, angle):
+        self.partial = (axis, layer, angle)
+        self.last_rotated = (axis, layer)
+
+    def commit_partial(self):
+        self.partial = None
+
+    def compute_face_quads(self):
+        # similar to previous helper: for each sticker produce its quad in model space
+        # list of (face, i, j, quad_points)
+        for face in CubieBase.FACES:
+            quads = CubeBase.face_quads(face, self.n)
+            for idx, quad in enumerate(quads):
+                i = idx // self.n
+                j = idx % self.n
+                yield face, i, j, quad
+
+    def draw(self):
+        raise NotImplementedError
+
+
+class CubeRenderer(BaseCubeRenderer):
     BLACK = (0, 0, 0)  # 黑色
     EDGE_COLOR = (20, 20, 20)
     HIGHLIGHT_COLOR = (0, 255, 200)
@@ -146,33 +177,18 @@ class RubiksCubeRenderer:
     #     'B': (0, 0, 255),  # 蓝
     # }
 
-    def __init__(self, cube: "RubiksCube", scale: float = None, screen=None):
-        self.cube = cube
-        self.n = cube.n  # 立方体外框边长
-        self.scale = scale or min(self.WIDTH, self.HEIGHT) * 0.45 / self.n  # 每个小方块大小缩放
+    def __init__(self, cube: "StickerCube", screen=None):
+        super().__init__(cube, scale=min(self.WIDTH, self.HEIGHT) * 0.45 / cube.n)  # 每个小方块大小缩放
 
         self.offset = -self.n / 2  # 三维坐标范围 [-n/2, +n/2]
-
         self.center = (self.WIDTH // 2, self.HEIGHT // 2)
-        self.screen = screen or pygame.display.set_mode((self.WIDTH, self.HEIGHT))
-
-        self.angles = np.array([0.8, 0.6, 0.2])  # 初始旋转角
-
-        # partial rotation state: (axis, layer, angle_degrees) or None
-        self.partial = None
-        self.last_rotated = None
-
-    def apply_partial_rotation(self, axis, layer, angle_deg):
-        self.partial = (axis, layer, math.radians(angle_deg))
-        self.last_rotated = (axis, layer)
-
-    def commit_partial(self):
-        self.partial = None
+        self.window_size = (self.WIDTH, self.HEIGHT)
+        self.screen = screen or pygame.display.set_mode(self.window_size)
 
     # --- 3D 转 2D ---
     def project(self, p3):
         """正交投影，中心偏移到屏幕中央"""
-        x, y, z = p3
+        x, y, z = p3  # point_3d
         sx = int(self.center[0] + x * self.scale)
         sy = int(self.center[1] - y * self.scale)
         return sx, sy
@@ -183,27 +199,16 @@ class RubiksCubeRenderer:
         pygame.draw.polygon(self.screen, self.COLOR_MAP[color], pts)
         pygame.draw.polygon(self.screen, self.EDGE_COLOR, pts, 2)  # 黑色边框
 
-    def compute_face_quads(self):
-        # similar to previous helper: for each sticker produce its quad in model space
-        # list of (face, i, j, quad_points)
-        for face in self.cube.FACES:
-            quads = CubeBase.face_quads(face, self.n)
-            for idx, quad in enumerate(quads):
-                i = idx // self.n
-                j = idx % self.n
-                yield face, i, j, quad
-
     # --- 绘制整个魔方 ---
     def draw_cube(self):
         R = CubeBase.rotation_matrix(self.angles)
-        cube_colors = self.cube.color  # Face->二维颜色
 
         # 根据 z 排序（从近到远）
         all_quads = []
         for face, i, j, quad in self.compute_face_quads():
             q = np.array([R @ v for v in quad])
             z_avg = np.mean(q[:, 2])
-            fcolor = cube_colors[face]
+            fcolor = self.colors[face]  # Face->二维颜色
             all_quads.append((z_avg, q, fcolor[i][j]))
 
         # 从远到近绘制
@@ -229,7 +234,7 @@ class RubiksCubeRenderer:
         layout = {
             'U': (1, 0), 'L': (0, 1), 'F': (1, 1), 'R': (2, 1), 'B': (3, 1), 'D': (1, 2)
         }
-        colors = self.cube.color
+        # self.colors = self.cube.color
         for face, (cx, cy) in layout.items():
             fx = x + cx * sticker * n
             fy = y + cy * sticker * n
@@ -237,7 +242,9 @@ class RubiksCubeRenderer:
                 for j in range(n):
                     rx = fx + j * sticker
                     ry = fy + i * sticker
-                    color = self.COLOR_MAP[colors[face][i][j]]
+                    ii = n - 1 - i  # 坐标系契约对齐
+                    jj = n - 1 - j
+                    color = self.COLOR_MAP[self.colors[face][ii][jj]]
                     rect = (rx, ry, sticker - 1, sticker - 1)
                     pygame.draw.rect(self.screen, color, rect)  # 贴纸背景
                     pygame.draw.rect(self.screen, self.EDGE_COLOR, rect, 1)  # 边框
@@ -257,12 +264,12 @@ class RubiksCubeRenderer:
 
         R = CubeBase.rotation_matrix(self.angles)
         quads = self.compute_face_quads()
-        colors = self.cube.color
+        self.colors = self.cube.color
         # build transformed quads and z depth, taking into account partial rotation
         draw_list = []
         for face, i, j, quad in quads:
             q = np.array(quad)
-            color = colors[face][i][j]
+            color = self.colors[face][i][j]
             # if partial affects these sticker positions, rotate them in model space
             if self.partial is not None:
                 axis, layer, ang = self.partial
@@ -297,7 +304,7 @@ class RubiksCubeRenderer:
 
     # --- 主循环 ---
     @classmethod
-    def run(cls, cube: "RubiksCube", rot_speed: float = 0.007):
+    def run(cls, cube: StickerCube, rot_speed: float = 0.007):
         pygame.init()
         pygame.display.set_caption("Rubik's Cube 3D Draw")
 
@@ -336,8 +343,8 @@ class RotationAnimation:
 class RubiksCubeDraw:
     ROT_DURATION = 0.22  # seconds per 90deg
 
-    def __init__(self, cube: RubiksCube = None, auto_rotate: bool = True):
-        self.renderer = RubiksCubeRenderer(cube or RubiksCube(3))
+    def __init__(self, cube: StickerCube = None, auto_rotate: bool = True):
+        self.renderer = CubeRenderer(cube or StickerCube(3))
         self.cube = self.renderer.cube
 
         self.clock = pygame.time.Clock()
@@ -382,7 +389,7 @@ class RubiksCubeDraw:
         if self.current_anim is not None:
             done, angle = self.current_anim.step(dt)
             axis, layer, dir = self.current_anim.op
-            self.renderer.apply_partial_rotation(axis, layer, angle)
+            self.renderer.apply_partial_rotation(axis, layer, math.radians(angle))
             if done:
                 # commit to model
                 self.cube.rotate(axis, layer, dir)
@@ -394,7 +401,7 @@ class RubiksCubeDraw:
         if button == 1:  # left
             # start potential face drag or view drag
             self.last_mouse = pos
-            self.view_drag = True
+            self.view_drag = True  # mouse_pressed
         elif button == 3:  # right button: start face drag (heuristic)
             self.face_dragging = True
             self.face_drag_start = pos
@@ -462,6 +469,8 @@ class RubiksCubeDraw:
         pending_moves = []
         pygame.display.set_caption("Interactive Rubik's Cube (Left drag=view, Right drag=turn)")
         running = True
+        cubie = CubieBase(n=self.cube.n)
+
         while running:
             dt = self.clock.tick(60) / 1000.0
             for ev in pygame.event.get():
@@ -489,6 +498,12 @@ class RubiksCubeDraw:
                     elif ev.key == pygame.K_s:  # 生成并播放 scramble 序列
                         pending_moves = self.cube.scramble(25)
                         self.enqueue_moves(pending_moves)
+                    elif ev.key == pygame.K_k:
+                        pending_moves = cubie.solve_sticker(self.cube.get_state())
+                        print(len(pending_moves))
+                        self.enqueue_moves(pending_moves)
+                    elif ev.key == pygame.K_l:
+                        print(self.cube.color)
                     elif ev.key == pygame.K_c:  # 清空 pending 队列
                         # clear pending
                         self.pending.clear()
@@ -510,10 +525,10 @@ if __name__ == "__main__":
     # 如果脚本被直接运行，则执行主函数
     # CubeDraw.main()
 
-    cube = RubiksCube(n=15)  # 初始解法状态
+    cube = StickerCube(n=3)  # 初始解法状态
     # mv = cube.scramble(20)
     # cube.apply(mv)
-    # RubiksCubeRenderer.run(cube)
+    # CubeRenderer.run(cube)
 
     app = RubiksCubeDraw(cube)
     app.run()
