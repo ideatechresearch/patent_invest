@@ -53,8 +53,8 @@ class FunctionManager:
                                                       module_name=None if module_name == 'default' else module_name))
 
     @classmethod
-    async def get_mcp_tools(cls) -> dict:
-        return await cls.mcp_server.get_tools() if cls.mcp_server else {}
+    async def get_mcp_tools(cls) -> list:
+        return await cls.mcp_server.list_tools() if cls.mcp_server else []
 
     @classmethod
     def register(cls, func: Callable):
@@ -67,8 +67,9 @@ class FunctionManager:
     @classmethod
     async def register_mcp_tools(cls):
         tools = await cls.get_mcp_tools()
+        names = {t.name for t in tools}
         for name, func in cls.global_registry.items():
-            if name in tools:
+            if name in names:
                 continue  # Tool already exists
             func = strip_kwargs_wrapper(func)
             try:
@@ -381,7 +382,7 @@ Registry_Module = {
               "get_day_range", "get_week_range", "get_month_range", "lang_token_size",
               "get_quarter_range", "get_year_range", "get_half_year_range", "math_solver",
               "decode_escaped_string", "extract_links", "extract_web_content", "remove_markdown",
-              "extract_table_segments","save_markdown", "read_markdown", "save_dictjson", "load_dictjson"],
+              "extract_table_segments", "save_markdown", "read_markdown", "save_dictjson", "load_dictjson"],
     "agents.ai_multi": ['xunfei_ppt_create', 'tencent_generate_image'],
     "agents.ai_company": ['annual_report_info', 'base_account_record', 'case_filing', 'company_black_list',
                           'company_exception_list', 'company_out_investment', 'company_personnel_risk',

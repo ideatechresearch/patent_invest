@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, AnyUrl, field_validator, model_validator, condecimal, conint
+from pydantic import BaseModel, ConfigDict, Field, AnyUrl, field_validator, model_validator, condecimal, conint
 from typing import Optional, Literal, Annotated, Generator, Dict, List, Tuple, Union, Any
 from abc import ABC, abstractmethod
 from enum import Enum
@@ -32,9 +32,7 @@ class BaseTool(ABC, BaseModel):
     name: str
     description: str
     parameters: Optional[Union[Dict, str]] = None
-
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     async def __call__(self, **kwargs) -> Any:
         """Execute the tool with given parameters."""
@@ -89,16 +87,22 @@ class Reflection(BaseModel):
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "developer", "tool"]
-    content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]
+    content: Optional[Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]] = None
     name: Optional[str] = None  # 可以包含 a-z、A-Z、0-9 和下划线，最大长度为 64 个字符
 
     @model_validator(mode="before")
     @classmethod
-    def set_default_name(cls, values):
+    def normalize_content(cls, values) -> dict[str, Any]:
         role = values.get("role")
         content = values.get("content")
-        if role != "user" and isinstance(content, list):
-            raise ValueError(f"Role '{role}' must not have list content (only 'user' can have list).")
+        if content is None:
+            if role == "assistant" and not values.get("tool_calls"):
+                raise ValueError("Assistant message must have content or tool_calls")
+        if role != "user" and isinstance(content, list):  # {"type": "text", "text": "..."}
+            if all(isinstance(item, dict) and "text" in item for item in content):
+                values["content"] = "\n\n".join(item["text"] for item in content)
+            else:  # json.dumps
+                raise ValueError(f"Role '{role}' must not have list content (only 'user' can have list).")
 
         name = values.get("name", "")
         if not name or not str(name).strip():
@@ -113,7 +117,7 @@ class ChatMessage(BaseModel):
 
 class IMessage(ChatMessage):
     """Represents a chat message in the conversation"""
-    tool_calls: Optional[List] = Field(default=None)
+    tool_calls: Optional[List[dict]] = Field(default=None)
     tool_call_id: Optional[str] = Field(default=None)
 
     def __add__(self, other) -> List["IMessage"]:
@@ -123,9 +127,7 @@ class IMessage(ChatMessage):
         elif isinstance(other, IMessage):
             return [self, other]
         else:
-            raise TypeError(
-                f"unsupported operand type(s) for +: '{type(self).__name__}' and '{type(other).__name__}'"
-            )
+            raise TypeError(f"unsupported operand type(s) for +: '{type(self).__name__}' and '{type(other).__name__}'")
 
     def __radd__(self, other) -> List["IMessage"]:
         """支持 list + Message 的操作"""
@@ -137,14 +139,9 @@ class IMessage(ChatMessage):
     def to_dict(self) -> dict:
         """Convert message to dictionary format"""
         message = {"role": self.role}
-        if self.content is not None:
-            message["content"] = self.content
-        if self.tool_calls is not None:
-            message["tool_calls"] = [tool_call.dict() for tool_call in self.tool_calls]
-        if self.name is not None:
-            message["name"] = self.name
-        if self.tool_call_id is not None:
-            message["tool_call_id"] = self.tool_call_id
+        # 统一用 model_dump 处理可选字段
+        extra = self.model_dump(exclude={"role"}, exclude_none=True, mode="json")
+        message.update(extra)
         return message
 
     @classmethod
@@ -195,21 +192,19 @@ class OpenAIRequest(BaseModel):
     stream_options: Optional[dict] = None  # 在流式输出的最后一行展示token使用信息
     extra_body: Optional[dict] = None
     extra_query: Optional[Dict[str, Any]] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "model": "silicon:Qwen/Qwen2.5-Coder-7B-Instruct",
-                "prompt": "User:你好,有问题要问你; Assistant:好的; User:请问1到100的和怎么计算?",
-                "suffix": "Assistant:",
-                "temperature": 1,
-                "user": 'test:test',
-                "top_p": 1,
-                "max_tokens": 512,
-                "stream": False,
-                # "stop": '\n\n',
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "model": "silicon:Qwen/Qwen2.5-Coder-7B-Instruct",
+            "prompt": "User:你好,有问题要问你; Assistant:好的; User:请问1到100的和怎么计算?",
+            "suffix": "Assistant:",
+            "temperature": 1,
+            "user": 'test:test',
+            "top_p": 1,
+            "max_tokens": 512,
+            "stream": False,
+            # "stop": '\n\n',
         }
+    })
 
     @field_validator("model")
     @classmethod
@@ -222,7 +217,7 @@ class OpenAIRequest(BaseModel):
 class OpenAIRequestMessage(BaseModel):
     # model: Literal[*tuple(MODEL_LIST.models)]
     model: str
-    messages: List[ChatMessage]
+    messages: List[IMessage]
     temperature: Optional[float] = 1.0  # 介于 0 和 2 之间
     top_p: Optional[float] = 1.0
     max_tokens: Optional[conint(ge=1)] = 512
@@ -256,37 +251,36 @@ class OpenAIRequestMessage(BaseModel):
     #     department: "accounting",
     #     source: "homepage"
     # }
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "model": "qwen-turbo",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
-                    },
-                    {
-                        "role": "user",
-                        "content": "你好,有问题要问你",
-                        "name": 'test'
-                    }
-                ],
-                "temperature": 1,
-                "user": 'test:test',
-                "top_p": 1,
-                "max_tokens": 1024,
-                "stream": False,
-                "extra_body": {"enable_thinking": False},
-                "tools": [{
-                    "type": "baidu_search",
-                    "baidu_search": {'query': '大象像什么'}
-                }],
-                "thinking": {
-                    "type": "disabled"
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "model": "qwen-turbo",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+                },
+                {
+                    "role": "user",
+                    "content": "你好,有问题要问你",
+                    "name": 'test'
                 }
+            ],
+            "temperature": 1,
+            "user": 'test:test',
+            "top_p": 1,
+            "max_tokens": 1024,
+            "stream": False,
+            "extra_body": {"enable_thinking": False},
+            "tools": [{
+                "type": "baidu_search",
+                "baidu_search": {'query': '大象像什么'}
+            }],
+            "thinking": {
+                "type": "disabled"
             }
         }
+    }
+    )
 
     @field_validator("model")
     @classmethod
@@ -333,35 +327,35 @@ class OpenAIRequestBatch(BaseModel):
 
     completion_window: Literal["24h", "now"] = "24h"
 
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "model": "qwen-plus",
+            "messages_list": [
+                [
+                    {
+                        "role": "system",
+                        "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+                    },
+                    {"role": "user", "content": "你好,有问题要问你", }
+                ],
+                [
+                    {
+                        "role": "system",
+                        "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
+                    },
+                    {"role": "user", "content": "请问1到100的和怎么计算?", }
+                ]
+            ],
+            "temperature": 1,
+            "top_p": 1,
+            "max_tokens": 1024,
+            "completion_window": "24h"
+        }
+    }
+    )
+
     def payload(self):
         return self.model_dump(exclude_unset=True, exclude={'messages', 'model', 'messages_list', 'completion_window'})
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "model": "qwen-plus",
-                "messages_list": [
-                    [
-                        {
-                            "role": "system",
-                            "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
-                        },
-                        {"role": "user", "content": "你好,有问题要问你", }
-                    ],
-                    [
-                        {
-                            "role": "system",
-                            "content": "你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。",
-                        },
-                        {"role": "user", "content": "请问1到100的和怎么计算?", }
-                    ]
-                ],
-                "temperature": 1,
-                "top_p": 1,
-                "max_tokens": 1024,
-                "completion_window": "24h"
-            }
-        }
 
 
 class OpenAIResponse(BaseModel):
@@ -399,18 +393,18 @@ class OpenAIEmbeddingRequest(BaseModel):
             values.pop("user", None)
         return values
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "model": "qwen:text-embedding-v3",
-                "input": [
-                    "role", "user",
-                    "content", "你好,有问题要问你", "第二条文本\n带换行"
-                ],
-                "encoding_format": "float",
-                "dimensions": 1024
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "model": "qwen:text-embedding-v3",
+            "input": [
+                "role", "user",
+                "content", "你好,有问题要问你", "第二条文本\n带换行"
+            ],
+            "encoding_format": "float",
+            "dimensions": 1024
         }
+    }
+    )
 
 
 class AuthRequest(BaseModel):
@@ -425,19 +419,19 @@ class AuthRequest(BaseModel):
     phone: Optional[str] = None
     code: Optional[str] = None
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "username": "test",
-                "password": "123456",
-                "public_key": "0x123456789ABCDEF",
-                "eth_address": None,
-                "signed_message": None,
-                "original_message": None,
-                "phone": None,
-                "code": None,  # "NUM"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "username": "test",
+            "password": "123456",
+            "public_key": "0x123456789ABCDEF",
+            "eth_address": None,
+            "signed_message": None,
+            "original_message": None,
+            "phone": None,
+            "code": None,  # "NUM"
         }
+    }
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -454,20 +448,20 @@ class Registration(AuthRequest):
     role: Optional[str] = 'user'
     group: Optional[str] = '0'
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "username": "test",
-                "password": "123456",
-                "role": "user",
-                "group": '0',
-                "public_key": "0x123456789ABCDEF",
-                "eth_address": "0x123456789ABCDEF",
-                "signed_message": None,
-                "original_message": None,
-                "code": '123456',  # "NUM"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "username": "test",
+            "password": "123456",
+            "role": "user",
+            "group": '0',
+            "public_key": "0x123456789ABCDEF",
+            "eth_address": "0x123456789ABCDEF",
+            "signed_message": None,
+            "original_message": None,
+            "code": '123456',  # "NUM"
         }
+    }
+    )
 
 
 class Token(BaseModel):
@@ -492,13 +486,13 @@ class PromptRequest(BaseModel):
     model: Optional[str] = "deepseek:deepseek-reasoner"
     depth: List[str] = Field(default_factory=lambda: ["73", "71", "72", "74"])
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "depth": ["73", "71", "72", "74"],
-                "model": "deepseek:deepseek-reasoner"
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "depth": ["73", "71", "72", "74"],
+            "model": "deepseek:deepseek-reasoner"
         }
+    }
+    )
 
 
 class TranslateRequest(BaseModel):
@@ -514,18 +508,18 @@ class EmbeddingRequest(BaseModel):
     model_id: int = 0
     normalize: bool = False
 
-    class Config:
-        protected_namespaces = ()
-        json_schema_extra = {
-            "example": {
-                "model_name": "qwen:text-embedding-v2",
-                "texts": [
-                    "role", "user",
-                    "content", "你好,有问题要问你"
-                ],
-                "normalize": False
-            }
-        }
+    model_config = ConfigDict(protected_namespaces=(),
+                              json_schema_extra={
+                                  "example": {
+                                      "model_name": "qwen:text-embedding-v2",
+                                      "texts": [
+                                          "role", "user",
+                                          "content", "你好,有问题要问你"
+                                      ],
+                                      "normalize": False
+                                  }
+                              }
+                              )
 
 
 class FuzzyMatchRequest(BaseModel):
@@ -554,30 +548,29 @@ class ToolRequest(BaseModel):
     top_p: float = 0.95
     temperature: float = 0.01
 
-    class Config:
-        protected_namespaces = ()
-        json_schema_extra = {
-            "example": {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "请根据用户的提问分析意图，请转换用户的问题，提取所需的关键参数，并自动选择最合适的工具进行处理。"
-                    },
-                    {
-                        "role": "user",
-                        "content": "请告诉我 2023-11-22 前面三周的日期范围。"
-                    }
-                ],
-                "tools": [],
-                "prompt": '',
-                "user": '',
-                "model_name": "qwen:qwen-max",
-                "model_metadata": "qwen:qwen-coder-plus",
-                "model_id": -1,
-                "top_p": 0.95,
-                "temperature": 0.01
-            }
-        }
+    model_config = ConfigDict(protected_namespaces=(),
+                              json_schema_extra={
+                                  "example": {
+                                      "messages": [
+                                          {
+                                              "role": "system",
+                                              "content": "请根据用户的提问分析意图，请转换用户的问题，提取所需的关键参数，并自动选择最合适的工具进行处理。"
+                                          },
+                                          {
+                                              "role": "user",
+                                              "content": "请告诉我 2023-11-22 前面三周的日期范围。"
+                                          }
+                                      ],
+                                      "tools": [],
+                                      "prompt": '',
+                                      "user": '',
+                                      "model_name": "qwen:qwen-max",
+                                      "model_metadata": "qwen:qwen-coder-plus",
+                                      "model_id": -1,
+                                      "top_p": 0.95,
+                                      "temperature": 0.01
+                                  }
+                              })
 
     @field_validator("tools")
     @classmethod
@@ -600,8 +593,7 @@ class AssistantRequest(BaseModel):
     tools_type: AssistantToolsEnum = AssistantToolsEnum.code
     model_id: int = 4
 
-    class Config:
-        protected_namespaces = ()
+    model_config = ConfigDict(protected_namespaces=())
 
 
 class FunctionCallItem(BaseModel):
@@ -634,8 +626,8 @@ class CallbackUrl(BaseModel):
             data["url"] = None
         return data
 
-    class Config:
-        json_schema_extra = {"example": {'url': 'http://127.0.0.1:7000/callback', 'format': 'json'}}
+    model_config = ConfigDict(
+        json_schema_extra={"example": {'url': 'http://127.0.0.1:7000/callback', 'format': 'json'}})
 
 
 class MetadataRequest(BaseModel):
@@ -648,9 +640,9 @@ class MetadataRequest(BaseModel):
     code_type: Optional[str] = Field(default="Python", description="代码类型")
     cache_sec: Optional[int] = Field(default=0, description="缓存秒数，0 表示使用默认")
 
-    class Config:
-        protected_namespaces = ()
-        json_schema_extra = {
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        json_schema_extra={
             "example": {
                 "function_code": "async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc: str = None,\n                     model: str = 'deepseek-reasoner', max_tokens: int = 4096, temperature: float = 0.2,\n                     dbpool=None, **kwargs):\n    user_request = results if isinstance(results, str) else f\"```json\\n{json.dumps(results, ensure_ascii=False)}```\"\n    if desc:\n        user_request = f\"{desc}:\\n{user_request}\"\n\n    messages = create_analyze_messages(system_prompt, user_request)\n    content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True,\n                                             max_tokens=max_tokens, temperature=temperature, dbpool=dbpool, **kwargs)\n    logging.info(f'</{desc}>: {content}')\n    return content.split(\"</think>\")[-1]",
                 "user": "test",
@@ -665,6 +657,7 @@ class MetadataRequest(BaseModel):
                 "cache_sec": 0
             }
         }
+    )
 
 
 class AgentRequest(BaseModel):
@@ -673,9 +666,7 @@ class AgentRequest(BaseModel):
     model: Optional[str] = 'deepseek-chat'
     callback: Optional[Union[str, CallbackUrl]] = Field(default=None,
                                                         description="Callback info: either a URL string, or a dict with url + optional payload/params/headers")
-
-    class Config:
-        protected_namespaces = ()
+    model_config = ConfigDict(protected_namespaces=())
 
 
 class CompletionResponse(BaseModel):
@@ -741,44 +732,44 @@ class CompletionParams(BaseModel):
     #     ("complex_tool", [1, 2], {"key": "v"})  #  (函数名, 位置参数列表, 关键字参数)
     # ]
 
-    class Config:
-        protected_namespaces = ()
-        json_schema_extra = {
-            "examples": [
-                {
-                    'prompt': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
-                    "stream": False,
-                    "question": ["请解释人工智能的原理。", "AI是什么啊,可以描述一下吗?"],
-                    "agent": "0",
-                    "temperature": 0.7,
-                    "top_p": 0.8,
-                    "model_name": "silicon",
-                    "model_id": 0,
-                    "extract": "raw",
-                    "max_tokens": 4000,
-                    "keywords": ["AI智能"],
-                    "tools": [],
-                    "callback": None
-                },
-                {
-                    "extract": "wechat",
-                    "callback": None,
-                    "stream": False,
-                    "model_name": "doubao",
-                    "model_id": -1,
-                    "prompt": "这是什么啊,可以描述一下吗?。",
-                    "agent": "42",
-                    "top_p": 0.8,
-                    "question": "",
-                    "keywords": [('web_search', "大象")],  # [("tool_name", {"key": "value"})]
-                    "suffix": "这是",
-                    "temperature": 0.7,
-                    "max_tokens": 4096,
-                    "tools": [],
-                    "thinking": 0
-                }
-            ]
-        }
+    model_config = ConfigDict(protected_namespaces=(),
+                              json_schema_extra={
+                                  "examples": [
+                                      {
+                                          'prompt': '你是一个知识广博且乐于助人的助手，擅长分析和解决各种问题。请根据我提供的信息进行帮助。',
+                                          "stream": False,
+                                          "question": ["请解释人工智能的原理。", "AI是什么啊,可以描述一下吗?"],
+                                          "agent": "0",
+                                          "temperature": 0.7,
+                                          "top_p": 0.8,
+                                          "model_name": "silicon",
+                                          "model_id": 0,
+                                          "extract": "raw",
+                                          "max_tokens": 4000,
+                                          "keywords": ["AI智能"],
+                                          "tools": [],
+                                          "callback": None
+                                      },
+                                      {
+                                          "extract": "wechat",
+                                          "callback": None,
+                                          "stream": False,
+                                          "model_name": "doubao",
+                                          "model_id": -1,
+                                          "prompt": "这是什么啊,可以描述一下吗?。",
+                                          "agent": "42",
+                                          "top_p": 0.8,
+                                          "question": "",
+                                          "keywords": [('web_search', "大象")],  # [("tool_name", {"key": "value"})]
+                                          "suffix": "这是",
+                                          "temperature": 0.7,
+                                          "max_tokens": 4096,
+                                          "tools": [],
+                                          "thinking": 0
+                                      }
+                                  ]
+                              }
+                              )
 
     @field_validator("model_name")
     @classmethod
@@ -869,8 +860,8 @@ class SubmitMessagesRequest(BaseModel):
 
     params: Optional[List[Union[CompletionParams, Dict[str, Any]]]] = None
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "request_id": None,
                 "name": None,
@@ -922,6 +913,7 @@ class SubmitMessagesRequest(BaseModel):
                 ]
             }
         }
+    )
 
     @model_validator(mode='before')
     @classmethod
@@ -963,51 +955,50 @@ class ChatCompletionRequest(CompletionParams):
                                                 "the last user message content in `messages`. Otherwise, this `question` field "
                                                 "will be used directly as the prompt for the AI.")
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "request_id": None,
-                "name": None,
-                "user": "test",
-                "robot_id": None,
-                "agent": "0",
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "request_id": None,
+            "name": None,
+            "user": "test",
+            "robot_id": None,
+            "agent": "0",
 
-                "use_hist": False,
-                "filter_limit": -500,
-                "filter_time": 0.0,
-                "model_name": "deepseek",
-                "model_id": 0,
-                "prompt": '',
-                "question": "什么是区块链金融?",
-                "messages": [],
-                "keywords": ["区块链"],
-                "tools": [
-                    {
-                        "type": "intent_search",
-                        "intent_search": {
-                            "text": "什么是区块链金融",
-                            "engine": "search_std",
-                            "recency_filter": "noLimit",
-                            "search_intent": True,
-                            "count": "10"
-                        }
-                    },
-                    {
-                        "type": "web_search"
+            "use_hist": False,
+            "filter_limit": -500,
+            "filter_time": 0.0,
+            "model_name": "deepseek",
+            "model_id": 0,
+            "prompt": '',
+            "question": "什么是区块链金融?",
+            "messages": [],
+            "keywords": ["区块链"],
+            "tools": [
+                {
+                    "type": "intent_search",
+                    "intent_search": {
+                        "text": "什么是区块链金融",
+                        "engine": "search_std",
+                        "recency_filter": "noLimit",
+                        "search_intent": True,
+                        "count": "10"
                     }
-                ],
-                "images": [],
-                "thinking": 0,
-                "extract": 'wechat',
-                "callback": None,
-                "stream": False,
-                "temperature": 0.4,
-                "top_p": 0.8,
-                "max_tokens": 1024,
-                # "score_threshold": 0.0,
-                # "top_n": 10,
-            }
+                },
+                {
+                    "type": "web_search"
+                }
+            ],
+            "images": [],
+            "thinking": 0,
+            "extract": 'wechat',
+            "callback": None,
+            "stream": False,
+            "temperature": 0.4,
+            "top_p": 0.8,
+            "max_tokens": 1024,
+            # "score_threshold": 0.0,
+            # "top_n": 10,
         }
+    })
 
 
 class SummaryRequest(BaseModel):
@@ -1031,32 +1022,32 @@ class ClassifyRequest(BaseModel):
     rerank_model: Optional[str] = "BAAI/bge-reranker-v2-m3"
     cutoff: float = 0.85
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                'query': '今天几号？',
-                "class_terms": {
-                    "经营数据查询": ["经营数据查询", "经营分析", "公司经营状况", "经营报告"],
-                    "财务报销": ["财务报销", "报销流程", "报销单", "财务审批", "报销申请"],
-                    "跟进记录录入": ["跟进记录", "跟进情况", "客户跟进", "记录跟进", "跟进内容"],
-                    "商机录入": ["商机录入", "商机信息", "录入商机", "商机跟进", "商机记录"],
-                    "新增客户信息": ["新增客户", "添加客户", "客户信息", "客户录入", "客户添加"],
-                    "查询销售额": ["销售额查询", "查询销售额", "销售收入", "销售总额", "销售情况"],
-                    "查询回款额": ["回款额查询", "查询回款额", "回款情况", "回款金额", "回款记录"],
-                    "研发详情": ["研发详细情况", "研发的单据情况", "研发明细", "研发单据", "研发进展"],
-                    "研发进度": ["产研进度", "工作完成进度", "单据完成进度", "研发进展", "工作进度"],
-                    "研发质量": ["产品缺陷", "产品质量", "质量问题", "产品问题", "质量报告"],
-                    "项目情况": ["项目情况", "项目进度", "项目跟进", "项目状态", "项目详情"],
-                    "未验收的项目数": [
-                        "待验收的项目数", "尚未验收的项目数", "未完成验收的项目数", "未交付的项目数",
-                        "验收未完成的项目数"],
-                    "本季度计划验收的项目数": [
-                        "本季度预定验收的项目数量", "本季度预计完成验收的项目数", "本季度计划验收的项目数",
-                        "本季度安排验收的项目数", "本季度计划交付的项目数量"]
-                },
-                "class_default": '聊天',
-                'emb_model': 'text-embedding-v2',
-                "rerank_model": "BAAI/bge-reranker-v2-m3",
-                "cutoff": 0.85
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            'query': '今天几号？',
+            "class_terms": {
+                "经营数据查询": ["经营数据查询", "经营分析", "公司经营状况", "经营报告"],
+                "财务报销": ["财务报销", "报销流程", "报销单", "财务审批", "报销申请"],
+                "跟进记录录入": ["跟进记录", "跟进情况", "客户跟进", "记录跟进", "跟进内容"],
+                "商机录入": ["商机录入", "商机信息", "录入商机", "商机跟进", "商机记录"],
+                "新增客户信息": ["新增客户", "添加客户", "客户信息", "客户录入", "客户添加"],
+                "查询销售额": ["销售额查询", "查询销售额", "销售收入", "销售总额", "销售情况"],
+                "查询回款额": ["回款额查询", "查询回款额", "回款情况", "回款金额", "回款记录"],
+                "研发详情": ["研发详细情况", "研发的单据情况", "研发明细", "研发单据", "研发进展"],
+                "研发进度": ["产研进度", "工作完成进度", "单据完成进度", "研发进展", "工作进度"],
+                "研发质量": ["产品缺陷", "产品质量", "质量问题", "产品问题", "质量报告"],
+                "项目情况": ["项目情况", "项目进度", "项目跟进", "项目状态", "项目详情"],
+                "未验收的项目数": [
+                    "待验收的项目数", "尚未验收的项目数", "未完成验收的项目数", "未交付的项目数",
+                    "验收未完成的项目数"],
+                "本季度计划验收的项目数": [
+                    "本季度预定验收的项目数量", "本季度预计完成验收的项目数", "本季度计划验收的项目数",
+                    "本季度安排验收的项目数", "本季度计划交付的项目数量"]
+            },
+            "class_default": '聊天',
+            'emb_model': 'text-embedding-v2',
+            "rerank_model": "BAAI/bge-reranker-v2-m3",
+            "cutoff": 0.85
         }
+    }
+    )

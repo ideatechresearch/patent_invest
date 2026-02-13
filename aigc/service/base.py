@@ -8,7 +8,7 @@ import asyncio
 
 def get_root_logging(file_name="app.log", level: int = logging.WARNING,
                      _format: str = "%(asctime)s - %(levelname)s - %(message)s"):
-    root_logger = logging.getLogger()
+    root_logger = logging.getLogger()  # logging.getLogger(__name__)
     root_logger.setLevel(level)
 
     # 如果已有 handler，就不重复添加

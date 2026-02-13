@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request, Header, Depends, Query, Body, File, Upload
 from fastapi.responses import Response, StreamingResponse, JSONResponse, FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.exceptions import RequestValidationError
 from starlette.middleware.sessions import SessionMiddleware
 from sse_starlette.sse import EventSourceResponse
 
@@ -53,9 +54,8 @@ async def lifespan(app: FastAPI):
 
         app.state.worker_id = get_worker_identity()
         app.state.worker_num = int(os.environ.get("UVICORN_WORKERS") or os.environ.get("GUNICORN_WORKERS", 1))
-        app.state.is_debug = Config.get('IS_DEBUG', False)
-        if app.state.is_debug:
-            print('Config:', Config.get_config_data())
+
+        if Config.TRACE:
             tracemalloc.start()
 
         await init_ai_clients(AI_Models)
@@ -63,12 +63,15 @@ async def lifespan(app: FastAPI):
 
         app.state.scheduler = get_scheduler(redis_host=Config.REDIS_HOST)
         app.state.ai_scheduler = TaskGraphManager(dask_client=None)
+        app.state.is_debug = Config.get('IS_DEBUG', False)
         app.state.is_main = await is_main_worker(worker_id=app.state.worker_id, redis=app.state.redis)
         if app.state.is_main:
             TaskManager.htw.add_daily_task(18, 18, run_adjustment_sync_tasks, concurrent=False)
             print("Main worker started. Do once-only init. Total workers:", app.state.worker_num)
             # app.state.dask_client = get_dask_client()
             print('AI Client:', AI_Client.keys(), ModelList.owners)
+            if app.state.is_debug:
+                print('Config:', Config.get_config_data())
         else:
             pass
             # app.state.dask_client = get_dask_client(Config.DASK_Cluster)
@@ -122,7 +125,7 @@ async def lifespan(app: FastAPI):
         close_dask_client()
         # if app.state.is_main:
         #     ModelList.save()
-        if app.state.is_debug:
+        if Config.TRACE:
             tracemalloc.stop()
 
 
@@ -147,7 +150,7 @@ app.mount("/data", StaticFiles(directory=Config.DATA_FOLDER), name="data")
 # 配置静态文件和模板
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/.well-known", StaticFiles(directory="static/.well-known"), name="well-known")
-app.mount("/mcp", mcp_app)
+app.mount("/mcp", mcp_app, name="mcp")
 
 app.include_router(index_router, prefix="")
 app.include_router(ideatech_router, prefix="/ideatech")
@@ -207,13 +210,67 @@ async def handle_hour():
 
 # @app.middleware("http")
 # async def verify_api_key(request: Request, call_next):
+#     # 跳过某些公开路由
+#     if request.url.path in ["/health", "/docs", "/openapi.json"]:
+#         return await call_next(request)
 #     api_key = request.headers.get("Authorization")
 #     if api_key:
-#         api_key = api_key.replace("Bearer ", "")  # 如果用的是 Bearer Token
+#         api_key = api_key.replace("Bearer ", "").strip()  # 如果用的是 Bearer Token
 #     if api_key not in Config.VALID_API_KEYS:
 #         raise HTTPException(status_code=401, detail="Invalid API key")
 #     response = await call_next(request)
 #     return response
+
+
+# 中间件：处理 Content-Type 和日志,请求进入路由之前
+@app.middleware("http")
+async def handle_content_log(request: Request, call_next):
+    # 只对 POST/PUT 等有 body 的请求处理   
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_type = request.headers.get("content-type", "").lower()
+
+        if "application/json" not in content_type:
+            body = await request.body()
+            try:
+                # 记录原始请求（调试用，生产环境谨慎开启）
+                raw_body = body.decode("utf-8", errors="ignore")
+                if app.state.is_debug:
+                    app.state.logger.debug(f"Request path: {request.url.path}")
+                    app.state.logger.debug(f"Request headers: {dict(request.headers)}")
+                    app.state.logger.debug(f"Raw body: {raw_body}")  # Assuming JSON/UTF-8
+
+                json.loads(raw_body)  # 尝试解析为 JSON,提前发现 JSON 语法错误
+                # 如果解析成功，可以选择继续（但 FastAPI 还是会因为 Content-Type 不对而报错，除非手动处理）
+                request._body = body  # 保持原样
+                # 注意：这里并没有真正修改 Content-Type，FastAPI 仍然会校验
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"detail": "Request body is not valid JSON"})
+
+    response = await call_next(request)
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    app.state.logger.error(f"Validation Errors: {errors}")
+    body_str = "<unable to decode body>"
+    if exc.body is not None:
+        if isinstance(exc.body, bytes):
+            body_str = exc.body.decode("utf-8", errors="ignore")
+        elif isinstance(exc.body, (dict, list, str)):
+            body_str = str(exc.body)  # 直接转字符串
+        else:
+            body_str = f"<unexpected body type: {type(exc.body).__name__}>"
+    else:
+        try:
+            body = await request.body()  # Body is still available here,验证失败时 body 还没被完全消费
+            body_str = body.decode('utf-8', errors="ignore")
+        except Exception as e:
+            app.state.logger.warning(f"Failed to read request body: {e}")
+
+    app.state.logger.error(f"Request body: {body_str}")
+    return JSONResponse(status_code=422, content={"detail": errors, "body_preview": body_str[:1000]})
 
 
 @app.get("/send_wechat_code")
@@ -994,11 +1051,17 @@ async def get_tools(request: ToolRequest, session: AsyncSession = Depends(get_db
     return JSONResponse(await ai_tools_results(tool_messages, app.state.func_manager))
 
 
+@app.get("/prompts/mcp")
+async def get_mcp_prompts():
+    mcp_prompts = await app.state.func_manager.mcp_server.list_prompts()
+    return JSONResponse(content=[t.to_mcp_prompt().model_dump() for t in mcp_prompts])
+
+
 @app.get("/tools/mcp")
-async def get_mcp_tool():
+async def get_mcp_tools():
     await app.state.func_manager.register_mcp_tools()
     mcp_tools = await app.state.func_manager.get_mcp_tools()
-    return JSONResponse(content={k: v.to_mcp_tool().model_dump() for k, v in mcp_tools.items()})
+    return JSONResponse(content=[t.to_mcp_tool().model_dump() for t in mcp_tools])
 
 
 @app.get('/tools/classes/{class_name}')
@@ -1335,7 +1398,7 @@ async def chat_completions(request: OpenAIRequestMessage):
     """
     # print(request.dict())
     kwargs = request.payload()
-    messages = [msg.dict() for msg in request.messages]
+    messages = [msg.to_dict() for msg in request.messages]
     instance = BaseReBot(model=request.model, user=request.user, agent='chat')
     if request.stream:
         async def fake_stream_response():
@@ -1461,7 +1524,7 @@ async def websocket_chat(websocket: WebSocket):
     except WebSocketDisconnect:
         print("Client disconnected")
     except Exception as e:
-        logger.error(f"Connection error: {e}")
+        app.state.logger.error(f"Connection error: {e}")
     finally:
         await websocket.close()
         db.close()

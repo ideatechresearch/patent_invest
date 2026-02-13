@@ -21,9 +21,9 @@ class Config(object):
     SECRET_KEY = '***'
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 60
-    VERIFY_TIMEOUT_SEC = 300
-    HTTP_TIMEOUT_SEC = 100.0
-    LLM_TIMEOUT_SEC = 300.0
+    VERIFY_TIMEOUT_SEC: float = 300
+    HTTP_TIMEOUT_SEC: float = 100.0
+    LLM_TIMEOUT_SEC: float = 300.0
     LLM_STREAM_INTERVAL_SEC: float = 0.03
     MAX_TASKS = 1024
     MAX_CACHE = 1024
@@ -35,7 +35,8 @@ class Config(object):
     DEVICE_ID = 'IusetTHaVvDmji5odDRZBQIhcTvcGWs6'
     INFURA_PROJECT_ID = ''
     DATA_FOLDER = 'data'
-    Version = 'v1.3.0'
+    Version = 'v1.3.5'
+    TRACE = False
     _config_path = 'config.yaml'
     __config_data = {}  # 动态加载的数据，用于还原
     __config_dynamic = {}  # 其他默认配置项，用于运行时
@@ -48,7 +49,7 @@ class Config(object):
     NEO_Password = '***'
     DASK_Cluster = 'tcp://127.0.0.1:8786'
     DASK_DASHBOARD_HOST = "http://127.0.0.1:8787"
-    QDRANT_HOST = 'qdrant' 
+    QDRANT_HOST = 'qdrant'
     QDRANT_GRPC_PORT = 6334
     QDRANT_URL = "http://xxx:6333"  # ":memory:"
     WECHAT_URL = 'http://idea_ai_robot:28089'
@@ -128,6 +129,7 @@ class Config(object):
     # https://aistudio.google.com/apikey
     GEMINI_Service_Key = '***'
     # https://console.anthropic.com/settings/keys
+    # https://platform.claude.com/settings/keys
     # https://www.cursor.com/cn/settings
     Anthropic_Service_Key = '***'
 
@@ -137,6 +139,7 @@ class Config(object):
     # https://cloud.siliconflow.cn/models
     Silicon_Service_Key = '***'
     Moonshot_Service_Key = "***"
+    Moonshot_Service_Keys = ["sk-***"]  # cubie,idea
     # https://modelscope.cn/my/myaccesstoken
     ModelScope_Service_Key = "***"
     # https://aihubmix.com/token
@@ -145,8 +148,12 @@ class Config(object):
     TokenFlux_Service_Key = "***"
     # https://console.x.ai/team/457298eb-40a8-4308-907d-0a36ec706042/api-keys/create
     Grok_Service_Key = '***'
-    # https://build.nvidia.com/explore/discover
-    NVIDIA_Service_Key = '***'  
+    # https://build.nvidia.com/settings/api-keys
+    NVIDIA_Service_Key = '***'
+    NVIDIA_Service_Keys = ['nvapi-***']
+    # https://github.com/settings/personal-access-tokens
+    GITHUB_Service_Key = '***'
+    GITHUB_Service_Keys = ['github_pat_***']  # Access_Tokens
     # https://platform.openai.com/settings/organization/admin-keys
     OPENAI_Admin_Service_Key = '***'
     OPENAI_Service_Key = '***'
@@ -155,11 +162,12 @@ class Config(object):
     # https://platform.baichuan-ai.com/console/apikey
     Baichuan_Service_Key = '***'
     # https://platform.deepseek.com/usage
-    DeepSeek_Service_Key = '***'  
-    DeepSeek_Service_Keys = ['***']
+    DeepSeek_Service_Key = '***'
+    DeepSeek_Service_Keys = ['sk-***']
     # https://platform.minimaxi.com/user-center/basic-information
     MINIMAX_Group_ID = '1887488082316366022'
-    MINIMAX_Service_Key = '***'
+    MINIMAX_Service_Key = "***"
+    MINIMAX_Service_Keys = ['***']
     # https://platform.lingyiwanwu.com/apikeys
     Lingyiwanwu_Service_Key = '***'
     # https://o3.fan/token
@@ -178,14 +186,16 @@ class Config(object):
     JINA_Service_Key = '***'
     # https://www.firecrawl.dev/app
     # https://docs.firecrawl.dev/introduction
-    Firecrawl_Service_Key = '***' 
+    Firecrawl_Service_Key = '***'
     # https://console.volcengine.com/iam/keymanage
     VOLC_AK_ID = '***'
     VOLC_Secret_Key = '***'
     VOLC_AK_ID_admin = '***'  
-    VOLC_Secret_Key_admin = '***'  
+    VOLC_Secret_Key_admin = '***'
     # https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D
     ARK_Service_Key = '***'
+    Discord_bot_Token = '***'
+    Telegram_bot_Token = '***'
 
     # https://vanna.ai/account/models 基于大模型和RAG的Text2SQL
     # https://vanna.ai/docs/app/
@@ -215,8 +225,6 @@ class Config(object):
     TAVILY_Api_Key = '***' 
     # https://dashboard.exa.ai/api-keys
     Exa_Api_Key = '***'
-    # https://github.com/settings/personal-access-tokens
-    GITHUB_Access_Tokens = '***'
     # https://studio.d-id.com/
     DID_Service_Key = '***'
     # https://www.weatherapi.com/my/
@@ -238,7 +246,7 @@ class Config(object):
     Ideatech_API_Key = '***'
     Ideatech_Host = '***.info' 
 
-    Risk_BASE_URL = "https://risk-qa.ezhanghu.cn"
+    Risk_BASE_URL = "https://***.ezhanghu.cn"
     Risk_API_KEY = "***"
     Risk_DB_CONFIG = {
         "host": "rm-***.mysql.rds.aliyuncs.com",  # 数据库地址
@@ -249,7 +257,7 @@ class Config(object):
         "charset": "utf8mb4"
     }
 
-    HTTP_Proxy = 'http://***:***@www.***.***:7930'
+    HTTP_Proxy = 'http://***:****@www.***:7930'
     HTTP_Proxies = {
         'http': HTTP_Proxy,
         'https': HTTP_Proxy,
@@ -274,11 +282,13 @@ class Config(object):
         cls.DASK_DASHBOARD_HOST = "http://host.docker.internal:8787"
 
         cls.HTTP_Proxy = 'http://***:***@10.10.10.3:7890'
-        # cls.HTTP_Proxies = {'http': cls.HTTP_Proxy,'https': cls.HTTP_Proxy}
+        cls.HTTP_Proxies = {'http': cls.HTTP_Proxy, 'https': cls.HTTP_Proxy}
         os.environ['HTTP_PROXY'] = cls.HTTP_Proxies['http']
         os.environ['HTTPS_PROXY'] = cls.HTTP_Proxies['https']
 
-        cls.Moonshot_Service_Key = "sk-***" 
+        cls.TENCENT_SecretId = "***"
+        cls.TENCENT_Secret_Key = "***"
+        cls.Moonshot_Service_Key = "sk-***"
         cls.DeepSeek_Service_Key = 'sk-***'
         cls.DashScope_Service_Key = 'sk-***'
         cls.ARK_Service_Key = '***'
@@ -492,6 +502,7 @@ AI_Models = [
                'qwq-plus', "qwq-plus-latest", "qwen-plus-2025-04-28",
                "qwen3-235b-a22b", "qwen3-235b-a22b-thinking-2507", "qwen3-235b-a22b-instruct-2507",  # 128K
                "tongyi-intent-detect-v3", "abab6.5t-chat", 'abab6.5s-chat',
+               "kimi-k2-thinking",
                "deepseek-r1-distill-qwen-1.5b", "deepseek-r1-distill-qwen-7b",
                "deepseek-r1-distill-qwen-14b", "deepseek-r1-distill-qwen-32b",  # 32k
                "deepseek-r1-distill-llama-8b", "deepseek-r1-distill-llama-70b",
@@ -515,21 +526,25 @@ AI_Models = [
      'generation_url': "https://api.deepseek.com/beta",  # https://api.deepseek.com/beta/completions
      'base_url': 'https://api.deepseek.com',
      'extra_url': ["https://api.deepseek.com/v3.1_terminus_expires_on_20251015"],
-     'supported_openai': True, 'supported_list': True, "timeout": 300},  # /v1
+     'supported_openai': True, 'supported_list': True, "timeout": 600},  # /v1
     # https://platform.moonshot.cn/console/api-keys
     {'name': 'moonshot', 'type': 'default', 'api_key': '',
-     "model": ["moonshot-v1-auto", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k", "kimi-latest"],
+     "model": ["moonshot-v1-auto", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k",
+               "kimi-k2-thinking", "kimi-k2-thinking-turbo", "kimi-k2-turbo-preview", "kimi-k2.5",
+               "kimi-latest"],
      'url': "https://api.moonshot.cn/v1/chat/completions", 'base_url': "https://api.moonshot.cn/v1",
      'file_url': "https://api.moonshot.cn/v1/files",
      'supported_openai': True, 'supported_list': True, "timeout": 300},
     # https://open.bigmodel.cn/console/overview
     # https://docs.bigmodel.cn/cn/guide/start/introduction
+    # https://docs.bigmodel.cn/cn/coding-plan/tool/claude
     {'name': 'glm', 'type': 'default', 'api_key': '',
      "model": ["glm-4-air", "glm-4-flash", "glm-4-flashx", "glm-4v-flash", "glm-4-air", "glm-4-airx", 'glm-4-plus',
                "glm-4-long",
                "glm-4.5-flash", "glm-4.5-air", "glm-4.5-airx", "glm-4.5", "glm-4.5-x",
+               "glm-4.6v-flash", "glm-4.6", "glm-4.7",
                "glm-z1-flash", "glm-z1-air", "glm-z1-airx", "glm-4-air-250414",
-               "codegeex-4", "glm-4", "glm-4v", "glm-4-9b", "glm-3-turbo"],  # "glm-4-assistant"
+               "codegeex-4", "emohaa", "glm-4", "glm-4v", "glm-4-9b", "glm-3-turbo"],  # "glm-4-assistant"
      #  "glm-4-0520"
      "embedding": ["embedding-2", "embedding-3"],
      "reranker": ["rerank"],
@@ -541,20 +556,25 @@ AI_Models = [
      'speech_url': "https://open.bigmodel.cn/api/paas/v4/audio/speech",
      'image_url': 'https://open.bigmodel.cn/api/paas/v4/images/generations',
      'video_url': 'https://open.bigmodel.cn/api/paas/v4/videos/generations',
+     'ocr_url': "https://open.bigmodel.cn/api/paas/v4/files/ocr",
      'file_url': "https://open.bigmodel.cn/api/paas/v4/files",
      'tool_url': "https://open.bigmodel.cn/api/paas/v4/tools",
-     'agent_url': "https://open.bigmodel.cn/api/v1/agents",
+     'agent_url': "https://open.bigmodel.cn/api/v1/agents",  # agent_id
      'supported_openai': True, 'supported_list': False, "timeout": 300},
     # https://console.volcengine.com/ark/region:ark+cn-beijing/endpoint?config=%7B%7D
     # https://console.volcengine.com/ark/region:ark+cn-beijing/model?vendor=Bytedance&view=LIST_VIEW
+    # https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&advancedActiveKey=model
     # https://www.volcengine.com/docs/82379/1494384
     {'name': 'doubao', 'type': 'default', 'api_key': '',
      "model": ["doubao-1-5-lite-32k-250115", "doubao-1-5-pro-32k-250115", "doubao-1-5-pro-256k-250115",
                "doubao-pro-32k-browsing-241115", "doubao-pro-32k-character-241215",
                "doubao-pro-32k-functioncall-241028", 'doubao-pro-32k-functioncall-preview',
                "doubao-pro-256k-241115",
-               "doubao-seed-1-6-flash-250715", "doubao-seed-1-6-thinking-250715", "doubao-seed-1-6-250615",
-               "kimi-k2-250905", "deepseek-v3-1-250821", "deepseek-v3-1-terminus",
+               "doubao-seed-1-6-flash-250715", "doubao-seed-1-6-thinking-250715",
+               "doubao-seed-1-6-vision-250815", "doubao-seed-code-preview-251028",
+               "doubao-seed-1-6-250615", "doubao-seed-1-8-251228",
+               "kimi-k2-250905", "kimi-k2-thinking-251104", "glm-4-7-251222",
+               "deepseek-v3-1-250821", "deepseek-v3-1-terminus",
                ],
      "model_map": {
          # 自定义接入点调用 The model or endpoint doubao-pro-32k does not exist or you do not have access to it
@@ -573,7 +593,7 @@ AI_Models = [
      'url': 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
      'tokenization_url': 'https://ark.cn-beijing.volces.com/api/v3/tokenization',
      'base_url': "https://ark.cn-beijing.volces.com/api/v3",
-     'supported_openai': True, 'supported_list': False, "timeout": 100},
+     'supported_openai': True, 'supported_list': False, "timeout": 300},
     # https://platform.baichuan-ai.com/docs/api
     {'name': 'baichuan', 'type': 'default', 'api_key': '',
      "model": ['Baichuan3-Turbo', "Baichuan2-Turbo", 'Baichuan3-Turbo', 'Baichuan3-Turbo-128k', 'Baichuan3-Turbo-128k',
@@ -584,14 +604,14 @@ AI_Models = [
      'base_url': "https://api.baichuan-ai.com/v1/",  # assistants,files,threads
      'assistants_url': 'https://api.baichuan-ai.com/v1/assistants',
      'embedding_url': 'https://api.baichuan-ai.com/v1/embeddings',
-     'supported_openai': True, 'supported_list': True, "timeout": 100},
+     'supported_openai': True, 'supported_list': True, "timeout": 300},
     # https://platform.lingyiwanwu.com/docs/api-reference#api-keys
     {'name': 'lingyiwanwu', 'type': 'default', 'api_key': '',
      "model": ['yi-lightning', 'yi-medium', 'yi-large', 'yi-large-fc', 'yi-spark'],
      "embedding": ["Baichuan-Text-Embedding"],
      'url': 'https://api.lingyiwanwu.com/v1/chat/completions',
      'base_url': "https://api.lingyiwanwu.com/v1",
-     'supported_openai': True, 'supported_list': True, "timeout": 100},
+     'supported_openai': True, 'supported_list': True, "timeout": 300},
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/Zm2ycv77m
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/mlm0nonsv
     {'name': 'ernie', 'type': 'default', 'api_key': '',
@@ -607,7 +627,7 @@ AI_Models = [
      'embedding_url': 'https://qianfan.baidubce.com/v2/embeddings',
      'reranker_url': "https://qianfan.baidubce.com/v2/rerankers",
      'base_url': "https://qianfan.baidubce.com/v2",
-     'supported_openai': True, 'supported_list': False, "timeout": 100
+     'supported_openai': True, 'supported_list': False, "timeout": 300
      },
     # https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t
     # https://console.bce.baidu.com/qianfan/ais/console/onlineService
@@ -644,7 +664,7 @@ AI_Models = [
      'reranker_url': "https://api.jina.ai/v1/rerank",
      'classify_url': "https://api.jina.ai/v1/classify",
      'segment_url': 'https://api.jina.ai/v1/segment',
-     'supported_openai': False, 'supported_list': False, 'proxy': True, "timeout": 200},
+     'supported_openai': False, 'supported_list': False, 'proxy': True, "timeout": 300},
     # open.volcengineapi.com
     # https://cloud.tencent.com/document/product/1729
     # https://cloud.tencent.com/document/product/1729/104753
@@ -657,7 +677,34 @@ AI_Models = [
      'base_url': "https://api.hunyuan.cloud.tencent.com/v1",
      'embedding_url': "https://api.hunyuan.cloud.tencent.com/v1/embeddings",
      'nlp_url': "nlp.tencentcloudapi.com", 'ocr_url': 'ocr.tencentcloudapi.com',
-     'supported_openai': True, 'supported_list': True, "timeout": 100},
+     'supported_openai': True, 'supported_list': True, "timeout": 300},
+    # https://build.nvidia.com/explore/discover
+    # https://docs.api.nvidia.com/nim/reference/llm-apis
+    {'name': 'nvidia', 'type': 'default', 'api_key': '',
+     'model': ['minimaxai/minimax-m2.1', "minimaxai/minimax-m2",
+               "z-ai/glm4.7", "moonshotai/kimi-k2.5", "moonshotai/kimi-k2-thinking",
+               "deepseek-ai/deepseek-v3.2", "deepseek-ai/deepseek-v3.1",
+               "openai/gpt-oss-20b", "meta/llama3-70b-instruct",
+               "qwen/qwen3-next-80b-a3b-thinking",
+               "thudm/chatglm3-6b", "baichuan-inc/baichuan2-13b-chat"],
+     'embedding': ['nvidia/llama-nemotron-embed-vl-1b-v2', "nvidia/nv-embed-v1", "baai/bge-m3"],
+     'url': 'https://integrate.api.nvidia.com/v1/chat/completions',
+     'base_url': "https://integrate.api.nvidia.com/v1",
+     'embedding_url': "https://integrate.api.nvidia.com/v1/embeddings",
+     "invoke_url": "https://health.api.nvidia.com/v1/biology/nvidia/genmol/generate",
+     'supported_openai': True, 'supported_list': True, "timeout": 600},
+    # https://docs.github.com/en/github-models/about-github-models
+    # https://github.com/marketplace?type=models
+    {'name': 'github', 'type': 'default', 'api_key': '',
+     'model': ["openai/gpt-4o", "openai/gpt-4.1",
+               "xai/grok-3", "microsoft/Phi-4-reasoning",
+               "deepseek/DeepSeek-V3-0324"],
+     'embedding': ["Cohere-embed-v3-multilingual", "openai/text-embedding-3-large", "openai/text-embedding-3-small"],
+     'url': 'https://models.github.ai/inference/chat/completions',
+     'base_url': "https://models.inference.ai.azure.com",  # "https://models.github.ai/inference"
+     'model_url': "https://models.inference.ai.azure.com/models",
+     'embedding_url': "https://models.inference.ai.azure.com/embeddings",
+     'supported_openai': False, 'supported_list': True, 'proxy': False, "timeout": 300},
     # https://cloud.siliconflow.cn/playground/chat
     {'name': 'silicon', 'type': 'default', 'api_key': '',
      'model': ["Qwen/Qwen2-7B-Instruct", "Qwen/Qwen2-1.5B-Instruct",
@@ -703,7 +750,7 @@ AI_Models = [
      'reranker_url': "https://api.siliconflow.cn/v1/rerank",
      'image_url': 'https://api.siliconflow.cn/v1/images/generations',
      'speech_url': "https://api.siliconflow.cn/v1/uploads/audio/voice",
-     'supported_openai': True, 'supported_list': True, "timeout": 100},
+     'supported_openai': True, 'supported_list': True, "timeout": 300},
 
     # https://console.xfyun.cn/services/sparkapiCenter
     # https://www.xfyun.cn/doc/spark/HTTP%E8%B0%83%E7%94%A8%E6%96%87%E6%A1%A3.html#_3-%E8%AF%B7%E6%B1%82%E8%AF%B4%E6%98%8E
@@ -715,17 +762,18 @@ AI_Models = [
      'embedding_url': 'https://emb-cn-huabei-1.xf-yun.com/',
      'translation_url': 'https://itrans.xf-yun.com/v1/its',
      'ws_url': 'wss://spark-api.xf-yun.com/v3.5/chat',
-     'supported_openai': False, 'supported_list': False, "timeout": 100
+     'supported_openai': False, 'supported_list': False, "timeout": 300
      },
     # https://platform.minimaxi.com/document/ChatCompletion%20v2?key=66701d281d57f38758d581d0
     {'name': 'minimax', 'type': 'default', 'api_key': '',
-     'model': ["MiniMax-Text-01", 'abab6.5s-chat', 'DeepSeek-R1'],
-     'speech': ['speech-02-hd', 'speech-01-hd', 'speech-02-turbo', 'speech-01-turbo'],
+     'model': ["MiniMax-Text-01", 'abab6.5s-chat', 'DeepSeek-R1', "M2-her", "MiniMax-M2",
+               "MiniMax-M2.1-lightning", "MiniMax-M2.1"],
+     'speech': ['speech-02-hd', 'speech-01-hd', 'speech-02-turbo', 'speech-01-turbo', "speech-2.8-hd"],
      'image': ['image-01'],
-     'url': 'https://api.minimax.chat/v1/text/chatcompletion_v2',
-     'speech_url': 'https://api.minimax.chat/v1/t2a_v2',  # t2a_async_v2
-     'base_url': 'https://api.minimax.chat/v1',
-     'supported_openai': True, 'supported_list': False},
+     'url': 'https://api.minimaxi.com/v1/text/chatcompletion_v2',
+     'speech_url': 'https://api.minimaxi.com/v1/t2a_v2',  # t2a_async_v2
+     'base_url': 'https://api.minimaxi.com/v1',
+     'supported_openai': True, 'supported_list': False, "timeout": 600},
     # https://docs.mistral.ai/api/#tag/chat/operation/chat_completion_v1_chat_completions_post
     {'name': 'mistral', 'type': 'default', 'api_key': '',
      'model': ["mistral-small-latest", 'open-mistral-nemo', 'open-codestral-mamba', 'codestral-latest',
@@ -735,7 +783,7 @@ AI_Models = [
      'agent_url': 'https://api.mistral.ai/v1/agents/completions',
      'embedding_url': 'https://api.mistral.ai/v1/embeddings',
      'base_url': 'https://api.mistral.ai/v1',
-     'supported_openai': True, 'supported_list': True, 'proxy': True, "timeout": 200},
+     'supported_openai': True, 'supported_list': True, 'proxy': True, "timeout": 300},
     # https://ai.google.dev/gemini-api/docs/openai?hl=zh-cn#python
     {'name': 'gemini', 'type': 'default', 'api_key': '',
      'model': ["gemini-1.5-flash", 'gemini-1.5-flash-8b', 'gemini-1.5-pro',
@@ -779,7 +827,7 @@ AI_Models = [
      # 'unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF'
      'url': 'https://ms-fc-283a6661-de97.api-inference.modelscope.cn/v1',
      'base_url': "https://api-inference.modelscope.cn/v1",
-     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 100},
+     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 300},
     # https://docs.aihubmix.com/cn/index
     {'name': 'aihubmix', 'type': 'default', 'api_key': '',
      'model': ["gpt-4o-mini", "gpt-3.5-turbo", 'o3-mini', 'o4-mini', 'gpt-4o',
@@ -959,7 +1007,7 @@ AI_Models = [
      'url': 'https://api.zhizengzeng.com/v1/chat/completions',
      'embedding_url': 'https://api.zhizengzeng.com/v1/embeddings',
      'base_url': "https://api.zhizengzeng.com/v1",
-     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 300},
+     'supported_openai': True, 'supported_list': True, 'proxy': False, "timeout": 600},
     {'name': '147', 'type': 'default', 'api_key': '', 'model': ['deepseek-v3-2-exp'],
      'url': 'https://147ai.com/v1/chat/completions',
      'base_url': "https://147ai.com/v1",
@@ -982,7 +1030,7 @@ AI_Models = [
      'embedding_url': 'https://api.openai.com/v1/embeddings',
      'base_url': "https://api.openai.com/v1",
      'ws_url': 'wss://api.openai.com/v1/realtime',
-     'supported_openai': True, 'supported_list': True, 'proxy': True, "timeout": 200,
+     'supported_openai': True, 'supported_list': True, 'proxy': True, "timeout": 300,
      },
 
 ]
@@ -1008,13 +1056,15 @@ def model_api_keys(name: str = None):
         'grok': Config.Grok_Service_Key,
         'claude': Config.Anthropic_Service_Key,
         # 'gpt': Config.OPENAI_Service_Key
+        'github': Config.GITHUB_Service_Key,
+        'nvidia': Config.NVIDIA_Service_Key,
         'silicon': Config.Silicon_Service_Key,
         'modelscope': Config.ModelScope_Service_Key,
         'aihubmix': Config.AiHubMix_Service_Key,
         'tokenflux': Config.TokenFlux_Service_Key,
         'othree': Config.OThree_Service_Key,
         'zzz': Config.ZZZ_Service_Key,
-        '147': Config.AI147_Service_Key
+        '147': Config.AI147_Service_Key,
     }
     if not name:
         return api_keys

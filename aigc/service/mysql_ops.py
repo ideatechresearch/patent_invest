@@ -281,6 +281,38 @@ class BaseMysql:
         cols = [desc[0] for desc in cursor.description]
         return result_rows, cols
 
+    @staticmethod
+    def execute_sql(conn, sql, params=None):
+        """
+        执行给定的SQL语句，返回结果。
+        参数：
+            - conn： SQLite连接
+            - sql：要执行的SQL语句
+            - params：SQL语句中的参数
+        """
+        try:
+            # connection.text_factory = bytes
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(sql, params)
+            else:
+                cursor.execute(sql)
+            return cursor.fetchall()
+        except Exception as e:
+            try:
+                conn.text_factory = bytes
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(sql, params)
+                else:
+                    cursor.execute(sql)
+                rdata = cursor.fetchall()
+                conn.text_factory = str
+                return rdata
+            except Exception as e:
+                logging.error(f"**********\nSQL: {sql}\nparams: {params}\n{e}\n**********", exc_info=True)
+                return None
+
 
 class SyncMysql(BaseMysql):
     def __init__(self, *args, **kwargs):

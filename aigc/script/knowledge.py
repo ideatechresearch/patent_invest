@@ -2,7 +2,7 @@ from utils import cosine_similarity_np, split_sentences
 from generates import *
 from igraph import Graph
 import asyncio
-import PyPDF2
+import pypdf
 import re
 
 def parse_toc(pdf_path, toc_pages=(0, 0)):
@@ -17,7 +17,7 @@ def parse_toc(pdf_path, toc_pages=(0, 0)):
         list: 包含目录信息的列表，每个元素为字典形式。
     """
     with open(pdf_path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
+        reader = pypdf.PdfReader(f)
         toc_text = ""
         if toc_pages[0] == toc_pages[1]:
             toc_text = reader.pages[toc_pages[0]].extract_text()
@@ -67,7 +67,7 @@ def get_full_parent_path(toc, current_key):
 
 def extract_content(pdf_path, toc):
     with open(pdf_path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
+        reader = pypdf.PdfReader(f)
         content = {}
         for idx, item in enumerate(toc):
             start_page = item['page'] - 1

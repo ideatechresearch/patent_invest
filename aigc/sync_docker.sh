@@ -16,6 +16,9 @@ chmod -R 777 "$DST"
 # -----------------------------
 echo "同步文件: $SRC -> $DST"
 rsync -av --update "$SRC" "$DST"
+echo "确保脚本可执行"
+chmod +x "$0"
+chmod +x "$DST/sync_docker.sh"
 # -----------------------------
 # 重启 Docker 容器
 # -----------------------------

@@ -4,6 +4,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Type, Dict, List, Tuple, Any, Union, Literal
 from contextlib import asynccontextmanager, contextmanager
+
+from sqlalchemy.util import ellipses_string
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from redis.asyncio import Redis, StrictRedis, ConnectionPool
@@ -39,8 +41,10 @@ DB_Client = OperationMysql(async_mode=True, minsize=2)
 
 AliyunBucket = oss2.Bucket(oss2.Auth(Config.ALIYUN_oss_AK_ID, Config.ALIYUN_oss_Secret_Key), Config.ALIYUN_oss_endpoint,
                            Config.ALIYUN_Bucket_Name)
-logger = get_root_logging(file_name="app.log")  # logging.getLogger(__name__)
+logger = get_root_logging(file_name="app.log", level=logging.DEBUG if Config.get('IS_DEBUG') else logging.WARNING)
 mcp = FastMCP(name="FastMCP Server")  # Create a server instance,main_mcp
+for logger_name in ["asyncio", "websockets", "uvicorn", "fastmcp", "docket"]:
+    logging.getLogger(logger_name).setLevel(logging.INFO if Config.get('IS_DEBUG') else logging.WARNING)
 
 
 # mcp_app = mcp.http_app(transport="streamable-http", path="/mcp")
@@ -810,7 +814,7 @@ async def get_data_for_model(model: dict):
         response.raise_for_status()
         models = response.json()
         if models:
-            return models.get('data')
+            return models.get('data') if isinstance(models, dict) else models
 
     return None
 
@@ -1034,8 +1038,9 @@ class ModelList:
 
 async def init_ai_clients(ai_models: list = AI_Models) -> dict:
     limits = httpx.Limits(max_connections=max(Config.MAX_HTTP_CONNECTIONS, Config.MAX_KEEPALIVE_CONNECTIONS),
-                          max_keepalive_connections=Config.MAX_KEEPALIVE_CONNECTIONS)
-    transport = httpx.AsyncHTTPTransport(proxy=Config.HTTP_Proxy)
+                          max_keepalive_connections=Config.MAX_KEEPALIVE_CONNECTIONS,
+                          keepalive_expiry=Config.LLM_TIMEOUT_SEC)
+    transport = httpx.AsyncHTTPTransport(proxy=Config.HTTP_Proxy, retries=Config.MAX_RETRY_COUNT, http2=True)
     # proxies = {"http://": Config.HTTP_Proxy, "https://": Config.HTTP_Proxy}
     # http_client = DefaultHttpxClient(proxy="http://my.test.proxy.example.com", transport=httpx.HTTPTransport(local_address="0.0.0.0"))
     for model in ai_models:

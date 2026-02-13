@@ -553,11 +553,11 @@ def extract_tagged_content(text, tag="answer"):
 
 
 # reasoning
-def extract_tagged_split(text, tag="think"):
+def extract_tagged_split(text, tag="think") -> tuple:
     """
     Splits the text into two parts: the content inside the specified tag
     and the remaining text outside the tag.
-
+    think_pattern = r'<think>(.*?)</think>'
     Args:
         text (str): The input text containing the tagged content.
         tag (str): The tag to extract content from (default is 'think',reasoning).
@@ -565,15 +565,15 @@ def extract_tagged_split(text, tag="think"):
     Returns:
         list: A list containing [tag_content, remaining_text].
     """
-    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>\s*(.*)", re.DOTALL)
+    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>\s*(.*)", flags=re.DOTALL)
     match = pattern.search(text)
 
     if match:
         think_content = match.group(1).strip()  # 提取 <think> 内的内容,
         output_content = match.group(2).strip()  # 提取最终输出内容
-        return [think_content, output_content]
+        return think_content, output_content
 
-    return [None, text]
+    return None, text
 
 
 def ordinal_generator():

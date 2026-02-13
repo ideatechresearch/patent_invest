@@ -11,6 +11,7 @@ class CubeBase:
     表示不能混层
     不变量是结构给的,不是定义的
     贴纸世界是表示的一种投影，投影不可逆
+    魔方是一个噪声极低、结构极硬的实验宇宙
     axis = 0 → x → R/L
     axis = 1 → y → U/D
     axis = 2 → z → F/B
@@ -18,9 +19,6 @@ class CubeBase:
 
     Coordinate system:
       Right-handed Cartesian system.
-      +X → Right  (R)
-      +Y → Up     (U)
-      +Z → Front  (F)
 
     AXIS_FACE[axis] = (POS_FACE, NEG_FACE)
       POS_FACE: face whose outward normal aligns with +axis direction
@@ -108,6 +106,7 @@ class CubeBase:
     # edge_positions = np.array(EDGE_POS_SIGNS, dtype=int)
 
     def __init__(self, n: int = 3):
+        """纯几何 / move 定义（无状态）"""
         self.n = n
         self.solved_idx = np.arange(6 * n * n, dtype=np.uint32).reshape(6, n, n)
         self.solved = np.zeros((6, n, n), dtype=np.uint8)
@@ -133,7 +132,7 @@ class CubeBase:
     def is_solved(self, state: np.ndarray) -> bool:
         return bool(np.array_equal(state, self.solved))  # not (state ^ self.solved).any()
 
-    def is_solved_idx(self, state_idx: np.ndarray) -> bool:
+    def is_solved_by_idx(self, state_idx: np.ndarray) -> bool:
         return bool(np.array_equal(self.idx_to_state(state_idx), self.solved))
 
     def diff_coords(self, state: np.ndarray) -> np.ndarray:
@@ -154,9 +153,34 @@ class CubeBase:
 
     @staticmethod
     def embedding(state_idx: np.ndarray) -> np.ndarray:
+        """MLP, n 变化（比如同时训练 3×3，甚至 7×7），网络就很难学到一致的模式"""
         n = state_idx.shape[1]
         # (state_idx // (n * n)).astype(float) + (state_idx % (n * n)).astype(float) / (n * n)
         return state_idx.astype(float) / (n * n)
+
+    @staticmethod
+    def embedding_relative(state_idx: np.ndarray) -> np.ndarray:
+        """
+        Transformer / GNN 相对坐标 [color,u,v]
+        返回: (batch, 6*n*n, 3)
+        """
+        if state_idx.ndim == 3:
+            state_idx = state_idx[None]  # 加 batch dim (1, 6, n, n)
+
+        b, f, n, _ = state_idx.shape
+        # 颜色归一化
+        color = (state_idx // (n * n)).astype(np.float32) / 5.0  # (b, 6, n, n)
+
+        # 相对坐标网格 ∈ [-1, 1]
+        grid = np.linspace(-1.0, 1.0, n)
+        u, v = np.meshgrid(grid, grid)  # (n,n) for each face
+
+        uv = np.stack([u, v], axis=-1)[None, None]  # (1,1,n,n,2)
+        uv = np.broadcast_to(uv, (b, f, n, n, 2))  # 广播到(b,6,n,n,2)
+
+        color = color[..., None]
+        emb = np.concatenate([color, uv], axis=-1)  # (b,6,n,n,3)
+        return emb.reshape(b, -1, 3)  # (b, 6*n*n, 3)
 
     @staticmethod
     def get_data(state: np.ndarray, coords_def: list | tuple) -> tuple:
@@ -201,7 +225,7 @@ class CubeBase:
         """
         返回每个 corner 对应的 piece id（0~7）, corners_perm (8)
         perm 表示 piece 的重排，当前位置 i 的角块，原来是 solved 的哪一块？ 群作用矩阵里计算 twist
-        corner_ori 不是物理量，是约定量
+        corner_ori 不是物理量，是约定量，测不准
         """
         corners = self.get_corners(state)
         perm = np.empty(8, dtype=np.int8)
@@ -215,10 +239,6 @@ class CubeBase:
         # ori = (ori - ori[0]) % 3  # 全局 orientation gauge fix
         ori[-1] = (-ori[:-1].sum()) % 3  # 把 orientation 投影到合法子空间,修正最后一个角方向
         return perm, ori
-
-    def heuristic_corner_perm(self, state: np.ndarray):
-        corners_perm, _ = self.corner_ids_ori(state)
-        return np.count_nonzero(corners_perm != np.arange(8))
 
     def solved_edges_map(self) -> dict:
         """
@@ -278,13 +298,13 @@ class CubeBase:
                 for direction in (-1, 1, 2):  # direction 只用 ±1，2 步可视为两步重复
                     yield axis, layer, direction
 
-    def scramble(self, moves: int = 20) -> list:
+    def generate_moves(self, length: int = 20) -> list:
         """生成打乱序列，返回 move list"""
         scramble_moves = []
-        for _ in range(moves):
+        for _ in range(length):
             axis = random.choice(range(3))
             layer = random.choice(self.center_layers)
-            direction = random.choice((1, 2, 3))
+            direction = random.choice((-1, 1, 2))  # 1, 2, 3
             scramble_moves.append((axis, layer, direction))
         return scramble_moves  # -> act/apply
 
@@ -319,22 +339,6 @@ class CubeBase:
         if axis == pa and layer == pl:
             return (pd + direction) % 4 == 0
         return False
-
-    @staticmethod
-    def commutator(A: list, B: list) -> list:
-        """
-        交换子,制造局部扰动,奇偶性不变
-        A, B: move list
-        return: [A, B] = A B A⁻¹ B⁻¹
-        """
-        return A + B + CubeBase.invert_moves(A) + CubeBase.invert_moves(B)
-
-    @staticmethod
-    def conjugate(A: list, B: list) -> list:
-        """
-        共轭 A B A⁻¹ 改变作用位置,保持结构不变 or A⁻¹ B A
-        """
-        return A + B + CubeBase.invert_moves(A)
 
     def transform(self, move: str) -> list[tuple]:
         """
@@ -400,6 +404,7 @@ class CubeBase:
     def permutation_parity(perm: np.ndarray | list) -> int:
         """
         Return 0 for even, 1 for odd permutation
+        0（偶置换）或 1（奇置换）
         """
         visited = np.zeros(len(perm), dtype=bool)
         parity = 0
@@ -413,7 +418,7 @@ class CubeBase:
                 j = perm[j]
                 cycle_len += 1
             if cycle_len > 0:
-                parity ^= (cycle_len - 1) & 1
+                parity ^= (cycle_len - 1) & 1  # 奇长循环贡献奇置换 (cycle_len % 2)
         return parity
 
     def dfs(self, state: np.ndarray, depth: int, bound, visited, path, max_depth: int = 25):
@@ -544,6 +549,20 @@ class CubeBase:
         if c == 0 and layer >= mid:
             layer_idx -= 1
         return layer_idx
+
+    @staticmethod
+    def layer_to_side(layer: int, n: int) -> int | None:
+        """
+        最外层 → ±1
+        中心层 → 0（奇数:0, 偶数:-1）
+        其他中间层 → None
+        """
+        mid, c = divmod(n, 2)
+        if abs(layer) == mid:
+            return 1 if layer > 0 else -1
+        if layer == 0 or (c == 0 and layer == -1):
+            return 0
+        return None
 
     @staticmethod
     def layer_to_logic(layer: int, n: int) -> float:
@@ -932,7 +951,7 @@ class CubeBase:
         return stickers
 
     @classmethod
-    def get_edge_stickers(cls, n: int) -> list:
+    def get_edge_stickers(cls, n: int) -> list[tuple]:
         """
         返回所有 edge 贴纸:
         [(face, r, c, pos), ...]
@@ -953,6 +972,21 @@ class CubeBase:
             ):
                 pos = cls.sticker_pos(normal, u_dir, v_dir, r, c, n)
                 stickers.append((face, r, c, pos))
+        return stickers
+
+    @class_cache(cache_name='_CENTER_CACHE', key=lambda n: n)
+    @classmethod
+    def get_center_stickers(cls, n: int) -> list[tuple]:
+        """
+        返回每个面的中心贴纸坐标,6
+        """
+        mid, c = divmod(n, 2)  # 中心永远是几何中心
+        cr = cc = mid if c == 1 else mid - 1  # 奇数取正中，偶数取偏左/上
+        stickers = []
+        for face in cls.FACES:
+            normal, u_dir, v_dir = cls.face_basis(face)
+            pos = cls.sticker_pos(normal, u_dir, v_dir, cr, cc, n)
+            stickers.append((cls.face_idx[face], cr, cc, pos))  # 通常不需要 pos，直接返回坐标
         return stickers
 
     @class_cache(cache_name='_CENTER_RINGS_CACHE', key=lambda n: n)
@@ -1086,14 +1120,14 @@ class CubeBase:
                  for sx in (+1, -1)
                  for sy in (+1, -1)
                  for sz in (+1, -1)]  # list(product([1, -1], repeat=3))
+        定义基准：UFR
         """
         stickers = cls.get_corner_stickers(n)
         corners = {k: [] for k in cls.CORNER_POS_SIGNS}  # 8 个角
 
         for face, r, c, pos in stickers:
-            sx = 1 if pos[0] > 0 else -1
-            sy = 1 if pos[1] > 0 else -1
-            sz = 1 if pos[2] > 0 else -1
+            signs = np.sign(np.round(pos, decimals=5)).astype(int)
+            sx, sy, sz = signs
             corners[(sx, sy, sz)].append((face, r, c, pos))
 
         result = [[] for _ in range(len(cls.CORNER_POS_SIGNS))]
@@ -1103,11 +1137,39 @@ class CubeBase:
                 raise ValueError(f"illegal corner {sign}: {len(group)}")
             center = np.mean([p for *_, p in group], axis=0)
             assert tuple(np.sign(center)) == sign, f"Sign mismatch for corner {cid}: expected {sign}"
-            # “已正确分组后”再做主轴排序
+            # 已正确分组后,再做主轴排序,能让起点更一致
             group.sort(key=lambda x: np.argmax(np.abs(x[3])))
-            result[cid] = [(cls.face_idx[f], r, c) for f, r, c, _ in group]
+
+            # 用法向量排序（代替 pos） 叉积排序，确保右手定则顺序
+            v_corner = np.array(sign, dtype=float)
+            # 先找该角的“U/D”面（如果有），作为起点 标准顺序 standard: ['U', 'F', 'R']
+            face_to_item = {item[0]: item for item in group}
+            start_face = next((f for f in ('U', 'D') if f in face_to_item), list(face_to_item)[0])  # 优先用 U/D 面作为起点
+            start = face_to_item[start_face]
+
+            sorted_group = [start]  # 起点
+            remaining = [item for item in group if item != start]
+
+            for _ in range(2):
+                curr_f = sorted_group[-1][0]
+                curr_normal = cls.face_normal[curr_f]  # curr_pos = sorted_group[-1][3]
+                for i, next_item in enumerate(remaining):
+                    next_f = next_item[0]
+                    next_normal = cls.face_normal[next_f]  # next_pos = next_item[3]
+                    cross = np.cross(curr_normal, next_normal)
+                    if np.dot(cross, v_corner) < 0:  # 右手定则 顺时针 >0
+                        sorted_group.append(remaining.pop(i))
+                        break
+                else:  # 如果叉积失败，fallback 到面优先级
+                    remaining.sort(key=lambda x: cls.face_idx[x[0]])
+                    sorted_group.extend(remaining)
+                    # raise ValueError(f"Cannot find consistent order for corner {cid}")
+                    break
+
+            result[cid] = [(cls.face_idx[f], r, c) for f, r, c, _ in sorted_group]
 
         assert len(result) == 8, f"Expected 8 corners, got {len(result)}"
+        print([''.join([cls.FACES[y[0]] for y in x]) for x in result], '\n', cls.corner_face_cycle())
         return result
 
     @staticmethod
@@ -1305,6 +1367,7 @@ class CubeBase:
 
 
 class StickerCube(CubeBase):
+    """贴纸态"""
     COLORS = ['W', 'Y', 'R', 'O', 'G', 'B']  # Rubiks 0:白色, 1:黄色, 2:红色, 3:橙色, 4:绿色, 5:蓝色
 
     def __init__(self, state: np.ndarray | dict = None, n: int = 3):
@@ -1851,11 +1914,10 @@ if __name__ == "__main__":
         colors = [[cube.cube[f, r, c] for f, r, c in s] for s in strip]
         print(colors)
 
-    print('heuristic_corner_perm', cube.heuristic_corner_perm(cube.cube))
-
     print('encode_state', cube.encode_state(cube.cube))
     print('encode_state_idx', cube.encode_state(cube.solved_idx).astype(float) / (cube.n * cube.n))
     print('embedding', cube.embedding(cube.solved_idx))
+    print('embedding_relative', cube.embedding_relative(cube.solved_idx))
 
     xxx = cube.get_layer_stickers(0, 1, 5)
     print(len(xxx), xxx)
@@ -1910,7 +1972,7 @@ if __name__ == "__main__":
     # test_rotate()
 
     def test_scramble(moves: int = 10):
-        mv = cube.scramble(moves)
+        mv = cube.generate_moves(moves)
         cube.apply(mv)
         # print(cube.cube)
         print(mv)
@@ -1933,7 +1995,7 @@ if __name__ == "__main__":
     # print(f"✔️ all good.err {err}")
 
     def test_scramble2(moves: int = 10):
-        mv = cube.scramble(moves)
+        mv = cube.generate_moves(moves)
         s0 = cube.solved_idx.copy()
         cube.act_moves(s0, mv)
         if not np.array_equal(np.sort(s0.reshape(-1)), cube.solved_idx.reshape(-1)):
@@ -1957,7 +2019,7 @@ if __name__ == "__main__":
     cube = StickerCube(n=3)
     print(cube.get_state())
     print('corners', cube.get_corners(cube.cube))
-    mv = cube.scramble(20)
+    mv = cube.generate_moves(20)
     cube.apply(mv)
     print(mv)
 
@@ -1986,8 +2048,8 @@ if __name__ == "__main__":
         )
 
 
-    # class_cache.save(StickerCube)
-    # class_property.save(StickerCube)
+    class_cache.save(StickerCube)
+    class_property.save(StickerCube)
 
     print(cube.get_vars())
     print(cube.strip_coords_from_axis.cache)

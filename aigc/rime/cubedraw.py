@@ -495,10 +495,10 @@ class RubiksCubeDraw:
                         seq = self.cube.invert_moves(pending_moves)
                         self.enqueue_moves(seq)
                         pending_moves.clear()
-                    elif ev.key == pygame.K_s:  # 生成并播放 scramble 序列
-                        pending_moves = self.cube.scramble(25)
+                    elif ev.key == pygame.K_g:  # 生成并播放 scramble 序列
+                        pending_moves = self.cube.generate_moves(25)
                         self.enqueue_moves(pending_moves)
-                    elif ev.key == pygame.K_k:
+                    elif ev.key == pygame.K_s:
                         pending_moves = cubie.solve_sticker(self.cube.get_state())
                         print(len(pending_moves))
                         self.enqueue_moves(pending_moves)

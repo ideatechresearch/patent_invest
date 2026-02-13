@@ -422,7 +422,7 @@ async def get_chat_payload(messages: list[dict] = None, user_request: str = '', 
     extra_body = payload.get("extra_body")
     if not isinstance(extra_body, dict):
         extra_body = {}
-    enable_thinking = extra_body.get('enable_thinking', thinking > 0)
+    enable_thinking = extra_body.get('enable_thinking', thinking > 0)  # {"chat_template_kwargs": {"thinking":True}},
     thinking_budget = max(0, thinking) or extra_body.get('thinking_budget', 0)
     # https://help.aliyun.com/zh/model-studio/deep-thinking?spm=a2c4g.11186623.0.0.31a44823XJPxi9#e7c0002fe4meu
     if name in ('qwen3-32b', "qwen3-14b", "qwen3-8b", "qwen3-235b-a22b", "qwq-32b", "qwen-turbo", "qwen-plus",
@@ -468,7 +468,7 @@ def get_chat_payload_post(model_info: Dict[str, Any], payload: dict):
     # 通过 requests 库直接发起 HTTP POST 请求
     url = model_info['url'] if model_info.get('url') else model_info['base_url'] + '/chat/completions'
     api_key = model_info['api_key']
-    headers = {'Content-Type': 'application/json', }
+    headers = {'Content-Type': 'application/json', "Accept": "application/json"}
     payload = payload.copy()
     if api_key:
         if isinstance(api_key, list):
@@ -742,8 +742,11 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, str
     }
     url, headers, payload = get_chat_payload_post(model_info, payload)
     payload["stream"] = True
-    cx = get_httpx_client(proxy=Config.HTTP_Proxy if model_info.get('proxy') else None)
+    headers["Accept"] = "text/event-stream"
     model_type = model_info['type']
+    assistant_content = ''
+    completion = None
+    cx = get_httpx_client(proxy=Config.HTTP_Proxy if model_info.get('proxy') else None)
     async for item in post_httpx_sse(url, payload, headers, Config.LLM_TIMEOUT_SEC, cx):
         data_type = item.get("type")
         if data_type == 'done':
@@ -753,6 +756,7 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, str
         if not data:
             continue
 
+        completion = data
         if data_type != "data":
             # text / error 直接返回原始字符串 yield
             content = f"OpenAI error occurred: {data}" if data_type == "error" else data
@@ -767,6 +771,7 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, str
             content = data.get("result") or data.get("error_msg")
             fake_response["choices"][0]["delta"]["content"] = content
             yield content, json.dumps(fake_response)
+
         elif model_type == 'tencent':
             reason = data.get('Choices', [{}])[0].get('FinishReason')
             if reason == "stop":
@@ -777,8 +782,31 @@ async def ai_chat_stream(model_info: Optional[Dict[str, Any]], payload=None, str
         choices = data.get('choices', [])  # 通用逻辑：处理 choices -> delta -> content
         if choices:
             delta = choices[0].get('delta', {})
-            yield delta.get("content", ""), json.dumps(data)
-            # print(delta.get("content", ""), end="", flush=True)
+            content_chunk = delta.get("content", "") or delta.get("reasoning_content", "")
+            assistant_content += content_chunk
+            yield content_chunk, json.dumps(data)
+            # print(content_chunk, end="", flush=True)
+
+    if completion:
+        if "<think>" in assistant_content:
+            reasoning_content, final_content = extract_tagged_split(assistant_content)  # .split("</think>")[-1]
+        else:
+            reasoning_content, final_content = None, assistant_content
+        completion.update({
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_content,
+                        "reasoning_content": reasoning_content
+                    },
+                    # "metadata": {"reasoning": reasoning}
+                }
+            ],
+        })
+        yield None, json.dumps(completion)
 
     # yield "[DONE]"
 

@@ -7,7 +7,8 @@ import numpy as np
 
 from agents.ai_prompt import System_content
 from utils import build_prompt, create_analyze_messages, deduplicate_functions_by_name, run_togather, get_tokenizer, \
-    lang_token_size, generate_hash_key, extract_json_struct, normalize_embeddings, cosine_similarity_np
+    lang_token_size, generate_hash_key, extract_json_struct, normalize_embeddings, cosine_similarity_np, \
+    extract_tagged_split
 from service import AI_Client, DB_Client, AliyunBucket, BaseMysql, AsyncAbortController, LRUCache, logger, get_redis, \
     get_httpx_client, post_aiohttp_stream, upload_file_to_oss, upload_file_to_oss_from_file, find_ai_model, \
     async_error_logger, async_polling_check
@@ -145,7 +146,7 @@ async def ai_analyze(results: dict | list | str, system_prompt: str = None, desc
     content, _ = await ai_client_completions(messages, client=None, model=model, get_content=True, reference=reference,
                                              max_tokens=max_tokens, temperature=temperature, dbpool=dbpool, **kwargs)
     print(f'</{desc}>: {content}')
-    return content.split("</think>")[-1]
+    return content.split("</think>")[-1]  # reason, prompt = extract_tagged_split
 
 
 async def ai_files_messages(files: List[str], question: str = None, messages: list = None,
@@ -271,6 +272,7 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
         payload["stream_options"]["include_usage"] = True  # 可选，配置以后会在流式输出的最后一行展示token使用信息
 
     # print(payload, client)
+    stream = None
     try:
         abort_event = await Active_Stream_Events.set_abort_event(stream_id)
         stream = await client.chat.completions.create(**payload)
@@ -279,8 +281,10 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
         if not hasattr(stream, "__aiter__"):
             raise TypeError("OpenAI API returned a non-streaming response")
 
-        reasoning_content = ''
         assistant_content = []  # answer_content
+        tool_calls_acc = []  # List[dict]
+        reasoning_content = ''
+        has_think = False
         completion_chunk = None
         async for chunk in stream:
             if not chunk:
@@ -290,6 +294,7 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
             if abort_event and abort_event.is_set():  # 被 poll_abort 触发 or should_abort_async
                 yield '[DONE]', chunk.model_dump_json()
                 await stream.close()
+                stream = None
                 logger.warning(f"检测到中断信号，已停止流: {stream_id}")
                 break  # return
 
@@ -297,32 +302,79 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
             if not chunk.choices:
                 if set_usage:
                     yield None, chunk.model_dump_json()  # '[DONE]' usage
-                if assistant_content:
+                if assistant_content or tool_calls_acc:
                     break
                 else:
                     continue
 
             delta = chunk.choices[0].delta
             if delta.content:  # 以两个换行符 \n\n 结束当前传输的数据块
-                assistant_content.append(delta.content)
-                yield delta.content, chunk.model_dump_json()  # 获取字节流数据
+                content_chunk = delta.content
+                if not has_think and "<think>" in content_chunk:
+                    has_think = True
+
+                assistant_content.append(content_chunk)
+                yield content_chunk, chunk.model_dump_json()  # 获取字节流数据
+
+            if delta.tool_calls:  # 通常 content 为 nul
+                for tc_delta in delta.tool_calls:
+                    index = tc_delta.index or 0
+
+                    # 确保这个 index 的 tool_call 已初始化
+                    while len(tool_calls_acc) <= index:
+                        tool_calls_acc.append({"id": None, "type": None, "function": {"name": "", "arguments": ""}})
+
+                    current = tool_calls_acc[index]
+
+                    if tc_delta.id:  # 合并 id（只出现一次）
+                        current["id"] = tc_delta.id
+
+                    if tc_delta.type:
+                        current["type"] = tc_delta.type
+
+                    if tc_delta.function:
+                        func = current["function"]
+                        if tc_delta.function.name:
+                            func["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            func["arguments"] += tc_delta.function.arguments  # arguments 是字符串拼接
+
+                # yield 特殊标记或直接包含在 json 中 json.dumps({"tool_calls": delta.tool_calls})
+                yield None, chunk.model_dump_json()
 
             if hasattr(delta, "reasoning_content") and delta.reasoning_content:
                 reasoning_content += delta.reasoning_content
                 yield delta.reasoning_content, chunk.model_dump_json()
+                # print(f"{delta.reasoning_content}", end="", flush=True)
 
-        if not assistant_content and not reasoning_content:
+        if not assistant_content and not reasoning_content and not tool_calls_acc:
             raise ValueError("OpenAI API returned an empty stream response")
+
         if completion_chunk:
+            finish_reason = completion_chunk.choices[
+                0].finish_reason if completion_chunk.choices else "stop"  # "length"
+            final_content = ''.join(assistant_content)
+            if assistant_content and has_think:
+                reasoning_content, final_content = extract_tagged_split(final_content, tag='think')
+
+            final_message = {
+                "role": "assistant",
+                "content": final_content,
+                "reasoning_content": reasoning_content if reasoning_content else None,
+            }
+            if tool_calls_acc:
+                cleaned_tool_calls = [tc for tc in tool_calls_acc if tc.get("id") and tc["function"].get("name")]
+                if cleaned_tool_calls:
+                    final_message["tool_calls"] = json.dumps(cleaned_tool_calls, indent=2, ensure_ascii=False)
+                    finish_reason = "tool_calls"
             completion = completion_chunk.model_dump()
             completion.update({
                 "object": "chat.completion",
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": ''.join(assistant_content),
-                                    "reasoning_content": reasoning_content},
-                        "finish_reason": "stop",  # "length"
+                        "message": final_message,
+                        "finish_reason": finish_reason,
                         # "metadata": {"reasoning": reasoning}  # .split("</think>")[-1]
                     }
                 ],
@@ -331,6 +383,8 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
 
     except Exception as e:
         logger.error(f"OpenAI error:{e}, {payload}")
+        # if "peer closed" in str(e) or "incomplete chunked" in str(e):
+        #     await asyncio.sleep(3)
         error_message = f"OpenAI error occurred: {e}"
         fake_response = {
             "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion.chunk",
@@ -342,6 +396,11 @@ async def stream_chat_completion(client: AsyncOpenAI, payload: dict, stream_id: 
     finally:
         if stream_id:
             await Active_Stream_Events.delete(stream_id)
+        if stream:
+            try:
+                await stream.close()
+            except:
+                pass
 
 
 async def ai_try(client: AsyncOpenAI, payload: dict, e: Exception) -> Tuple[str, Dict]:
